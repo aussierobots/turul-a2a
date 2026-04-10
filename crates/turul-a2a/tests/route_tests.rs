@@ -64,6 +64,7 @@ fn test_state() -> AppState {
         executor: Arc::new(TestExecutor),
         task_storage: Arc::new(storage.clone()),
         push_storage: Arc::new(storage),
+        event_broker: turul_a2a::streaming::TaskEventBroker::new(),
     }
 }
 
@@ -197,8 +198,8 @@ async fn subscribe_task_routes() {
     let req = Request::get("/tasks/some-id:subscribe")
         .body(Body::empty())
         .unwrap();
-    let status = response_status(router, req).await;
-    assert_ne!(status, 404, "GET /tasks/{{id}}:subscribe must route");
+    // Task doesn't exist, so handler returns 404 with body (not axum's empty 404)
+    assert_route_dispatches(router, req).await;
 }
 
 // =========================================================

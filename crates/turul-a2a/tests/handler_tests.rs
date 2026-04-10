@@ -87,6 +87,7 @@ fn test_state() -> AppState {
         executor: Arc::new(CompletingExecutor),
         task_storage: Arc::new(storage.clone()),
         push_storage: Arc::new(storage),
+        event_broker: turul_a2a::streaming::TaskEventBroker::new(),
     }
 }
 

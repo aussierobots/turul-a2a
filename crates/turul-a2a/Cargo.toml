@@ -24,6 +24,8 @@ tracing = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 http = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

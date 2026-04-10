@@ -6,13 +6,17 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 
 use crate::error::A2aError;
 use crate::executor::AgentExecutor;
 use crate::storage::{A2aPushNotificationStorage, A2aStorageError, A2aTaskStorage, TaskFilter, TaskListPage};
+use crate::streaming::StreamEvent;
 use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
 
 /// Shared server state.
@@ -21,6 +25,7 @@ pub struct AppState {
     pub executor: Arc<dyn AgentExecutor>,
     pub task_storage: Arc<dyn A2aTaskStorage>,
     pub push_storage: Arc<dyn A2aPushNotificationStorage>,
+    pub event_broker: crate::streaming::TaskEventBroker,
 }
 
 /// Build the axum router with all proto-defined routes.
@@ -43,7 +48,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         // Tenant-prefixed routes (proto additional_bindings)
         .route("/{tenant}/message:send", post(tenant_send_message_handler))
-        .route("/{tenant}/message:stream", post(send_streaming_message_handler))
+        .route("/{tenant}/message:stream", post(tenant_send_streaming_message_handler))
         .route("/{tenant}/tasks", get(tenant_list_tasks_handler))
         .route("/{tenant}/extendedAgentCard", get(extended_agent_card_handler))
         .route(
@@ -121,7 +126,7 @@ async fn task_get_dispatch(
     State(state): State<AppState>,
     Path(rest): Path<String>,
     Query(query): Query<TaskGetCombinedQuery>,
-) -> Result<Json<serde_json::Value>, A2aError> {
+) -> Result<axum::response::Response, A2aError> {
     dispatch_task_get(state, DEFAULT_TENANT, &rest, &query).await
 }
 
@@ -129,14 +134,14 @@ async fn task_post_dispatch(
     State(state): State<AppState>,
     Path(rest): Path<String>,
     body: String,
-) -> Result<Json<serde_json::Value>, A2aError> {
+) -> Result<axum::response::Response, A2aError> {
     dispatch_task_post(state, DEFAULT_TENANT, &rest, body).await
 }
 
 async fn task_delete_dispatch(
     State(state): State<AppState>,
     Path(rest): Path<String>,
-) -> Result<Json<serde_json::Value>, A2aError> {
+) -> Result<axum::response::Response, A2aError> {
     dispatch_task_delete(state, DEFAULT_TENANT, &rest).await
 }
 
@@ -164,7 +169,7 @@ async fn tenant_task_get_dispatch(
     State(state): State<AppState>,
     Path((tenant, rest)): Path<(String, String)>,
     Query(query): Query<TaskGetCombinedQuery>,
-) -> Result<Json<serde_json::Value>, A2aError> {
+) -> Result<axum::response::Response, A2aError> {
     dispatch_task_get(state, &tenant, &rest, &query).await
 }
 
@@ -172,14 +177,14 @@ async fn tenant_task_post_dispatch(
     State(state): State<AppState>,
     Path((tenant, rest)): Path<(String, String)>,
     body: String,
-) -> Result<Json<serde_json::Value>, A2aError> {
+) -> Result<axum::response::Response, A2aError> {
     dispatch_task_post(state, &tenant, &rest, body).await
 }
 
 async fn tenant_task_delete_dispatch(
     State(state): State<AppState>,
     Path((tenant, rest)): Path<(String, String)>,
-    ) -> Result<Json<serde_json::Value>, A2aError> {
+) -> Result<axum::response::Response, A2aError> {
     dispatch_task_delete(state, &tenant, &rest).await
 }
 
@@ -205,21 +210,26 @@ async fn dispatch_task_get(
     tenant: &str,
     rest: &str,
     query: &TaskGetCombinedQuery,
-) -> Result<Json<serde_json::Value>, A2aError> {
+) -> Result<axum::response::Response, A2aError> {
     match parse_task_path(rest) {
-        Some(TaskAction::GetTask(id)) => core_get_task(state, tenant, &id, query.history_length).await,
-        Some(TaskAction::SubscribeToTask(_)) => Err(A2aError::UnsupportedOperation {
-            message: "Streaming not implemented in v0.1".into(),
-        }),
+        Some(TaskAction::GetTask(id)) => {
+            let Json(v) = core_get_task(state, tenant, &id, query.history_length).await?;
+            Ok(Json(v).into_response())
+        }
+        Some(TaskAction::SubscribeToTask(id)) => {
+            core_subscribe_to_task(state, tenant, &id).await
+        }
         Some(TaskAction::PushConfigCollection(task_id)) => {
             let pq = PushConfigQuery {
                 page_size: query.page_size,
                 page_token: query.page_token.clone(),
             };
-            core_list_push_configs(state, tenant, &task_id, &pq).await
+            let Json(v) = core_list_push_configs(state, tenant, &task_id, &pq).await?;
+            Ok(Json(v).into_response())
         }
         Some(TaskAction::PushConfigItem(task_id, config_id)) => {
-            core_get_push_config(state, tenant, &task_id, &config_id).await
+            let Json(v) = core_get_push_config(state, tenant, &task_id, &config_id).await?;
+            Ok(Json(v).into_response())
         }
         _ => Err(A2aError::InvalidRequest { message: "Invalid task path".into() }),
     }
@@ -230,11 +240,15 @@ async fn dispatch_task_post(
     tenant: &str,
     rest: &str,
     body: String,
-) -> Result<Json<serde_json::Value>, A2aError> {
+) -> Result<axum::response::Response, A2aError> {
     match parse_task_path(rest) {
-        Some(TaskAction::CancelTask(id)) => core_cancel_task(state, tenant, &id).await,
+        Some(TaskAction::CancelTask(id)) => {
+            let Json(v) = core_cancel_task(state, tenant, &id).await?;
+            Ok(Json(v).into_response())
+        }
         Some(TaskAction::PushConfigCollection(task_id)) => {
-            core_create_push_config(state, tenant, &task_id, body).await
+            let Json(v) = core_create_push_config(state, tenant, &task_id, body).await?;
+            Ok(Json(v).into_response())
         }
         _ => Err(A2aError::InvalidRequest { message: "Invalid task path".into() }),
     }
@@ -244,10 +258,11 @@ async fn dispatch_task_delete(
     state: AppState,
     tenant: &str,
     rest: &str,
-) -> Result<Json<serde_json::Value>, A2aError> {
+) -> Result<axum::response::Response, A2aError> {
     match parse_task_path(rest) {
         Some(TaskAction::PushConfigItem(task_id, config_id)) => {
-            core_delete_push_config(state, tenant, &task_id, &config_id).await
+            let Json(v) = core_delete_push_config(state, tenant, &task_id, &config_id).await?;
+            Ok(Json(v).into_response())
         }
         _ => Err(A2aError::InvalidRequest { message: "Invalid task path".into() }),
     }
@@ -271,11 +286,161 @@ async fn extended_agent_card_handler(
 }
 
 async fn send_streaming_message_handler(
-    State(_state): State<AppState>,
-) -> Result<Json<serde_json::Value>, A2aError> {
-    Err(A2aError::UnsupportedOperation {
-        message: "Streaming not implemented in v0.1".into(),
-    })
+    State(state): State<AppState>,
+    body: String,
+) -> Result<axum::response::Response, A2aError> {
+    core_send_streaming_message(state, DEFAULT_TENANT, body).await
+}
+
+async fn tenant_send_streaming_message_handler(
+    State(state): State<AppState>,
+    Path(tenant): Path<String>,
+    body: String,
+) -> Result<axum::response::Response, A2aError> {
+    core_send_streaming_message(state, &tenant, body).await
+}
+
+pub(crate) async fn core_send_streaming_message(
+    state: AppState,
+    tenant: &str,
+    body: String,
+) -> Result<axum::response::Response, A2aError> {
+    let request: turul_a2a_proto::SendMessageRequest = serde_json::from_str(&body)
+        .map_err(|e| A2aError::InvalidRequest {
+            message: format!("Invalid request body: {e}"),
+        })?;
+
+    let proto_message = request.message.ok_or(A2aError::InvalidRequest {
+        message: "message field is required".into(),
+    })?;
+
+    let message = Message::try_from(proto_message).map_err(|e| A2aError::InvalidRequest {
+        message: format!("Invalid message: {e}"),
+    })?;
+
+    let task_id = uuid::Uuid::now_v7().to_string();
+    let context_id = if message.as_proto().context_id.is_empty() {
+        uuid::Uuid::now_v7().to_string()
+    } else {
+        message.as_proto().context_id.clone()
+    };
+
+    // Subscribe BEFORE creating the task so we don't miss events
+    let rx = state.event_broker.subscribe(&task_id).await;
+
+    // Create task
+    let mut task = Task::new(&task_id, TaskStatus::new(TaskState::Submitted))
+        .with_context_id(&context_id);
+    task.append_message(message.clone());
+
+    state
+        .task_storage
+        .create_task(tenant, DEFAULT_OWNER, task)
+        .await
+        .map_err(A2aError::from)?;
+
+    // Publish initial status
+    state
+        .event_broker
+        .publish_status_update(&task_id, &context_id, &TaskStatus::new(TaskState::Submitted))
+        .await;
+
+    // Spawn task execution in background
+    let exec_state = state.clone();
+    let exec_tenant = tenant.to_string();
+    let exec_task_id = task_id.clone();
+    let exec_context_id = context_id.clone();
+    let exec_message = message.clone();
+    tokio::spawn(async move {
+        // Move to Working
+        if let Ok(mut task) = exec_state
+            .task_storage
+            .update_task_status(&exec_tenant, &exec_task_id, DEFAULT_OWNER, TaskStatus::new(TaskState::Working))
+            .await
+        {
+            exec_state
+                .event_broker
+                .publish_status_update(&exec_task_id, &exec_context_id, &TaskStatus::new(TaskState::Working))
+                .await;
+
+            // Execute agent logic
+            let _ = exec_state.executor.execute(&mut task, &exec_message).await;
+
+            // Persist final state
+            let _ = exec_state
+                .task_storage
+                .update_task(&exec_tenant, DEFAULT_OWNER, task.clone())
+                .await;
+
+            // Publish final status
+            if let Some(status) = task.status() {
+                exec_state
+                    .event_broker
+                    .publish_status_update(&exec_task_id, &exec_context_id, &status)
+                    .await;
+            }
+        }
+    });
+
+    // Return SSE stream
+    Ok(make_sse_response(rx))
+}
+
+pub(crate) async fn core_subscribe_to_task(
+    state: AppState,
+    tenant: &str,
+    task_id: &str,
+) -> Result<axum::response::Response, A2aError> {
+    // Verify task exists
+    let task = state
+        .task_storage
+        .get_task(tenant, task_id, DEFAULT_OWNER, Some(0))
+        .await
+        .map_err(A2aError::from)?
+        .ok_or_else(|| A2aError::TaskNotFound {
+            task_id: task_id.to_string(),
+        })?;
+
+    // Check if task is already terminal
+    if let Some(status) = task.status() {
+        if let Ok(s) = status.state() {
+            if s.is_terminal() {
+                return Err(A2aError::UnsupportedOperation {
+                    message: format!("Task {task_id} is already in terminal state {s:?}"),
+                });
+            }
+        }
+    }
+
+    let rx = state.event_broker.subscribe(task_id).await;
+
+    // Send current status as first event
+    if let Some(status) = task.status() {
+        state
+            .event_broker
+            .publish_status_update(task_id, task.context_id(), &status)
+            .await;
+    }
+
+    Ok(make_sse_response(rx))
+}
+
+fn make_sse_response(
+    rx: tokio::sync::broadcast::Receiver<StreamEvent>,
+) -> axum::response::Response {
+    let stream = BroadcastStream::new(rx).filter_map(|result| async move {
+        match result {
+            Ok(event) => {
+                let json = serde_json::to_string(&event).ok()?;
+                Some(Ok::<_, std::convert::Infallible>(Event::default().data(json)))
+            }
+            Err(_) => None, // Lagged — skip
+        }
+    });
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 // =========================================================
