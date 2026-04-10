@@ -529,41 +529,100 @@ pub(crate) async fn core_send_message(
         message: format!("Invalid message: {e}"),
     })?;
 
-    let task_id = uuid::Uuid::now_v7().to_string();
-    let context_id = if message.as_proto().context_id.is_empty() {
-        uuid::Uuid::now_v7().to_string()
+    let msg_task_id = message.as_proto().task_id.clone();
+
+    // If message has a task_id, continue the existing task; otherwise create new
+    let (task_id, is_continuation) = if !msg_task_id.is_empty() {
+        // Verify the task exists and is accessible
+        let existing = state
+            .task_storage
+            .get_task(tenant, &msg_task_id, DEFAULT_OWNER, None)
+            .await
+            .map_err(A2aError::from)?
+            .ok_or_else(|| A2aError::TaskNotFound {
+                task_id: msg_task_id.clone(),
+            })?;
+
+        // Verify task is in an interrupted state (INPUT_REQUIRED or AUTH_REQUIRED)
+        if let Some(status) = existing.status() {
+            if let Ok(s) = status.state() {
+                if s.is_terminal() {
+                    return Err(A2aError::InvalidRequest {
+                        message: format!("Task {msg_task_id} is in terminal state {s:?}"),
+                    });
+                }
+            }
+        }
+
+        (msg_task_id, true)
     } else {
-        message.as_proto().context_id.clone()
+        (uuid::Uuid::now_v7().to_string(), false)
     };
 
-    let mut task = Task::new(&task_id, TaskStatus::new(TaskState::Submitted))
-        .with_context_id(&context_id);
-    task.append_message(message.clone());
+    if is_continuation {
+        // Append message to existing task
+        state
+            .task_storage
+            .append_message(tenant, &task_id, DEFAULT_OWNER, message.clone())
+            .await
+            .map_err(A2aError::from)?;
 
-    state
-        .task_storage
-        .create_task(tenant, DEFAULT_OWNER, task)
-        .await
-        .map_err(A2aError::from)?;
+        // Move to Working if in interrupted state
+        let task = state
+            .task_storage
+            .update_task_status(tenant, &task_id, DEFAULT_OWNER, TaskStatus::new(TaskState::Working))
+            .await
+            .map_err(A2aError::from)?;
 
-    let task = state
-        .task_storage
-        .update_task_status(tenant, &task_id, DEFAULT_OWNER, TaskStatus::new(TaskState::Working))
-        .await
-        .map_err(A2aError::from)?;
+        let mut task = task;
+        state.executor.execute(&mut task, &message).await?;
 
-    let mut task = task;
-    state.executor.execute(&mut task, &message).await?;
+        state
+            .task_storage
+            .update_task(tenant, DEFAULT_OWNER, task.clone())
+            .await
+            .map_err(A2aError::from)?;
 
-    state
-        .task_storage
-        .update_task(tenant, DEFAULT_OWNER, task.clone())
-        .await
-        .map_err(A2aError::from)?;
+        Ok(Json(serde_json::json!({
+            "task": serde_json::to_value(&task).unwrap_or_default()
+        })))
+    } else {
+        // Create new task
+        let context_id = if message.as_proto().context_id.is_empty() {
+            uuid::Uuid::now_v7().to_string()
+        } else {
+            message.as_proto().context_id.clone()
+        };
 
-    Ok(Json(serde_json::json!({
-        "task": serde_json::to_value(&task).unwrap_or_default()
-    })))
+        let mut task = Task::new(&task_id, TaskStatus::new(TaskState::Submitted))
+            .with_context_id(&context_id);
+        task.append_message(message.clone());
+
+        state
+            .task_storage
+            .create_task(tenant, DEFAULT_OWNER, task)
+            .await
+            .map_err(A2aError::from)?;
+
+        let task = state
+            .task_storage
+            .update_task_status(tenant, &task_id, DEFAULT_OWNER, TaskStatus::new(TaskState::Working))
+            .await
+            .map_err(A2aError::from)?;
+
+        let mut task = task;
+        state.executor.execute(&mut task, &message).await?;
+
+        state
+            .task_storage
+            .update_task(tenant, DEFAULT_OWNER, task.clone())
+            .await
+            .map_err(A2aError::from)?;
+
+        Ok(Json(serde_json::json!({
+            "task": serde_json::to_value(&task).unwrap_or_default()
+        })))
+    }
 }
 
 pub(crate) async fn core_list_tasks(

@@ -16,7 +16,7 @@ use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
 use turul_a2a::router::{build_router, AppState};
 use turul_a2a::storage::InMemoryA2aStorage;
-use turul_a2a_types::{Message, Task};
+use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
 
 // =========================================================
 // Test executors with different behaviors
@@ -165,6 +165,7 @@ fn send_body_with_task(id: &str, text: &str, task_id: &str) -> String {
     serde_json::json!({"message":{"messageId":id,"taskId":task_id,"role":"ROLE_USER","parts":[{"text":text}]}}).to_string()
 }
 
+
 fn jrpc(method: &str, params: serde_json::Value, id: i64) -> String {
     serde_json::json!({"jsonrpc":"2.0","method":method,"params":params,"id":id}).to_string()
 }
@@ -184,16 +185,27 @@ fn parse_sse_events(text: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Collect SSE events by reading body frames with a timeout.
+/// Unlike body.collect(), this returns partial data when the stream is still open.
 async fn collect_sse(body: Body, timeout: Duration) -> Vec<serde_json::Value> {
-    match tokio::time::timeout(timeout, async {
-        let b = body.collect().await.unwrap().to_bytes();
-        parse_sse_events(&String::from_utf8_lossy(&b))
+    use http_body_util::BodyExt;
+    let mut body = body;
+    let mut buf = Vec::new();
+
+    let result = tokio::time::timeout(timeout, async {
+        while let Some(frame) = body.frame().await {
+            if let Ok(frame) = frame {
+                if let Some(data) = frame.data_ref() {
+                    buf.extend_from_slice(data);
+                }
+            }
+        }
     })
-    .await
-    {
-        Ok(e) => e,
-        Err(_) => vec![],
-    }
+    .await;
+
+    // Timeout is fine — stream may still be open
+    let _ = result;
+    parse_sse_events(&String::from_utf8_lossy(&buf))
 }
 
 // =========================================================
@@ -231,22 +243,31 @@ async fn e2e_multi_turn_input_required() {
     let st = state_with(MultiTurnExecutor::new());
 
     // First send → INPUT_REQUIRED
-    let (_, body) = post_json(build_router(st.clone()), "/message:send", &send_body("mt1", "first")).await;
+    let (status, body) = post_json(build_router(st.clone()), "/message:send", &send_body("mt1", "first")).await;
+    assert_eq!(status, 200);
     let tid = body["task"]["id"].as_str().unwrap().to_string();
     let state_str = body["task"]["status"]["state"].as_str().unwrap();
     assert_eq!(state_str, "TASK_STATE_INPUT_REQUIRED");
 
-    // Second send with same task_id → COMPLETED
-    let (_, body) = post_json(
+    // Second send with same task_id → resumes the SAME task → COMPLETED
+    let (status, body) = post_json(
         build_router(st.clone()),
         "/message:send",
         &send_body_with_task("mt2", "follow-up", &tid),
     )
     .await;
-    // The second send creates a new task since we haven't wired task_id lookup yet.
-    // For now verify the executor was called a second time and completed.
-    let state_str2 = body["task"]["status"]["state"].as_str().unwrap();
-    assert_eq!(state_str2, "TASK_STATE_COMPLETED");
+    assert_eq!(status, 200);
+    let tid2 = body["task"]["id"].as_str().unwrap();
+    assert_eq!(tid2, tid, "Second send must continue the same task, not create a new one");
+    assert_eq!(body["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+
+    // Verify the task has both messages in history
+    let (_, body) = get_json(build_router(st), &format!("/tasks/{tid}")).await;
+    let history = body["history"].as_array();
+    assert!(
+        history.is_some_and(|h| h.len() >= 2),
+        "Task should have at least 2 messages in history from multi-turn"
+    );
 }
 
 // =========================================================
@@ -302,6 +323,56 @@ async fn e2e_streaming_event_sequence() {
         *last == "TASK_STATE_COMPLETED" || *last == "TASK_STATE_FAILED",
         "Last status should be terminal, got: {last}"
     );
+}
+
+// =========================================================
+// E2E-06: Subscribe on live non-terminal task
+// =========================================================
+
+#[tokio::test]
+async fn e2e_subscribe_live_task() {
+    let st = state_with(MultiTurnExecutor::new());
+
+    // Create a task that pauses at INPUT_REQUIRED
+    let (_, body) = post_json(build_router(st.clone()), "/message:send", &send_body("sub-e2e", "pause")).await;
+    let tid = body["task"]["id"].as_str().unwrap().to_string();
+    assert_eq!(body["task"]["status"]["state"], "TASK_STATE_INPUT_REQUIRED");
+
+    // Subscribe to the non-terminal task
+    let router = build_router(st.clone());
+    let req = Request::get(&format!("/tasks/{tid}:subscribe"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+    assert!(ct.contains("text/event-stream"));
+
+    // The SSE stream is long-lived (keeps alive until terminal).
+    // Read the body in a background task, publish a new event, then check.
+    let body = resp.into_body();
+
+    // Publish another status update to ensure there's an event to read
+    st.event_broker
+        .publish_status_update(
+            &tid,
+            "",
+            &TaskStatus::new(TaskState::InputRequired),
+        )
+        .await;
+
+    let events = collect_sse(body, Duration::from_millis(500)).await;
+    // Should have at least the snapshot + our published event
+    assert!(!events.is_empty(), "Subscribe should emit events");
+
+    // All events should be statusUpdate
+    for event in &events {
+        assert!(
+            event.get("statusUpdate").is_some(),
+            "Subscribe event should be statusUpdate, got: {event}"
+        );
+    }
 }
 
 // =========================================================
