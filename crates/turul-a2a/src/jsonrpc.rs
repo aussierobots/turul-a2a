@@ -19,47 +19,69 @@ use crate::router::AppState;
 pub async fn jsonrpc_dispatch_handler(
     State(state): State<AppState>,
     body: String,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     // 1. Parse JSON
     let value: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
-        Err(_) => return Json(jsonrpc_error(Value::Null, -32700, "Parse error", None)),
+        Err(_) => {
+            return Json(jsonrpc_error(Value::Null, -32700, "Parse error", None)).into_response();
+        }
     };
 
     // 2. Validate JSON-RPC 2.0 envelope
-    let id = value.get("id").cloned().unwrap_or(Value::Null);
-
     let jsonrpc = value.get("jsonrpc").and_then(|v| v.as_str());
     if jsonrpc != Some("2.0") {
-        return Json(jsonrpc_error(id, -32600, "Invalid Request: missing or wrong jsonrpc version", None));
+        let id = value.get("id").cloned().unwrap_or(Value::Null);
+        return Json(jsonrpc_error(id, -32600, "Invalid Request: missing or wrong jsonrpc version", None)).into_response();
     }
 
     let method = match value.get("method").and_then(|v| v.as_str()) {
         Some(m) => m.to_string(),
         None => {
-            return Json(jsonrpc_error(id, -32600, "Invalid Request: missing method", None));
+            let id = value.get("id").cloned().unwrap_or(Value::Null);
+            return Json(jsonrpc_error(id, -32600, "Invalid Request: missing method", None)).into_response();
         }
     };
 
-    let params = value.get("params").cloned().unwrap_or(json!({}));
+    // 3. Check if this is a notification (no "id" field = notification, must not reply)
+    let is_notification = !value.as_object().map_or(false, |o| o.contains_key("id"));
+    let id = value.get("id").cloned().unwrap_or(Value::Null);
 
-    // 3. Extract tenant from params (JSON-RPC gets tenant from request body, not URL)
+    // 4. Validate params: must be object, null, or absent. Arrays/scalars are -32602.
+    let params = match value.get("params") {
+        None => json!({}),
+        Some(Value::Null) => json!({}),
+        Some(Value::Object(_)) => value.get("params").cloned().unwrap(),
+        Some(_) => {
+            if is_notification {
+                return axum::http::StatusCode::NO_CONTENT.into_response();
+            }
+            return Json(jsonrpc_error(id, -32602, "Invalid params: params must be an object", None)).into_response();
+        }
+    };
+
+    // 5. Extract tenant from params
     let tenant = params
         .get("tenant")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
 
-    // 4. Dispatch by method name
+    // 6. Dispatch by method name
     let result = dispatch(state, &method, &tenant, params).await;
 
-    // 5. Build response
+    // 7. Notifications: suppress response entirely
+    if is_notification {
+        return axum::http::StatusCode::NO_CONTENT.into_response();
+    }
+
+    // 8. Build response
     match result {
-        Ok(value) => Json(jsonrpc_success(id.clone(), value)),
+        Ok(value) => Json(jsonrpc_success(id, value)).into_response(),
         Err(ref e) if matches!(e, A2aError::InvalidRequest { message } if message == "Method not found") => {
-            Json(jsonrpc_error(id, -32601, "Method not found", None))
+            Json(jsonrpc_error(id, -32601, "Method not found", None)).into_response()
         }
-        Err(e) => Json(e.to_jsonrpc_error(Some(&id))),
+        Err(e) => Json(e.to_jsonrpc_error(Some(&id))).into_response(),
     }
 }
 

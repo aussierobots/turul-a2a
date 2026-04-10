@@ -323,3 +323,104 @@ async fn string_id_preserved() {
     let (_, body) = jsonrpc_call(router, &req).await;
     assert_eq!(body["id"], "string-id-123");
 }
+
+// =========================================================
+// [P1] Notifications (no id) must not receive a response
+// =========================================================
+
+#[tokio::test]
+async fn notification_without_id_returns_empty_body() {
+    let router = build_router(test_state());
+    // JSON-RPC 2.0: request without "id" is a notification — server must not reply
+    let req_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "ListTasks",
+        "params": {}
+    })
+    .to_string();
+    let req = Request::post("/jsonrpc")
+        .header("content-type", "application/json")
+        .body(Body::from(req_body))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+
+    // Server should return 204 No Content or 200 with empty body
+    assert!(
+        status == 204 || bytes.is_empty(),
+        "Notification must not produce a response body, got status={status} body={}",
+        String::from_utf8_lossy(&bytes)
+    );
+}
+
+#[tokio::test]
+async fn notification_error_still_suppressed() {
+    let router = build_router(test_state());
+    // Notification that would produce an error — still must not reply
+    let req_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "NonExistentMethod",
+        "params": {}
+    })
+    .to_string();
+    let req = Request::post("/jsonrpc")
+        .header("content-type", "application/json")
+        .body(Body::from(req_body))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+
+    assert!(
+        status == 204 || bytes.is_empty(),
+        "Notification error must not produce a response body"
+    );
+}
+
+// =========================================================
+// [P2] Non-object params must be rejected as invalid params
+// =========================================================
+
+#[tokio::test]
+async fn array_params_returns_invalid_params() {
+    let router = build_router(test_state());
+    let req_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "ListTasks",
+        "params": [1, 2, 3],
+        "id": 99
+    })
+    .to_string();
+    let (_, body) = jsonrpc_call(router, &req_body).await;
+    assert_eq!(body["error"]["code"], -32602, "Array params should be -32602 Invalid params");
+}
+
+#[tokio::test]
+async fn scalar_params_returns_invalid_params() {
+    let router = build_router(test_state());
+    let req_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "ListTasks",
+        "params": "not an object",
+        "id": 100
+    })
+    .to_string();
+    let (_, body) = jsonrpc_call(router, &req_body).await;
+    assert_eq!(body["error"]["code"], -32602, "Scalar params should be -32602 Invalid params");
+}
+
+#[tokio::test]
+async fn null_params_treated_as_empty_object() {
+    let router = build_router(test_state());
+    // null params should be treated as {} (no params), not rejected
+    let req_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "ListTasks",
+        "params": null,
+        "id": 101
+    })
+    .to_string();
+    let (_, body) = jsonrpc_call(router, &req_body).await;
+    assert!(body.get("error").is_none(), "null params should be accepted as empty");
+}
