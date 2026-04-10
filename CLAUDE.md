@@ -11,13 +11,18 @@ Turul-a2a is a Rust implementation of the A2A (Agent-to-Agent) Protocol v1.0. Li
 ## Build & Development Commands
 
 ```bash
-cargo build                        # Build all crates
-cargo check --workspace            # Type-check entire workspace
-cargo test --workspace             # Run all tests
-cargo test -p turul-a2a-proto      # Test proto generation
-cargo test -p turul-a2a-types      # Test types + state machine
-cargo clippy --workspace           # Lint
-cargo fmt --all                    # Format code
+cargo build --workspace              # Build all crates
+cargo check --workspace              # Type-check
+cargo test --workspace               # Run all 202 tests
+cargo test -p turul-a2a-proto        # Proto generation + wire format (26 tests)
+cargo test -p turul-a2a-types        # Types + state machine (54 tests)
+cargo test -p turul-a2a              # Server + storage + handlers (122 tests)
+cargo test -p turul-a2a --test e2e_tests    # E2E scenarios (12 tests)
+cargo test -p turul-a2a --test sse_tests    # SSE transport (10 tests)
+cargo test -p turul-a2a --test jsonrpc_tests # JSON-RPC dispatch (19 tests)
+cargo clippy --workspace             # Lint
+cargo fmt --all                      # Format
+cargo run -p echo-agent              # Run echo agent example on :3000
 ```
 
 All crate dependencies MUST use `workspace = true` — versions are managed in root `Cargo.toml` `[workspace.dependencies]`.
@@ -33,7 +38,7 @@ All crate dependencies MUST use `workspace = true` — versions are managed in r
 
 - `turul-a2a-proto` — prost-generated types from `a2a.proto`. Build.rs generates via `prost-build` + `pbjson-build`. JSON serialization uses camelCase (proto JSON mapping) via pbjson.
 - `turul-a2a-types` — Ergonomic Rust wrappers over proto types. Publishable, no server/storage/auth deps. `#[non_exhaustive]` on all public types. State machine enforcement on `TaskState`.
-- `turul-a2a` — Server + storage + HTTP/JSON-RPC/SSE transports. Feature-gated backends (in-memory default). AgentExecutor trait for user-defined agent logic.
+- `turul-a2a` — Server + storage + HTTP/JSON-RPC/SSE transports. Feature-gated backends (in-memory default). `AgentExecutor` trait for user-defined agent logic. `A2aServer::builder()` for configuration.
 
 ### Proto Build Pipeline
 
@@ -44,19 +49,13 @@ Google well-known types (`google.protobuf.Struct`, `Value`, `Timestamp`) mapped 
 ### Phase 2 Exceptions (Temporary)
 
 - **Push notification configs** use raw `turul_a2a_proto::TaskPushNotificationConfig` in storage traits and handler signatures. This is an intentional exception — push configs are simple CRUD with no state machine or invariants that warrant a wrapper. Keep this leakage isolated; do not let raw proto types spread into general handler/router code.
-- **`last_chunk` on `append_artifact`** is transport-level metadata for Phase 3 SSE streaming. Storage passes it through but does not persist completion state in v0.1. The server layer should forward it to streaming subscribers, not model it in storage.
+- **`last_chunk` on `append_artifact`** is transport-level metadata for SSE streaming. Storage passes it through but does not persist completion state in v0.1. The server layer forwards it to streaming subscribers.
 
 ### Future Streaming Architecture Note
 
 - The current in-process event broker is only valid for a single server instance.
 - Before claiming production-ready streaming for multi-instance deployments or AWS Lambda, add a design task for cross-instance stream delivery and replay.
-- Open question: where are stream events stored or coordinated when the instance that created them is not the one serving `:stream` or `:subscribe`?
-- Minimum requirements for that future task:
-  - durable or shared event coordination across instances
-  - replay support for reconnects and missed events
-  - ordering guarantees per task
-  - explicit decision on whether Lambda supports true SSE directly or requires an alternative adapter path
-- Candidate approaches include a shared event log or broker such as Redis, DynamoDB-backed event storage, EventBridge, or another external pub/sub mechanism. Do not assume the in-memory broker can be stretched to Lambda or horizontal scale.
+- Candidate approaches include a shared event log (Redis, DynamoDB, EventBridge).
 
 ### Architecture Decision Records
 
@@ -84,6 +83,15 @@ Tests are written from the A2A proto/spec FIRST, then implementation follows. If
 - Subscribe: `GET /tasks/{id=*}:subscribe`
 - Extended card: `GET /extendedAgentCard`
 - Discovery: `GET /.well-known/agent-card.json`
+- JSON-RPC: `POST /jsonrpc` (all 11 methods, PascalCase)
 - TaskState: `TASK_STATE_SUBMITTED`, `TASK_STATE_WORKING`, etc.
-- Error: TaskNotCancelableError → 409, ContentTypeNotSupportedError → 415
-- All errors MUST include `google.rpc.ErrorInfo` with reason + domain
+- Error: TaskNotFoundError → 404/-32001, TaskNotCancelableError → 409/-32002, ContentTypeNotSupportedError → 415/-32005
+- All A2A errors MUST include `google.rpc.ErrorInfo` with reason + domain
+
+### Deferred to v0.2+
+
+- Auth middleware (`turul-a2a-auth` with `gps-trust-jwt-validator`)
+- Client library (`turul-a2a-client`)
+- AWS Lambda adapter (`turul-a2a-aws-lambda`)
+- Additional storage backends (SQLite, PostgreSQL, DynamoDB)
+- gRPC transport (feature-gated in `turul-a2a-proto`)
