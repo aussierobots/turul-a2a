@@ -390,3 +390,95 @@ async fn subscribe_tenant_scoped_missing_returns_404() {
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 404, "Subscribe under wrong tenant should 404");
 }
+
+// =========================================================
+// GET /tasks/{id}:subscribe — positive happy path
+// =========================================================
+
+#[tokio::test]
+async fn subscribe_non_terminal_task_returns_sse_with_status_snapshot() {
+    let state = test_state();
+
+    // Create a task directly in storage in WORKING state (non-terminal)
+    let task = turul_a2a_types::Task::new(
+        "sub-happy-1",
+        turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Working),
+    )
+    .with_context_id("ctx-sub-happy");
+
+    state
+        .task_storage
+        .create_task("", "anonymous", task)
+        .await
+        .unwrap();
+
+    // Advance to Working (it was created as Submitted internally, need to match)
+    // Actually Task::new creates with the given status directly, but storage
+    // might validate. Let me create as Submitted then advance.
+    // Re-create properly:
+    let task2 = turul_a2a_types::Task::new(
+        "sub-happy-2",
+        turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Submitted),
+    )
+    .with_context_id("ctx-sub-happy-2");
+
+    state
+        .task_storage
+        .create_task("", "anonymous", task2)
+        .await
+        .unwrap();
+
+    // Move to Working (non-terminal)
+    state
+        .task_storage
+        .update_task_status(
+            "",
+            "sub-happy-2",
+            "anonymous",
+            turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Working),
+        )
+        .await
+        .unwrap();
+
+    // Subscribe — should return 200 + text/event-stream
+    let router = build_router(state);
+    let req = Request::get("/tasks/sub-happy-2:subscribe")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200, "Subscribe to non-terminal task should return 200");
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.contains("text/event-stream"),
+        "Subscribe should return text/event-stream, got: {content_type}"
+    );
+
+    // Read the first event — should be a status snapshot
+    let events = collect_sse_events(resp.into_body(), Duration::from_secs(2)).await;
+    assert!(
+        !events.is_empty(),
+        "Subscribe should emit at least one event (current status snapshot)"
+    );
+
+    let first = &events[0];
+    assert!(
+        first.get("statusUpdate").is_some(),
+        "First subscribe event should be statusUpdate, got: {first}"
+    );
+    let su = &first["statusUpdate"];
+    assert_eq!(su["taskId"], "sub-happy-2");
+    assert_eq!(su["contextId"], "ctx-sub-happy-2");
+    assert!(
+        su["status"]["state"]
+            .as_str()
+            .unwrap_or("")
+            .contains("WORKING"),
+        "Status snapshot should reflect current WORKING state"
+    );
+}
