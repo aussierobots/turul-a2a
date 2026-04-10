@@ -70,7 +70,8 @@ pub trait A2aTaskStorage: Send + Sync {
 
     /// Append an artifact to a task. Enforces tenant + owner isolation.
     /// `append`: if true and artifact_id matches existing, append parts to it.
-    /// `last_chunk`: if true, marks the artifact as complete.
+    /// `last_chunk`: transport-level signal for SSE streaming (Phase 3).
+    ///   Storage passes it through but does not model completion state in v0.1.
     async fn append_artifact(
         &self,
         tenant: &str,
@@ -89,6 +90,12 @@ pub trait A2aTaskStorage: Send + Sync {
 }
 
 /// Storage trait for push notification configurations.
+///
+/// **Design note**: This trait uses `turul_a2a_proto::TaskPushNotificationConfig` directly
+/// rather than a wrapper type. Push configs are simple CRUD resources with no state machine
+/// or invariant enforcement, so a wrapper adds no safety value. If a wrapper is needed later
+/// (e.g., for validation), it can be added without breaking the storage contract since the
+/// proto type's serde behavior is stable via pbjson.
 #[async_trait]
 pub trait A2aPushNotificationStorage: Send + Sync {
     fn backend_name(&self) -> &'static str;
