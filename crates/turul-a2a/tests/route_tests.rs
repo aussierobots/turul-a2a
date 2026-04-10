@@ -78,6 +78,17 @@ async fn response_body(router: axum::Router, req: Request<Body>) -> serde_json::
     serde_json::from_slice(&body).unwrap_or_default()
 }
 
+/// Assert route dispatches to a handler (not axum's empty-body 404).
+/// A handler 404 (TaskNotFound) has a JSON body; axum's 404 is empty.
+async fn assert_route_dispatches(router: axum::Router, req: Request<Body>) {
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status().as_u16();
+    if status == 404 {
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(!body.is_empty(), "Route returned 404 with empty body — not registered");
+    }
+}
+
 // =========================================================
 // Agent Card Discovery — proto line 124, RFC 8615
 // =========================================================
@@ -159,8 +170,8 @@ async fn get_task_routes() {
     let req = Request::get("/tasks/some-task-id")
         .body(Body::empty())
         .unwrap();
-    let status = response_status(router, req).await;
-    assert_ne!(status, 404, "GET /tasks/{{id}} must route");
+    // Handler returns 404 with body (TaskNotFound) — that's correct routing
+    assert_route_dispatches(router, req).await;
 }
 
 #[tokio::test]
@@ -177,8 +188,7 @@ async fn cancel_task_routes() {
     let req = Request::post("/tasks/some-id:cancel")
         .body(Body::empty())
         .unwrap();
-    let status = response_status(router, req).await;
-    assert_ne!(status, 404, "POST /tasks/{{id}}:cancel must route");
+    assert_route_dispatches(router, req).await;
 }
 
 #[tokio::test]
@@ -212,8 +222,8 @@ async fn get_push_config_routes() {
     let req = Request::get("/tasks/t1/pushNotificationConfigs/c1")
         .body(Body::empty())
         .unwrap();
-    let status = response_status(router, req).await;
-    assert_ne!(status, 404, "GET push config must route");
+    // Returns 404 with body (config not found) — that's correct routing
+    assert_route_dispatches(router, req).await;
 }
 
 #[tokio::test]
