@@ -53,6 +53,12 @@ pub fn build_router(state: AppState) -> Router {
                 .delete(tenant_task_delete_dispatch),
         );
 
+    // JSON-RPC endpoint
+    let router = router.route(
+        "/jsonrpc",
+        post(crate::jsonrpc::jsonrpc_dispatch_handler),
+    );
+
     router.with_state(state)
 }
 
@@ -299,27 +305,27 @@ async fn list_tasks_handler(
 
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
-struct ListTasksQuery {
+pub(crate) struct ListTasksQuery {
     #[serde(rename = "contextId")]
-    context_id: Option<String>,
-    status: Option<String>,
+    pub(crate) context_id: Option<String>,
+    pub(crate) status: Option<String>,
     #[serde(rename = "pageSize")]
-    page_size: Option<i32>,
+    pub(crate) page_size: Option<i32>,
     #[serde(rename = "pageToken")]
-    page_token: Option<String>,
+    pub(crate) page_token: Option<String>,
     #[serde(rename = "historyLength")]
-    history_length: Option<i32>,
+    pub(crate) history_length: Option<i32>,
     #[serde(rename = "includeArtifacts")]
-    include_artifacts: Option<bool>,
+    pub(crate) include_artifacts: Option<bool>,
 }
 
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
-struct PushConfigQuery {
+pub(crate) struct PushConfigQuery {
     #[serde(rename = "pageSize")]
-    page_size: Option<i32>,
+    pub(crate) page_size: Option<i32>,
     #[serde(rename = "pageToken")]
-    page_token: Option<String>,
+    pub(crate) page_token: Option<String>,
 }
 
 // =========================================================
@@ -340,7 +346,7 @@ fn parse_task_state(s: &str) -> Option<TaskState> {
     }
 }
 
-async fn core_send_message(
+pub(crate) async fn core_send_message(
     state: AppState,
     tenant: &str,
     body: String,
@@ -395,7 +401,7 @@ async fn core_send_message(
     })))
 }
 
-async fn core_list_tasks(
+pub(crate) async fn core_list_tasks(
     state: AppState,
     tenant: &str,
     query: &ListTasksQuery,
@@ -437,7 +443,7 @@ fn list_page_to_json(page: &TaskListPage) -> serde_json::Value {
     })
 }
 
-async fn core_get_task(
+pub(crate) async fn core_get_task(
     state: AppState,
     tenant: &str,
     task_id: &str,
@@ -455,7 +461,7 @@ async fn core_get_task(
     Ok(Json(serde_json::to_value(&task).unwrap_or_default()))
 }
 
-async fn core_cancel_task(
+pub(crate) async fn core_cancel_task(
     state: AppState,
     tenant: &str,
     task_id: &str,
@@ -475,7 +481,7 @@ async fn core_cancel_task(
     }
 }
 
-async fn core_create_push_config(
+pub(crate) async fn core_create_push_config(
     state: AppState,
     tenant: &str,
     task_id: &str,
@@ -491,7 +497,7 @@ async fn core_create_push_config(
     Ok(Json(serde_json::to_value(&created).unwrap_or_default()))
 }
 
-async fn core_list_push_configs(
+pub(crate) async fn core_list_push_configs(
     state: AppState,
     tenant: &str,
     task_id: &str,
@@ -515,7 +521,7 @@ async fn core_list_push_configs(
     })))
 }
 
-async fn core_get_push_config(
+pub(crate) async fn core_get_push_config(
     state: AppState,
     tenant: &str,
     task_id: &str,
@@ -533,7 +539,7 @@ async fn core_get_push_config(
     Ok(Json(serde_json::to_value(&config).unwrap_or_default()))
 }
 
-async fn core_delete_push_config(
+pub(crate) async fn core_delete_push_config(
     state: AppState,
     tenant: &str,
     task_id: &str,
