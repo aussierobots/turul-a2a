@@ -30,5 +30,13 @@ pbjson = "0.9"
 pbjson-types = "0.9"
 
 # Internal
+# HTTP server
+axum = { version = "0.8", features = ["json"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+hyper = "1"
+http = "1"
+http-body-util = "0.1"
+
 turul-a2a-proto = { version = "0.1.0", path = "crates/turul-a2a-proto" }
 turul-a2a-types = { version = "0.1.0", path = "crates/turul-a2a-types" }
