@@ -72,6 +72,8 @@ impl Part {
     }
 }
 
+/// Wrap a proto Part without validation (content may be None).
+/// Use `TryFrom` when you need to validate content is present.
 impl From<pb::Part> for Part {
     fn from(inner: pb::Part) -> Self {
         Self { inner }
@@ -171,9 +173,17 @@ impl Message {
     }
 }
 
-impl From<pb::Message> for Message {
-    fn from(inner: pb::Message) -> Self {
-        Self { inner }
+impl TryFrom<pb::Message> for Message {
+    type Error = crate::error::A2aTypeError;
+
+    fn try_from(inner: pb::Message) -> Result<Self, Self::Error> {
+        // Validate role is not UNSPECIFIED
+        let role_val = pb::Role::try_from(inner.role)
+            .unwrap_or(pb::Role::Unspecified);
+        if role_val == pb::Role::Unspecified {
+            return Err(crate::error::A2aTypeError::MissingField("role"));
+        }
+        Ok(Self { inner })
     }
 }
 
@@ -191,7 +201,8 @@ impl Serialize for Message {
 
 impl<'de> Deserialize<'de> for Message {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        pb::Message::deserialize(deserializer).map(Self::from)
+        let proto = pb::Message::deserialize(deserializer)?;
+        Message::try_from(proto).map_err(serde::de::Error::custom)
     }
 }
 
@@ -309,5 +320,43 @@ mod tests {
         assert_eq!(Role::try_from(pb::Role::User).unwrap(), Role::User);
         assert_eq!(Role::try_from(pb::Role::Agent).unwrap(), Role::Agent);
         assert!(Role::try_from(pb::Role::Unspecified).is_err());
+    }
+
+    #[test]
+    fn message_try_from_proto_rejects_unspecified_role() {
+        let proto_msg = pb::Message {
+            message_id: "m-1".to_string(),
+            role: pb::Role::Unspecified.into(),
+            parts: vec![],
+            context_id: String::new(),
+            task_id: String::new(),
+            metadata: None,
+            extensions: vec![],
+            reference_task_ids: vec![],
+        };
+        assert!(Message::try_from(proto_msg).is_err());
+    }
+
+    #[test]
+    fn message_try_from_proto_accepts_valid_role() {
+        let proto_msg = pb::Message {
+            message_id: "m-2".to_string(),
+            role: pb::Role::User.into(),
+            parts: vec![],
+            context_id: String::new(),
+            task_id: String::new(),
+            metadata: None,
+            extensions: vec![],
+            reference_task_ids: vec![],
+        };
+        let msg = Message::try_from(proto_msg).unwrap();
+        assert_eq!(msg.message_id(), "m-2");
+    }
+
+    #[test]
+    fn message_json_deserialization_rejects_unspecified_role() {
+        let json = r#"{"messageId":"m-bad","role":"ROLE_UNSPECIFIED","parts":[]}"#;
+        let result: Result<Message, _> = serde_json::from_str(json);
+        assert!(result.is_err());
     }
 }

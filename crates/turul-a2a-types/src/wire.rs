@@ -68,6 +68,14 @@ pub mod http {
     pub const TENANT_LIST_TASKS: &str = "/{tenant}/tasks";
     pub const TENANT_CANCEL_TASK: &str = "/{tenant}/tasks/{id=*}:cancel";
     pub const TENANT_SUBSCRIBE_TO_TASK: &str = "/{tenant}/tasks/{id=*}:subscribe";
+    pub const TENANT_CREATE_PUSH_CONFIG: &str =
+        "/{tenant}/tasks/{task_id=*}/pushNotificationConfigs";
+    pub const TENANT_GET_PUSH_CONFIG: &str =
+        "/{tenant}/tasks/{task_id=*}/pushNotificationConfigs/{id=*}";
+    pub const TENANT_LIST_PUSH_CONFIGS: &str =
+        "/{tenant}/tasks/{task_id=*}/pushNotificationConfigs";
+    pub const TENANT_DELETE_PUSH_CONFIG: &str =
+        "/{tenant}/tasks/{task_id=*}/pushNotificationConfigs/{id=*}";
     pub const TENANT_EXTENDED_AGENT_CARD: &str = "/{tenant}/extendedAgentCard";
 }
 
@@ -206,13 +214,31 @@ mod tests {
 
     #[test]
     fn http_tenant_prefixed_routes_exist() {
+        // All proto additional_bindings (proto lines 26,38,49,59,69,80,95,106,116,126,135)
         assert_eq!(http::TENANT_SEND_MESSAGE, "/{tenant}/message:send");
+        assert_eq!(http::TENANT_SEND_STREAMING_MESSAGE, "/{tenant}/message:stream");
         assert_eq!(http::TENANT_GET_TASK, "/{tenant}/tasks/{id=*}");
         assert_eq!(http::TENANT_LIST_TASKS, "/{tenant}/tasks");
         assert_eq!(http::TENANT_CANCEL_TASK, "/{tenant}/tasks/{id=*}:cancel");
         assert_eq!(
             http::TENANT_SUBSCRIBE_TO_TASK,
             "/{tenant}/tasks/{id=*}:subscribe"
+        );
+        assert_eq!(
+            http::TENANT_CREATE_PUSH_CONFIG,
+            "/{tenant}/tasks/{task_id=*}/pushNotificationConfigs"
+        );
+        assert_eq!(
+            http::TENANT_GET_PUSH_CONFIG,
+            "/{tenant}/tasks/{task_id=*}/pushNotificationConfigs/{id=*}"
+        );
+        assert_eq!(
+            http::TENANT_LIST_PUSH_CONFIGS,
+            "/{tenant}/tasks/{task_id=*}/pushNotificationConfigs"
+        );
+        assert_eq!(
+            http::TENANT_DELETE_PUSH_CONFIG,
+            "/{tenant}/tasks/{task_id=*}/pushNotificationConfigs/{id=*}"
         );
         assert_eq!(
             http::TENANT_EXTENDED_AGENT_CARD,

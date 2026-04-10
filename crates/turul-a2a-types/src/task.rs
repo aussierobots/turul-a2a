@@ -1,5 +1,9 @@
-use crate::error::A2aTypeError;
+use serde::{Deserialize, Serialize};
 use turul_a2a_proto as pb;
+
+use crate::artifact::Artifact;
+use crate::error::A2aTypeError;
+use crate::message::Message;
 
 /// A2A task states — type-safe wrapper over proto TaskState.
 ///
@@ -72,9 +76,182 @@ impl TryFrom<i32> for TaskState {
     }
 }
 
+/// Ergonomic wrapper over proto `TaskStatus`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct TaskStatus {
+    pub(crate) inner: pb::TaskStatus,
+}
+
+impl TaskStatus {
+    pub fn new(state: TaskState) -> Self {
+        Self {
+            inner: pb::TaskStatus {
+                state: pb::TaskState::from(state).into(),
+                message: None,
+                timestamp: None,
+            },
+        }
+    }
+
+    pub fn with_message(mut self, message: Message) -> Self {
+        self.inner.message = Some(message.into_proto());
+        self
+    }
+
+    pub fn state(&self) -> Result<TaskState, A2aTypeError> {
+        let proto_state = pb::TaskState::try_from(self.inner.state)
+            .map_err(|_| A2aTypeError::InvalidState)?;
+        TaskState::try_from(proto_state)
+    }
+
+    pub fn as_proto(&self) -> &pb::TaskStatus {
+        &self.inner
+    }
+
+    pub fn into_proto(self) -> pb::TaskStatus {
+        self.inner
+    }
+}
+
+impl TryFrom<pb::TaskStatus> for TaskStatus {
+    type Error = A2aTypeError;
+
+    fn try_from(inner: pb::TaskStatus) -> Result<Self, Self::Error> {
+        // Validate state is not UNSPECIFIED
+        let proto_state = pb::TaskState::try_from(inner.state)
+            .map_err(|_| A2aTypeError::InvalidState)?;
+        if proto_state == pb::TaskState::Unspecified {
+            return Err(A2aTypeError::InvalidState);
+        }
+        Ok(Self { inner })
+    }
+}
+
+impl From<TaskStatus> for pb::TaskStatus {
+    fn from(status: TaskStatus) -> Self {
+        status.inner
+    }
+}
+
+impl Serialize for TaskStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.inner.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let proto = pb::TaskStatus::deserialize(deserializer)?;
+        TaskStatus::try_from(proto).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Ergonomic wrapper over proto `Task`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Task {
+    pub(crate) inner: pb::Task,
+}
+
+impl Task {
+    pub fn new(id: impl Into<String>, status: TaskStatus) -> Self {
+        Self {
+            inner: pb::Task {
+                id: id.into(),
+                context_id: String::new(),
+                status: Some(status.into_proto()),
+                artifacts: vec![],
+                history: vec![],
+                metadata: None,
+            },
+        }
+    }
+
+    pub fn with_context_id(mut self, context_id: impl Into<String>) -> Self {
+        self.inner.context_id = context_id.into();
+        self
+    }
+
+    pub fn id(&self) -> &str {
+        &self.inner.id
+    }
+
+    pub fn context_id(&self) -> &str {
+        &self.inner.context_id
+    }
+
+    pub fn status(&self) -> Option<TaskStatus> {
+        self.inner.status.clone().and_then(|s| TaskStatus::try_from(s).ok())
+    }
+
+    pub fn history(&self) -> &[pb::Message] {
+        &self.inner.history
+    }
+
+    pub fn artifacts(&self) -> &[pb::Artifact] {
+        &self.inner.artifacts
+    }
+
+    pub fn append_message(&mut self, message: Message) {
+        self.inner.history.push(message.into_proto());
+    }
+
+    pub fn append_artifact(&mut self, artifact: Artifact) {
+        self.inner.artifacts.push(artifact.into_proto());
+    }
+
+    pub fn as_proto(&self) -> &pb::Task {
+        &self.inner
+    }
+
+    pub fn into_proto(self) -> pb::Task {
+        self.inner
+    }
+}
+
+impl TryFrom<pb::Task> for Task {
+    type Error = A2aTypeError;
+
+    fn try_from(inner: pb::Task) -> Result<Self, Self::Error> {
+        if inner.id.is_empty() {
+            return Err(A2aTypeError::MissingField("id"));
+        }
+        // Validate status if present
+        if let Some(ref status) = inner.status {
+            let proto_state = pb::TaskState::try_from(status.state)
+                .map_err(|_| A2aTypeError::InvalidState)?;
+            if proto_state == pb::TaskState::Unspecified {
+                return Err(A2aTypeError::InvalidState);
+            }
+        }
+        Ok(Self { inner })
+    }
+}
+
+impl From<Task> for pb::Task {
+    fn from(task: Task) -> Self {
+        task.inner
+    }
+}
+
+impl Serialize for Task {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.inner.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Task {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let proto = pb::Task::deserialize(deserializer)?;
+        Task::try_from(proto).map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::{Part, Role};
 
     #[test]
     fn try_from_proto_all_valid_states() {
@@ -130,5 +307,98 @@ mod tests {
     fn is_terminal_delegates() {
         assert!(!TaskState::Working.is_terminal());
         assert!(TaskState::Completed.is_terminal());
+    }
+
+    // TaskStatus tests
+
+    #[test]
+    fn task_status_constructor() {
+        let status = TaskStatus::new(TaskState::Working);
+        assert_eq!(status.state().unwrap(), TaskState::Working);
+    }
+
+    #[test]
+    fn task_status_with_message() {
+        let msg = crate::Message::new("s-msg", Role::Agent, vec![Part::text("working")]);
+        let status = TaskStatus::new(TaskState::Working).with_message(msg);
+        assert!(status.as_proto().message.is_some());
+    }
+
+    #[test]
+    fn task_status_try_from_proto_rejects_unspecified() {
+        let proto = pb::TaskStatus {
+            state: pb::TaskState::Unspecified.into(),
+            message: None,
+            timestamp: None,
+        };
+        assert!(TaskStatus::try_from(proto).is_err());
+    }
+
+    #[test]
+    fn task_status_serde_round_trip() {
+        let status = TaskStatus::new(TaskState::Submitted);
+        let json = serde_json::to_string(&status).unwrap();
+        let back: TaskStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.state().unwrap(), TaskState::Submitted);
+    }
+
+    // Task tests
+
+    #[test]
+    fn task_constructor() {
+        let task = Task::new("t-1", TaskStatus::new(TaskState::Submitted))
+            .with_context_id("ctx-1");
+        assert_eq!(task.id(), "t-1");
+        assert_eq!(task.context_id(), "ctx-1");
+        assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Submitted);
+    }
+
+    #[test]
+    fn task_append_history_and_artifacts() {
+        let mut task = Task::new("t-2", TaskStatus::new(TaskState::Working));
+        task.append_message(crate::Message::new("m-1", Role::User, vec![Part::text("hi")]));
+        task.append_artifact(crate::Artifact::new("a-1", vec![Part::text("result")]));
+        assert_eq!(task.history().len(), 1);
+        assert_eq!(task.artifacts().len(), 1);
+    }
+
+    #[test]
+    fn task_try_from_proto_rejects_empty_id() {
+        let proto = pb::Task {
+            id: String::new(),
+            context_id: String::new(),
+            status: None,
+            artifacts: vec![],
+            history: vec![],
+            metadata: None,
+        };
+        assert!(Task::try_from(proto).is_err());
+    }
+
+    #[test]
+    fn task_try_from_proto_rejects_unspecified_state() {
+        let proto = pb::Task {
+            id: "t-bad".to_string(),
+            context_id: String::new(),
+            status: Some(pb::TaskStatus {
+                state: pb::TaskState::Unspecified.into(),
+                message: None,
+                timestamp: None,
+            }),
+            artifacts: vec![],
+            history: vec![],
+            metadata: None,
+        };
+        assert!(Task::try_from(proto).is_err());
+    }
+
+    #[test]
+    fn task_serde_round_trip() {
+        let task = Task::new("t-rt", TaskStatus::new(TaskState::Working))
+            .with_context_id("ctx-rt");
+        let json = serde_json::to_string(&task).unwrap();
+        let back: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id(), "t-rt");
+        assert_eq!(back.context_id(), "ctx-rt");
     }
 }

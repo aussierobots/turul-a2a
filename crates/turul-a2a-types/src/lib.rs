@@ -13,4 +13,4 @@ pub mod proto {
 pub use artifact::Artifact;
 pub use error::A2aTypeError;
 pub use message::{Message, Part, Role};
-pub use task::TaskState;
+pub use task::{Task, TaskState, TaskStatus};
