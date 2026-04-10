@@ -205,6 +205,10 @@ impl Task {
         &self.inner
     }
 
+    pub fn as_proto_mut(&mut self) -> &mut pb::Task {
+        &mut self.inner
+    }
+
     pub fn into_proto(self) -> pb::Task {
         self.inner
     }
@@ -217,13 +221,15 @@ impl TryFrom<pb::Task> for Task {
         if inner.id.is_empty() {
             return Err(A2aTypeError::MissingField("id"));
         }
-        // Validate status if present
-        if let Some(ref status) = inner.status {
-            let proto_state = pb::TaskState::try_from(status.state)
-                .map_err(|_| A2aTypeError::InvalidState)?;
-            if proto_state == pb::TaskState::Unspecified {
-                return Err(A2aTypeError::InvalidState);
-            }
+        // Status is REQUIRED per proto field_behavior
+        let status = inner
+            .status
+            .as_ref()
+            .ok_or(A2aTypeError::MissingField("status"))?;
+        let proto_state = pb::TaskState::try_from(status.state)
+            .map_err(|_| A2aTypeError::InvalidState)?;
+        if proto_state == pb::TaskState::Unspecified {
+            return Err(A2aTypeError::InvalidState);
         }
         Ok(Self { inner })
     }
@@ -366,6 +372,24 @@ mod tests {
     fn task_try_from_proto_rejects_empty_id() {
         let proto = pb::Task {
             id: String::new(),
+            context_id: String::new(),
+            status: Some(pb::TaskStatus {
+                state: pb::TaskState::Submitted.into(),
+                message: None,
+                timestamp: None,
+            }),
+            artifacts: vec![],
+            history: vec![],
+            metadata: None,
+        };
+        assert!(Task::try_from(proto).is_err());
+    }
+
+    #[test]
+    fn task_try_from_proto_rejects_missing_status() {
+        // Status is REQUIRED per proto field_behavior
+        let proto = pb::Task {
+            id: "t-no-status".to_string(),
             context_id: String::new(),
             status: None,
             artifacts: vec![],

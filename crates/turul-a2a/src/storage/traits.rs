@@ -59,21 +59,23 @@ pub trait A2aTaskStorage: Send + Sync {
         new_status: TaskStatus,
     ) -> Result<Task, A2aStorageError>;
 
-    /// Append a message to a task's history.
+    /// Append a message to a task's history. Enforces tenant + owner isolation.
     async fn append_message(
         &self,
         tenant: &str,
         task_id: &str,
+        owner: &str,
         message: Message,
     ) -> Result<(), A2aStorageError>;
 
-    /// Append an artifact to a task.
-    /// `append`: if true and artifact_id matches, append parts to existing.
+    /// Append an artifact to a task. Enforces tenant + owner isolation.
+    /// `append`: if true and artifact_id matches existing, append parts to it.
     /// `last_chunk`: if true, marks the artifact as complete.
     async fn append_artifact(
         &self,
         tenant: &str,
         task_id: &str,
+        owner: &str,
         artifact: Artifact,
         append: bool,
         last_chunk: bool,

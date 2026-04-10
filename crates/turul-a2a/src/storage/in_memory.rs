@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
-use turul_a2a_types::{Artifact, Message, Task, TaskState, TaskStatus};
+use turul_a2a_types::{Artifact, Message, Task, TaskStatus};
 
 use super::error::A2aStorageError;
 use super::filter::{PushConfigListPage, TaskFilter, TaskListPage};
@@ -305,6 +305,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         &self,
         tenant: &str,
         task_id: &str,
+        owner: &str,
         message: Message,
     ) -> Result<(), A2aStorageError> {
         let key = (tenant.to_string(), task_id.to_string());
@@ -312,6 +313,12 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         let stored = tasks
             .get_mut(&key)
             .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?;
+
+        if stored.owner != owner {
+            return Err(A2aStorageError::OwnerMismatch {
+                task_id: task_id.to_string(),
+            });
+        }
 
         stored.task.append_message(message);
         Ok(())
@@ -321,8 +328,9 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         &self,
         tenant: &str,
         task_id: &str,
+        owner: &str,
         artifact: Artifact,
-        _append: bool,
+        append: bool,
         _last_chunk: bool,
     ) -> Result<(), A2aStorageError> {
         let key = (tenant.to_string(), task_id.to_string());
@@ -331,6 +339,26 @@ impl A2aTaskStorage for InMemoryA2aStorage {
             .get_mut(&key)
             .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?;
 
+        if stored.owner != owner {
+            return Err(A2aStorageError::OwnerMismatch {
+                task_id: task_id.to_string(),
+            });
+        }
+
+        if append {
+            // Find existing artifact with same ID and append parts
+            let proto_task = stored.task.as_proto_mut();
+            if let Some(existing) = proto_task
+                .artifacts
+                .iter_mut()
+                .find(|a| a.artifact_id == artifact.as_proto().artifact_id)
+            {
+                existing.parts.extend(artifact.into_proto().parts);
+                return Ok(());
+            }
+        }
+
+        // No existing or append=false: add/replace
         stored.task.append_artifact(artifact);
         Ok(())
     }
@@ -385,18 +413,42 @@ impl A2aPushNotificationStorage for InMemoryA2aStorage {
         &self,
         tenant: &str,
         task_id: &str,
-        _page_token: Option<&str>,
-        _page_size: Option<i32>,
+        page_token: Option<&str>,
+        page_size: Option<i32>,
     ) -> Result<PushConfigListPage, A2aStorageError> {
         let configs = self.push_configs.read().await;
-        let matching: Vec<_> = configs
+        let mut matching: Vec<_> = configs
             .iter()
             .filter(|((t, tid, _), _)| t == tenant && tid == task_id)
             .map(|(_, v)| v.clone())
             .collect();
+
+        // Deterministic order by config id
+        matching.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let page_size = page_size.map(|ps| ps.clamp(1, 100)).unwrap_or(50) as usize;
+
+        let start_idx = if let Some(token) = page_token {
+            matching
+                .iter()
+                .position(|c| c.id.as_str() > token)
+                .unwrap_or(matching.len())
+        } else {
+            0
+        };
+
+        let end_idx = (start_idx + page_size).min(matching.len());
+        let page_configs = matching[start_idx..end_idx].to_vec();
+
+        let next_page_token = if end_idx < matching.len() {
+            page_configs.last().map(|c| c.id.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
         Ok(PushConfigListPage {
-            configs: matching,
-            next_page_token: String::new(),
+            configs: page_configs,
+            next_page_token,
         })
     }
 
@@ -491,6 +543,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_push_config_list_pagination() {
+        parity_tests::test_push_config_list_pagination(&storage()).await;
+    }
+
+    #[tokio::test]
     async fn test_push_config_idempotent_delete() {
         parity_tests::test_push_config_idempotent_delete(&storage()).await;
     }
@@ -498,5 +555,15 @@ mod tests {
     #[tokio::test]
     async fn test_push_config_tenant_isolation() {
         parity_tests::test_push_config_tenant_isolation(&storage()).await;
+    }
+
+    #[tokio::test]
+    async fn test_owner_isolation_mutations() {
+        parity_tests::test_owner_isolation_mutations(&storage()).await;
+    }
+
+    #[tokio::test]
+    async fn test_artifact_chunk_semantics() {
+        parity_tests::test_artifact_chunk_semantics(&storage()).await;
     }
 }

@@ -6,7 +6,6 @@
 
 use turul_a2a_types::{Artifact, Message, Part, Role, Task, TaskState, TaskStatus};
 
-use super::error::A2aStorageError;
 use super::filter::TaskFilter;
 use super::traits::{A2aPushNotificationStorage, A2aTaskStorage};
 
@@ -198,7 +197,7 @@ pub async fn test_history_length(storage: &dyn A2aTaskStorage) {
     // Append 5 messages
     for i in 0..5 {
         storage
-            .append_message("default", "hl-1", make_message(&format!("m-{i}"), &format!("msg {i}")))
+            .append_message("default", "hl-1", "owner", make_message(&format!("m-{i}"), &format!("msg {i}")))
             .await
             .unwrap();
     }
@@ -315,8 +314,8 @@ pub async fn test_list_filter_by_context_id(storage: &dyn A2aTaskStorage) {
 pub async fn test_append_message(storage: &dyn A2aTaskStorage) {
     storage.create_task("default", "owner", make_task("am-1", "ctx")).await.unwrap();
 
-    storage.append_message("default", "am-1", make_message("m-1", "first")).await.unwrap();
-    storage.append_message("default", "am-1", make_message("m-2", "second")).await.unwrap();
+    storage.append_message("default", "am-1", "owner", make_message("m-1", "first")).await.unwrap();
+    storage.append_message("default", "am-1", "owner", make_message("m-2", "second")).await.unwrap();
 
     let task = storage.get_task("default", "am-1", "owner", None).await.unwrap().unwrap();
     assert_eq!(task.history().len(), 2);
@@ -331,13 +330,87 @@ pub async fn test_append_artifact(storage: &dyn A2aTaskStorage) {
     storage.create_task("default", "owner", make_task("aa-1", "ctx")).await.unwrap();
 
     storage
-        .append_artifact("default", "aa-1", make_artifact("art-1", "chunk1"), false, false)
+        .append_artifact("default", "aa-1", "owner", make_artifact("art-1", "chunk1"), false, false)
         .await
         .unwrap();
 
     let task = storage.get_task("default", "aa-1", "owner", None).await.unwrap().unwrap();
     assert_eq!(task.artifacts().len(), 1);
     assert_eq!(task.artifacts()[0].artifact_id, "art-1");
+}
+
+// =========================================================
+// Owner isolation for mutation APIs
+// =========================================================
+pub async fn test_owner_isolation_mutations(storage: &dyn A2aTaskStorage) {
+    storage.create_task("default", "alice", make_task("oim-1", "ctx")).await.unwrap();
+
+    // Bob can't append message to Alice's task
+    let result = storage
+        .append_message("default", "oim-1", "bob", make_message("m-bad", "nope"))
+        .await;
+    assert!(result.is_err(), "Bob should not append message to Alice's task");
+
+    // Bob can't append artifact to Alice's task
+    let result = storage
+        .append_artifact("default", "oim-1", "bob", make_artifact("a-bad", "nope"), false, false)
+        .await;
+    assert!(result.is_err(), "Bob should not append artifact to Alice's task");
+
+    // Alice CAN append
+    storage
+        .append_message("default", "oim-1", "alice", make_message("m-ok", "yes"))
+        .await
+        .unwrap();
+    storage
+        .append_artifact("default", "oim-1", "alice", make_artifact("a-ok", "yes"), false, false)
+        .await
+        .unwrap();
+}
+
+// =========================================================
+// P2-008: Artifact chunk semantics (append + last_chunk)
+// =========================================================
+pub async fn test_artifact_chunk_semantics(storage: &dyn A2aTaskStorage) {
+    storage.create_task("default", "owner", make_task("acs-1", "ctx")).await.unwrap();
+
+    // First chunk: append=false (new artifact)
+    storage
+        .append_artifact("default", "acs-1", "owner", make_artifact("art-1", "chunk-1"), false, false)
+        .await
+        .unwrap();
+
+    let task = storage.get_task("default", "acs-1", "owner", None).await.unwrap().unwrap();
+    assert_eq!(task.artifacts().len(), 1);
+    assert_eq!(task.artifacts()[0].parts.len(), 1);
+
+    // Second chunk: append=true, same artifact_id -> should append parts
+    storage
+        .append_artifact("default", "acs-1", "owner", make_artifact("art-1", "chunk-2"), true, false)
+        .await
+        .unwrap();
+
+    let task = storage.get_task("default", "acs-1", "owner", None).await.unwrap().unwrap();
+    assert_eq!(task.artifacts().len(), 1, "should still be 1 artifact");
+    assert_eq!(task.artifacts()[0].parts.len(), 2, "should have 2 parts after append");
+
+    // Third chunk: append=true, last_chunk=true -> append parts, mark complete
+    storage
+        .append_artifact("default", "acs-1", "owner", make_artifact("art-1", "chunk-3"), true, true)
+        .await
+        .unwrap();
+
+    let task = storage.get_task("default", "acs-1", "owner", None).await.unwrap().unwrap();
+    assert_eq!(task.artifacts()[0].parts.len(), 3, "should have 3 parts total");
+
+    // New artifact with different ID: append=false
+    storage
+        .append_artifact("default", "acs-1", "owner", make_artifact("art-2", "separate"), false, true)
+        .await
+        .unwrap();
+
+    let task = storage.get_task("default", "acs-1", "owner", None).await.unwrap().unwrap();
+    assert_eq!(task.artifacts().len(), 2, "should have 2 distinct artifacts");
 }
 
 // =========================================================
@@ -403,6 +476,46 @@ pub async fn test_push_config_idempotent_delete(storage: &dyn A2aPushNotificatio
     storage.delete_config("default", "task-del", &created.id).await.unwrap();
     // Get returns None
     assert!(storage.get_config("default", "task-del", &created.id).await.unwrap().is_none());
+}
+
+// =========================================================
+// P2-017: Push config list pagination
+// =========================================================
+pub async fn test_push_config_list_pagination(storage: &dyn A2aPushNotificationStorage) {
+    // Create 5 configs for one task
+    for i in 0..5 {
+        let config = turul_a2a_proto::TaskPushNotificationConfig {
+            tenant: String::new(),
+            id: String::new(),
+            task_id: "task-pg".to_string(),
+            url: format!("https://example.com/hook-{i}"),
+            token: String::new(),
+            authentication: None,
+        };
+        storage.create_config("default", config).await.unwrap();
+    }
+
+    // Page through with page_size=2
+    let mut all_ids = Vec::new();
+    let mut page_token = None;
+
+    loop {
+        let page = storage
+            .list_configs("default", "task-pg", page_token.as_deref(), Some(2))
+            .await
+            .unwrap();
+        assert!(page.configs.len() <= 2);
+        all_ids.extend(page.configs.iter().map(|c| c.id.clone()));
+
+        if page.next_page_token.is_empty() {
+            break;
+        }
+        page_token = Some(page.next_page_token);
+    }
+
+    assert_eq!(all_ids.len(), 5, "should collect all 5 configs across pages");
+    let unique: std::collections::HashSet<_> = all_ids.iter().collect();
+    assert_eq!(unique.len(), 5, "no duplicate configs");
 }
 
 // =========================================================
