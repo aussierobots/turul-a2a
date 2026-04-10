@@ -334,6 +334,82 @@ mod tests {
     }
 
     // =========================================================
+    // Proto REQUIRED field verification
+    // Reads a2a.proto source to verify field_behavior annotations
+    // haven't been removed — catches spec drift at test time
+    // =========================================================
+
+    #[test]
+    fn proto_required_annotations_present() {
+        let proto_source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../proto/a2a.proto"))
+                .expect("should read a2a.proto");
+
+        // Each tuple: (message context, field pattern that must have REQUIRED)
+        let required_fields = [
+            // Task (proto lines 170-176)
+            ("Task", "string id = 1", "REQUIRED"),
+            ("Task", "TaskStatus status = 3", "REQUIRED"),
+            // Message (proto lines 262-270)
+            ("Message", "string message_id = 1", "REQUIRED"),
+            ("Message", "Role role = 4", "REQUIRED"),
+            ("Message", "repeated Part parts = 5", "REQUIRED"),
+            // Artifact (proto lines 282-288)
+            ("Artifact", "string artifact_id = 1", "REQUIRED"),
+            ("Artifact", "repeated Part parts = 4", "REQUIRED"),
+            // TaskStatus (proto lines 213)
+            ("TaskStatus", "TaskState state = 1", "REQUIRED"),
+            // TaskStatusUpdateEvent (proto lines 298-302)
+            ("TaskStatusUpdateEvent", "string task_id = 1", "REQUIRED"),
+            ("TaskStatusUpdateEvent", "string context_id = 2", "REQUIRED"),
+            ("TaskStatusUpdateEvent", "TaskStatus status = 3", "REQUIRED"),
+            // TaskArtifactUpdateEvent (proto lines 310-314)
+            ("TaskArtifactUpdateEvent", "string task_id = 1", "REQUIRED"),
+            ("TaskArtifactUpdateEvent", "string context_id = 2", "REQUIRED"),
+            ("TaskArtifactUpdateEvent", "Artifact artifact = 3", "REQUIRED"),
+            // AgentCard (proto lines 359-388)
+            ("AgentCard", "string name = 1", "REQUIRED"),
+            ("AgentCard", "string description = 2", "REQUIRED"),
+            ("AgentCard", "repeated AgentInterface supported_interfaces = 3", "REQUIRED"),
+            ("AgentCard", "string version = 5", "REQUIRED"),
+            ("AgentCard", "AgentCapabilities capabilities = 7", "REQUIRED"),
+            ("AgentCard", "repeated string default_input_modes = 10", "REQUIRED"),
+            ("AgentCard", "repeated string default_output_modes = 11", "REQUIRED"),
+            ("AgentCard", "repeated AgentSkill skills = 12", "REQUIRED"),
+            // AgentInterface (proto lines 339-349)
+            ("AgentInterface", "string url = 1", "REQUIRED"),
+            ("AgentInterface", "string protocol_binding = 2", "REQUIRED"),
+            ("AgentInterface", "string protocol_version = 4", "REQUIRED"),
+            // AgentSkill (proto lines 432-438)
+            ("AgentSkill", "string id = 1", "REQUIRED"),
+            ("AgentSkill", "string name = 2", "REQUIRED"),
+            ("AgentSkill", "string description = 3", "REQUIRED"),
+            ("AgentSkill", "repeated string tags = 4", "REQUIRED"),
+            // ListTasksResponse (proto lines 696-702)
+            ("ListTasksResponse", "repeated Task tasks = 1", "REQUIRED"),
+            ("ListTasksResponse", "string next_page_token = 2", "REQUIRED"),
+            ("ListTasksResponse", "int32 page_size = 3", "REQUIRED"),
+            ("ListTasksResponse", "int32 total_size = 4", "REQUIRED"),
+            // SendMessageRequest (proto line 646)
+            ("SendMessageRequest", "Message message = 2", "REQUIRED"),
+            // GetTaskRequest (proto line 658)
+            ("GetTaskRequest", "string id = 2", "REQUIRED"),
+        ];
+
+        for (msg, field_pattern, _annotation) in &required_fields {
+            // Find lines containing the field pattern and verify they have REQUIRED
+            let found = proto_source.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed.contains(field_pattern) && trimmed.contains("REQUIRED")
+            });
+            assert!(
+                found,
+                "Proto field '{field_pattern}' in {msg} must have field_behavior = REQUIRED annotation"
+            );
+        }
+    }
+
+    // =========================================================
     // JSON wire format tests
     // Verify pbjson generates correct camelCase JSON field names
     // =========================================================

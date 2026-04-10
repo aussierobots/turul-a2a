@@ -589,6 +589,7 @@ name = "turul-a2a-types"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "pbjson-types",
  "serde",
  "serde_json",
  "thiserror",

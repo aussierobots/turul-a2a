@@ -33,27 +33,42 @@ pub mod jsonrpc {
     ];
 }
 
-/// HTTP route patterns (from proto google.api.http annotations)
+/// HTTP route templates — exact proto `google.api.http` annotation values.
+///
+/// These are the normative path templates from `a2a.proto` lines 21-139.
+/// The `{id=*}` and `{task_id=*}` patterns are proto resource-name wildcards
+/// that match any single path segment in practice.
 pub mod http {
-    // Message operations
+    // Message operations (proto lines 23, 35)
     pub const SEND_MESSAGE: &str = "/message:send";
     pub const SEND_STREAMING_MESSAGE: &str = "/message:stream";
 
-    // Task operations
-    pub const GET_TASK: &str = "/tasks/{id}";
+    // Task operations (proto lines 47, 57, 66, 78)
+    pub const GET_TASK: &str = "/tasks/{id=*}";
     pub const LIST_TASKS: &str = "/tasks";
-    pub const CANCEL_TASK: &str = "/tasks/{id}:cancel";
-    pub const SUBSCRIBE_TO_TASK: &str = "/tasks/{id}:subscribe";
+    pub const CANCEL_TASK: &str = "/tasks/{id=*}:cancel";
+    pub const SUBSCRIBE_TO_TASK: &str = "/tasks/{id=*}:subscribe";
 
-    // Push notification config operations
-    pub const CREATE_PUSH_CONFIG: &str = "/tasks/{task_id}/pushNotificationConfigs";
-    pub const GET_PUSH_CONFIG: &str = "/tasks/{task_id}/pushNotificationConfigs/{id}";
-    pub const LIST_PUSH_CONFIGS: &str = "/tasks/{task_id}/pushNotificationConfigs";
-    pub const DELETE_PUSH_CONFIG: &str = "/tasks/{task_id}/pushNotificationConfigs/{id}";
+    // Push notification config operations (proto lines 92, 104, 114, 133)
+    pub const CREATE_PUSH_CONFIG: &str = "/tasks/{task_id=*}/pushNotificationConfigs";
+    pub const GET_PUSH_CONFIG: &str =
+        "/tasks/{task_id=*}/pushNotificationConfigs/{id=*}";
+    pub const LIST_PUSH_CONFIGS: &str = "/tasks/{task_id=*}/pushNotificationConfigs";
+    pub const DELETE_PUSH_CONFIG: &str =
+        "/tasks/{task_id=*}/pushNotificationConfigs/{id=*}";
 
-    // Agent card
+    // Agent card (proto line 124; well-known from discovery docs)
     pub const EXTENDED_AGENT_CARD: &str = "/extendedAgentCard";
     pub const WELL_KNOWN_AGENT_CARD: &str = "/.well-known/agent-card.json";
+
+    // Tenant-prefixed variants (proto additional_bindings)
+    pub const TENANT_SEND_MESSAGE: &str = "/{tenant}/message:send";
+    pub const TENANT_SEND_STREAMING_MESSAGE: &str = "/{tenant}/message:stream";
+    pub const TENANT_GET_TASK: &str = "/{tenant}/tasks/{id=*}";
+    pub const TENANT_LIST_TASKS: &str = "/{tenant}/tasks";
+    pub const TENANT_CANCEL_TASK: &str = "/{tenant}/tasks/{id=*}:cancel";
+    pub const TENANT_SUBSCRIBE_TO_TASK: &str = "/{tenant}/tasks/{id=*}:subscribe";
+    pub const TENANT_EXTENDED_AGENT_CARD: &str = "/{tenant}/extendedAgentCard";
 }
 
 /// A2A error codes and their mappings (spec Section 5.4)
@@ -141,35 +156,68 @@ mod tests {
     }
 
     #[test]
+    fn http_routes_match_proto_annotations_exactly() {
+        // Verified against proto/a2a.proto google.api.http annotations
+        assert_eq!(http::SEND_MESSAGE, "/message:send"); // proto line 23
+        assert_eq!(http::SEND_STREAMING_MESSAGE, "/message:stream"); // proto line 35
+        assert_eq!(http::GET_TASK, "/tasks/{id=*}"); // proto line 47
+        assert_eq!(http::LIST_TASKS, "/tasks"); // proto line 57
+        assert_eq!(http::CANCEL_TASK, "/tasks/{id=*}:cancel"); // proto line 66
+        assert_eq!(http::SUBSCRIBE_TO_TASK, "/tasks/{id=*}:subscribe"); // proto line 78
+        assert_eq!(
+            http::CREATE_PUSH_CONFIG,
+            "/tasks/{task_id=*}/pushNotificationConfigs"
+        ); // proto line 92
+        assert_eq!(
+            http::GET_PUSH_CONFIG,
+            "/tasks/{task_id=*}/pushNotificationConfigs/{id=*}"
+        ); // proto line 104
+        assert_eq!(
+            http::LIST_PUSH_CONFIGS,
+            "/tasks/{task_id=*}/pushNotificationConfigs"
+        ); // proto line 114
+        assert_eq!(
+            http::DELETE_PUSH_CONFIG,
+            "/tasks/{task_id=*}/pushNotificationConfigs/{id=*}"
+        ); // proto line 133
+        assert_eq!(http::EXTENDED_AGENT_CARD, "/extendedAgentCard"); // proto line 124
+        assert_eq!(http::WELL_KNOWN_AGENT_CARD, "/.well-known/agent-card.json"); // discovery docs
+    }
+
+    #[test]
     fn http_send_routes_are_message_not_tasks() {
-        // Proto annotations: POST /message:send, POST /message:stream
         assert!(http::SEND_MESSAGE.starts_with("/message:"));
-        assert!(http::SEND_STREAMING_MESSAGE.starts_with("/message:"));
         assert!(!http::SEND_MESSAGE.starts_with("/tasks"));
     }
 
     #[test]
-    fn http_discovery_path_is_well_known_agent_card_json() {
-        assert_eq!(http::WELL_KNOWN_AGENT_CARD, "/.well-known/agent-card.json");
+    fn http_task_routes_use_wildcard_id_syntax() {
+        // Proto uses {id=*} not {id} — resource-name wildcard
+        assert!(http::GET_TASK.contains("{id=*}"));
+        assert!(http::CANCEL_TASK.contains("{id=*}"));
+        assert!(http::SUBSCRIBE_TO_TASK.contains("{id=*}"));
     }
 
     #[test]
-    fn http_extended_card_is_not_well_known() {
-        // Proto annotation: GET /extendedAgentCard (not under /.well-known/)
-        assert_eq!(http::EXTENDED_AGENT_CARD, "/extendedAgentCard");
-        assert!(!http::EXTENDED_AGENT_CARD.contains(".well-known"));
+    fn http_push_config_routes_use_wildcard_syntax() {
+        assert!(http::CREATE_PUSH_CONFIG.contains("{task_id=*}"));
+        assert!(http::GET_PUSH_CONFIG.contains("{id=*}"));
     }
 
     #[test]
-    fn http_subscribe_uses_colon_prefix() {
-        // Proto: GET /tasks/{id=*}:subscribe (colon, not slash)
-        assert!(http::SUBSCRIBE_TO_TASK.contains(":subscribe"));
-        assert!(!http::SUBSCRIBE_TO_TASK.contains("/subscribe"));
-    }
-
-    #[test]
-    fn http_cancel_uses_colon_prefix() {
-        assert!(http::CANCEL_TASK.contains(":cancel"));
+    fn http_tenant_prefixed_routes_exist() {
+        assert_eq!(http::TENANT_SEND_MESSAGE, "/{tenant}/message:send");
+        assert_eq!(http::TENANT_GET_TASK, "/{tenant}/tasks/{id=*}");
+        assert_eq!(http::TENANT_LIST_TASKS, "/{tenant}/tasks");
+        assert_eq!(http::TENANT_CANCEL_TASK, "/{tenant}/tasks/{id=*}:cancel");
+        assert_eq!(
+            http::TENANT_SUBSCRIBE_TO_TASK,
+            "/{tenant}/tasks/{id=*}:subscribe"
+        );
+        assert_eq!(
+            http::TENANT_EXTENDED_AGENT_CARD,
+            "/{tenant}/extendedAgentCard"
+        );
     }
 
     #[test]
