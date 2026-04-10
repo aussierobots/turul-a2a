@@ -46,7 +46,32 @@ Both Bearer and API key paths enforce non-empty owner identity symmetrically:
 - Bearer: extracts configurable claim (default `sub`). Rejects empty, missing, or whitespace-only values.
 - API key: `ApiKeyMiddleware` rejects `Some("")` from lookup. `None` = invalid key.
 
-`AuthIdentity` carries owner and optional claims. `is_authenticated()` is an explicit method (returns `owner != "anonymous"`), not scattered string comparisons.
+`AuthIdentity` is an enum, not a struct with a sentinel string:
+
+```rust
+pub enum AuthIdentity {
+    Anonymous,
+    Authenticated {
+        owner: String,
+        claims: Option<serde_json::Value>,
+    },
+}
+
+impl AuthIdentity {
+    pub fn is_authenticated(&self) -> bool {
+        matches!(self, Self::Authenticated { .. })
+    }
+
+    pub fn owner(&self) -> &str {
+        match self {
+            Self::Anonymous => "anonymous",
+            Self::Authenticated { owner, .. } => owner,
+        }
+    }
+}
+```
+
+Authentication state is a type-level distinction, not a magic string comparison. A principal whose identifier is literally `"anonymous"` is `Authenticated { owner: "anonymous", .. }` — correctly treated as authenticated. The `owner()` method returns the string for storage calls, but auth decisions use `is_authenticated()`.
 
 ### 4. AnyOfMiddleware Failure Precedence
 
@@ -58,7 +83,13 @@ When all children fail: Internal short-circuits (fatal), then Forbidden(403) > H
 
 **Provenance note:** This crate's design originates from `turul-mcp-framework/crates/turul-mcp-oauth/src/jwt.rs`. Future extraction to a shared crate used by both MCP and A2A is a separate follow-up ADR.
 
-### 6. v0.2 Auth Scope
+### 6. AWS Lambda Deployment Path
+
+The Tower auth layer wraps the axum Router. Since the planned `turul-a2a-aws-lambda` adapter (deferred to v0.2+) converts Lambda events to axum-compatible requests and runs them through the same Router, the auth middleware applies identically to Lambda deployments without a separate auth implementation.
+
+If Lambda uses API Gateway authorizers instead of (or in addition to) application-level auth, that is a Lambda adapter concern — the authorizer result would be mapped into `AuthIdentity::Authenticated` by the adapter before reaching the Router. This mapping is the responsibility of the future Lambda adapter crate, not this auth middleware.
+
+### 7. v0.2 Auth Scope
 
 - **Implemented:** Agent-level `security_schemes` and `security_requirements` from middleware. Bearer/JWT and API Key. Principal extraction with configurable claim.
 - **Deferred:** Skill-level `security_requirements` (proto `AgentSkill.security_requirements`). mTLS. OIDC-specific discovery (uses generic JWT path).
