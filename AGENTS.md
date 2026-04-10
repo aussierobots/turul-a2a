@@ -2,10 +2,10 @@
 
 ## Current State
 
-- This repository is in bootstrap state.
-- At the time this file was written, the repo contains only the license, git metadata, and a local `CLAUDE.md`.
-- Do not assume a Cargo workspace, crates, tests, or deployment files already exist.
-- Treat architecture claims as proposals until the corresponding code and tests exist.
+- The repository has a working Cargo workspace with 3 crates: `turul-a2a-proto`, `turul-a2a-types`, `turul-a2a`.
+- 199 tests cover proto generation, types, storage, HTTP handlers, JSON-RPC dispatch, SSE streaming, and E2E scenarios.
+- v0.1 scope: HTTP+JSON, JSON-RPC, SSE streaming, in-memory storage. Auth, client, Lambda, additional backends deferred.
+- Architecture decisions are documented in `docs/adr/`.
 
 ## Source of Truth
 
@@ -221,19 +221,12 @@ When reviewing plans, docs, or code in this repo, always check:
 
 ## Commands
 
-Current repo reality:
-
-- `cargo` commands are not yet valid here until a workspace exists.
-- Before claiming build/test instructions, confirm the files actually exist in this repo.
-
-Once a Rust workspace exists, the expected baseline commands are:
-
-- `cargo build --workspace`
-- `cargo test --workspace`
-- `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo fmt --all -- --check`
-
-Do not add command guidance that the repository cannot currently support.
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
 
 ## Documentation Rules
 

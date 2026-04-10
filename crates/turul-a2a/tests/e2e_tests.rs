@@ -16,7 +16,7 @@ use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
 use turul_a2a::router::{build_router, AppState};
 use turul_a2a::storage::InMemoryA2aStorage;
-use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
+use turul_a2a_types::{Message, Task};
 
 // =========================================================
 // Test executors with different behaviors
@@ -349,24 +349,26 @@ async fn e2e_subscribe_live_task() {
     let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
     assert!(ct.contains("text/event-stream"));
 
-    // The SSE stream is long-lived (keeps alive until terminal).
-    // Read the body in a background task, publish a new event, then check.
-    let body = resp.into_body();
+    // Read the SSE body in the background while we drive an application-level transition.
+    let sse_body = resp.into_body();
 
-    // Publish another status update to ensure there's an event to read
-    st.event_broker
-        .publish_status_update(
-            &tid,
-            "",
-            &TaskStatus::new(TaskState::InputRequired),
-        )
-        .await;
+    // Resume the task via SendMessage with task_id — this is the application-driven
+    // transition that should produce events on the subscribe stream.
+    // The MultiTurnExecutor completes on second call.
+    let _ = post_json(
+        build_router(st.clone()),
+        "/message:send",
+        &send_body_with_task("sub-e2e-resume", "follow-up", &tid),
+    )
+    .await;
 
-    let events = collect_sse(body, Duration::from_millis(500)).await;
-    // Should have at least the snapshot + our published event
-    assert!(!events.is_empty(), "Subscribe should emit events");
+    // Collect events that arrived on the subscribe stream
+    let events = collect_sse(sse_body, Duration::from_millis(500)).await;
 
-    // All events should be statusUpdate
+    // Should have received events from the application-driven transition
+    assert!(!events.is_empty(), "Subscribe should receive events from task resumption");
+
+    // All events should be statusUpdate (from the task state changes)
     for event in &events {
         assert!(
             event.get("statusUpdate").is_some(),

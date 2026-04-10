@@ -33,7 +33,7 @@ All crate dependencies MUST use `workspace = true` — versions are managed in r
 
 - `turul-a2a-proto` — prost-generated types from `a2a.proto`. Build.rs generates via `prost-build` + `pbjson-build`. JSON serialization uses camelCase (proto JSON mapping) via pbjson.
 - `turul-a2a-types` — Ergonomic Rust wrappers over proto types. Publishable, no server/storage/auth deps. `#[non_exhaustive]` on all public types. State machine enforcement on `TaskState`.
-- `turul-a2a` (planned) — Server + storage. Feature-gated backends (in-memory default).
+- `turul-a2a` — Server + storage + HTTP/JSON-RPC/SSE transports. Feature-gated backends (in-memory default). AgentExecutor trait for user-defined agent logic.
 
 ### Proto Build Pipeline
 
@@ -58,10 +58,18 @@ Google well-known types (`google.protobuf.Struct`, `Value`, `Timestamp`) mapped 
   - explicit decision on whether Lambda supports true SSE directly or requires an alternative adapter path
 - Candidate approaches include a shared event log or broker such as Redis, DynamoDB-backed event storage, EventBridge, or another external pub/sub mechanism. Do not assume the in-memory broker can be stretched to Lambda or horizontal scale.
 
-### ADR Note
+### Architecture Decision Records
 
-- Architectural decisions made in this repository should be documented under `docs/ADR/`.
-- For non-trivial architecture changes, do not implement first and explain later: the ADR should be accepted before implementation starts.
+Documented under `docs/adr/`:
+
+- **ADR-001**: Proto-first architecture (Option C) — prost + pbjson generation with ergonomic wrappers
+- **ADR-002**: Wrapper boundary and validation — TryFrom/Deserialize enforcement of REQUIRED fields
+- **ADR-003**: Storage trait design — tenant/owner scoping, parity tests, push config exception
+- **ADR-004**: Error model — A2A error codes, HTTP/JSON-RPC mapping, google.rpc.ErrorInfo
+- **ADR-005**: Dual transport — shared core handlers for HTTP+JSON and JSON-RPC
+- **ADR-006**: SSE streaming — in-process broker, last_chunk as transport metadata, single-instance limitation
+
+For non-trivial architecture changes, the ADR should be accepted before implementation starts.
 
 ### TDD Discipline
 

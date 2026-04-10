@@ -543,13 +543,18 @@ pub(crate) async fn core_send_message(
                 task_id: msg_task_id.clone(),
             })?;
 
-        // Verify task is in an interrupted state (INPUT_REQUIRED or AUTH_REQUIRED)
+        // Only allow continuation for interrupted states (INPUT_REQUIRED, AUTH_REQUIRED)
         if let Some(status) = existing.status() {
             if let Ok(s) = status.state() {
-                if s.is_terminal() {
-                    return Err(A2aError::InvalidRequest {
-                        message: format!("Task {msg_task_id} is in terminal state {s:?}"),
-                    });
+                match s {
+                    TaskState::InputRequired | TaskState::AuthRequired => {}
+                    _ => {
+                        return Err(A2aError::InvalidRequest {
+                            message: format!(
+                                "Task {msg_task_id} is in state {s:?}, only INPUT_REQUIRED or AUTH_REQUIRED tasks accept follow-up messages"
+                            ),
+                        });
+                    }
                 }
             }
         }
