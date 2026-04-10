@@ -41,6 +41,11 @@ All crate dependencies MUST use `workspace = true` — versions are managed in r
 
 Google well-known types (`google.protobuf.Struct`, `Value`, `Timestamp`) mapped to `pbjson_types` via `compile_well_known_types()` + `extern_path`.
 
+### Phase 2 Exceptions (Temporary)
+
+- **Push notification configs** use raw `turul_a2a_proto::TaskPushNotificationConfig` in storage traits and handler signatures. This is an intentional exception — push configs are simple CRUD with no state machine or invariants that warrant a wrapper. Keep this leakage isolated; do not let raw proto types spread into general handler/router code.
+- **`last_chunk` on `append_artifact`** is transport-level metadata for Phase 3 SSE streaming. Storage passes it through but does not persist completion state in v0.1. The server layer should forward it to streaming subscribers, not model it in storage.
+
 ### TDD Discipline
 
 Tests are written from the A2A proto/spec FIRST, then implementation follows. If code disagrees with tests, re-check `proto/a2a.proto` before changing anything. Only change tests when the test is wrong relative to the normative source.
