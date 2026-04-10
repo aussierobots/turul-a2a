@@ -269,8 +269,7 @@ async fn tenant_get_task_routes() {
     let req = Request::get("/acme-corp/tasks/t1")
         .body(Body::empty())
         .unwrap();
-    let status = response_status(router, req).await;
-    assert_ne!(status, 404, "/{{tenant}}/tasks/{{id}} must route");
+    assert_route_dispatches(router, req).await;
 }
 
 #[tokio::test]
@@ -289,8 +288,7 @@ async fn tenant_cancel_task_routes() {
     let req = Request::post("/acme-corp/tasks/t1:cancel")
         .body(Body::empty())
         .unwrap();
-    let status = response_status(router, req).await;
-    assert_ne!(status, 404, "/{{tenant}}/tasks/{{id}}:cancel must route");
+    assert_route_dispatches(router, req).await;
 }
 
 #[tokio::test]

@@ -42,15 +42,15 @@ pub fn build_router(state: AppState) -> Router {
                 .delete(task_delete_dispatch),
         )
         // Tenant-prefixed routes (proto additional_bindings)
-        .route("/{tenant}/message:send", post(send_message_handler))
+        .route("/{tenant}/message:send", post(tenant_send_message_handler))
         .route("/{tenant}/message:stream", post(send_streaming_message_handler))
-        .route("/{tenant}/tasks", get(list_tasks_handler))
+        .route("/{tenant}/tasks", get(tenant_list_tasks_handler))
         .route("/{tenant}/extendedAgentCard", get(extended_agent_card_handler))
         .route(
             "/{tenant}/tasks/{*rest}",
-            get(task_get_dispatch)
-                .post(task_post_dispatch)
-                .delete(task_delete_dispatch),
+            get(tenant_task_get_dispatch)
+                .post(tenant_task_post_dispatch)
+                .delete(tenant_task_delete_dispatch),
         );
 
     router.with_state(state)
@@ -108,31 +108,15 @@ fn parse_task_path(rest: &str) -> Option<TaskAction> {
 }
 
 // =========================================================
-// Dispatch handlers for wildcard task routes
+// Dispatch — default tenant (primary routes)
 // =========================================================
 
 async fn task_get_dispatch(
     State(state): State<AppState>,
     Path(rest): Path<String>,
-    Query(query): Query<GetTaskQuery>,
+    Query(query): Query<TaskGetCombinedQuery>,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    match parse_task_path(&rest) {
-        Some(TaskAction::GetTask(id)) => get_task_handler(state, &id, query.history_length).await,
-        Some(TaskAction::SubscribeToTask(_id)) => Err(A2aError::UnsupportedOperation {
-            message: "Streaming not implemented in v0.1".into(),
-        }),
-        // GET on pushNotificationConfigs collection = list
-        Some(TaskAction::PushConfigCollection(task_id)) => {
-            list_push_configs_handler(state, &task_id).await
-        }
-        // GET on pushNotificationConfigs/{id} = get single
-        Some(TaskAction::PushConfigItem(task_id, config_id)) => {
-            get_push_config_handler(state, &task_id, &config_id).await
-        }
-        _ => Err(A2aError::InvalidRequest {
-            message: "Invalid task path".into(),
-        }),
-    }
+    dispatch_task_get(state, DEFAULT_TENANT, &rest, &query).await
 }
 
 async fn task_post_dispatch(
@@ -140,124 +124,144 @@ async fn task_post_dispatch(
     Path(rest): Path<String>,
     body: String,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    match parse_task_path(&rest) {
-        Some(TaskAction::CancelTask(id)) => cancel_task_handler(state, &id).await,
-        // POST on pushNotificationConfigs = create
-        Some(TaskAction::PushConfigCollection(task_id)) => {
-            create_push_config_handler(state, &task_id, body).await
-        }
-        _ => Err(A2aError::InvalidRequest {
-            message: "Invalid task path".into(),
-        }),
-    }
+    dispatch_task_post(state, DEFAULT_TENANT, &rest, body).await
 }
 
 async fn task_delete_dispatch(
     State(state): State<AppState>,
     Path(rest): Path<String>,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    match parse_task_path(&rest) {
-        // DELETE on pushNotificationConfigs/{id} = delete
-        Some(TaskAction::PushConfigItem(task_id, config_id)) => {
-            delete_push_config_handler(state, &task_id, &config_id).await
-        }
-        _ => Err(A2aError::InvalidRequest {
-            message: "Invalid task path".into(),
+    dispatch_task_delete(state, DEFAULT_TENANT, &rest).await
+}
+
+// =========================================================
+// Dispatch — tenant-prefixed routes
+// =========================================================
+
+async fn tenant_send_message_handler(
+    State(state): State<AppState>,
+    Path(tenant): Path<String>,
+    body: String,
+) -> Result<Json<serde_json::Value>, A2aError> {
+    core_send_message(state, &tenant, body).await
+}
+
+async fn tenant_list_tasks_handler(
+    State(state): State<AppState>,
+    Path(tenant): Path<String>,
+    Query(query): Query<ListTasksQuery>,
+) -> Result<Json<serde_json::Value>, A2aError> {
+    core_list_tasks(state, &tenant, &query).await
+}
+
+async fn tenant_task_get_dispatch(
+    State(state): State<AppState>,
+    Path((tenant, rest)): Path<(String, String)>,
+    Query(query): Query<TaskGetCombinedQuery>,
+) -> Result<Json<serde_json::Value>, A2aError> {
+    dispatch_task_get(state, &tenant, &rest, &query).await
+}
+
+async fn tenant_task_post_dispatch(
+    State(state): State<AppState>,
+    Path((tenant, rest)): Path<(String, String)>,
+    body: String,
+) -> Result<Json<serde_json::Value>, A2aError> {
+    dispatch_task_post(state, &tenant, &rest, body).await
+}
+
+async fn tenant_task_delete_dispatch(
+    State(state): State<AppState>,
+    Path((tenant, rest)): Path<(String, String)>,
+    ) -> Result<Json<serde_json::Value>, A2aError> {
+    dispatch_task_delete(state, &tenant, &rest).await
+}
+
+// =========================================================
+// Shared dispatch logic
+// =========================================================
+
+/// Combined query params — works for both task and push config GET routes.
+/// axum parses all query params into a single struct; unused fields default.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct TaskGetCombinedQuery {
+    #[serde(rename = "historyLength")]
+    history_length: Option<i32>,
+    #[serde(rename = "pageSize")]
+    page_size: Option<i32>,
+    #[serde(rename = "pageToken")]
+    page_token: Option<String>,
+}
+
+async fn dispatch_task_get(
+    state: AppState,
+    tenant: &str,
+    rest: &str,
+    query: &TaskGetCombinedQuery,
+) -> Result<Json<serde_json::Value>, A2aError> {
+    match parse_task_path(rest) {
+        Some(TaskAction::GetTask(id)) => core_get_task(state, tenant, &id, query.history_length).await,
+        Some(TaskAction::SubscribeToTask(_)) => Err(A2aError::UnsupportedOperation {
+            message: "Streaming not implemented in v0.1".into(),
         }),
+        Some(TaskAction::PushConfigCollection(task_id)) => {
+            let pq = PushConfigQuery {
+                page_size: query.page_size,
+                page_token: query.page_token.clone(),
+            };
+            core_list_push_configs(state, tenant, &task_id, &pq).await
+        }
+        Some(TaskAction::PushConfigItem(task_id, config_id)) => {
+            core_get_push_config(state, tenant, &task_id, &config_id).await
+        }
+        _ => Err(A2aError::InvalidRequest { message: "Invalid task path".into() }),
+    }
+}
+
+async fn dispatch_task_post(
+    state: AppState,
+    tenant: &str,
+    rest: &str,
+    body: String,
+) -> Result<Json<serde_json::Value>, A2aError> {
+    match parse_task_path(rest) {
+        Some(TaskAction::CancelTask(id)) => core_cancel_task(state, tenant, &id).await,
+        Some(TaskAction::PushConfigCollection(task_id)) => {
+            core_create_push_config(state, tenant, &task_id, body).await
+        }
+        _ => Err(A2aError::InvalidRequest { message: "Invalid task path".into() }),
+    }
+}
+
+async fn dispatch_task_delete(
+    state: AppState,
+    tenant: &str,
+    rest: &str,
+) -> Result<Json<serde_json::Value>, A2aError> {
+    match parse_task_path(rest) {
+        Some(TaskAction::PushConfigItem(task_id, config_id)) => {
+            core_delete_push_config(state, tenant, &task_id, &config_id).await
+        }
+        _ => Err(A2aError::InvalidRequest { message: "Invalid task path".into() }),
     }
 }
 
 // =========================================================
-// Handler stubs — return spec-correct envelopes/errors
+// Handlers — agent card (no tenant scoping)
 // =========================================================
 
-async fn agent_card_handler(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn agent_card_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::to_value(state.executor.agent_card()).unwrap_or_default())
 }
 
 async fn extended_agent_card_handler(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, A2aError> {
-    // TODO: check auth claims from middleware
     match state.executor.extended_agent_card(None) {
         Some(card) => Ok(Json(serde_json::to_value(card).unwrap_or_default())),
         None => Err(A2aError::ExtendedAgentCardNotConfigured),
     }
-}
-
-// Default tenant/owner for unauthenticated requests.
-// Auth middleware would override these from JWT claims.
-const DEFAULT_TENANT: &str = "";
-const DEFAULT_OWNER: &str = "anonymous";
-
-async fn send_message_handler(
-    State(state): State<AppState>,
-    body: String,
-) -> Result<Json<serde_json::Value>, A2aError> {
-    // Parse SendMessageRequest
-    let request: turul_a2a_proto::SendMessageRequest = serde_json::from_str(&body)
-        .map_err(|e| A2aError::InvalidRequest {
-            message: format!("Invalid request body: {e}"),
-        })?;
-
-    let proto_message = request.message.ok_or(A2aError::InvalidRequest {
-        message: "message field is required".into(),
-    })?;
-
-    let message = Message::try_from(proto_message).map_err(|e| A2aError::InvalidRequest {
-        message: format!("Invalid message: {e}"),
-    })?;
-
-    let tenant = if request.tenant.is_empty() {
-        DEFAULT_TENANT
-    } else {
-        &request.tenant
-    };
-
-    // Create a new task with Submitted status
-    let task_id = uuid::Uuid::now_v7().to_string();
-    let context_id = if message.as_proto().context_id.is_empty() {
-        uuid::Uuid::now_v7().to_string()
-    } else {
-        message.as_proto().context_id.clone()
-    };
-
-    let mut task = Task::new(&task_id, TaskStatus::new(TaskState::Submitted))
-        .with_context_id(&context_id);
-    task.append_message(message.clone());
-
-    // Persist initial task
-    state
-        .task_storage
-        .create_task(tenant, DEFAULT_OWNER, task)
-        .await
-        .map_err(A2aError::from)?;
-
-    // Move to Working
-    let task = state
-        .task_storage
-        .update_task_status(tenant, &task_id, DEFAULT_OWNER, TaskStatus::new(TaskState::Working))
-        .await
-        .map_err(A2aError::from)?;
-
-    // Execute agent logic
-    let mut task = task;
-    state.executor.execute(&mut task, &message).await?;
-
-    // Persist final state
-    state
-        .task_storage
-        .update_task(tenant, DEFAULT_OWNER, task.clone())
-        .await
-        .map_err(A2aError::from)?;
-
-    // Return SendMessageResponse with task variant
-    let response = serde_json::json!({
-        "task": serde_json::to_value(&task).unwrap_or_default()
-    });
-    Ok(Json(response))
 }
 
 async fn send_streaming_message_handler(
@@ -267,6 +271,31 @@ async fn send_streaming_message_handler(
         message: "Streaming not implemented in v0.1".into(),
     })
 }
+
+// =========================================================
+// Default-tenant axum handlers (delegate to core with DEFAULT_TENANT)
+// =========================================================
+
+const DEFAULT_TENANT: &str = "";
+const DEFAULT_OWNER: &str = "anonymous";
+
+async fn send_message_handler(
+    State(state): State<AppState>,
+    body: String,
+) -> Result<Json<serde_json::Value>, A2aError> {
+    core_send_message(state, DEFAULT_TENANT, body).await
+}
+
+async fn list_tasks_handler(
+    State(state): State<AppState>,
+    Query(query): Query<ListTasksQuery>,
+) -> Result<Json<serde_json::Value>, A2aError> {
+    core_list_tasks(state, DEFAULT_TENANT, &query).await
+}
+
+// =========================================================
+// Query param structs
+// =========================================================
 
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
@@ -284,30 +313,109 @@ struct ListTasksQuery {
     include_artifacts: Option<bool>,
 }
 
-async fn list_tasks_handler(
-    State(state): State<AppState>,
-    Query(query): Query<ListTasksQuery>,
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct PushConfigQuery {
+    #[serde(rename = "pageSize")]
+    page_size: Option<i32>,
+    #[serde(rename = "pageToken")]
+    page_token: Option<String>,
+}
+
+// =========================================================
+// Core handler functions — all take tenant explicitly
+// =========================================================
+
+fn parse_task_state(s: &str) -> Option<TaskState> {
+    match s {
+        "TASK_STATE_SUBMITTED" => Some(TaskState::Submitted),
+        "TASK_STATE_WORKING" => Some(TaskState::Working),
+        "TASK_STATE_COMPLETED" => Some(TaskState::Completed),
+        "TASK_STATE_FAILED" => Some(TaskState::Failed),
+        "TASK_STATE_CANCELED" => Some(TaskState::Canceled),
+        "TASK_STATE_INPUT_REQUIRED" => Some(TaskState::InputRequired),
+        "TASK_STATE_REJECTED" => Some(TaskState::Rejected),
+        "TASK_STATE_AUTH_REQUIRED" => Some(TaskState::AuthRequired),
+        _ => None,
+    }
+}
+
+async fn core_send_message(
+    state: AppState,
+    tenant: &str,
+    body: String,
 ) -> Result<Json<serde_json::Value>, A2aError> {
+    let request: turul_a2a_proto::SendMessageRequest = serde_json::from_str(&body)
+        .map_err(|e| A2aError::InvalidRequest {
+            message: format!("Invalid request body: {e}"),
+        })?;
+
+    let proto_message = request.message.ok_or(A2aError::InvalidRequest {
+        message: "message field is required".into(),
+    })?;
+
+    let message = Message::try_from(proto_message).map_err(|e| A2aError::InvalidRequest {
+        message: format!("Invalid message: {e}"),
+    })?;
+
+    let task_id = uuid::Uuid::now_v7().to_string();
+    let context_id = if message.as_proto().context_id.is_empty() {
+        uuid::Uuid::now_v7().to_string()
+    } else {
+        message.as_proto().context_id.clone()
+    };
+
+    let mut task = Task::new(&task_id, TaskStatus::new(TaskState::Submitted))
+        .with_context_id(&context_id);
+    task.append_message(message.clone());
+
+    state
+        .task_storage
+        .create_task(tenant, DEFAULT_OWNER, task)
+        .await
+        .map_err(A2aError::from)?;
+
+    let task = state
+        .task_storage
+        .update_task_status(tenant, &task_id, DEFAULT_OWNER, TaskStatus::new(TaskState::Working))
+        .await
+        .map_err(A2aError::from)?;
+
+    let mut task = task;
+    state.executor.execute(&mut task, &message).await?;
+
+    state
+        .task_storage
+        .update_task(tenant, DEFAULT_OWNER, task.clone())
+        .await
+        .map_err(A2aError::from)?;
+
+    Ok(Json(serde_json::json!({
+        "task": serde_json::to_value(&task).unwrap_or_default()
+    })))
+}
+
+async fn core_list_tasks(
+    state: AppState,
+    tenant: &str,
+    query: &ListTasksQuery,
+) -> Result<Json<serde_json::Value>, A2aError> {
+    let status = query.status.as_deref().and_then(parse_task_state);
+
     let filter = TaskFilter {
-        tenant: Some(DEFAULT_TENANT.to_string()),
+        tenant: Some(tenant.to_string()),
         owner: Some(DEFAULT_OWNER.to_string()),
-        context_id: query.context_id,
-        status: None, // TODO: parse TaskState from query.status string
+        context_id: query.context_id.clone(),
+        status,
         page_size: query.page_size,
-        page_token: query.page_token,
+        page_token: query.page_token.clone(),
         history_length: query.history_length,
         include_artifacts: query.include_artifacts,
         ..Default::default()
     };
 
-    let page = state
-        .task_storage
-        .list_tasks(filter)
-        .await
-        .map_err(A2aError::from)?;
-
-    let response = list_page_to_json(&page);
-    Ok(Json(response))
+    let page = state.task_storage.list_tasks(filter).await.map_err(A2aError::from)?;
+    Ok(Json(list_page_to_json(&page)))
 }
 
 fn list_page_to_json(page: &TaskListPage) -> serde_json::Value {
@@ -324,21 +432,15 @@ fn list_page_to_json(page: &TaskListPage) -> serde_json::Value {
     })
 }
 
-#[derive(serde::Deserialize, Default)]
-#[serde(default)]
-struct GetTaskQuery {
-    #[serde(rename = "historyLength")]
-    history_length: Option<i32>,
-}
-
-async fn get_task_handler(
+async fn core_get_task(
     state: AppState,
+    tenant: &str,
     task_id: &str,
     history_length: Option<i32>,
 ) -> Result<Json<serde_json::Value>, A2aError> {
     let task = state
         .task_storage
-        .get_task(DEFAULT_TENANT, task_id, DEFAULT_OWNER, history_length)
+        .get_task(tenant, task_id, DEFAULT_OWNER, history_length)
         .await
         .map_err(A2aError::from)?
         .ok_or_else(|| A2aError::TaskNotFound {
@@ -348,35 +450,29 @@ async fn get_task_handler(
     Ok(Json(serde_json::to_value(&task).unwrap_or_default()))
 }
 
-async fn cancel_task_handler(
+async fn core_cancel_task(
     state: AppState,
+    tenant: &str,
     task_id: &str,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    // Try to transition to Canceled
     let result = state
         .task_storage
-        .update_task_status(
-            DEFAULT_TENANT,
-            task_id,
-            DEFAULT_OWNER,
-            TaskStatus::new(TaskState::Canceled),
-        )
+        .update_task_status(tenant, task_id, DEFAULT_OWNER, TaskStatus::new(TaskState::Canceled))
         .await;
 
     match result {
         Ok(task) => Ok(Json(serde_json::to_value(&task).unwrap_or_default())),
         Err(A2aStorageError::TaskNotFound(id)) => Err(A2aError::TaskNotFound { task_id: id }),
         Err(A2aStorageError::TerminalState(_)) | Err(A2aStorageError::InvalidTransition { .. }) => {
-            Err(A2aError::TaskNotCancelable {
-                task_id: task_id.to_string(),
-            })
+            Err(A2aError::TaskNotCancelable { task_id: task_id.to_string() })
         }
         Err(other) => Err(A2aError::from(other)),
     }
 }
 
-async fn create_push_config_handler(
+async fn core_create_push_config(
     state: AppState,
+    tenant: &str,
     task_id: &str,
     body: String,
 ) -> Result<Json<serde_json::Value>, A2aError> {
@@ -386,22 +482,19 @@ async fn create_push_config_handler(
         })?;
     config.task_id = task_id.to_string();
 
-    let created = state
-        .push_storage
-        .create_config(DEFAULT_TENANT, config)
-        .await
-        .map_err(A2aError::from)?;
-
+    let created = state.push_storage.create_config(tenant, config).await.map_err(A2aError::from)?;
     Ok(Json(serde_json::to_value(&created).unwrap_or_default()))
 }
 
-async fn list_push_configs_handler(
+async fn core_list_push_configs(
     state: AppState,
+    tenant: &str,
     task_id: &str,
+    query: &PushConfigQuery,
 ) -> Result<Json<serde_json::Value>, A2aError> {
     let page = state
         .push_storage
-        .list_configs(DEFAULT_TENANT, task_id, None, None)
+        .list_configs(tenant, task_id, query.page_token.as_deref(), query.page_size)
         .await
         .map_err(A2aError::from)?;
 
@@ -417,14 +510,15 @@ async fn list_push_configs_handler(
     })))
 }
 
-async fn get_push_config_handler(
+async fn core_get_push_config(
     state: AppState,
+    tenant: &str,
     task_id: &str,
     config_id: &str,
 ) -> Result<Json<serde_json::Value>, A2aError> {
     let config = state
         .push_storage
-        .get_config(DEFAULT_TENANT, task_id, config_id)
+        .get_config(tenant, task_id, config_id)
         .await
         .map_err(A2aError::from)?
         .ok_or_else(|| A2aError::TaskNotFound {
@@ -434,14 +528,15 @@ async fn get_push_config_handler(
     Ok(Json(serde_json::to_value(&config).unwrap_or_default()))
 }
 
-async fn delete_push_config_handler(
+async fn core_delete_push_config(
     state: AppState,
+    tenant: &str,
     task_id: &str,
     config_id: &str,
 ) -> Result<Json<serde_json::Value>, A2aError> {
     state
         .push_storage
-        .delete_config(DEFAULT_TENANT, task_id, config_id)
+        .delete_config(tenant, task_id, config_id)
         .await
         .map_err(A2aError::from)?;
 

@@ -405,3 +405,179 @@ async fn well_known_agent_card_has_all_required_fields() {
     assert!(body.get("defaultInputModes").is_some());
     assert!(body.get("defaultOutputModes").is_some());
 }
+
+// =========================================================
+// [P1] Tenant isolation — tenant from path actually scopes data
+// =========================================================
+
+#[tokio::test]
+async fn tenant_prefixed_send_scopes_to_tenant() {
+    let state = test_state();
+
+    // Create task under tenant "acme"
+    let router = build_router(state.clone());
+    let req = Request::post("/acme/message:send")
+        .header("content-type", "application/json")
+        .body(Body::from(send_message_json("m-ta", "acme task")))
+        .unwrap();
+    let (status, send_body) = json_response(router, req).await;
+    assert_eq!(status, 200);
+    let task_id = send_body["task"]["id"].as_str().unwrap();
+
+    // Get the task under tenant "acme" — should find it
+    let router = build_router(state.clone());
+    let req = Request::get(&format!("/acme/tasks/{task_id}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = json_response(router, req).await;
+    assert_eq!(status, 200, "Task should be visible under its own tenant");
+
+    // Get the same task under default (no tenant) — should NOT find it
+    let router = build_router(state.clone());
+    let req = Request::get(&format!("/tasks/{task_id}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = json_response(router, req).await;
+    assert_eq!(status, 404, "Task should be invisible under different tenant");
+
+    // Get the same task under tenant "other" — should NOT find it
+    let router = build_router(state.clone());
+    let req = Request::get(&format!("/other/tasks/{task_id}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = json_response(router, req).await;
+    assert_eq!(status, 404, "Task should be invisible under wrong tenant");
+
+    // List under "acme" should include it
+    let router = build_router(state.clone());
+    let req = Request::get("/acme/tasks")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = json_response(router, req).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["totalSize"], 1);
+
+    // List under default should NOT include it
+    let router = build_router(state);
+    let req = Request::get("/tasks")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = json_response(router, req).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["totalSize"], 0, "Default tenant should not see acme's tasks");
+}
+
+#[tokio::test]
+async fn tenant_prefixed_cancel_scopes_to_tenant() {
+    let state = test_state();
+
+    // Create task under "acme"
+    let router = build_router(state.clone());
+    let req = Request::post("/acme/message:send")
+        .header("content-type", "application/json")
+        .body(Body::from(send_message_json("m-tc", "cancel me")))
+        .unwrap();
+    let (_, send_body) = json_response(router, req).await;
+    let task_id = send_body["task"]["id"].as_str().unwrap();
+
+    // Cancel under wrong tenant — should fail (404)
+    let router = build_router(state.clone());
+    let req = Request::post(&format!("/other/tasks/{task_id}:cancel"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = json_response(router, req).await;
+    assert_eq!(status, 404, "Cancel under wrong tenant should return 404");
+}
+
+// =========================================================
+// [P2] ListTasks status filter — actually narrows results
+// =========================================================
+
+#[tokio::test]
+async fn list_tasks_status_filter_narrows_results() {
+    let state = test_state();
+
+    // Create 2 tasks — both will complete (executor completes them)
+    for i in 0..2 {
+        let router = build_router(state.clone());
+        let req = Request::post("/message:send")
+            .header("content-type", "application/json")
+            .body(Body::from(send_message_json(&format!("m-sf-{i}"), "task")))
+            .unwrap();
+        json_response(router, req).await;
+    }
+
+    // List all — should see 2
+    let router = build_router(state.clone());
+    let req = Request::get("/tasks")
+        .body(Body::empty())
+        .unwrap();
+    let (_, body) = json_response(router, req).await;
+    assert_eq!(body["totalSize"], 2);
+
+    // List with status=TASK_STATE_COMPLETED — should see 2 (both completed)
+    let router = build_router(state.clone());
+    let req = Request::get("/tasks?status=TASK_STATE_COMPLETED")
+        .body(Body::empty())
+        .unwrap();
+    let (_, body) = json_response(router, req).await;
+    assert_eq!(body["totalSize"], 2, "Both tasks should be completed");
+
+    // List with status=TASK_STATE_WORKING — should see 0
+    let router = build_router(state);
+    let req = Request::get("/tasks?status=TASK_STATE_WORKING")
+        .body(Body::empty())
+        .unwrap();
+    let (_, body) = json_response(router, req).await;
+    assert_eq!(body["totalSize"], 0, "No tasks should be in working state");
+}
+
+// =========================================================
+// [P2] Push config list pagination through HTTP
+// =========================================================
+
+#[tokio::test]
+async fn push_config_list_pagination_through_http() {
+    let state = test_state();
+
+    // Create a task
+    let router = build_router(state.clone());
+    let req = Request::post("/message:send")
+        .header("content-type", "application/json")
+        .body(Body::from(send_message_json("m-pcp", "for push pagination")))
+        .unwrap();
+    let (_, send_body) = json_response(router, req).await;
+    let task_id = send_body["task"]["id"].as_str().unwrap();
+
+    // Create 5 push configs
+    for i in 0..5 {
+        let router = build_router(state.clone());
+        let config_body = serde_json::json!({
+            "taskId": task_id,
+            "url": format!("https://example.com/hook-{i}")
+        })
+        .to_string();
+        let req = Request::post(&format!("/tasks/{task_id}/pushNotificationConfigs"))
+            .header("content-type", "application/json")
+            .body(Body::from(config_body))
+            .unwrap();
+        let (status, _) = json_response(router, req).await;
+        assert_eq!(status, 200);
+    }
+
+    // List with pageSize=2 — should paginate
+    let router = build_router(state.clone());
+    let req = Request::get(&format!(
+        "/tasks/{task_id}/pushNotificationConfigs?pageSize=2"
+    ))
+    .body(Body::empty())
+    .unwrap();
+    let (status, body) = json_response(router, req).await;
+    assert_eq!(status, 200);
+    let configs = body["configs"].as_array().unwrap();
+    assert!(configs.len() <= 2, "pageSize=2 should return at most 2");
+    assert!(
+        !body["nextPageToken"].as_str().unwrap_or("").is_empty(),
+        "Should have nextPageToken for next page"
+    );
+}
