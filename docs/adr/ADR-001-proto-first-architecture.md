@@ -1,4 +1,4 @@
-# ADR-001: Proto-First Architecture (Option C)
+# ADR-001: Proto-First Architecture with Generated Proto and Wrapper Layer
 
 - **Status:** Accepted
 - **Date:** 2026-04-10
@@ -7,17 +7,17 @@
 
 The A2A Protocol v1.0 designates `a2a.proto` (package `lf.a2a.v1`) as the single normative definition for all message types and service interfaces. Any Rust implementation must decide how to represent these types internally while maintaining wire-format compliance.
 
-Three options were evaluated:
+Three approaches were evaluated:
 
-| Option | Approach | Trade-offs |
-|--------|----------|------------|
-| **A** | Generate from proto with `prost` + `tonic` | Tight gRPC coupling; serde JSON mapping requires manual work; no camelCase JSON out of the box. |
-| **B** | Hand-code types with `serde`, test against proto | Maximum ergonomics but proto drift risk. Testing found 15+ wire-format violations in early prototypes. |
-| **C** | Generate from proto with `prost` + `pbjson`, wrap in ergonomic Rust types | Two-layer system adds conversion boilerplate but anchors correctness to the normative source. |
+| Approach | Trade-offs |
+|----------|------------|
+| Generate from proto with `prost` + `tonic` | Tight gRPC coupling; serde JSON mapping requires manual work; no camelCase JSON out of the box. |
+| Hand-code types with `serde`, test against proto | Maximum ergonomics but proto drift risk. Testing found 15+ wire-format violations in early prototypes. |
+| Generate from proto with `prost` + `pbjson`, wrap in ergonomic Rust types | Two-layer system adds conversion boilerplate but anchors correctness to the normative source. |
 
 ## Decision
 
-**Option C.** The project uses a two-crate architecture:
+Generate from proto with `prost` + `pbjson`, then wrap in ergonomic Rust types. The project uses a two-crate architecture:
 
 1. **`turul-a2a-proto`** -- generates Rust types via `prost-build` + `pbjson-build`. The proto file is vendored at `proto/a2a.proto`. Google well-known types are mapped to `pbjson_types` via `compile_well_known_types()` + `extern_path`. `pbjson` provides `serde::Serialize` / `serde::Deserialize` implementations with camelCase JSON field names, matching the proto JSON mapping specification.
 
@@ -31,7 +31,7 @@ gRPC support via `tonic` is deferred and will be feature-gated behind `grpc` whe
 ## Consequences
 
 - **Proto updates are a single `cargo build`.** Regeneration happens automatically; no manual sync step.
-- **Wire-format compliance is anchored to the normative source.** The 15+ violations found in hand-coded approaches (Option B) are structurally eliminated.
+- **Wire-format compliance is anchored to the normative source.** The 15+ violations found in hand-coded approaches are structurally eliminated.
 - **Two-layer type system adds conversion boilerplate.** Every proto type that surfaces in the public API has a corresponding wrapper, with `From` or `TryFrom` conversions in both directions.
 - **`pbjson` handles JSON serialization.** camelCase field names, `oneof` representations, and well-known type mappings all follow the proto JSON mapping spec without manual `#[serde(rename)]` annotations.
 - **`#[non_exhaustive]` on all public wrapper types.** New fields can be added to wrapper types in minor versions without breaking downstream consumers.

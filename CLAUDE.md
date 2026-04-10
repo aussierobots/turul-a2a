@@ -62,7 +62,7 @@ Google well-known types (`google.protobuf.Struct`, `Value`, `Timestamp`) mapped 
 
 Documented under `docs/adr/`:
 
-- **ADR-001**: Proto-first architecture (Option C) — prost + pbjson generation with ergonomic wrappers
+- **ADR-001**: Proto-first architecture — prost + pbjson generation with ergonomic wrappers
 - **ADR-002**: Wrapper boundary and validation — TryFrom/Deserialize enforcement of REQUIRED fields
 - **ADR-003**: Storage trait design — tenant/owner scoping, parity tests, push config exception
 - **ADR-004**: Error model — A2A error codes, HTTP/JSON-RPC mapping, google.rpc.ErrorInfo

@@ -234,7 +234,7 @@ cargo fmt --all -- --check
 - Keep `CLAUDE.md` concise and operational.
 - If both files exist and conflict, `AGENTS.md` wins.
 - Do not document speculative endpoints or field names as if implemented.
-- Architectural decisions made during planning or implementation should be captured later as ADRs under `docs/ADR/`.
+- Architectural decisions made during planning or implementation should be captured later as ADRs under `docs/adr/`.
 - For meaningful architecture changes, require the ADR to be written and accepted before implementation proceeds.
 
 ## Final Review Standard
