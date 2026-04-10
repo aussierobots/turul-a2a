@@ -532,6 +532,23 @@ async fn list_tasks_status_filter_narrows_results() {
     assert_eq!(body["totalSize"], 0, "No tasks should be in working state");
 }
 
+#[tokio::test]
+async fn list_tasks_invalid_status_returns_400() {
+    let router = build_router(test_state());
+    let req = Request::get("/tasks?status=NOT_A_REAL_STATE")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = json_response(router, req).await;
+    assert_eq!(status, 400, "Invalid status value should return 400");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("status"),
+        "Error message should mention status"
+    );
+}
+
 // =========================================================
 // [P2] Push config list pagination through HTTP
 // =========================================================

@@ -400,7 +400,12 @@ async fn core_list_tasks(
     tenant: &str,
     query: &ListTasksQuery,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    let status = query.status.as_deref().and_then(parse_task_state);
+    let status = match &query.status {
+        Some(s) => Some(parse_task_state(s).ok_or_else(|| A2aError::InvalidRequest {
+            message: format!("Invalid status value: {s}"),
+        })?),
+        None => None,
+    };
 
     let filter = TaskFilter {
         tenant: Some(tenant.to_string()),
