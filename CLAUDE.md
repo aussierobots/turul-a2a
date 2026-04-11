@@ -43,6 +43,8 @@ cargo run -p echo-agent              # Run echo agent example on :3000
 - `turul-a2a` — Server + storage + HTTP/JSON-RPC/SSE transports + auth middleware foundation. Feature-gated backends (in-memory default). `AgentExecutor` trait, `A2aMiddleware` trait, `A2aServer::builder()`.
 - `turul-a2a-auth` — Concrete auth middleware: `BearerMiddleware` (JWT), `ApiKeyMiddleware`. Uses `turul-jwt-validator`.
 - `turul-jwt-validator` — Local JWT validator with JWKS caching (design sourced from turul-mcp-oauth).
+- `turul-a2a-client` — Independent A2A client: discovery, send, get, cancel, list, auth, tenant.
+- `turul-a2a-aws-lambda` — Lambda adapter: thin wrapper over same Router, request/response only (ADR-008).
 
 ### Proto Build Pipeline
 
@@ -103,7 +105,6 @@ Tests are written from the A2A proto/spec FIRST, then implementation follows. If
 
 ### Deferred
 
-- PostgreSQL storage backend (feature-gated, pass 18 parity tests)
 - Distributed multi-instance verification (two instances, shared backend, alternating requests for request/response correctness)
 - D3: durable event coordination for multi-instance streaming (new ADR needed, not Lambda-specific)
 - gRPC transport (feature-gated in `turul-a2a-proto`)
