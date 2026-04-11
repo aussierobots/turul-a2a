@@ -89,6 +89,7 @@ Documented under `docs/adr/`:
 - **ADR-006**: SSE streaming — in-process broker, last_chunk as transport metadata, single-instance limitation
 - **ADR-007**: Auth middleware — transport-level Tower layer, AuthIdentity enum, SecurityContribution, local JWT validator
 - **ADR-008**: Lambda adapter — request/response only, streaming deferred to D3, authorizer anti-spoofing
+- **ADR-009**: Durable event coordination — same-backend transaction atomicity, tenant-scoped, per-task monotonic sequences
 
 For non-trivial architecture changes, the ADR should be accepted before implementation starts.
 

@@ -1,6 +1,6 @@
 # ADR-009: Durable Event Coordination for Multi-Instance Streaming
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-11
 
 ## Context
