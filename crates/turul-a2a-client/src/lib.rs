@@ -1,0 +1,250 @@
+//! A2A Protocol v1.0 client library.
+//!
+//! Independent of the server crate — depends only on turul-a2a-types and turul-a2a-proto.
+
+mod error;
+
+use turul_a2a_proto as pb;
+use turul_a2a_types::wire;
+
+pub use error::A2aClientError;
+
+/// Auth configuration for the client.
+#[derive(Debug, Clone)]
+pub enum ClientAuth {
+    None,
+    Bearer(String),
+    ApiKey { header: String, key: String },
+}
+
+impl Default for ClientAuth {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+/// A2A client for communicating with A2A agents.
+#[derive(Debug, Clone)]
+pub struct A2aClient {
+    base_url: String,
+    tenant: Option<String>,
+    auth: ClientAuth,
+    http: reqwest::Client,
+    agent_card: Option<pb::AgentCard>,
+}
+
+impl A2aClient {
+    /// Create a client pointing at a base URL.
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            tenant: None,
+            auth: ClientAuth::None,
+            http: reqwest::Client::new(),
+            agent_card: None,
+        }
+    }
+
+    pub fn with_auth(mut self, auth: ClientAuth) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
+        self
+    }
+
+    /// Discover the agent by fetching `/.well-known/agent-card.json`.
+    pub async fn discover(base_url: impl Into<String>) -> Result<Self, A2aClientError> {
+        let mut client = Self::new(base_url);
+        let card = client.fetch_agent_card().await?;
+        client.agent_card = Some(card);
+        Ok(client)
+    }
+
+    /// Fetch the agent card from the well-known endpoint.
+    pub async fn fetch_agent_card(&self) -> Result<pb::AgentCard, A2aClientError> {
+        let url = format!("{}{}", self.base_url, wire::http::WELL_KNOWN_AGENT_CARD);
+        let resp = self.http.get(&url).send().await?;
+        if !resp.status().is_success() {
+            return Err(A2aClientError::Http {
+                status: resp.status().as_u16(),
+                message: resp.text().await.unwrap_or_default(),
+            });
+        }
+        let card: pb::AgentCard = resp.json().await?;
+        Ok(card)
+    }
+
+    /// Get the cached agent card (from `discover()` or `fetch_agent_card()`).
+    pub fn agent_card(&self) -> Option<&pb::AgentCard> {
+        self.agent_card.as_ref()
+    }
+
+    /// Build the URL with optional tenant prefix.
+    fn url(&self, path: &str) -> String {
+        match &self.tenant {
+            Some(tenant) => format!("{}/{}{}", self.base_url, tenant, path),
+            None => format!("{}{}", self.base_url, path),
+        }
+    }
+
+    /// Build a request with auth headers and A2A-Version.
+    fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
+        let mut req = self.http.request(method, url).header("a2a-version", "1.0");
+        match &self.auth {
+            ClientAuth::None => {}
+            ClientAuth::Bearer(token) => {
+                req = req.bearer_auth(token);
+            }
+            ClientAuth::ApiKey { header, key } => {
+                req = req.header(header.as_str(), key.as_str());
+            }
+        }
+        req
+    }
+
+    /// Send a message to the agent.
+    /// Returns `SendMessageResponse` (oneof: Task | Message).
+    pub async fn send_message(
+        &self,
+        request: pb::SendMessageRequest,
+    ) -> Result<pb::SendMessageResponse, A2aClientError> {
+        let url = self.url("/message:send");
+        let resp = self
+            .request(reqwest::Method::POST, &url)
+            .header("content-type", "application/json")
+            .json(&request)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(self.parse_error(resp).await);
+        }
+        let response: pb::SendMessageResponse = resp.json().await?;
+        Ok(response)
+    }
+
+    /// Get a task by ID.
+    pub async fn get_task(
+        &self,
+        task_id: &str,
+        history_length: Option<i32>,
+    ) -> Result<pb::Task, A2aClientError> {
+        let mut url = self.url(&format!("/tasks/{task_id}"));
+        if let Some(hl) = history_length {
+            url = format!("{url}?historyLength={hl}");
+        }
+        let resp = self
+            .request(reqwest::Method::GET, &url)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(self.parse_error(resp).await);
+        }
+        let task: pb::Task = resp.json().await?;
+        Ok(task)
+    }
+
+    /// Cancel a task.
+    pub async fn cancel_task(
+        &self,
+        task_id: &str,
+    ) -> Result<pb::Task, A2aClientError> {
+        let url = self.url(&format!("/tasks/{task_id}:cancel"));
+        let resp = self
+            .request(reqwest::Method::POST, &url)
+            .header("a2a-version", "1.0")
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(self.parse_error(resp).await);
+        }
+        let task: pb::Task = resp.json().await?;
+        Ok(task)
+    }
+
+    /// List tasks with optional filtering.
+    pub async fn list_tasks(
+        &self,
+        params: &ListTasksParams,
+    ) -> Result<pb::ListTasksResponse, A2aClientError> {
+        let mut url = self.url("/tasks");
+        let mut query_parts = vec![];
+        if let Some(ref ctx) = params.context_id {
+            query_parts.push(format!("contextId={ctx}"));
+        }
+        if let Some(ref status) = params.status {
+            query_parts.push(format!("status={status}"));
+        }
+        if let Some(ps) = params.page_size {
+            query_parts.push(format!("pageSize={ps}"));
+        }
+        if let Some(ref pt) = params.page_token {
+            query_parts.push(format!("pageToken={pt}"));
+        }
+        if !query_parts.is_empty() {
+            url = format!("{url}?{}", query_parts.join("&"));
+        }
+
+        let resp = self
+            .request(reqwest::Method::GET, &url)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(self.parse_error(resp).await);
+        }
+        let response: pb::ListTasksResponse = resp.json().await?;
+        Ok(response)
+    }
+
+    /// Parse an error response from the server.
+    async fn parse_error(&self, resp: reqwest::Response) -> A2aClientError {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+
+        // Try to parse as AIP-193 error
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(error) = json.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Unknown error")
+                    .to_string();
+
+                // Extract ErrorInfo reason if present
+                let reason = error
+                    .get("details")
+                    .and_then(|d| d.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|info| info.get("reason"))
+                    .and_then(|r| r.as_str())
+                    .map(|s| s.to_string());
+
+                return A2aClientError::A2aError {
+                    status,
+                    message,
+                    reason,
+                };
+            }
+        }
+
+        A2aClientError::Http {
+            status,
+            message: body,
+        }
+    }
+}
+
+/// Parameters for listing tasks.
+#[derive(Debug, Clone, Default)]
+pub struct ListTasksParams {
+    pub context_id: Option<String>,
+    pub status: Option<String>,
+    pub page_size: Option<i32>,
+    pub page_token: Option<String>,
+}

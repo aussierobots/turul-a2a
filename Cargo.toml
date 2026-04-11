@@ -6,6 +6,7 @@ members = [
   "crates/turul-a2a",
   "crates/turul-jwt-validator",
   "crates/turul-a2a-auth",
+  "crates/turul-a2a-client",
   "examples/echo-agent",
   "examples/auth-agent",
 ]
