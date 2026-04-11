@@ -1,6 +1,7 @@
 pub mod error;
 pub mod executor;
 pub mod jsonrpc;
+pub mod middleware;
 pub mod router;
 pub mod server;
 pub mod storage;
