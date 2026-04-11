@@ -1,6 +1,6 @@
 # ADR-008: Lambda Adapter and Streaming Coordination
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-11
 
 ## Context
