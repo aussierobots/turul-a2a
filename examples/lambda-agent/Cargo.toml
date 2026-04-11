@@ -1,0 +1,19 @@
+[package]
+name = "lambda-agent"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "bootstrap"
+path = "src/main.rs"
+
+[dependencies]
+turul-a2a = { path = "../../crates/turul-a2a" }
+turul-a2a-aws-lambda = { path = "../../crates/turul-a2a-aws-lambda" }
+turul-a2a-types = { path = "../../crates/turul-a2a-types" }
+turul-a2a-proto = { path = "../../crates/turul-a2a-proto" }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+lambda_http = { workspace = true }
+serde_json = { workspace = true }

@@ -10,6 +10,7 @@ members = [
   "crates/turul-a2a-aws-lambda",
   "examples/echo-agent",
   "examples/auth-agent",
+  "examples/lambda-agent",
 ]
 
 [workspace.package]
