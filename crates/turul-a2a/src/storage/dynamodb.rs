@@ -170,8 +170,10 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         let json = Self::task_to_json(&task)?;
         let state_str = Self::status_state_str(&task);
 
-        // Conditional update: owner must match
-        self.client
+        // Conditional write: only succeeds if the item exists AND owner matches.
+        // This prevents ownership transfer and ensures isolation.
+        let result = self
+            .client
             .put_item()
             .table_name(&self.config.tasks_table)
             .item("pk", AttributeValue::S(pk))
@@ -181,11 +183,28 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .item("contextId", AttributeValue::S(task.context_id().to_string()))
             .item("statusState", AttributeValue::S(state_str))
             .item("taskJson", AttributeValue::S(json))
+            .condition_expression("attribute_exists(pk) AND #o = :expected_owner")
+            .expression_attribute_names("#o", "owner")
+            .expression_attribute_values(
+                ":expected_owner",
+                AttributeValue::S(owner.to_string()),
+            )
             .send()
-            .await
-            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            .await;
 
-        Ok(())
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("ConditionalCheckFailed") {
+                    Err(A2aStorageError::OwnerMismatch {
+                        task_id: task.id().to_string(),
+                    })
+                } else {
+                    Err(A2aStorageError::DatabaseError(err_str))
+                }
+            }
+        }
     }
 
     async fn delete_task(
@@ -532,8 +551,162 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
     }
 }
 
-// Note: DynamoDB parity tests require a local DynamoDB instance or AWS credentials.
-// They are not included in the default test suite. Run with:
-// docker run -p 8000:8000 amazon/dynamodb-local
-// AWS_DEFAULT_REGION=us-east-1 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
-//   AWS_ENDPOINT_URL=http://localhost:8000 cargo test --features dynamodb -p turul-a2a -- storage::dynamodb
+/// DynamoDB parity tests require a local DynamoDB instance.
+///
+/// Run local DynamoDB:
+///   docker run -p 8000:8000 amazon/dynamodb-local
+///
+/// Run tests:
+///   AWS_DEFAULT_REGION=us-east-1 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+///     AWS_ENDPOINT_URL=http://localhost:8000 \
+///     cargo test --features dynamodb -p turul-a2a -- storage::dynamodb
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::parity_tests;
+    use aws_sdk_dynamodb::types::{
+        AttributeDefinition, KeySchemaElement, KeyType, ProvisionedThroughput, ScalarAttributeType,
+    };
+
+    async fn create_test_table(client: &Client, table_name: &str) {
+        let _ = client
+            .create_table()
+            .table_name(table_name)
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name("pk")
+                    .key_type(KeyType::Hash)
+                    .build()
+                    .unwrap(),
+            )
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name("pk")
+                    .attribute_type(ScalarAttributeType::S)
+                    .build()
+                    .unwrap(),
+            )
+            .provisioned_throughput(
+                ProvisionedThroughput::builder()
+                    .read_capacity_units(5)
+                    .write_capacity_units(5)
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+            .await;
+    }
+
+    async fn storage() -> DynamoDbA2aStorage {
+        // Use unique table names per test to avoid cross-test contamination
+        let id = uuid::Uuid::now_v7().to_string();
+        let tasks_table = format!("test_tasks_{id}");
+        let push_table = format!("test_push_{id}");
+
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .load()
+            .await;
+        let client = Client::new(&config);
+
+        create_test_table(&client, &tasks_table).await;
+        create_test_table(&client, &push_table).await;
+
+        DynamoDbA2aStorage::from_client(
+            client,
+            DynamoDbConfig {
+                tasks_table,
+                push_configs_table: push_table,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn test_create_and_retrieve() {
+        parity_tests::test_create_and_retrieve(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_state_machine_enforcement() {
+        parity_tests::test_state_machine_enforcement(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_terminal_state_rejection() {
+        parity_tests::test_terminal_state_rejection(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_tenant_isolation() {
+        parity_tests::test_tenant_isolation(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_owner_isolation() {
+        parity_tests::test_owner_isolation(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_history_length() {
+        parity_tests::test_history_length(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_pagination() {
+        parity_tests::test_list_pagination(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_filter_by_status() {
+        parity_tests::test_list_filter_by_status(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_filter_by_context_id() {
+        parity_tests::test_list_filter_by_context_id(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_append_message() {
+        parity_tests::test_append_message(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_append_artifact() {
+        parity_tests::test_append_artifact(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_task_count() {
+        parity_tests::test_task_count(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_owner_isolation_mutations() {
+        parity_tests::test_owner_isolation_mutations(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_artifact_chunk_semantics() {
+        parity_tests::test_artifact_chunk_semantics(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_config_crud() {
+        parity_tests::test_push_config_crud(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_config_idempotent_delete() {
+        parity_tests::test_push_config_idempotent_delete(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_config_tenant_isolation() {
+        parity_tests::test_push_config_tenant_isolation(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_config_list_pagination() {
+        parity_tests::test_push_config_list_pagination(&storage().await).await;
+    }
+}
