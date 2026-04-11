@@ -1,4 +1,15 @@
 //! DynamoDB storage backend for A2A tasks and push notification configs.
+//!
+//! ## Key Design
+//!
+//! Tasks PK: `{tenant}#{task_id}`. Owner is a non-key attribute used for
+//! conditional writes (owner enforcement). Task IDs are server-generated
+//! UUID v7, so collisions within a tenant are not possible in normal operation.
+//!
+//! Tables are shareable across tenants (tenant is in the PK). However, owner
+//! isolation is enforced at the application layer via conditional expressions,
+//! not via the key structure. If multiple independent agents share the same
+//! tenant, they must use distinct task IDs (guaranteed by UUID v7 generation).
 
 use async_trait::async_trait;
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -614,47 +625,141 @@ mod tests {
     const TEST_TASKS_TABLE: &str = "test_a2a_tasks";
     const TEST_PUSH_TABLE: &str = "test_a2a_push_configs";
 
-    /// Shared test tables — cleaned before each test via scan+delete.
-    async fn storage() -> DynamoDbA2aStorage {
+    /// Each test gets a unique tenant prefix for data isolation.
+    /// Tests can run in parallel without interfering — the PK includes
+    /// the tenant, so each test's data is in a separate key space.
+    async fn storage() -> TestStorage {
+        static TABLES_CREATED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
         let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .load()
             .await;
         let client = Client::new(&config);
 
-        create_test_table(&client, TEST_TASKS_TABLE).await;
-        create_test_table(&client, TEST_PUSH_TABLE).await;
+        // Create tables once (idempotent)
+        if !TABLES_CREATED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            create_test_table(&client, TEST_TASKS_TABLE).await;
+            create_test_table(&client, TEST_PUSH_TABLE).await;
+        }
 
-        // Clean existing data
-        clean_table(&client, TEST_TASKS_TABLE).await;
-        clean_table(&client, TEST_PUSH_TABLE).await;
-
-        DynamoDbA2aStorage::from_client(
+        let storage = DynamoDbA2aStorage::from_client(
             client,
             DynamoDbConfig {
                 tasks_table: TEST_TASKS_TABLE.into(),
                 push_configs_table: TEST_PUSH_TABLE.into(),
             },
-        )
+        );
+
+        // Each test gets a unique tenant prefix for isolation
+        TestStorage {
+            inner: storage,
+            tenant_prefix: uuid::Uuid::now_v7().to_string(),
+        }
     }
 
-    async fn clean_table(client: &Client, table_name: &str) {
-        let result = client
-            .scan()
-            .table_name(table_name)
-            .projection_expression("pk")
-            .send()
-            .await;
-        if let Ok(output) = result {
-            for item in output.items.unwrap_or_default() {
-                if let Some(pk) = item.get("pk") {
-                    let _ = client
-                        .delete_item()
-                        .table_name(table_name)
-                        .key("pk", pk.clone())
-                        .send()
-                        .await;
-                }
-            }
+    /// Wrapper that prefixes tenant on all calls for test isolation.
+    /// The parity tests pass tenant strings like "default", "tenant-a", etc.
+    /// This wrapper makes them unique per test instance.
+    struct TestStorage {
+        inner: DynamoDbA2aStorage,
+        tenant_prefix: String,
+    }
+
+    impl TestStorage {
+        fn scoped_tenant(&self, tenant: &str) -> String {
+            format!("{}_{}", self.tenant_prefix, tenant)
+        }
+    }
+
+    #[async_trait]
+    impl A2aTaskStorage for TestStorage {
+        fn backend_name(&self) -> &'static str { "dynamodb-test" }
+
+        async fn create_task(&self, tenant: &str, owner: &str, task: Task)
+            -> Result<Task, A2aStorageError> {
+            self.inner.create_task(&self.scoped_tenant(tenant), owner, task).await
+        }
+
+        async fn get_task(&self, tenant: &str, task_id: &str, owner: &str, history_length: Option<i32>)
+            -> Result<Option<Task>, A2aStorageError> {
+            self.inner.get_task(&self.scoped_tenant(tenant), task_id, owner, history_length).await
+        }
+
+        async fn update_task(&self, tenant: &str, owner: &str, task: Task)
+            -> Result<(), A2aStorageError> {
+            self.inner.update_task(&self.scoped_tenant(tenant), owner, task).await
+        }
+
+        async fn delete_task(&self, tenant: &str, task_id: &str, owner: &str)
+            -> Result<bool, A2aStorageError> {
+            self.inner.delete_task(&self.scoped_tenant(tenant), task_id, owner).await
+        }
+
+        async fn list_tasks(&self, mut filter: TaskFilter) -> Result<TaskListPage, A2aStorageError> {
+            filter.tenant = filter.tenant.map(|t| self.scoped_tenant(&t));
+            self.inner.list_tasks(filter).await
+        }
+
+        async fn update_task_status(&self, tenant: &str, task_id: &str, owner: &str, new_status: TaskStatus)
+            -> Result<Task, A2aStorageError> {
+            self.inner.update_task_status(&self.scoped_tenant(tenant), task_id, owner, new_status).await
+        }
+
+        async fn append_message(&self, tenant: &str, task_id: &str, owner: &str, message: Message)
+            -> Result<(), A2aStorageError> {
+            self.inner.append_message(&self.scoped_tenant(tenant), task_id, owner, message).await
+        }
+
+        async fn append_artifact(&self, tenant: &str, task_id: &str, owner: &str, artifact: Artifact, append: bool, last_chunk: bool)
+            -> Result<(), A2aStorageError> {
+            self.inner.append_artifact(&self.scoped_tenant(tenant), task_id, owner, artifact, append, last_chunk).await
+        }
+
+        async fn task_count(&self) -> Result<usize, A2aStorageError> {
+            // Count only this test's tasks by filtering on tenant prefix
+            let result = self.inner.client
+                .scan()
+                .table_name(&self.inner.config.tasks_table)
+                .filter_expression("begins_with(pk, :prefix)")
+                .expression_attribute_values(
+                    ":prefix",
+                    AttributeValue::S(format!("{}_", self.tenant_prefix)),
+                )
+                .select(aws_sdk_dynamodb::types::Select::Count)
+                .send()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            Ok(result.count as usize)
+        }
+
+        async fn maintenance(&self) -> Result<(), A2aStorageError> {
+            self.inner.maintenance().await
+        }
+    }
+
+    #[async_trait]
+    impl A2aPushNotificationStorage for TestStorage {
+        fn backend_name(&self) -> &'static str { "dynamodb-test" }
+
+        async fn create_config(&self, tenant: &str, config: turul_a2a_proto::TaskPushNotificationConfig)
+            -> Result<turul_a2a_proto::TaskPushNotificationConfig, A2aStorageError> {
+            self.inner.create_config(&self.scoped_tenant(tenant), config).await
+        }
+
+        async fn get_config(&self, tenant: &str, task_id: &str, config_id: &str)
+            -> Result<Option<turul_a2a_proto::TaskPushNotificationConfig>, A2aStorageError> {
+            self.inner.get_config(&self.scoped_tenant(tenant), task_id, config_id).await
+        }
+
+        async fn list_configs(&self, tenant: &str, task_id: &str, page_token: Option<&str>, page_size: Option<i32>)
+            -> Result<PushConfigListPage, A2aStorageError> {
+            self.inner.list_configs(&self.scoped_tenant(tenant), task_id, page_token, page_size).await
+        }
+
+        async fn delete_config(&self, tenant: &str, task_id: &str, config_id: &str)
+            -> Result<(), A2aStorageError> {
+            self.inner.delete_config(&self.scoped_tenant(tenant), task_id, config_id).await
         }
     }
 
