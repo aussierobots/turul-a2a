@@ -8,25 +8,36 @@ Turul-a2a is a Rust implementation of the A2A (Agent-to-Agent) Protocol v1.0. Li
 
 **Proto-first architecture**: Types are generated from the normative `proto/a2a.proto` (package `lf.a2a.v1`) using `prost` + `pbjson`, then wrapped in ergonomic Rust types.
 
-**Maturity**: Single-instance and multi-instance request/response is verified (334 tests including distributed verification with shared backend). Lambda adapter is verified. Only cross-instance streaming/subscription (D3) remains before full scale claims.
+**Maturity**: Single-instance and multi-instance request/response verified (334+ tests including distributed verification with shared backend). Lambda adapter verified. Cross-instance streaming/subscription deferred to D3 (ADR-009).
 
 ## Build & Development Commands
 
 ```bash
-cargo build --workspace              # Build all crates
-cargo check --workspace              # Type-check
-cargo test --workspace               # Run all 202 tests
-cargo test -p turul-a2a-proto        # Proto generation + wire format (26 tests)
-cargo test -p turul-a2a-types        # Types + state machine (54 tests)
-cargo test -p turul-a2a              # Server + storage + handlers + auth
-cargo test -p turul-a2a-auth         # Auth middleware (API key, Bearer)
-cargo test -p turul-jwt-validator    # JWT validator
-cargo test -p turul-a2a --test e2e_tests    # E2E scenarios (12 tests)
-cargo test -p turul-a2a --test sse_tests    # SSE transport (10 tests)
-cargo test -p turul-a2a --test jsonrpc_tests # JSON-RPC dispatch (19 tests)
-cargo clippy --workspace             # Lint
-cargo fmt --all                      # Format
-cargo run -p echo-agent              # Run echo agent example on :3000
+cargo build --workspace                    # Build all crates
+cargo check --workspace                    # Type-check
+cargo test --workspace                     # Run all tests (334+)
+cargo test --workspace --features sqlite   # Include SQLite parity tests
+cargo clippy --workspace -- -D warnings    # Lint (deny warnings)
+cargo fmt --all -- --check                 # Format check
+
+# Per-crate tests
+cargo test -p turul-a2a-proto              # Proto generation + wire format
+cargo test -p turul-a2a-types              # Types, state machine, wrappers
+cargo test -p turul-a2a                    # Server, storage, handlers, auth, E2E
+cargo test -p turul-a2a-auth               # Auth middleware (API key, Bearer)
+cargo test -p turul-a2a-client             # Client library
+cargo test -p turul-a2a-aws-lambda         # Lambda adapter
+cargo test -p turul-jwt-validator          # JWT validator (E2E with wiremock)
+
+# Storage backend parity tests (feature-gated)
+cargo test -p turul-a2a --features sqlite --lib -- storage::sqlite
+cargo test -p turul-a2a --features postgres --lib -- storage::postgres --test-threads=1
+cargo test -p turul-a2a --features dynamodb --lib -- storage::dynamodb --test-threads=1
+
+# Examples
+cargo run -p echo-agent                    # Echo agent on :3000
+cargo run -p auth-agent                    # Auth agent on :3001 (requires X-API-Key)
+cargo lambda watch -p lambda-agent         # Lambda agent via cargo-lambda
 ```
 
 **All crate dependencies MUST use `workspace = true`** — versions are managed in root `Cargo.toml` `[workspace.dependencies]`. This includes dev-dependencies. Never put a version number in a crate's own `Cargo.toml` — add the dependency to the workspace root first, then reference it with `{ workspace = true }` in the crate.
@@ -54,7 +65,7 @@ cargo run -p echo-agent              # Run echo agent example on :3000
 
 Google well-known types (`google.protobuf.Struct`, `Value`, `Timestamp`) mapped to `pbjson_types` via `compile_well_known_types()` + `extern_path`.
 
-### Phase 2 Exceptions (Temporary)
+### Known Exceptions
 
 - **Push notification configs** use raw `turul_a2a_proto::TaskPushNotificationConfig` in storage traits and handler signatures. This is an intentional exception — push configs are simple CRUD with no state machine or invariants that warrant a wrapper. Keep this leakage isolated; do not let raw proto types spread into general handler/router code.
 - **`last_chunk` on `append_artifact`** is transport-level metadata for SSE streaming. Storage passes it through but does not persist completion state in v0.1. The server layer forwards it to streaming subscribers.
@@ -107,10 +118,9 @@ Tests are written from the A2A proto/spec FIRST, then implementation follows. If
 
 ### Deferred (ordered by priority)
 
-1. **Distributed multi-instance verification** — two instances, shared backend, alternating requests. Proves request/response correctness across instances.
-2. **D3: Durable event coordination** — new ADR. Enables streaming/subscription across any multi-instance deployment (Lambda, load-balanced, K8s). Requires durable event store + replay semantics.
-3. **gRPC transport** — feature-gated in `turul-a2a-proto`
-4. **Skill-level `security_requirements`** — agent-level only for now
-5. **Shared `turul-jwt-validator` extraction** — currently local, see ADR-007
+1. **D3: Durable event coordination** — ADR-009 proposed. Enables cross-instance streaming/subscription (Lambda, load-balanced, K8s). Requires durable event store + replay. Same-backend transaction atomicity.
+2. **gRPC transport** — feature-gated in `turul-a2a-proto`
+3. **Skill-level `security_requirements`** — agent-level only for now
+4. **Shared `turul-jwt-validator` extraction** — currently local, see ADR-007
 
-Only after items 1-2 should the project claim production readiness for horizontally scaled deployments.
+Multi-instance request/response is verified. Only D3 (cross-instance streaming) remains before full scale claims.
