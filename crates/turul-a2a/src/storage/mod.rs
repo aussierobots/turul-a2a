@@ -8,6 +8,9 @@ pub mod in_memory;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+#[cfg(feature = "dynamodb")]
+pub mod dynamodb;
+
 #[cfg(test)]
 pub(crate) mod parity_tests;
 
