@@ -127,25 +127,28 @@ fn parse_task_path(rest: &str) -> Option<TaskAction> {
 
 async fn task_get_dispatch(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
     Path(rest): Path<String>,
     Query(query): Query<TaskGetCombinedQuery>,
 ) -> Result<axum::response::Response, A2aError> {
-    dispatch_task_get(state, DEFAULT_TENANT, &rest, &query).await
+    dispatch_task_get(state, DEFAULT_TENANT, ctx.identity.owner(), &rest, &query).await
 }
 
 async fn task_post_dispatch(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
     Path(rest): Path<String>,
     body: String,
 ) -> Result<axum::response::Response, A2aError> {
-    dispatch_task_post(state, DEFAULT_TENANT, &rest, body).await
+    dispatch_task_post(state, DEFAULT_TENANT, ctx.identity.owner(), &rest, body).await
 }
 
 async fn task_delete_dispatch(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
     Path(rest): Path<String>,
 ) -> Result<axum::response::Response, A2aError> {
-    dispatch_task_delete(state, DEFAULT_TENANT, &rest).await
+    dispatch_task_delete(state, DEFAULT_TENANT, ctx.identity.owner(), &rest).await
 }
 
 // =========================================================
@@ -154,41 +157,46 @@ async fn task_delete_dispatch(
 
 async fn tenant_send_message_handler(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
     Path(tenant): Path<String>,
     body: String,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    core_send_message(state, &tenant, "anonymous", body).await
+    core_send_message(state, &tenant, ctx.identity.owner(), body).await
 }
 
 async fn tenant_list_tasks_handler(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
     Path(tenant): Path<String>,
     Query(query): Query<ListTasksQuery>,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    core_list_tasks(state, &tenant, "anonymous", &query).await
+    core_list_tasks(state, &tenant, ctx.identity.owner(), &query).await
 }
 
 async fn tenant_task_get_dispatch(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
     Path((tenant, rest)): Path<(String, String)>,
     Query(query): Query<TaskGetCombinedQuery>,
 ) -> Result<axum::response::Response, A2aError> {
-    dispatch_task_get(state, &tenant, &rest, &query).await
+    dispatch_task_get(state, &tenant, ctx.identity.owner(), &rest, &query).await
 }
 
 async fn tenant_task_post_dispatch(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
     Path((tenant, rest)): Path<(String, String)>,
     body: String,
 ) -> Result<axum::response::Response, A2aError> {
-    dispatch_task_post(state, &tenant, &rest, body).await
+    dispatch_task_post(state, &tenant, ctx.identity.owner(), &rest, body).await
 }
 
 async fn tenant_task_delete_dispatch(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
     Path((tenant, rest)): Path<(String, String)>,
 ) -> Result<axum::response::Response, A2aError> {
-    dispatch_task_delete(state, &tenant, &rest).await
+    dispatch_task_delete(state, &tenant, ctx.identity.owner(), &rest).await
 }
 
 // =========================================================
@@ -211,27 +219,28 @@ struct TaskGetCombinedQuery {
 async fn dispatch_task_get(
     state: AppState,
     tenant: &str,
+    owner: &str,
     rest: &str,
     query: &TaskGetCombinedQuery,
 ) -> Result<axum::response::Response, A2aError> {
     match parse_task_path(rest) {
         Some(TaskAction::GetTask(id)) => {
-            let Json(v) = core_get_task(state, tenant, "anonymous", &id, query.history_length).await?;
+            let Json(v) = core_get_task(state, tenant, owner, &id, query.history_length).await?;
             Ok(Json(v).into_response())
         }
         Some(TaskAction::SubscribeToTask(id)) => {
-            core_subscribe_to_task(state, tenant, "anonymous", &id).await
+            core_subscribe_to_task(state, tenant, owner, &id).await
         }
         Some(TaskAction::PushConfigCollection(task_id)) => {
             let pq = PushConfigQuery {
                 page_size: query.page_size,
                 page_token: query.page_token.clone(),
             };
-            let Json(v) = core_list_push_configs(state, tenant, "anonymous", &task_id, &pq).await?;
+            let Json(v) = core_list_push_configs(state, tenant, owner, &task_id, &pq).await?;
             Ok(Json(v).into_response())
         }
         Some(TaskAction::PushConfigItem(task_id, config_id)) => {
-            let Json(v) = core_get_push_config(state, tenant, "anonymous", &task_id, &config_id).await?;
+            let Json(v) = core_get_push_config(state, tenant, owner, &task_id, &config_id).await?;
             Ok(Json(v).into_response())
         }
         _ => Err(A2aError::InvalidRequest { message: "Invalid task path".into() }),
@@ -241,16 +250,17 @@ async fn dispatch_task_get(
 async fn dispatch_task_post(
     state: AppState,
     tenant: &str,
+    owner: &str,
     rest: &str,
     body: String,
 ) -> Result<axum::response::Response, A2aError> {
     match parse_task_path(rest) {
         Some(TaskAction::CancelTask(id)) => {
-            let Json(v) = core_cancel_task(state, tenant, "anonymous", &id).await?;
+            let Json(v) = core_cancel_task(state, tenant, owner, &id).await?;
             Ok(Json(v).into_response())
         }
         Some(TaskAction::PushConfigCollection(task_id)) => {
-            let Json(v) = core_create_push_config(state, tenant, "anonymous", &task_id, body).await?;
+            let Json(v) = core_create_push_config(state, tenant, owner, &task_id, body).await?;
             Ok(Json(v).into_response())
         }
         _ => Err(A2aError::InvalidRequest { message: "Invalid task path".into() }),
@@ -260,11 +270,12 @@ async fn dispatch_task_post(
 async fn dispatch_task_delete(
     state: AppState,
     tenant: &str,
+    owner: &str,
     rest: &str,
 ) -> Result<axum::response::Response, A2aError> {
     match parse_task_path(rest) {
         Some(TaskAction::PushConfigItem(task_id, config_id)) => {
-            let Json(v) = core_delete_push_config(state, tenant, "anonymous", &task_id, &config_id).await?;
+            let Json(v) = core_delete_push_config(state, tenant, owner, &task_id, &config_id).await?;
             Ok(Json(v).into_response())
         }
         _ => Err(A2aError::InvalidRequest { message: "Invalid task path".into() }),
@@ -290,17 +301,19 @@ async fn extended_agent_card_handler(
 
 async fn send_streaming_message_handler(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
     body: String,
 ) -> Result<axum::response::Response, A2aError> {
-    core_send_streaming_message(state, DEFAULT_TENANT, "anonymous", body).await
+    core_send_streaming_message(state, DEFAULT_TENANT, ctx.identity.owner(), body).await
 }
 
 async fn tenant_send_streaming_message_handler(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
     Path(tenant): Path<String>,
     body: String,
 ) -> Result<axum::response::Response, A2aError> {
-    core_send_streaming_message(state, &tenant, "anonymous", body).await
+    core_send_streaming_message(state, &tenant, ctx.identity.owner(), body).await
 }
 
 pub(crate) async fn core_send_streaming_message(
@@ -455,9 +468,6 @@ fn make_sse_response(
 
 const DEFAULT_TENANT: &str = "";
 
-/// Default owner for anonymous (no middleware) requests.
-const DEFAULT_OWNER: &str = "anonymous";
-
 async fn send_message_handler(
     State(state): State<AppState>,
     axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
@@ -468,9 +478,10 @@ async fn send_message_handler(
 
 async fn list_tasks_handler(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
     Query(query): Query<ListTasksQuery>,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    core_list_tasks(state, DEFAULT_TENANT, "anonymous", &query).await
+    core_list_tasks(state, DEFAULT_TENANT, ctx.identity.owner(), &query).await
 }
 
 // =========================================================

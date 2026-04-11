@@ -224,56 +224,155 @@ async fn no_middleware_jsonrpc_works() {
 // Mark as ignored until the layer is wired.
 
 #[tokio::test]
-#[ignore = "Requires Tower auth layer (Phase 3 implementation)"]
 async fn auth_middleware_rejects_unauthenticated_http() {
-    // POST /message:send without X-Test-Auth header → HTTP 401
-    // Response should have WWW-Authenticate header
-    // Response body should be AIP-193 format, NOT JSON-RPC
+    let router = build_router(state_with_auth());
+    let req = Request::post("/message:send")
+        .header("content-type", "application/json")
+        .body(Body::from(send_body("no-auth")))
+        .unwrap();
+    let (status, _headers, body) = response_with_headers(router, req).await;
+    assert_eq!(status, 401, "Unauthenticated should return 401");
+    assert!(body["error"]["code"].as_u64().is_some(), "Should have AIP-193 error body");
 }
 
 #[tokio::test]
-#[ignore = "Requires Tower auth layer (Phase 3 implementation)"]
 async fn auth_middleware_rejects_unauthenticated_jsonrpc() {
-    // POST /jsonrpc without X-Test-Auth header → HTTP 401 (NOT JSON-RPC error)
-    // The JSON-RPC body is never parsed
+    let router = build_router(state_with_auth());
+    let req = Request::post("/jsonrpc")
+        .header("content-type", "application/json")
+        .body(Body::from(jrpc_body("ListTasks", 1)))
+        .unwrap();
+    let (status, _, body) = response_with_headers(router, req).await;
+    assert_eq!(status, 401, "JSON-RPC without auth should get HTTP 401");
+    // Must NOT be a JSON-RPC error object
+    assert!(
+        body.get("jsonrpc").is_none(),
+        "Auth failure on /jsonrpc must be HTTP 401, not JSON-RPC error: {body}"
+    );
+    assert!(body["error"]["code"].as_u64().is_some(), "Should be AIP-193 format");
 }
 
 #[tokio::test]
-#[ignore = "Requires Tower auth layer (Phase 3 implementation)"]
 async fn well_known_agent_card_excluded_from_auth() {
-    // GET /.well-known/agent-card.json → 200 even with auth middleware configured
+    let router = build_router(state_with_auth());
+    let req = Request::get("/.well-known/agent-card.json")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = json_response(router, req).await;
+    assert_eq!(status, 200, "Agent card should be public even with auth configured");
 }
 
 #[tokio::test]
-#[ignore = "Requires Tower auth layer (Phase 3 implementation)"]
 async fn extended_agent_card_requires_authenticated_identity() {
-    // GET /extendedAgentCard without auth → 401
-    // GET /extendedAgentCard with auth (X-Test-Auth: user) → 200
-    // This gates on is_authenticated(), not claims.is_some()
+    let state = state_with_auth();
+
+    // Without auth → 401
+    let router = build_router(state.clone());
+    let req = Request::get("/extendedAgentCard")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = json_response(router, req).await;
+    assert_eq!(status, 401, "Extended card without auth should return 401");
+
+    // With auth → 200 (gated on is_authenticated, not claims)
+    let router = build_router(state);
+    let req = Request::get("/extendedAgentCard")
+        .header("x-test-auth", "any-user")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = json_response(router, req).await;
+    assert_eq!(status, 200, "Extended card with auth should return 200");
+    assert!(body.get("name").is_some());
 }
 
 #[tokio::test]
-#[ignore = "Requires Tower auth layer (Phase 3 implementation)"]
 async fn authenticated_owner_flows_to_storage() {
+    let state = state_with_auth();
+
     // Send message with X-Test-Auth: user-123
-    // Get the task back
-    // Verify it was stored with owner="user-123" (not "anonymous")
-    // Another user (X-Test-Auth: user-456) cannot see it
+    let router = build_router(state.clone());
+    let req = Request::post("/message:send")
+        .header("content-type", "application/json")
+        .header("x-test-auth", "user-123")
+        .body(Body::from(send_body("auth-flow")))
+        .unwrap();
+    let (status, body) = json_response(router, req).await;
+    assert_eq!(status, 200);
+    let task_id = body["task"]["id"].as_str().unwrap();
+
+    // Same user can see the task
+    let router = build_router(state.clone());
+    let req = Request::get(&format!("/tasks/{task_id}"))
+        .header("x-test-auth", "user-123")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = json_response(router, req).await;
+    assert_eq!(status, 200, "Owner should see their own task");
+
+    // Different user cannot see it
+    let router = build_router(state);
+    let req = Request::get(&format!("/tasks/{task_id}"))
+        .header("x-test-auth", "user-456")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = json_response(router, req).await;
+    assert_eq!(status, 404, "Different owner should not see the task");
 }
 
 #[tokio::test]
-#[ignore = "Requires Tower auth layer (Phase 3 implementation)"]
 async fn jsonrpc_unauthenticated_is_http_401_not_jsonrpc_error() {
-    // POST /jsonrpc without auth → HTTP 401
-    // Response body is NOT {"jsonrpc":"2.0","error":{...}}
-    // Response body IS {"error":{"code":401,...}} (AIP-193)
+    let router = build_router(state_with_auth());
+    let req = Request::post("/jsonrpc")
+        .header("content-type", "application/json")
+        .body(Body::from(jrpc_body("GetTask", 99)))
+        .unwrap();
+    let (status, _, body) = response_with_headers(router, req).await;
+    assert_eq!(status, 401);
+    // NOT a JSON-RPC error
+    assert!(body.get("jsonrpc").is_none(), "Must be HTTP error, not JSON-RPC");
+    // IS AIP-193
+    assert_eq!(body["error"]["code"], 401);
 }
 
 #[tokio::test]
-#[ignore = "Requires Tower auth layer (Phase 3 implementation)"]
 async fn tenant_plus_auth_scoped_together() {
-    // POST /acme/message:send with X-Test-Auth: user-a → creates task
-    // GET /acme/tasks/{id} with X-Test-Auth: user-b → 404 (wrong owner)
-    // GET /other/tasks/{id} with X-Test-Auth: user-a → 404 (wrong tenant)
-    // GET /acme/tasks/{id} with X-Test-Auth: user-a → 200 (correct both)
+    let state = state_with_auth();
+
+    // Create task under tenant "acme" with user-a
+    let router = build_router(state.clone());
+    let req = Request::post("/acme/message:send")
+        .header("content-type", "application/json")
+        .header("x-test-auth", "user-a")
+        .body(Body::from(send_body("tenant-auth")))
+        .unwrap();
+    let (status, body) = json_response(router, req).await;
+    assert_eq!(status, 200);
+    let task_id = body["task"]["id"].as_str().unwrap();
+
+    // user-a under acme can see it
+    let router = build_router(state.clone());
+    let req = Request::get(&format!("/acme/tasks/{task_id}"))
+        .header("x-test-auth", "user-a")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = json_response(router, req).await;
+    assert_eq!(status, 200, "Correct tenant + owner should work");
+
+    // user-b under acme cannot see it (wrong owner)
+    let router = build_router(state.clone());
+    let req = Request::get(&format!("/acme/tasks/{task_id}"))
+        .header("x-test-auth", "user-b")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = json_response(router, req).await;
+    assert_eq!(status, 404, "Wrong owner under correct tenant should 404");
+
+    // user-a under different tenant cannot see it (wrong tenant)
+    let router = build_router(state);
+    let req = Request::get(&format!("/other/tasks/{task_id}"))
+        .header("x-test-auth", "user-a")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = json_response(router, req).await;
+    assert_eq!(status, 404, "Correct owner under wrong tenant should 404");
 }
