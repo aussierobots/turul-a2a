@@ -2,10 +2,10 @@
 
 ## Current State
 
-- The repository has a working Cargo workspace with 3 crates: `turul-a2a-proto`, `turul-a2a-types`, `turul-a2a`.
-- 199 tests cover proto generation, types, storage, HTTP handlers, JSON-RPC dispatch, SSE streaming, and E2E scenarios.
-- v0.1 scope: HTTP+JSON, JSON-RPC, SSE streaming, in-memory storage. Auth, client, Lambda, additional backends deferred.
-- Architecture decisions are documented in `docs/adr/`.
+- 9 crates in workspace, 328+ tests, 8 ADRs, 3 example agents.
+- **Strong for**: single-instance/server deployment, request/response Lambda, 4 parity-tested storage backends (in-memory, SQLite, PostgreSQL, DynamoDB), auth middleware (Bearer JWT + API Key), client library.
+- **Not yet complete for**: distributed multi-instance deployment claims, cross-instance streaming/subscription, full Lambda streaming parity.
+- Do not present the project as production-complete for horizontally scaled deployments until distributed verification and durable event coordination (D3) are done.
 
 ## Source of Truth
 

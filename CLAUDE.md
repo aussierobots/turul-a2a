@@ -8,6 +8,8 @@ Turul-a2a is a Rust implementation of the A2A (Agent-to-Agent) Protocol v1.0. Li
 
 **Proto-first architecture**: Types are generated from the normative `proto/a2a.proto` (package `lf.a2a.v1`) using `prost` + `pbjson`, then wrapped in ergonomic Rust types.
 
+**Maturity**: Single-instance server + storage is strong. Request/response Lambda adapter is strong. Distributed multi-instance streaming is explicitly deferred (D3). Do not claim horizontally-scaled production readiness until D3 is complete.
+
 ## Build & Development Commands
 
 ```bash
@@ -103,10 +105,12 @@ Tests are written from the A2A proto/spec FIRST, then implementation follows. If
 - Error: TaskNotFoundError → 404/-32001, TaskNotCancelableError → 409/-32002, ContentTypeNotSupportedError → 415/-32005
 - All A2A errors MUST include `google.rpc.ErrorInfo` with reason + domain
 
-### Deferred
+### Deferred (ordered by priority)
 
-- Distributed multi-instance verification (two instances, shared backend, alternating requests for request/response correctness)
-- D3: durable event coordination for multi-instance streaming (new ADR needed, not Lambda-specific)
-- gRPC transport (feature-gated in `turul-a2a-proto`)
-- Skill-level `security_requirements` (agent-level only for now)
-- Shared `turul-jwt-validator` extraction (currently local, see ADR-007)
+1. **Distributed multi-instance verification** — two instances, shared backend, alternating requests. Proves request/response correctness across instances.
+2. **D3: Durable event coordination** — new ADR. Enables streaming/subscription across any multi-instance deployment (Lambda, load-balanced, K8s). Requires durable event store + replay semantics.
+3. **gRPC transport** — feature-gated in `turul-a2a-proto`
+4. **Skill-level `security_requirements`** — agent-level only for now
+5. **Shared `turul-jwt-validator` extraction** — currently local, see ADR-007
+
+Only after items 1-2 should the project claim production readiness for horizontally scaled deployments.
