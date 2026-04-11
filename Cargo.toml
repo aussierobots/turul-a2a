@@ -47,7 +47,7 @@ http-body-util = "0.1"
 
 # Auth / JWT
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
 tracing-subscriber = "0.3"
 
 # Testing / crypto

@@ -83,9 +83,18 @@ impl A2aClient {
     }
 
     /// Build the URL with optional tenant prefix.
+    /// Tenant is percent-encoded to handle special characters safely.
     fn url(&self, path: &str) -> String {
         match &self.tenant {
-            Some(tenant) => format!("{}/{}{}", self.base_url, tenant, path),
+            Some(tenant) => {
+                let encoded_tenant =
+                    reqwest::Url::parse("http://x")
+                        .unwrap()
+                        .join(&format!("{}/", tenant))
+                        .map(|u| u.path().trim_end_matches('/').trim_start_matches('/').to_string())
+                        .unwrap_or_else(|_| tenant.clone());
+                format!("{}/{}{}", self.base_url, encoded_tenant, path)
+            }
             None => format!("{}{}", self.base_url, path),
         }
     }
@@ -132,14 +141,12 @@ impl A2aClient {
         task_id: &str,
         history_length: Option<i32>,
     ) -> Result<pb::Task, A2aClientError> {
-        let mut url = self.url(&format!("/tasks/{task_id}"));
+        let url = self.url(&format!("/tasks/{task_id}"));
+        let mut req = self.request(reqwest::Method::GET, &url);
         if let Some(hl) = history_length {
-            url = format!("{url}?historyLength={hl}");
+            req = req.query(&[("historyLength", hl.to_string())]);
         }
-        let resp = self
-            .request(reqwest::Method::GET, &url)
-            .send()
-            .await?;
+        let resp = req.send().await?;
 
         if !resp.status().is_success() {
             return Err(self.parse_error(resp).await);
@@ -172,28 +179,22 @@ impl A2aClient {
         &self,
         params: &ListTasksParams,
     ) -> Result<pb::ListTasksResponse, A2aClientError> {
-        let mut url = self.url("/tasks");
-        let mut query_parts = vec![];
+        let url = self.url("/tasks");
+        let mut req = self.request(reqwest::Method::GET, &url);
         if let Some(ref ctx) = params.context_id {
-            query_parts.push(format!("contextId={ctx}"));
+            req = req.query(&[("contextId", ctx.as_str())]);
         }
         if let Some(ref status) = params.status {
-            query_parts.push(format!("status={status}"));
+            req = req.query(&[("status", status.as_str())]);
         }
         if let Some(ps) = params.page_size {
-            query_parts.push(format!("pageSize={ps}"));
+            req = req.query(&[("pageSize", &ps.to_string())]);
         }
         if let Some(ref pt) = params.page_token {
-            query_parts.push(format!("pageToken={pt}"));
-        }
-        if !query_parts.is_empty() {
-            url = format!("{url}?{}", query_parts.join("&"));
+            req = req.query(&[("pageToken", pt.as_str())]);
         }
 
-        let resp = self
-            .request(reqwest::Method::GET, &url)
-            .send()
-            .await?;
+        let resp = req.send().await?;
 
         if !resp.status().is_success() {
             return Err(self.parse_error(resp).await);
