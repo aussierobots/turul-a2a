@@ -219,19 +219,19 @@ impl A2aTaskStorage for PostgresA2aStorage {
         let page_size = filter.page_size.map(|ps| ps.clamp(1, 100)).unwrap_or(50);
 
         // Count total with filters
-        let total_size: i64 = if let (Some(ref ctx), Some(ref status)) = (&filter.context_id, &filter.status) {
+        let total_size: i64 = if let (Some(ctx), Some(status)) = (&filter.context_id, &filter.status) {
             sqlx::query_scalar::<_, Option<i64>>(
                 "SELECT COUNT(*) FROM a2a_tasks WHERE tenant = $1 AND owner = $2 AND context_id = $3 AND status_state = $4",
             )
             .bind(tenant).bind(owner).bind(ctx).bind(format!("{status:?}"))
             .fetch_one(&self.pool).await
-        } else if let Some(ref ctx) = filter.context_id {
+        } else if let Some(ctx) = filter.context_id.as_ref() {
             sqlx::query_scalar::<_, Option<i64>>(
                 "SELECT COUNT(*) FROM a2a_tasks WHERE tenant = $1 AND owner = $2 AND context_id = $3",
             )
             .bind(tenant).bind(owner).bind(ctx)
             .fetch_one(&self.pool).await
-        } else if let Some(ref status) = filter.status {
+        } else if let Some(status) = filter.status.as_ref() {
             sqlx::query_scalar::<_, Option<i64>>(
                 "SELECT COUNT(*) FROM a2a_tasks WHERE tenant = $1 AND owner = $2 AND status_state = $3",
             )
@@ -247,23 +247,23 @@ impl A2aTaskStorage for PostgresA2aStorage {
         .unwrap_or(0);
 
         // Fetch page — build query based on filters
-        let base = if filter.page_token.is_some() {
+        let _base = if filter.page_token.is_some() {
             "SELECT task_json FROM a2a_tasks WHERE tenant = $1 AND owner = $2"
         } else {
             "SELECT task_json FROM a2a_tasks WHERE tenant = $1 AND owner = $2"
         };
 
         // Use a dynamic approach for simplicity
-        let rows: Vec<(serde_json::Value,)> = if let Some(ref token) = filter.page_token {
-            if let (Some(ref ctx), Some(ref status)) = (&filter.context_id, &filter.status) {
+        let rows: Vec<(serde_json::Value,)> = if let Some(token) = filter.page_token.as_ref() {
+            if let (Some(ctx), Some(status)) = (&filter.context_id, &filter.status) {
                 sqlx::query_as("SELECT task_json FROM a2a_tasks WHERE tenant = $1 AND owner = $2 AND context_id = $3 AND status_state = $4 AND task_id > $5 ORDER BY task_id LIMIT $6")
                     .bind(tenant).bind(owner).bind(ctx).bind(format!("{status:?}")).bind(token).bind(page_size)
                     .fetch_all(&self.pool).await
-            } else if let Some(ref ctx) = filter.context_id {
+            } else if let Some(ctx) = filter.context_id.as_ref() {
                 sqlx::query_as("SELECT task_json FROM a2a_tasks WHERE tenant = $1 AND owner = $2 AND context_id = $3 AND task_id > $4 ORDER BY task_id LIMIT $5")
                     .bind(tenant).bind(owner).bind(ctx).bind(token).bind(page_size)
                     .fetch_all(&self.pool).await
-            } else if let Some(ref status) = filter.status {
+            } else if let Some(status) = filter.status.as_ref() {
                 sqlx::query_as("SELECT task_json FROM a2a_tasks WHERE tenant = $1 AND owner = $2 AND status_state = $3 AND task_id > $4 ORDER BY task_id LIMIT $5")
                     .bind(tenant).bind(owner).bind(format!("{status:?}")).bind(token).bind(page_size)
                     .fetch_all(&self.pool).await
@@ -273,15 +273,15 @@ impl A2aTaskStorage for PostgresA2aStorage {
                     .fetch_all(&self.pool).await
             }
         } else {
-            if let (Some(ref ctx), Some(ref status)) = (&filter.context_id, &filter.status) {
+            if let (Some(ctx), Some(status)) = (&filter.context_id, &filter.status) {
                 sqlx::query_as("SELECT task_json FROM a2a_tasks WHERE tenant = $1 AND owner = $2 AND context_id = $3 AND status_state = $4 ORDER BY task_id LIMIT $5")
                     .bind(tenant).bind(owner).bind(ctx).bind(format!("{status:?}")).bind(page_size)
                     .fetch_all(&self.pool).await
-            } else if let Some(ref ctx) = filter.context_id {
+            } else if let Some(ctx) = filter.context_id.as_ref() {
                 sqlx::query_as("SELECT task_json FROM a2a_tasks WHERE tenant = $1 AND owner = $2 AND context_id = $3 ORDER BY task_id LIMIT $4")
                     .bind(tenant).bind(owner).bind(ctx).bind(page_size)
                     .fetch_all(&self.pool).await
-            } else if let Some(ref status) = filter.status {
+            } else if let Some(status) = filter.status.as_ref() {
                 sqlx::query_as("SELECT task_json FROM a2a_tasks WHERE tenant = $1 AND owner = $2 AND status_state = $3 ORDER BY task_id LIMIT $4")
                     .bind(tenant).bind(owner).bind(format!("{status:?}")).bind(page_size)
                     .fetch_all(&self.pool).await
