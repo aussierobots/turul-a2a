@@ -8,6 +8,9 @@ pub mod in_memory;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 

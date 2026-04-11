@@ -10,6 +10,7 @@ license.workspace = true
 default = ["in-memory"]
 in-memory = []
 sqlite = ["sqlx"]
+postgres = ["sqlx"]
 dynamodb = ["aws-config", "aws-sdk-dynamodb"]
 
 [dependencies]

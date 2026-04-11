@@ -53,7 +53,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 tracing-subscriber = "0.3"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "postgres", "json"] }
 aws-config = "1"
 aws-sdk-dynamodb = "1"
 
