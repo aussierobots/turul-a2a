@@ -45,9 +45,15 @@ http = "1"
 http-body-util = "0.1"
 
 # Auth / JWT
-jsonwebtoken = "10"
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 tracing-subscriber = "0.3"
+
+# Testing / crypto
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
+base64 = "0.22"
+wiremock = "0.6"
 
 turul-a2a-proto = { version = "0.1.0", path = "crates/turul-a2a-proto" }
 turul-a2a-types = { version = "0.1.0", path = "crates/turul-a2a-types" }

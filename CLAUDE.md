@@ -27,7 +27,7 @@ cargo fmt --all                      # Format
 cargo run -p echo-agent              # Run echo agent example on :3000
 ```
 
-All crate dependencies MUST use `workspace = true` — versions are managed in root `Cargo.toml` `[workspace.dependencies]`.
+**All crate dependencies MUST use `workspace = true`** — versions are managed in root `Cargo.toml` `[workspace.dependencies]`. This includes dev-dependencies. Never put a version number in a crate's own `Cargo.toml` — add the dependency to the workspace root first, then reference it with `{ workspace = true }` in the crate.
 
 ## Git Conventions
 
