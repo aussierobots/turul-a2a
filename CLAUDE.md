@@ -67,6 +67,7 @@ Documented under `docs/adr/`:
 - **ADR-004**: Error model — A2A error codes, HTTP/JSON-RPC mapping, google.rpc.ErrorInfo
 - **ADR-005**: Dual transport — shared core handlers for HTTP+JSON and JSON-RPC
 - **ADR-006**: SSE streaming — in-process broker, last_chunk as transport metadata, single-instance limitation
+- **ADR-007**: Auth middleware — transport-level Tower layer, AuthIdentity enum, SecurityContribution, local JWT validator
 
 For non-trivial architecture changes, the ADR should be accepted before implementation starts.
 

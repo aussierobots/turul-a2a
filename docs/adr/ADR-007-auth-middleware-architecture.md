@@ -1,6 +1,6 @@
 # ADR-007: Auth Middleware Architecture
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-04-11
 
 ## Context
