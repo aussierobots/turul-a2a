@@ -18,17 +18,21 @@ This affects any multi-instance deployment: load-balanced binaries, ECS/Fargate,
 A new **durable event store** is the source of truth for streaming events. The in-process broker becomes a local delivery optimization — it accelerates delivery to clients attached to the same instance, but the event store is what guarantees correctness.
 
 **Stored per event:**
+- `tenant` — tenant scope (consistent with all other storage traits)
 - `task_id` — which task this event belongs to
-- `event_sequence` — monotonically increasing integer per task (assigned by the store)
+- `event_sequence` — monotonically increasing integer per task within tenant (assigned by the store)
 - `event_type` — `status_update` or `artifact_update`
 - `event_data` — serialized `StreamEvent` JSON
 - `created_at` — timestamp
 - `ttl` — expiration (for cleanup)
 
 **Key shape:**
-- Primary key: `(task_id, event_sequence)`
+- Primary key: `(tenant, task_id, event_sequence)`
 - Events are append-only within a task
 - The store assigns `event_sequence` atomically (no caller-assigned IDs)
+- Tenant is part of the key — events cannot collide across tenants even if task IDs overlap
+
+**Owner:** Owner is NOT part of the event key. Owner authorization is checked at the handler level before subscribing or replaying events (same pattern as task storage — `get_task` verifies owner, then the handler accesses events for the verified task). The event store does not re-check owner on every read.
 
 **Retention:** Events are retained for a configurable TTL (default: 24 hours). After TTL, events are eligible for cleanup. Terminal task events are retained at least until the task itself is cleaned up.
 
@@ -92,24 +96,28 @@ pub trait A2aEventStore: Send + Sync {
     fn backend_name(&self) -> &'static str;
 
     /// Append an event for a task. Returns the assigned sequence number.
+    /// The store assigns the sequence atomically.
     async fn append_event(
         &self,
+        tenant: &str,
         task_id: &str,
         event: StreamEvent,
     ) -> Result<u64, A2aStorageError>;
 
     /// Get all events for a task after a given sequence number.
-    /// Returns events in sequence order.
+    /// Returns events in sequence order. Tenant-scoped.
     async fn get_events_after(
         &self,
+        tenant: &str,
         task_id: &str,
         after_sequence: u64,
     ) -> Result<Vec<(u64, StreamEvent)>, A2aStorageError>;
 
     /// Get the latest event sequence number for a task.
-    /// Returns 0 if no events exist.
+    /// Returns 0 if no events exist. Tenant-scoped.
     async fn latest_sequence(
         &self,
+        tenant: &str,
         task_id: &str,
     ) -> Result<u64, A2aStorageError>;
 
@@ -124,21 +132,23 @@ This trait is backend-neutral. Implementations for DynamoDB, PostgreSQL, SQLite,
 
 **DynamoDB:**
 - Table: `a2a_task_events`
-- PK: `taskId` (String)
-- SK: `eventSequence` (Number) — assigned via atomic counter or conditional write
-- Attributes: `eventType`, `eventData` (JSON string), `createdAt`, `ttl` (DynamoDB TTL)
-- Query: `taskId = :tid AND eventSequence > :seq` with `ScanIndexForward = true`
-- Atomic sequence: use `UpdateItem` with `ADD eventSequence :inc` on a counter item, or conditional `PutItem` with sequence check
+- PK: `pk` (String) — `{tenant}#{taskId}` (consistent with `a2a_tasks` key shape)
+- SK: `eventSequence` (Number)
+- Attributes: `tenant`, `taskId`, `eventType`, `eventData` (JSON string), `createdAt`, `ttl` (DynamoDB TTL)
+- Query: `pk = :pk AND eventSequence > :seq` with `ScanIndexForward = true`
+- Per-task sequence allocation: `UpdateItem` on a counter item (`pk = {tenant}#{taskId}#counter`, `ADD nextSequence :one`) to atomically increment and return the new value. Then `PutItem` the event with that sequence. This provides a real monotonic per-task sequence.
 
 **PostgreSQL:**
 - Table: `a2a_task_events`
-- Columns: `task_id TEXT, event_sequence BIGSERIAL, event_type TEXT, event_data JSONB, created_at TIMESTAMPTZ DEFAULT NOW()`
-- Primary key: `(task_id, event_sequence)`
-- `event_sequence` is auto-assigned by `BIGSERIAL` — monotonic per-database, not per-task. For per-task monotonic ordering, use `ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY event_sequence)` or a separate sequence table.
-- Query: `WHERE task_id = $1 AND event_sequence > $2 ORDER BY event_sequence`
+- Columns: `tenant TEXT, task_id TEXT, event_sequence BIGINT, event_type TEXT, event_data JSONB, created_at TIMESTAMPTZ DEFAULT NOW()`
+- Primary key: `(tenant, task_id, event_sequence)`
+- **Per-task sequence allocation:** `INSERT ... SELECT COALESCE(MAX(event_sequence), 0) + 1 FROM a2a_task_events WHERE tenant = $1 AND task_id = $2` within a transaction, or use `SELECT ... FOR UPDATE` on a sequence counter row in a separate `a2a_task_event_counters` table (`tenant, task_id, next_sequence`). The sequence is a real stored value, not a derived view.
+- Query: `WHERE tenant = $1 AND task_id = $2 AND event_sequence > $3 ORDER BY event_sequence`
+- The sequence is stable across retention/deletion — deleting old events does not renumber remaining events.
 
 **SQLite:**
-- Same schema as PostgreSQL with `INTEGER PRIMARY KEY AUTOINCREMENT` for global sequence
+- Same schema as PostgreSQL
+- Per-task sequence: `INSERT ... SELECT COALESCE(MAX(event_sequence), 0) + 1` — safe under SQLite's single-writer model
 - Suitable for single-instance and testing
 
 **In-memory:**
@@ -168,7 +178,15 @@ This trait is backend-neutral. Implementations for DynamoDB, PostgreSQL, SQLite,
 
 ### 8. Failure and Retention Model
 
-**Event write failure:** If the durable store write fails, the event is lost. The task storage update (which happens first) may succeed, creating a state where the task has progressed but the event was not recorded. This is acceptable — the subscriber can detect the gap via sequence numbers and fall back to polling the task's current status.
+**Event write failure:** The event store write is the correctness-critical path. If it fails, the task state mutation MUST NOT commit. The write sequence is:
+
+1. Write event to durable store (get sequence number)
+2. If event write succeeds, update task state in storage
+3. Publish to local broker (optimization, fire-and-forget)
+
+If step 1 fails, the operation returns an error to the caller — the task does not advance. This ensures the event stream is never behind the task's actual state. The cost is that a transient event store failure blocks task progress, which is the correct trade-off for streaming correctness.
+
+**No silent event loss.** If the event store is unavailable, task mutations fail rather than silently dropping events. This is consistent with the claim that durable store write is correctness-critical.
 
 **Backpressure:** The event store does not apply backpressure to producers. Events are fire-and-forget from the producer's perspective. Slow subscribers catch up via replay.
 
