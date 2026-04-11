@@ -1,0 +1,16 @@
+[package]
+name = "auth-agent"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+turul-a2a = { path = "../../crates/turul-a2a" }
+turul-a2a-auth = { path = "../../crates/turul-a2a-auth" }
+turul-a2a-types = { path = "../../crates/turul-a2a-types" }
+turul-a2a-proto = { path = "../../crates/turul-a2a-proto" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = "0.3"
+serde_json = "1.0"
+uuid = { version = "1", features = ["v7"] }

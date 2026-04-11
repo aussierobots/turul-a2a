@@ -7,6 +7,7 @@ members = [
   "crates/turul-jwt-validator",
   "crates/turul-a2a-auth",
   "examples/echo-agent",
+  "examples/auth-agent",
 ]
 
 [workspace.package]
