@@ -26,9 +26,11 @@ D2 delivers Lambda support for all **request/response** operations. Streaming en
 - `POST /jsonrpc` — all request/response methods
 
 **Not supported on Lambda (D2):**
-- `POST /message:stream` → returns `501 Not Implemented` with explanation
-- `GET /tasks/{id}:subscribe` → returns `501 Not Implemented`
-- JSON-RPC `SendStreamingMessage` / `SubscribeToTask` → returns unsupported operation error
+- `POST /message:stream` → returns `UnsupportedOperationError` (HTTP 400, JSON-RPC -32004, ErrorInfo `UNSUPPORTED_OPERATION`)
+- `GET /tasks/{id}:subscribe` → returns `UnsupportedOperationError`
+- JSON-RPC `SendStreamingMessage` / `SubscribeToTask` → returns `UnsupportedOperationError`
+
+Streaming rejection uses the existing A2A error contract — same wire format as any other unsupported operation. No Lambda-specific HTTP status codes.
 
 **Why streaming is deferred:** The in-process broker cannot coordinate across Lambda invocations. Making streaming work requires a durable event store (new DynamoDB table, new trait surface, replay semantics) — this is a design-level change, not an adapter-level change. It gets its own ADR.
 
@@ -40,7 +42,7 @@ The Lambda adapter wraps the existing `axum::Router` (which implements `tower::S
 Lambda Event (API Gateway / Function URL)
   → classify_runtime_event()
   → lambda_to_axum_request() (extract headers, body, authorizer context)
-  → NoStreamingLayer (rejects /message:stream and :subscribe with 501)
+  → NoStreamingLayer (rejects /message:stream and :subscribe with UnsupportedOperationError)
   → TransportComplianceLayer (A2A-Version, Content-Type)
   → AuthLayer (reads headers or LambdaAuthorizerMiddleware)
   → axum Router (same handlers as local server)
@@ -52,7 +54,9 @@ Lambda Event (API Gateway / Function URL)
 
 API Gateway authorizers produce a context (e.g., `{ "userId": "user-123", "tenantId": "acme" }`). The Lambda adapter injects this as synthetic `x-authorizer-*` headers before the request reaches the Tower auth stack.
 
-`LambdaAuthorizerMiddleware` (implements `A2aMiddleware`) reads these headers and constructs `AuthIdentity::Authenticated`. This does NOT bypass the auth stack — it IS a registered middleware, same as `BearerMiddleware` or `ApiKeyMiddleware`.
+**Trust boundary rule:** The adapter MUST strip any client-supplied `x-authorizer-*` headers from the incoming request before injecting authorizer context. Only data from Lambda's `requestContext.authorizer` is trusted to populate these headers. This prevents spoofing where an external caller sends fake `x-authorizer-userId` headers to bypass authentication.
+
+`LambdaAuthorizerMiddleware` (implements `A2aMiddleware`) reads these adapter-injected headers and constructs `AuthIdentity::Authenticated`. This does NOT bypass the auth stack — it IS a registered middleware, same as `BearerMiddleware` or `ApiKeyMiddleware`.
 
 If no authorizer is configured, standard header-based auth works as-is (Bearer token, API key headers pass through from API Gateway).
 
