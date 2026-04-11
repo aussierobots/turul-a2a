@@ -26,6 +26,7 @@ pub struct AppState {
     pub task_storage: Arc<dyn A2aTaskStorage>,
     pub push_storage: Arc<dyn A2aPushNotificationStorage>,
     pub event_broker: crate::streaming::TaskEventBroker,
+    pub middleware_stack: Arc<crate::middleware::MiddlewareStack>,
 }
 
 /// Build the axum router with all proto-defined routes.
@@ -64,7 +65,9 @@ pub fn build_router(state: AppState) -> Router {
         post(crate::jsonrpc::jsonrpc_dispatch_handler),
     );
 
-    router.with_state(state)
+    // Wrap with auth Tower layer
+    let auth_layer = crate::middleware::AuthLayer::new(state.middleware_stack.clone());
+    router.with_state(state).layer(auth_layer)
 }
 
 // =========================================================
@@ -154,7 +157,7 @@ async fn tenant_send_message_handler(
     Path(tenant): Path<String>,
     body: String,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    core_send_message(state, &tenant, body).await
+    core_send_message(state, &tenant, "anonymous", body).await
 }
 
 async fn tenant_list_tasks_handler(
@@ -162,7 +165,7 @@ async fn tenant_list_tasks_handler(
     Path(tenant): Path<String>,
     Query(query): Query<ListTasksQuery>,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    core_list_tasks(state, &tenant, &query).await
+    core_list_tasks(state, &tenant, "anonymous", &query).await
 }
 
 async fn tenant_task_get_dispatch(
@@ -213,22 +216,22 @@ async fn dispatch_task_get(
 ) -> Result<axum::response::Response, A2aError> {
     match parse_task_path(rest) {
         Some(TaskAction::GetTask(id)) => {
-            let Json(v) = core_get_task(state, tenant, &id, query.history_length).await?;
+            let Json(v) = core_get_task(state, tenant, "anonymous", &id, query.history_length).await?;
             Ok(Json(v).into_response())
         }
         Some(TaskAction::SubscribeToTask(id)) => {
-            core_subscribe_to_task(state, tenant, &id).await
+            core_subscribe_to_task(state, tenant, "anonymous", &id).await
         }
         Some(TaskAction::PushConfigCollection(task_id)) => {
             let pq = PushConfigQuery {
                 page_size: query.page_size,
                 page_token: query.page_token.clone(),
             };
-            let Json(v) = core_list_push_configs(state, tenant, &task_id, &pq).await?;
+            let Json(v) = core_list_push_configs(state, tenant, "anonymous", &task_id, &pq).await?;
             Ok(Json(v).into_response())
         }
         Some(TaskAction::PushConfigItem(task_id, config_id)) => {
-            let Json(v) = core_get_push_config(state, tenant, &task_id, &config_id).await?;
+            let Json(v) = core_get_push_config(state, tenant, "anonymous", &task_id, &config_id).await?;
             Ok(Json(v).into_response())
         }
         _ => Err(A2aError::InvalidRequest { message: "Invalid task path".into() }),
@@ -243,11 +246,11 @@ async fn dispatch_task_post(
 ) -> Result<axum::response::Response, A2aError> {
     match parse_task_path(rest) {
         Some(TaskAction::CancelTask(id)) => {
-            let Json(v) = core_cancel_task(state, tenant, &id).await?;
+            let Json(v) = core_cancel_task(state, tenant, "anonymous", &id).await?;
             Ok(Json(v).into_response())
         }
         Some(TaskAction::PushConfigCollection(task_id)) => {
-            let Json(v) = core_create_push_config(state, tenant, &task_id, body).await?;
+            let Json(v) = core_create_push_config(state, tenant, "anonymous", &task_id, body).await?;
             Ok(Json(v).into_response())
         }
         _ => Err(A2aError::InvalidRequest { message: "Invalid task path".into() }),
@@ -261,7 +264,7 @@ async fn dispatch_task_delete(
 ) -> Result<axum::response::Response, A2aError> {
     match parse_task_path(rest) {
         Some(TaskAction::PushConfigItem(task_id, config_id)) => {
-            let Json(v) = core_delete_push_config(state, tenant, &task_id, &config_id).await?;
+            let Json(v) = core_delete_push_config(state, tenant, "anonymous", &task_id, &config_id).await?;
             Ok(Json(v).into_response())
         }
         _ => Err(A2aError::InvalidRequest { message: "Invalid task path".into() }),
@@ -289,7 +292,7 @@ async fn send_streaming_message_handler(
     State(state): State<AppState>,
     body: String,
 ) -> Result<axum::response::Response, A2aError> {
-    core_send_streaming_message(state, DEFAULT_TENANT, body).await
+    core_send_streaming_message(state, DEFAULT_TENANT, "anonymous", body).await
 }
 
 async fn tenant_send_streaming_message_handler(
@@ -297,12 +300,13 @@ async fn tenant_send_streaming_message_handler(
     Path(tenant): Path<String>,
     body: String,
 ) -> Result<axum::response::Response, A2aError> {
-    core_send_streaming_message(state, &tenant, body).await
+    core_send_streaming_message(state, &tenant, "anonymous", body).await
 }
 
 pub(crate) async fn core_send_streaming_message(
     state: AppState,
     tenant: &str,
+    owner: &str,
     body: String,
 ) -> Result<axum::response::Response, A2aError> {
     let request: turul_a2a_proto::SendMessageRequest = serde_json::from_str(&body)
@@ -335,7 +339,7 @@ pub(crate) async fn core_send_streaming_message(
 
     state
         .task_storage
-        .create_task(tenant, DEFAULT_OWNER, task)
+        .create_task(tenant, owner, task)
         .await
         .map_err(A2aError::from)?;
 
@@ -348,6 +352,7 @@ pub(crate) async fn core_send_streaming_message(
     // Spawn task execution in background
     let exec_state = state.clone();
     let exec_tenant = tenant.to_string();
+    let exec_owner = owner.to_string();
     let exec_task_id = task_id.clone();
     let exec_context_id = context_id.clone();
     let exec_message = message.clone();
@@ -355,7 +360,7 @@ pub(crate) async fn core_send_streaming_message(
         // Move to Working
         if let Ok(mut task) = exec_state
             .task_storage
-            .update_task_status(&exec_tenant, &exec_task_id, DEFAULT_OWNER, TaskStatus::new(TaskState::Working))
+            .update_task_status(&exec_tenant, &exec_task_id, &exec_owner, TaskStatus::new(TaskState::Working))
             .await
         {
             exec_state
@@ -369,7 +374,7 @@ pub(crate) async fn core_send_streaming_message(
             // Persist final state
             let _ = exec_state
                 .task_storage
-                .update_task(&exec_tenant, DEFAULT_OWNER, task.clone())
+                .update_task(&exec_tenant, &exec_owner, task.clone())
                 .await;
 
             // Publish final status
@@ -389,12 +394,13 @@ pub(crate) async fn core_send_streaming_message(
 pub(crate) async fn core_subscribe_to_task(
     state: AppState,
     tenant: &str,
+    owner: &str,
     task_id: &str,
 ) -> Result<axum::response::Response, A2aError> {
     // Verify task exists
     let task = state
         .task_storage
-        .get_task(tenant, task_id, DEFAULT_OWNER, Some(0))
+        .get_task(tenant, task_id, owner, Some(0))
         .await
         .map_err(A2aError::from)?
         .ok_or_else(|| A2aError::TaskNotFound {
@@ -448,20 +454,23 @@ fn make_sse_response(
 // =========================================================
 
 const DEFAULT_TENANT: &str = "";
+
+/// Default owner for anonymous (no middleware) requests.
 const DEFAULT_OWNER: &str = "anonymous";
 
 async fn send_message_handler(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
     body: String,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    core_send_message(state, DEFAULT_TENANT, body).await
+    core_send_message(state, DEFAULT_TENANT, ctx.identity.owner(), body).await
 }
 
 async fn list_tasks_handler(
     State(state): State<AppState>,
     Query(query): Query<ListTasksQuery>,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    core_list_tasks(state, DEFAULT_TENANT, &query).await
+    core_list_tasks(state, DEFAULT_TENANT, "anonymous", &query).await
 }
 
 // =========================================================
@@ -514,6 +523,7 @@ fn parse_task_state(s: &str) -> Option<TaskState> {
 pub(crate) async fn core_send_message(
     state: AppState,
     tenant: &str,
+    owner: &str,
     body: String,
 ) -> Result<Json<serde_json::Value>, A2aError> {
     let request: turul_a2a_proto::SendMessageRequest = serde_json::from_str(&body)
@@ -536,7 +546,7 @@ pub(crate) async fn core_send_message(
         // Verify the task exists and is accessible
         let existing = state
             .task_storage
-            .get_task(tenant, &msg_task_id, DEFAULT_OWNER, None)
+            .get_task(tenant, &msg_task_id, owner, None)
             .await
             .map_err(A2aError::from)?
             .ok_or_else(|| A2aError::TaskNotFound {
@@ -568,14 +578,14 @@ pub(crate) async fn core_send_message(
         // Append message to existing task
         state
             .task_storage
-            .append_message(tenant, &task_id, DEFAULT_OWNER, message.clone())
+            .append_message(tenant, &task_id, owner, message.clone())
             .await
             .map_err(A2aError::from)?;
 
         // Move to Working if in interrupted state
         let task = state
             .task_storage
-            .update_task_status(tenant, &task_id, DEFAULT_OWNER, TaskStatus::new(TaskState::Working))
+            .update_task_status(tenant, &task_id, owner, TaskStatus::new(TaskState::Working))
             .await
             .map_err(A2aError::from)?;
 
@@ -584,7 +594,7 @@ pub(crate) async fn core_send_message(
 
         state
             .task_storage
-            .update_task(tenant, DEFAULT_OWNER, task.clone())
+            .update_task(tenant, owner, task.clone())
             .await
             .map_err(A2aError::from)?;
 
@@ -605,13 +615,13 @@ pub(crate) async fn core_send_message(
 
         state
             .task_storage
-            .create_task(tenant, DEFAULT_OWNER, task)
+            .create_task(tenant, owner, task)
             .await
             .map_err(A2aError::from)?;
 
         let task = state
             .task_storage
-            .update_task_status(tenant, &task_id, DEFAULT_OWNER, TaskStatus::new(TaskState::Working))
+            .update_task_status(tenant, &task_id, owner, TaskStatus::new(TaskState::Working))
             .await
             .map_err(A2aError::from)?;
 
@@ -620,7 +630,7 @@ pub(crate) async fn core_send_message(
 
         state
             .task_storage
-            .update_task(tenant, DEFAULT_OWNER, task.clone())
+            .update_task(tenant, owner, task.clone())
             .await
             .map_err(A2aError::from)?;
 
@@ -633,6 +643,7 @@ pub(crate) async fn core_send_message(
 pub(crate) async fn core_list_tasks(
     state: AppState,
     tenant: &str,
+    owner: &str,
     query: &ListTasksQuery,
 ) -> Result<Json<serde_json::Value>, A2aError> {
     let status = match &query.status {
@@ -644,7 +655,7 @@ pub(crate) async fn core_list_tasks(
 
     let filter = TaskFilter {
         tenant: Some(tenant.to_string()),
-        owner: Some(DEFAULT_OWNER.to_string()),
+        owner: Some(owner.to_string()),
         context_id: query.context_id.clone(),
         status,
         page_size: query.page_size,
@@ -675,12 +686,13 @@ fn list_page_to_json(page: &TaskListPage) -> serde_json::Value {
 pub(crate) async fn core_get_task(
     state: AppState,
     tenant: &str,
+    owner: &str,
     task_id: &str,
     history_length: Option<i32>,
 ) -> Result<Json<serde_json::Value>, A2aError> {
     let task = state
         .task_storage
-        .get_task(tenant, task_id, DEFAULT_OWNER, history_length)
+        .get_task(tenant, task_id, owner, history_length)
         .await
         .map_err(A2aError::from)?
         .ok_or_else(|| A2aError::TaskNotFound {
@@ -693,11 +705,12 @@ pub(crate) async fn core_get_task(
 pub(crate) async fn core_cancel_task(
     state: AppState,
     tenant: &str,
+    owner: &str,
     task_id: &str,
 ) -> Result<Json<serde_json::Value>, A2aError> {
     let result = state
         .task_storage
-        .update_task_status(tenant, task_id, DEFAULT_OWNER, TaskStatus::new(TaskState::Canceled))
+        .update_task_status(tenant, task_id, owner, TaskStatus::new(TaskState::Canceled))
         .await;
 
     match result {
@@ -713,6 +726,7 @@ pub(crate) async fn core_cancel_task(
 pub(crate) async fn core_create_push_config(
     state: AppState,
     tenant: &str,
+    owner: &str,
     task_id: &str,
     body: String,
 ) -> Result<Json<serde_json::Value>, A2aError> {
@@ -729,6 +743,7 @@ pub(crate) async fn core_create_push_config(
 pub(crate) async fn core_list_push_configs(
     state: AppState,
     tenant: &str,
+    owner: &str,
     task_id: &str,
     query: &PushConfigQuery,
 ) -> Result<Json<serde_json::Value>, A2aError> {
@@ -753,6 +768,7 @@ pub(crate) async fn core_list_push_configs(
 pub(crate) async fn core_get_push_config(
     state: AppState,
     tenant: &str,
+    owner: &str,
     task_id: &str,
     config_id: &str,
 ) -> Result<Json<serde_json::Value>, A2aError> {
@@ -771,6 +787,7 @@ pub(crate) async fn core_get_push_config(
 pub(crate) async fn core_delete_push_config(
     state: AppState,
     tenant: &str,
+    owner: &str,
     task_id: &str,
     config_id: &str,
 ) -> Result<Json<serde_json::Value>, A2aError> {

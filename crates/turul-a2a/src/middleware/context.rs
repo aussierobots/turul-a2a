@@ -45,7 +45,7 @@ impl Default for AuthIdentity {
 }
 
 /// Request context threaded through middleware and handlers.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RequestContext {
     pub bearer_token: Option<String>,
     pub headers: http::HeaderMap,

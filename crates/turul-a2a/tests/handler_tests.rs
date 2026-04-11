@@ -88,6 +88,7 @@ fn test_state() -> AppState {
         task_storage: Arc::new(storage.clone()),
         push_storage: Arc::new(storage),
         event_broker: turul_a2a::streaming::TaskEventBroker::new(),
+        middleware_stack: std::sync::Arc::new(turul_a2a::middleware::MiddlewareStack::new(vec![])),
     }
 }
 

@@ -131,6 +131,7 @@ fn state_with(executor: impl AgentExecutor + 'static) -> AppState {
         task_storage: Arc::new(s.clone()),
         push_storage: Arc::new(s),
         event_broker: turul_a2a::streaming::TaskEventBroker::new(),
+        middleware_stack: std::sync::Arc::new(turul_a2a::middleware::MiddlewareStack::new(vec![])),
     }
 }
 

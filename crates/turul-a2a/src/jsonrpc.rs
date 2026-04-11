@@ -138,7 +138,7 @@ async fn dispatch_send_message(
         message: format!("Invalid params: {e}"),
     })?;
     // Reuse the core handler, which returns Json<Value> with SendMessageResponse shape
-    let Json(response) = crate::router::core_send_message(state, tenant, body).await?;
+    let Json(response) = crate::router::core_send_message(state, tenant, "anonymous", body).await?;
     Ok(response)
 }
 
@@ -160,7 +160,7 @@ async fn dispatch_get_task(
         .and_then(|v| v.as_i64())
         .map(|v| v as i32);
 
-    let Json(response) = crate::router::core_get_task(state, tenant, &id, history_length).await?;
+    let Json(response) = crate::router::core_get_task(state, tenant, "anonymous", &id, history_length).await?;
     Ok(response)
 }
 
@@ -178,7 +178,7 @@ async fn dispatch_list_tasks(
         include_artifacts: params.get("includeArtifacts").and_then(|v| v.as_bool()),
     };
 
-    let Json(response) = crate::router::core_list_tasks(state, tenant, &query).await?;
+    let Json(response) = crate::router::core_list_tasks(state, tenant, "anonymous", &query).await?;
     Ok(response)
 }
 
@@ -195,7 +195,7 @@ async fn dispatch_cancel_task(
         })?
         .to_string();
 
-    let Json(response) = crate::router::core_cancel_task(state, tenant, &id).await?;
+    let Json(response) = crate::router::core_cancel_task(state, tenant, "anonymous", &id).await?;
     Ok(response)
 }
 
@@ -223,7 +223,7 @@ async fn dispatch_create_push_config(
         message: format!("Invalid params: {e}"),
     })?;
 
-    let Json(response) = crate::router::core_create_push_config(state, tenant, &task_id, body).await?;
+    let Json(response) = crate::router::core_create_push_config(state, tenant, "anonymous", &task_id, body).await?;
     Ok(response)
 }
 
@@ -239,7 +239,7 @@ async fn dispatch_get_push_config(
         message: "Missing required field: id".into(),
     })?.to_string();
 
-    let Json(response) = crate::router::core_get_push_config(state, tenant, &task_id, &id).await?;
+    let Json(response) = crate::router::core_get_push_config(state, tenant, "anonymous", &task_id, &id).await?;
     Ok(response)
 }
 
@@ -257,7 +257,7 @@ async fn dispatch_list_push_configs(
         page_token: params.get("pageToken").and_then(|v| v.as_str()).map(|s| s.to_string()),
     };
 
-    let Json(response) = crate::router::core_list_push_configs(state, tenant, &task_id, &query).await?;
+    let Json(response) = crate::router::core_list_push_configs(state, tenant, "anonymous", &task_id, &query).await?;
     Ok(response)
 }
 
@@ -273,7 +273,7 @@ async fn dispatch_delete_push_config(
         message: "Missing required field: id".into(),
     })?.to_string();
 
-    let Json(response) = crate::router::core_delete_push_config(state, tenant, &task_id, &id).await?;
+    let Json(response) = crate::router::core_delete_push_config(state, tenant, "anonymous", &task_id, &id).await?;
     Ok(response)
 }
 

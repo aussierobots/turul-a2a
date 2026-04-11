@@ -72,6 +72,7 @@ impl A2aServerBuilder {
                 task_storage,
                 push_storage,
                 event_broker: TaskEventBroker::new(),
+                middleware_stack: Arc::new(crate::middleware::MiddlewareStack::new(vec![])),
             },
             bind_addr: self.bind_addr,
         })
