@@ -25,6 +25,7 @@ pub struct AppState {
     pub executor: Arc<dyn AgentExecutor>,
     pub task_storage: Arc<dyn A2aTaskStorage>,
     pub push_storage: Arc<dyn A2aPushNotificationStorage>,
+    pub event_store: Arc<dyn crate::storage::A2aEventStore>,
     pub event_broker: crate::streaming::TaskEventBroker,
     pub middleware_stack: Arc<crate::middleware::MiddlewareStack>,
 }

@@ -15,6 +15,7 @@ pub struct A2aServerBuilder {
     executor: Option<Arc<dyn AgentExecutor>>,
     task_storage: Option<Arc<dyn A2aTaskStorage>>,
     push_storage: Option<Arc<dyn A2aPushNotificationStorage>>,
+    event_store: Option<Arc<dyn crate::storage::A2aEventStore>>,
     bind_addr: SocketAddr,
     middleware: Vec<Arc<dyn A2aMiddleware>>,
 }
@@ -25,6 +26,7 @@ impl A2aServerBuilder {
             executor: None,
             task_storage: None,
             push_storage: None,
+            event_store: None,
             bind_addr: ([0, 0, 0, 0], 3000).into(),
             middleware: vec![],
         }
@@ -35,9 +37,12 @@ impl A2aServerBuilder {
         self
     }
 
+    /// Set all storage from a single backend instance.
+    /// This is the preferred method — enforces same-backend requirement (ADR-009).
     pub fn storage(mut self, storage: InMemoryA2aStorage) -> Self {
         self.task_storage = Some(Arc::new(storage.clone()));
-        self.push_storage = Some(Arc::new(storage));
+        self.push_storage = Some(Arc::new(storage.clone()));
+        self.event_store = Some(Arc::new(storage));
         self
     }
 
@@ -48,6 +53,11 @@ impl A2aServerBuilder {
 
     pub fn push_storage(mut self, storage: impl A2aPushNotificationStorage + 'static) -> Self {
         self.push_storage = Some(Arc::new(storage));
+        self
+    }
+
+    pub fn event_store(mut self, store: impl crate::storage::A2aEventStore + 'static) -> Self {
+        self.event_store = Some(Arc::new(store));
         self
     }
 
@@ -74,6 +84,9 @@ impl A2aServerBuilder {
             .unwrap_or_else(|| Arc::new(default_storage.clone()));
         let push_storage = self
             .push_storage
+            .unwrap_or_else(|| Arc::new(default_storage.clone()));
+        let event_store: Arc<dyn crate::storage::A2aEventStore> = self
+            .event_store
             .unwrap_or_else(|| Arc::new(default_storage));
 
         // Collect and merge security contributions
@@ -89,6 +102,7 @@ impl A2aServerBuilder {
                 executor,
                 task_storage,
                 push_storage,
+                event_store,
                 event_broker: TaskEventBroker::new(),
                 middleware_stack: Arc::new(MiddlewareStack::new(self.middleware)),
             },
@@ -244,6 +258,7 @@ impl A2aServer {
             executor: Arc::new(wrapped),
             task_storage: self.state.task_storage,
             push_storage: self.state.push_storage,
+            event_store: self.state.event_store,
             event_broker: self.state.event_broker,
             middleware_stack: self.state.middleware_stack,
         };

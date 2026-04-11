@@ -135,6 +135,7 @@ fn state_no_auth() -> AppState {
         push_storage: Arc::new(s),
         event_broker: TaskEventBroker::new(),
         middleware_stack: Arc::new(MiddlewareStack::new(vec![])),
+        event_store: Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
     }
 }
 
@@ -143,7 +144,8 @@ fn state_with_auth() -> AppState {
     AppState {
         executor: Arc::new(TestExecutor),
         task_storage: Arc::new(s.clone()),
-        push_storage: Arc::new(s),
+        push_storage: Arc::new(s.clone()),
+        event_store: Arc::new(s),
         event_broker: TaskEventBroker::new(),
         middleware_stack: Arc::new(MiddlewareStack::new(vec![
             Arc::new(TestAuthMiddleware),

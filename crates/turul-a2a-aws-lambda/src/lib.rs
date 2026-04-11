@@ -72,10 +72,14 @@ impl LambdaA2aServerBuilder {
             "push_storage is required for Lambda".into(),
         ))?;
 
+        // Event store defaults to in-memory (inert on Lambda for D2 — streaming deferred)
+        let default_event_store = turul_a2a::storage::InMemoryA2aStorage::new();
+
         let state = AppState {
             executor,
             task_storage,
             push_storage,
+            event_store: Arc::new(default_event_store),
             event_broker: TaskEventBroker::new(), // inert on Lambda
             middleware_stack: Arc::new(MiddlewareStack::new(self.middleware)),
         };

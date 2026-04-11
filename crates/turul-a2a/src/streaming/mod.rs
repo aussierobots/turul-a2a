@@ -3,6 +3,8 @@
 //! Provides multi-subscriber fan-out for task status and artifact updates.
 //! Used by `POST /message:stream` and `GET /tasks/{id}:subscribe`.
 
+pub mod replay;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
