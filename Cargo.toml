@@ -5,6 +5,7 @@ members = [
   "crates/turul-a2a-types",
   "crates/turul-a2a",
   "crates/turul-jwt-validator",
+  "crates/turul-a2a-auth",
   "examples/echo-agent",
 ]
 

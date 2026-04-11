@@ -1771,6 +1771,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "turul-a2a-auth"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "jsonwebtoken",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "turul-a2a",
+ "turul-a2a-proto",
+ "turul-jwt-validator",
+]
+
+[[package]]
 name = "turul-a2a-proto"
 version = "0.1.0"
 dependencies = [
