@@ -51,17 +51,20 @@ Each event gets a **monotonic sequence number per task**, assigned by the event 
 ### 3. Replay Semantics
 
 **On subscribe/reconnect:**
-1. Client sends `Last-Event-ID: {task_id}:{sequence}` header (or equivalent for initial subscribe)
-2. Server queries event store: `get_events_after(task_id, sequence)`
-3. Server streams historical events first, then switches to live delivery
-4. If `sequence` is 0 or absent, all stored events for the task are replayed
+1. Client sends `Last-Event-ID: {tenant}:{task_id}:{sequence}` header (or equivalent for initial subscribe)
+2. Server extracts tenant from the request path (same as all other operations)
+3. Server queries event store: `get_events_after(tenant, task_id, sequence)`
+4. Server streams historical events first, then switches to live delivery
+5. If `sequence` is 0 or absent, all stored events for the task within that tenant are replayed
 
 **If the requested replay point has expired (TTL):**
 - Server returns the earliest available events, not an error
 - Server MAY include a synthetic `event: replay_gap` SSE comment indicating missed events
 - Client should treat this as best-effort catch-up, not a protocol error
 
-**Idempotency:** Clients SHOULD handle potential duplicate delivery during the transition from historical replay to live events. Events are identified by `(task_id, event_sequence)` — clients can deduplicate by tracking the last seen sequence per task.
+**Event identity:** Each event is identified by `(tenant, task_id, event_sequence)`. SSE event ID format: `{task_id}:{sequence}` (tenant is implicit from the request path, not repeated in the event ID).
+
+**Idempotency:** Clients SHOULD handle potential duplicate delivery during the transition from historical replay to live events. Clients deduplicate by tracking the last seen sequence per task.
 
 ### 4. Live Delivery vs Correctness
 
@@ -178,15 +181,25 @@ This trait is backend-neutral. Implementations for DynamoDB, PostgreSQL, SQLite,
 
 ### 8. Failure and Retention Model
 
-**Event write failure:** The event store write is the correctness-critical path. If it fails, the task state mutation MUST NOT commit. The write sequence is:
+**Atomicity model:** Task state mutation and event write MUST be atomic — neither can commit without the other.
 
-1. Write event to durable store (get sequence number)
-2. If event write succeeds, update task state in storage
-3. Publish to local broker (optimization, fire-and-forget)
+**Requirement: event store and task store share the same backend.** This is not a new constraint — turul-a2a already has each backend implementing all storage traits. Deployments use one backend (PostgreSQL, DynamoDB, SQLite), not a mix.
 
-If step 1 fails, the operation returns an error to the caller — the task does not advance. This ensures the event stream is never behind the task's actual state. The cost is that a transient event store failure blocks task progress, which is the correct trade-off for streaming correctness.
+**Per-backend atomicity:**
 
-**No silent event loss.** If the event store is unavailable, task mutations fail rather than silently dropping events. This is consistent with the claim that durable store write is correctness-critical.
+- **PostgreSQL/SQLite:** Single database transaction wrapping both the task update (`a2a_tasks`) and the event append (`a2a_task_events`). If either fails, the transaction rolls back. Both tables are in the same database.
+- **DynamoDB:** `TransactWriteItems` API writes both the task item update and the event item atomically. DynamoDB transactions support up to 100 items across tables in the same region.
+- **In-memory:** Both maps updated under the same write lock. Trivially atomic.
+
+**Write sequence within the transaction:**
+1. Append event to event store (get sequence number)
+2. Update task state in task store
+3. Commit transaction
+4. Publish to local broker (outside transaction, fire-and-forget optimization)
+
+If the transaction fails, neither the task nor the event is persisted. The caller gets an error. No orphan events, no silent event loss, no task-advanced-without-event.
+
+**Cross-backend deployments (e.g., DynamoDB tasks + PostgreSQL events) are not supported.** The event store and task store must use the same backend. This is enforced by the builder — a single storage instance implements both `A2aTaskStorage` and `A2aEventStore`.
 
 **Backpressure:** The event store does not apply backpressure to producers. Events are fire-and-forget from the producer's perspective. Slow subscribers catch up via replay.
 
