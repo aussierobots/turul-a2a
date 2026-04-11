@@ -9,12 +9,13 @@ The A2A spec defines 9 specific error types (-32001 to -32009 for JSON-RPC, HTTP
 
 ## Decision
 
-`A2aError` enum has one variant per A2A error type plus generic variants (InvalidRequest, Unauthenticated, Internal). Each variant maps to an exact HTTP status, JSON-RPC code, and ErrorInfo reason via wire constants from `turul_a2a_types::wire::errors`.
+`A2aError` enum has one variant per A2A error type plus generic variants (InvalidRequest, Internal). Each variant maps to an exact HTTP status, JSON-RPC code, and ErrorInfo reason via wire constants from `turul_a2a_types::wire::errors`.
 
 - `to_http_error_body()` produces AIP-193 format.
 - `to_jsonrpc_error()` produces JSON-RPC 2.0 format with ErrorInfo in `error.data` array.
 - Non-A2A errors (InvalidRequest, Internal) have no ErrorInfo.
 - `A2aStorageError` converts to `A2aError` via `From` impl.
+- **Transport auth (401/403) is NOT modeled in `A2aError`.** Authentication and authorization failures are handled by `MiddlewareError` in the Tower auth layer and produce HTTP responses directly, before any handler or JSON-RPC dispatch. See ADR-007.
 
 Key mappings:
 
