@@ -99,6 +99,7 @@ async fn assert_route_dispatches(router: axum::Router, req: Request<Body>) {
 async fn well_known_agent_card_returns_200() {
     let router = build_router(test_state());
     let req = Request::get("/.well-known/agent-card.json")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let status = response_status(router, req).await;
@@ -109,6 +110,7 @@ async fn well_known_agent_card_returns_200() {
 async fn well_known_agent_card_has_required_fields() {
     let router = build_router(test_state());
     let req = Request::get("/.well-known/agent-card.json")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let body = response_body(router, req).await;
@@ -127,6 +129,7 @@ async fn well_known_agent_card_has_required_fields() {
 async fn extended_agent_card_returns_400_when_not_configured() {
     let router = build_router(test_state());
     let req = Request::get("/extendedAgentCard")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let status = response_status(router, req).await;
@@ -143,6 +146,7 @@ async fn post_message_send_routes() {
     let router = build_router(test_state());
     let req = Request::post("/message:send")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from("{}"))
         .unwrap();
     let status = response_status(router, req).await;
@@ -156,6 +160,7 @@ async fn post_message_stream_routes() {
     let router = build_router(test_state());
     let req = Request::post("/message:stream")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let status = response_status(router, req).await;
@@ -170,6 +175,7 @@ async fn post_message_stream_routes() {
 async fn get_task_routes() {
     let router = build_router(test_state());
     let req = Request::get("/tasks/some-task-id")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     // Handler returns 404 with body (TaskNotFound) — that's correct routing
@@ -179,7 +185,8 @@ async fn get_task_routes() {
 #[tokio::test]
 async fn list_tasks_routes() {
     let router = build_router(test_state());
-    let req = Request::get("/tasks").body(Body::empty()).unwrap();
+    let req = Request::get("/tasks").header("a2a-version", "1.0")
+        .body(Body::empty()).unwrap();
     let status = response_status(router, req).await;
     assert_ne!(status, 404, "GET /tasks must route");
 }
@@ -188,6 +195,7 @@ async fn list_tasks_routes() {
 async fn cancel_task_routes() {
     let router = build_router(test_state());
     let req = Request::post("/tasks/some-id:cancel")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     assert_route_dispatches(router, req).await;
@@ -197,6 +205,7 @@ async fn cancel_task_routes() {
 async fn subscribe_task_routes() {
     let router = build_router(test_state());
     let req = Request::get("/tasks/some-id:subscribe")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     // Task doesn't exist, so handler returns 404 with body (not axum's empty 404)
@@ -212,6 +221,7 @@ async fn create_push_config_routes() {
     let router = build_router(test_state());
     let req = Request::post("/tasks/t1/pushNotificationConfigs")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from("{}"))
         .unwrap();
     // 404 is from task ownership check (task doesn't exist), not from routing
@@ -222,6 +232,7 @@ async fn create_push_config_routes() {
 async fn get_push_config_routes() {
     let router = build_router(test_state());
     let req = Request::get("/tasks/t1/pushNotificationConfigs/c1")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     // Returns 404 with body (config not found) — that's correct routing
@@ -232,6 +243,7 @@ async fn get_push_config_routes() {
 async fn list_push_configs_routes() {
     let router = build_router(test_state());
     let req = Request::get("/tasks/t1/pushNotificationConfigs")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     assert_route_dispatches(router, req).await;
@@ -243,6 +255,7 @@ async fn delete_push_config_routes() {
     let req = Request::builder()
         .method("DELETE")
         .uri("/tasks/t1/pushNotificationConfigs/c1")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     assert_route_dispatches(router, req).await;
@@ -257,6 +270,7 @@ async fn tenant_message_send_routes() {
     let router = build_router(test_state());
     let req = Request::post("/acme-corp/message:send")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from("{}"))
         .unwrap();
     let status = response_status(router, req).await;
@@ -267,6 +281,7 @@ async fn tenant_message_send_routes() {
 async fn tenant_get_task_routes() {
     let router = build_router(test_state());
     let req = Request::get("/acme-corp/tasks/t1")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     assert_route_dispatches(router, req).await;
@@ -276,6 +291,7 @@ async fn tenant_get_task_routes() {
 async fn tenant_list_tasks_routes() {
     let router = build_router(test_state());
     let req = Request::get("/acme-corp/tasks")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let status = response_status(router, req).await;
@@ -286,6 +302,7 @@ async fn tenant_list_tasks_routes() {
 async fn tenant_cancel_task_routes() {
     let router = build_router(test_state());
     let req = Request::post("/acme-corp/tasks/t1:cancel")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     assert_route_dispatches(router, req).await;
@@ -295,6 +312,7 @@ async fn tenant_cancel_task_routes() {
 async fn tenant_extended_agent_card_routes() {
     let router = build_router(test_state());
     let req = Request::get("/acme-corp/extendedAgentCard")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let status = response_status(router, req).await;
@@ -310,6 +328,7 @@ async fn http_error_includes_error_info() {
     let router = build_router(test_state());
     // Extended agent card is not configured -> should return ErrorInfo
     let req = Request::get("/extendedAgentCard")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let body = response_body(router, req).await;
@@ -334,6 +353,7 @@ async fn http_error_includes_error_info() {
 async fn unknown_route_returns_404() {
     let router = build_router(test_state());
     let req = Request::get("/nonexistent/path")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let status = response_status(router, req).await;

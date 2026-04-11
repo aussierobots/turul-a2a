@@ -89,6 +89,7 @@ async fn jsonrpc_call(
 ) -> (u16, serde_json::Value) {
     let req = Request::post("/jsonrpc")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(body.to_string()))
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -342,6 +343,7 @@ async fn notification_without_id_returns_empty_body() {
     .to_string();
     let req = Request::post("/jsonrpc")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(req_body))
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -368,6 +370,7 @@ async fn notification_error_still_suppressed() {
     .to_string();
     let req = Request::post("/jsonrpc")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(req_body))
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();

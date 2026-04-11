@@ -142,6 +142,7 @@ fn state_with(executor: impl AgentExecutor + 'static) -> AppState {
 async fn post_json(router: axum::Router, uri: &str, body: &str) -> (u16, serde_json::Value) {
     let req = Request::post(uri)
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(body.to_string()))
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -151,7 +152,8 @@ async fn post_json(router: axum::Router, uri: &str, body: &str) -> (u16, serde_j
 }
 
 async fn get_json(router: axum::Router, uri: &str) -> (u16, serde_json::Value) {
-    let req = Request::get(uri).body(Body::empty()).unwrap();
+    let req = Request::get(uri).header("a2a-version", "1.0")
+        .body(Body::empty()).unwrap();
     let resp = router.oneshot(req).await.unwrap();
     let st = resp.status().as_u16();
     let b = resp.into_body().collect().await.unwrap().to_bytes();
@@ -303,6 +305,7 @@ async fn e2e_streaming_event_sequence() {
     let router = build_router(st);
     let req = Request::post("/message:stream")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_body("se1", "stream me")))
         .unwrap();
 
@@ -342,6 +345,7 @@ async fn e2e_subscribe_live_task() {
     // Subscribe to the non-terminal task
     let router = build_router(st.clone());
     let req = Request::get(&format!("/tasks/{tid}:subscribe"))
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();

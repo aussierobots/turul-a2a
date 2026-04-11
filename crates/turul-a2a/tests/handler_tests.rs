@@ -123,6 +123,7 @@ async fn send_message_returns_send_message_response_with_task() {
     let router = build_router(test_state());
     let req = Request::post("/message:send")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_json("m-1", "hello")))
         .unwrap();
 
@@ -147,6 +148,7 @@ async fn send_message_tenant_prefixed_works() {
     let router = build_router(test_state());
     let req = Request::post("/acme/message:send")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_json("m-t", "hello tenant")))
         .unwrap();
 
@@ -170,6 +172,7 @@ async fn get_task_returns_task_after_send() {
     // First: send a message to create a task
     let req = Request::post("/message:send")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_json("m-g1", "create task")))
         .unwrap();
     let (_, send_body) = json_response(router, req).await;
@@ -178,6 +181,7 @@ async fn get_task_returns_task_after_send() {
     // Then: get the task
     let router = build_router(state);
     let req = Request::get(&format!("/tasks/{task_id}"))
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, body) = json_response(router, req).await;
@@ -190,6 +194,7 @@ async fn get_task_returns_task_after_send() {
 async fn get_task_nonexistent_returns_404_with_error_info() {
     let router = build_router(test_state());
     let req = Request::get("/tasks/nonexistent-id")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
 
@@ -215,6 +220,7 @@ async fn get_task_history_length_zero_omits_history() {
     let router = build_router(state.clone());
     let req = Request::post("/message:send")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_json("m-hl", "with history")))
         .unwrap();
     let (_, send_body) = json_response(router, req).await;
@@ -223,6 +229,7 @@ async fn get_task_history_length_zero_omits_history() {
     // Get with historyLength=0
     let router = build_router(state);
     let req = Request::get(&format!("/tasks/{task_id}?historyLength=0"))
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, body) = json_response(router, req).await;
@@ -247,6 +254,7 @@ async fn cancel_completed_task_returns_409_with_error_info() {
     let router = build_router(state.clone());
     let req = Request::post("/message:send")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_json("m-c", "complete me")))
         .unwrap();
     let (_, send_body) = json_response(router, req).await;
@@ -255,6 +263,7 @@ async fn cancel_completed_task_returns_409_with_error_info() {
     // Cancel the completed task
     let router = build_router(state);
     let req = Request::post(&format!("/tasks/{task_id}:cancel"))
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, body) = json_response(router, req).await;
@@ -269,6 +278,7 @@ async fn cancel_completed_task_returns_409_with_error_info() {
 async fn cancel_nonexistent_task_returns_404_with_error_info() {
     let router = build_router(test_state());
     let req = Request::post("/tasks/no-such-task:cancel")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, body) = json_response(router, req).await;
@@ -285,7 +295,8 @@ async fn cancel_nonexistent_task_returns_404_with_error_info() {
 #[tokio::test]
 async fn list_tasks_returns_required_pagination_fields() {
     let router = build_router(test_state());
-    let req = Request::get("/tasks").body(Body::empty()).unwrap();
+    let req = Request::get("/tasks").header("a2a-version", "1.0")
+        .body(Body::empty()).unwrap();
 
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 200);
@@ -303,7 +314,8 @@ async fn list_tasks_returns_required_pagination_fields() {
 #[tokio::test]
 async fn list_tasks_empty_result_still_has_all_fields() {
     let router = build_router(test_state());
-    let req = Request::get("/tasks").body(Body::empty()).unwrap();
+    let req = Request::get("/tasks").header("a2a-version", "1.0")
+        .body(Body::empty()).unwrap();
 
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 200);
@@ -323,6 +335,7 @@ async fn push_config_crud_through_http() {
     let router = build_router(state.clone());
     let req = Request::post("/message:send")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_json("m-pc", "for push")))
         .unwrap();
     let (_, send_body) = json_response(router, req).await;
@@ -337,6 +350,7 @@ async fn push_config_crud_through_http() {
     .to_string();
     let req = Request::post(&format!("/tasks/{task_id}/pushNotificationConfigs"))
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(config_body))
         .unwrap();
     let (status, body) = json_response(router, req).await;
@@ -349,7 +363,8 @@ async fn push_config_crud_through_http() {
     let req = Request::get(&format!(
         "/tasks/{task_id}/pushNotificationConfigs/{config_id}"
     ))
-    .body(Body::empty())
+    .header("a2a-version", "1.0")
+        .body(Body::empty())
     .unwrap();
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 200);
@@ -358,6 +373,7 @@ async fn push_config_crud_through_http() {
     // List push configs
     let router = build_router(state.clone());
     let req = Request::get(&format!("/tasks/{task_id}/pushNotificationConfigs"))
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, body) = json_response(router, req).await;
@@ -371,6 +387,7 @@ async fn push_config_crud_through_http() {
         .uri(&format!(
             "/tasks/{task_id}/pushNotificationConfigs/{config_id}"
         ))
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(router, req).await;
@@ -381,7 +398,8 @@ async fn push_config_crud_through_http() {
     let req = Request::get(&format!(
         "/tasks/{task_id}/pushNotificationConfigs/{config_id}"
     ))
-    .body(Body::empty())
+    .header("a2a-version", "1.0")
+        .body(Body::empty())
     .unwrap();
     let (status, _) = json_response(router, req).await;
     assert_eq!(status, 404);
@@ -395,6 +413,7 @@ async fn push_config_crud_through_http() {
 async fn well_known_agent_card_has_all_required_fields() {
     let router = build_router(test_state());
     let req = Request::get("/.well-known/agent-card.json")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, body) = json_response(router, req).await;
@@ -420,6 +439,7 @@ async fn tenant_prefixed_send_scopes_to_tenant() {
     let router = build_router(state.clone());
     let req = Request::post("/acme/message:send")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_json("m-ta", "acme task")))
         .unwrap();
     let (status, send_body) = json_response(router, req).await;
@@ -429,6 +449,7 @@ async fn tenant_prefixed_send_scopes_to_tenant() {
     // Get the task under tenant "acme" — should find it
     let router = build_router(state.clone());
     let req = Request::get(&format!("/acme/tasks/{task_id}"))
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(router, req).await;
@@ -437,6 +458,7 @@ async fn tenant_prefixed_send_scopes_to_tenant() {
     // Get the same task under default (no tenant) — should NOT find it
     let router = build_router(state.clone());
     let req = Request::get(&format!("/tasks/{task_id}"))
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(router, req).await;
@@ -445,6 +467,7 @@ async fn tenant_prefixed_send_scopes_to_tenant() {
     // Get the same task under tenant "other" — should NOT find it
     let router = build_router(state.clone());
     let req = Request::get(&format!("/other/tasks/{task_id}"))
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(router, req).await;
@@ -453,6 +476,7 @@ async fn tenant_prefixed_send_scopes_to_tenant() {
     // List under "acme" should include it
     let router = build_router(state.clone());
     let req = Request::get("/acme/tasks")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, body) = json_response(router, req).await;
@@ -462,6 +486,7 @@ async fn tenant_prefixed_send_scopes_to_tenant() {
     // List under default should NOT include it
     let router = build_router(state);
     let req = Request::get("/tasks")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, body) = json_response(router, req).await;
@@ -477,6 +502,7 @@ async fn tenant_prefixed_cancel_scopes_to_tenant() {
     let router = build_router(state.clone());
     let req = Request::post("/acme/message:send")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_json("m-tc", "cancel me")))
         .unwrap();
     let (_, send_body) = json_response(router, req).await;
@@ -485,6 +511,7 @@ async fn tenant_prefixed_cancel_scopes_to_tenant() {
     // Cancel under wrong tenant — should fail (404)
     let router = build_router(state.clone());
     let req = Request::post(&format!("/other/tasks/{task_id}:cancel"))
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(router, req).await;
@@ -504,7 +531,8 @@ async fn list_tasks_status_filter_narrows_results() {
         let router = build_router(state.clone());
         let req = Request::post("/message:send")
             .header("content-type", "application/json")
-            .body(Body::from(send_message_json(&format!("m-sf-{i}"), "task")))
+            .header("a2a-version", "1.0")
+        .body(Body::from(send_message_json(&format!("m-sf-{i}"), "task")))
             .unwrap();
         json_response(router, req).await;
     }
@@ -512,6 +540,7 @@ async fn list_tasks_status_filter_narrows_results() {
     // List all — should see 2
     let router = build_router(state.clone());
     let req = Request::get("/tasks")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (_, body) = json_response(router, req).await;
@@ -520,6 +549,7 @@ async fn list_tasks_status_filter_narrows_results() {
     // List with status=TASK_STATE_COMPLETED — should see 2 (both completed)
     let router = build_router(state.clone());
     let req = Request::get("/tasks?status=TASK_STATE_COMPLETED")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (_, body) = json_response(router, req).await;
@@ -528,6 +558,7 @@ async fn list_tasks_status_filter_narrows_results() {
     // List with status=TASK_STATE_WORKING — should see 0
     let router = build_router(state);
     let req = Request::get("/tasks?status=TASK_STATE_WORKING")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (_, body) = json_response(router, req).await;
@@ -538,6 +569,7 @@ async fn list_tasks_status_filter_narrows_results() {
 async fn list_tasks_invalid_status_returns_400() {
     let router = build_router(test_state());
     let req = Request::get("/tasks?status=NOT_A_REAL_STATE")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, body) = json_response(router, req).await;
@@ -563,6 +595,7 @@ async fn push_config_list_pagination_through_http() {
     let router = build_router(state.clone());
     let req = Request::post("/message:send")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_json("m-pcp", "for push pagination")))
         .unwrap();
     let (_, send_body) = json_response(router, req).await;
@@ -578,7 +611,8 @@ async fn push_config_list_pagination_through_http() {
         .to_string();
         let req = Request::post(&format!("/tasks/{task_id}/pushNotificationConfigs"))
             .header("content-type", "application/json")
-            .body(Body::from(config_body))
+            .header("a2a-version", "1.0")
+        .body(Body::from(config_body))
             .unwrap();
         let (status, _) = json_response(router, req).await;
         assert_eq!(status, 200);
@@ -589,7 +623,8 @@ async fn push_config_list_pagination_through_http() {
     let req = Request::get(&format!(
         "/tasks/{task_id}/pushNotificationConfigs?pageSize=2"
     ))
-    .body(Body::empty())
+    .header("a2a-version", "1.0")
+        .body(Body::empty())
     .unwrap();
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 200);

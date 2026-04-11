@@ -228,6 +228,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
+## Example and API Surface Rules
+
+- Examples and user-facing sample code must prefer wrapper/task helper APIs over direct `as_proto().clone()` mutation.
+- If a common operation (complete a task, add an artifact, set status) requires manual proto construction in an example, that is a signal that the wrapper surface is missing a helper method. Design the helper first, then update the example.
+- Repeated raw proto surgery in examples or tests is a review blocker — it teaches users the wrong pattern and bypasses the wrapper boundary the project claims to maintain.
+- Raw proto access is an escape hatch for unusual cases, not the primary development path.
+
 ## Documentation Rules
 
 - Keep `AGENTS.md` as the repo policy authority for agent behavior in this repo.

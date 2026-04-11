@@ -184,6 +184,7 @@ impl A2aMiddleware for DuplicateBearerMiddleware {
 
 async fn get_agent_card(router: axum::Router) -> serde_json::Value {
     let req = Request::get("/.well-known/agent-card.json")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();

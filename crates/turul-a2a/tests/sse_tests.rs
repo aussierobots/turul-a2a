@@ -149,6 +149,7 @@ async fn message_stream_returns_text_event_stream() {
     let router = build_router(state);
     let req = Request::post("/message:stream")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_body("sse-ct", "hello")))
         .unwrap();
 
@@ -172,6 +173,7 @@ async fn message_stream_first_event_is_status_snapshot() {
     let router = build_router(state);
     let req = Request::post("/message:stream")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_body("sse-first", "start")))
         .unwrap();
 
@@ -198,6 +200,7 @@ async fn message_stream_events_are_proto_correct_stream_response() {
     let router = build_router(state);
     let req = Request::post("/message:stream")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_body("sse-shape", "check shape")))
         .unwrap();
 
@@ -221,6 +224,7 @@ async fn message_stream_events_in_order() {
     let router = build_router(state);
     let req = Request::post("/message:stream")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_body("sse-order", "ordering")))
         .unwrap();
 
@@ -265,6 +269,7 @@ async fn message_stream_includes_terminal_event() {
     let router = build_router(state);
     let req = Request::post("/message:stream")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_body("sse-term", "complete me")))
         .unwrap();
 
@@ -305,6 +310,7 @@ async fn message_stream_tenant_prefixed_works() {
     let router = build_router(state);
     let req = Request::post("/acme/message:stream")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_body("sse-tenant", "tenant stream")))
         .unwrap();
 
@@ -327,6 +333,7 @@ async fn subscribe_missing_task_returns_404() {
     let state = test_state();
     let router = build_router(state);
     let req = Request::get("/tasks/nonexistent-task:subscribe")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
 
@@ -347,6 +354,7 @@ async fn subscribe_terminal_task_returns_error() {
     let router = build_router(state.clone());
     let req = Request::post("/message:send")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_body("sse-sub-term", "complete")))
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -357,6 +365,7 @@ async fn subscribe_terminal_task_returns_error() {
     // Subscribe to the completed task — should error
     let router = build_router(state);
     let req = Request::get(&format!("/tasks/{task_id}:subscribe"))
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -376,6 +385,7 @@ async fn subscribe_tenant_scoped_missing_returns_404() {
     let router = build_router(state.clone());
     let req = Request::post("/acme/message:send")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_message_body("sse-sub-ts", "tenant task")))
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -386,6 +396,7 @@ async fn subscribe_tenant_scoped_missing_returns_404() {
     // Subscribe under wrong tenant — should 404
     let router = build_router(state);
     let req = Request::get(&format!("/other/tasks/{task_id}:subscribe"))
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -444,6 +455,7 @@ async fn subscribe_non_terminal_task_returns_sse_with_status_snapshot() {
     // Subscribe — should return 200 + text/event-stream
     let router = build_router(state);
     let req = Request::get("/tasks/sub-happy-2:subscribe")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
 

@@ -65,9 +65,14 @@ pub fn build_router(state: AppState) -> Router {
         post(crate::jsonrpc::jsonrpc_dispatch_handler),
     );
 
-    // Wrap with auth Tower layer
+    // Wrap with auth Tower layer (runs second — after transport compliance)
     let auth_layer = crate::middleware::AuthLayer::new(state.middleware_stack.clone());
-    router.with_state(state).layer(auth_layer)
+    // Wrap with transport compliance layer (runs first — outermost)
+    let transport_layer = crate::middleware::transport::TransportComplianceLayer;
+    router
+        .with_state(state)
+        .layer(auth_layer)
+        .layer(transport_layer)
 }
 
 // =========================================================

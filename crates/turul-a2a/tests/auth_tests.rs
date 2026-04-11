@@ -196,6 +196,7 @@ async fn no_middleware_allows_all_requests() {
     // /message:send works without auth
     let req = Request::post("/message:send")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_body("no-auth")))
         .unwrap();
     let (status, _) = json_response(router, req).await;
@@ -207,6 +208,7 @@ async fn no_middleware_jsonrpc_works() {
     let router = build_router(state_no_auth());
     let req = Request::post("/jsonrpc")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(jrpc_body("ListTasks", 1)))
         .unwrap();
     let (status, body) = json_response(router, req).await;
@@ -228,6 +230,7 @@ async fn auth_middleware_rejects_unauthenticated_http() {
     let router = build_router(state_with_auth());
     let req = Request::post("/message:send")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_body("no-auth")))
         .unwrap();
     let (status, _headers, body) = response_with_headers(router, req).await;
@@ -240,6 +243,7 @@ async fn auth_middleware_rejects_unauthenticated_jsonrpc() {
     let router = build_router(state_with_auth());
     let req = Request::post("/jsonrpc")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(jrpc_body("ListTasks", 1)))
         .unwrap();
     let (status, _, body) = response_with_headers(router, req).await;
@@ -256,6 +260,7 @@ async fn auth_middleware_rejects_unauthenticated_jsonrpc() {
 async fn well_known_agent_card_excluded_from_auth() {
     let router = build_router(state_with_auth());
     let req = Request::get("/.well-known/agent-card.json")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(router, req).await;
@@ -269,6 +274,7 @@ async fn extended_agent_card_requires_authenticated_identity() {
     // Without auth → 401
     let router = build_router(state.clone());
     let req = Request::get("/extendedAgentCard")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(router, req).await;
@@ -278,6 +284,7 @@ async fn extended_agent_card_requires_authenticated_identity() {
     let router = build_router(state);
     let req = Request::get("/extendedAgentCard")
         .header("x-test-auth", "any-user")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, body) = json_response(router, req).await;
@@ -294,6 +301,7 @@ async fn authenticated_owner_flows_to_storage() {
     let req = Request::post("/message:send")
         .header("content-type", "application/json")
         .header("x-test-auth", "user-123")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_body("auth-flow")))
         .unwrap();
     let (status, body) = json_response(router, req).await;
@@ -304,6 +312,7 @@ async fn authenticated_owner_flows_to_storage() {
     let router = build_router(state.clone());
     let req = Request::get(&format!("/tasks/{task_id}"))
         .header("x-test-auth", "user-123")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(router, req).await;
@@ -313,6 +322,7 @@ async fn authenticated_owner_flows_to_storage() {
     let router = build_router(state);
     let req = Request::get(&format!("/tasks/{task_id}"))
         .header("x-test-auth", "user-456")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(router, req).await;
@@ -324,6 +334,7 @@ async fn jsonrpc_unauthenticated_is_http_401_not_jsonrpc_error() {
     let router = build_router(state_with_auth());
     let req = Request::post("/jsonrpc")
         .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
         .body(Body::from(jrpc_body("GetTask", 99)))
         .unwrap();
     let (status, _, body) = response_with_headers(router, req).await;
@@ -343,6 +354,7 @@ async fn tenant_plus_auth_scoped_together() {
     let req = Request::post("/acme/message:send")
         .header("content-type", "application/json")
         .header("x-test-auth", "user-a")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_body("tenant-auth")))
         .unwrap();
     let (status, body) = json_response(router, req).await;
@@ -353,6 +365,7 @@ async fn tenant_plus_auth_scoped_together() {
     let router = build_router(state.clone());
     let req = Request::get(&format!("/acme/tasks/{task_id}"))
         .header("x-test-auth", "user-a")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(router, req).await;
@@ -362,6 +375,7 @@ async fn tenant_plus_auth_scoped_together() {
     let router = build_router(state.clone());
     let req = Request::get(&format!("/acme/tasks/{task_id}"))
         .header("x-test-auth", "user-b")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(router, req).await;
@@ -371,6 +385,7 @@ async fn tenant_plus_auth_scoped_together() {
     let router = build_router(state);
     let req = Request::get(&format!("/other/tasks/{task_id}"))
         .header("x-test-auth", "user-a")
+        .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(router, req).await;
@@ -390,6 +405,7 @@ async fn push_config_owner_isolation() {
     let req = Request::post("/message:send")
         .header("content-type", "application/json")
         .header("x-test-auth", "user-a")
+        .header("a2a-version", "1.0")
         .body(Body::from(send_body("pc-owner")))
         .unwrap();
     let (_, body) = json_response(router, req).await;
@@ -405,6 +421,7 @@ async fn push_config_owner_isolation() {
     let req = Request::post(&format!("/tasks/{task_id}/pushNotificationConfigs"))
         .header("content-type", "application/json")
         .header("x-test-auth", "user-a")
+        .header("a2a-version", "1.0")
         .body(Body::from(config_body))
         .unwrap();
     let (status, _) = json_response(router, req).await;
@@ -420,6 +437,7 @@ async fn push_config_owner_isolation() {
     let req = Request::post(&format!("/tasks/{task_id}/pushNotificationConfigs"))
         .header("content-type", "application/json")
         .header("x-test-auth", "user-b")
+        .header("a2a-version", "1.0")
         .body(Body::from(config_body2))
         .unwrap();
     let (status, _) = json_response(router, req).await;

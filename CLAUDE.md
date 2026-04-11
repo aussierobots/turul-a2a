@@ -75,6 +75,12 @@ Documented under `docs/adr/`:
 
 For non-trivial architecture changes, the ADR should be accepted before implementation starts.
 
+### Example and API Surface Policy
+
+- **Examples must prefer wrapper/helper APIs over raw proto mutation.** Repeated `as_proto().clone()` + manual proto construction in examples is a design smell — it signals the wrapper layer is missing a helper that should be designed.
+- If a simple example needs generated-proto editing to do normal work (e.g., complete a task, add an artifact), stop and evaluate whether `Task`, `Artifact`, or related types are missing a helper method.
+- Raw proto access (`as_proto()`, `as_proto_mut()`) is an escape hatch, not the primary path for common operations.
+
 ### TDD Discipline
 
 Tests are written from the A2A proto/spec FIRST, then implementation follows. If code disagrees with tests, re-check `proto/a2a.proto` before changing anything. Only change tests when the test is wrong relative to the normative source.
