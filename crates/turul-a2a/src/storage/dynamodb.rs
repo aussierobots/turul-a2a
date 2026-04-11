@@ -585,9 +585,10 @@ mod tests {
             .await;
 
         if let Err(e) = &result {
-            let err_str = e.to_string();
-            if !err_str.contains("ResourceInUseException") {
-                panic!("Failed to create table {table_name}: {err_str}");
+            let err_debug = format!("{e:?}");
+            // Table already exists is fine
+            if !err_debug.contains("ResourceInUse") && !err_debug.contains("Table already exists") {
+                panic!("Failed to create table {table_name}: {err_debug}");
             }
         }
 
@@ -610,28 +611,51 @@ mod tests {
         panic!("Table {table_name} did not become ACTIVE in time");
     }
 
-    /// Each test gets its own unique-prefix tables to avoid cross-test contamination.
-    async fn storage() -> DynamoDbA2aStorage {
-        let id = uuid::Uuid::now_v7().to_string().replace('-', "");
-        let short_id = &id[..12];
-        let tasks_table = format!("turul_a2a_test_tasks_{short_id}");
-        let push_table = format!("turul_a2a_test_push_{short_id}");
+    const TEST_TASKS_TABLE: &str = "test_a2a_tasks";
+    const TEST_PUSH_TABLE: &str = "test_a2a_push_configs";
 
+    /// Shared test tables — cleaned before each test via scan+delete.
+    async fn storage() -> DynamoDbA2aStorage {
         let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .load()
             .await;
         let client = Client::new(&config);
 
-        create_test_table(&client, &tasks_table).await;
-        create_test_table(&client, &push_table).await;
+        create_test_table(&client, TEST_TASKS_TABLE).await;
+        create_test_table(&client, TEST_PUSH_TABLE).await;
+
+        // Clean existing data
+        clean_table(&client, TEST_TASKS_TABLE).await;
+        clean_table(&client, TEST_PUSH_TABLE).await;
 
         DynamoDbA2aStorage::from_client(
             client,
             DynamoDbConfig {
-                tasks_table,
-                push_configs_table: push_table,
+                tasks_table: TEST_TASKS_TABLE.into(),
+                push_configs_table: TEST_PUSH_TABLE.into(),
             },
         )
+    }
+
+    async fn clean_table(client: &Client, table_name: &str) {
+        let result = client
+            .scan()
+            .table_name(table_name)
+            .projection_expression("pk")
+            .send()
+            .await;
+        if let Ok(output) = result {
+            for item in output.items.unwrap_or_default() {
+                if let Some(pk) = item.get("pk") {
+                    let _ = client
+                        .delete_item()
+                        .table_name(table_name)
+                        .key("pk", pk.clone())
+                        .send()
+                        .await;
+                }
+            }
+        }
     }
 
     #[tokio::test]
