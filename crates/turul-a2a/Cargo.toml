@@ -9,6 +9,7 @@ license.workspace = true
 [features]
 default = ["in-memory"]
 in-memory = []
+sqlite = ["sqlx"]
 
 [dependencies]
 turul-a2a-types = { workspace = true }
@@ -26,8 +27,10 @@ tower = { workspace = true }
 http = { workspace = true }
 futures = { workspace = true }
 tokio-stream = { workspace = true }
+sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
+sqlx = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 http-body-util = { workspace = true }
 hyper = { workspace = true }

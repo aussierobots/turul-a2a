@@ -5,6 +5,9 @@ pub mod traits;
 #[cfg(feature = "in-memory")]
 pub mod in_memory;
 
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
+
 #[cfg(test)]
 pub(crate) mod parity_tests;
 
