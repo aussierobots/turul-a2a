@@ -30,27 +30,12 @@ impl AgentExecutor for EchoExecutor {
 
         let echo_text = format!("Echo: {user_text}");
 
-        // Build completed task with artifact
-        let mut proto = task.as_proto().clone();
-        proto.status = Some(turul_a2a_proto::TaskStatus {
-            state: turul_a2a_proto::TaskState::Completed.into(),
-            message: None,
-            timestamp: None,
-        });
-        proto.artifacts.push(turul_a2a_proto::Artifact {
-            artifact_id: uuid::Uuid::now_v7().to_string(),
-            name: "Echo Response".into(),
-            description: String::new(),
-            parts: vec![turul_a2a_proto::Part {
-                content: Some(turul_a2a_proto::part::Content::Text(echo_text)),
-                metadata: None,
-                filename: String::new(),
-                media_type: "text/plain".into(),
-            }],
-            metadata: None,
-            extensions: vec![],
-        });
-        *task = Task::try_from(proto).unwrap();
+        task.push_text_artifact(
+            uuid::Uuid::now_v7().to_string(),
+            "Echo Response",
+            echo_text,
+        );
+        task.complete();
         Ok(())
     }
 

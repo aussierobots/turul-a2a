@@ -201,6 +201,39 @@ impl Task {
         self.inner.artifacts.push(artifact.into_proto());
     }
 
+    /// Set the task's status. This is the low-level escape hatch —
+    /// prefer `complete()`, `fail()`, etc. for common transitions.
+    pub fn set_status(&mut self, status: TaskStatus) {
+        self.inner.status = Some(status.into_proto());
+    }
+
+    /// Mark the task as completed.
+    pub fn complete(&mut self) {
+        self.set_status(TaskStatus::new(TaskState::Completed));
+    }
+
+    /// Mark the task as failed with an optional message.
+    pub fn fail(&mut self, message: impl Into<String>) {
+        let msg = Message::new(
+            uuid::Uuid::now_v7().to_string(),
+            crate::Role::Agent,
+            vec![crate::Part::text(message)],
+        );
+        self.set_status(TaskStatus::new(TaskState::Failed).with_message(msg));
+    }
+
+    /// Add a text artifact to the task.
+    pub fn push_text_artifact(
+        &mut self,
+        artifact_id: impl Into<String>,
+        name: impl Into<String>,
+        text: impl Into<String>,
+    ) {
+        let artifact = Artifact::new(artifact_id, vec![crate::Part::text(text)])
+            .with_name(name);
+        self.append_artifact(artifact);
+    }
+
     pub fn as_proto(&self) -> &pb::Task {
         &self.inner
     }
@@ -424,5 +457,41 @@ mod tests {
         let back: Task = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id(), "t-rt");
         assert_eq!(back.context_id(), "ctx-rt");
+    }
+
+    // Task helper tests
+
+    #[test]
+    fn task_complete_sets_completed_status() {
+        let mut task = Task::new("h-1", TaskStatus::new(TaskState::Submitted));
+        task.complete();
+        assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Completed);
+    }
+
+    #[test]
+    fn task_fail_sets_failed_status_with_message() {
+        let mut task = Task::new("h-2", TaskStatus::new(TaskState::Submitted));
+        task.fail("something went wrong");
+        let status = task.status().unwrap();
+        assert_eq!(status.state().unwrap(), TaskState::Failed);
+        // Status should have a message
+        assert!(status.as_proto().message.is_some());
+    }
+
+    #[test]
+    fn task_set_status_generic() {
+        let mut task = Task::new("h-3", TaskStatus::new(TaskState::Submitted));
+        task.set_status(TaskStatus::new(TaskState::Working));
+        assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Working);
+    }
+
+    #[test]
+    fn task_push_text_artifact() {
+        let mut task = Task::new("h-4", TaskStatus::new(TaskState::Submitted));
+        task.push_text_artifact("art-1", "Result", "hello world");
+        assert_eq!(task.artifacts().len(), 1);
+        assert_eq!(task.artifacts()[0].artifact_id, "art-1");
+        assert_eq!(task.artifacts()[0].name, "Result");
+        assert_eq!(task.artifacts()[0].parts.len(), 1);
     }
 }
