@@ -1,7 +1,5 @@
 //! DynamoDB storage backend for A2A tasks and push notification configs.
 
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client;
@@ -112,7 +110,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .item("taskJson", AttributeValue::S(json))
             .send()
             .await
-            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
 
         Ok(task)
     }
@@ -133,7 +131,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .key("pk", AttributeValue::S(pk))
             .send()
             .await
-            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
 
         let item = match result.item {
             Some(item) => item,
@@ -226,7 +224,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .key("pk", AttributeValue::S(pk))
             .send()
             .await
-            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
 
         Ok(true)
     }
@@ -265,7 +263,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         let result = scan
             .send()
             .await
-            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
 
         let items = result.items.unwrap_or_default();
         let total_size = items.len() as i32;
@@ -406,7 +404,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .select(aws_sdk_dynamodb::types::Select::Count)
             .send()
             .await
-            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
         Ok(result.count as usize)
     }
 
@@ -443,7 +441,7 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
             .item("configJson", AttributeValue::S(json))
             .send()
             .await
-            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
 
         Ok(config)
     }
@@ -462,7 +460,7 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
             .key("pk", AttributeValue::S(pk))
             .send()
             .await
-            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
 
         match result.item {
             Some(item) => {
@@ -496,7 +494,7 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
             .expression_attribute_values(":tid", AttributeValue::S(task_id.to_string()))
             .send()
             .await
-            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
 
         let items = result.items.unwrap_or_default();
         let mut configs: Vec<turul_a2a_proto::TaskPushNotificationConfig> = items
@@ -546,30 +544,26 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
             .key("pk", AttributeValue::S(pk))
             .send()
             .await
-            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
         Ok(())
     }
 }
 
-/// DynamoDB parity tests require a local DynamoDB instance.
+/// DynamoDB parity tests require AWS credentials and DynamoDB access.
 ///
-/// Run local DynamoDB:
-///   docker run -p 8000:8000 amazon/dynamodb-local
-///
-/// Run tests:
-///   AWS_DEFAULT_REGION=us-east-1 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
-///     AWS_ENDPOINT_URL=http://localhost:8000 \
-///     cargo test --features dynamodb -p turul-a2a -- storage::dynamodb
+/// Run sequentially (DynamoDB table creation is throttled):
+///   cargo test --features dynamodb -p turul-a2a --lib -- storage::dynamodb --test-threads=1
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::parity_tests;
     use aws_sdk_dynamodb::types::{
-        AttributeDefinition, KeySchemaElement, KeyType, ProvisionedThroughput, ScalarAttributeType,
+        AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType,
     };
 
     async fn create_test_table(client: &Client, table_name: &str) {
-        let _ = client
+        // Create the table (ignore if already exists)
+        let result = client
             .create_table()
             .table_name(table_name)
             .key_schema(
@@ -586,22 +580,42 @@ mod tests {
                     .build()
                     .unwrap(),
             )
-            .provisioned_throughput(
-                ProvisionedThroughput::builder()
-                    .read_capacity_units(5)
-                    .write_capacity_units(5)
-                    .build()
-                    .unwrap(),
-            )
+            .billing_mode(aws_sdk_dynamodb::types::BillingMode::PayPerRequest)
             .send()
             .await;
+
+        if let Err(e) = &result {
+            let err_str = e.to_string();
+            if !err_str.contains("ResourceInUseException") {
+                panic!("Failed to create table {table_name}: {err_str}");
+            }
+        }
+
+        // Wait for table to become ACTIVE
+        for _ in 0..30 {
+            let desc = client
+                .describe_table()
+                .table_name(table_name)
+                .send()
+                .await;
+            if let Ok(resp) = desc {
+                if let Some(table) = resp.table {
+                    if table.table_status == Some(aws_sdk_dynamodb::types::TableStatus::Active) {
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        panic!("Table {table_name} did not become ACTIVE in time");
     }
 
+    /// Each test gets its own unique-prefix tables to avoid cross-test contamination.
     async fn storage() -> DynamoDbA2aStorage {
-        // Use unique table names per test to avoid cross-test contamination
-        let id = uuid::Uuid::now_v7().to_string();
-        let tasks_table = format!("test_tasks_{id}");
-        let push_table = format!("test_push_{id}");
+        let id = uuid::Uuid::now_v7().to_string().replace('-', "");
+        let short_id = &id[..12];
+        let tasks_table = format!("turul_a2a_test_tasks_{short_id}");
+        let push_table = format!("turul_a2a_test_push_{short_id}");
 
         let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .load()
