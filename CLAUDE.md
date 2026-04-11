@@ -8,7 +8,7 @@ Turul-a2a is a Rust implementation of the A2A (Agent-to-Agent) Protocol v1.0. Li
 
 **Proto-first architecture**: Types are generated from the normative `proto/a2a.proto` (package `lf.a2a.v1`) using `prost` + `pbjson`, then wrapped in ergonomic Rust types.
 
-**Maturity**: Single-instance server + storage is strong. Request/response Lambda adapter is strong. Distributed multi-instance streaming is explicitly deferred (D3). Do not claim horizontally-scaled production readiness until D3 is complete.
+**Maturity**: Single-instance and multi-instance request/response is verified (334 tests including distributed verification with shared backend). Lambda adapter is verified. Only cross-instance streaming/subscription (D3) remains before full scale claims.
 
 ## Build & Development Commands
 
