@@ -84,25 +84,38 @@ impl A2aMiddleware for AnyOfMiddleware {
             }
         }
 
-        // All children failed. Select highest-precedence error.
+        // All children failed. Collect all WWW-Authenticate challenges for merging.
+        let challenges: Vec<String> = errors
+            .iter()
+            .filter_map(|e| match e {
+                MiddlewareError::HttpChallenge {
+                    www_authenticate, ..
+                } => Some(www_authenticate.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Select highest-precedence error, ties by registration order.
         let selected = errors
             .into_iter()
             .reduce(|champion, challenger| {
                 if challenger.precedence() > champion.precedence() {
                     challenger
                 } else {
-                    champion // tie goes to first-registered
+                    champion
                 }
             })
             .expect("AnyOfMiddleware has at least one child");
 
-        // If the selected error is 401-class, merge WWW-Authenticate headers
-        if let MiddlewareError::HttpChallenge { .. } = &selected {
-            // Already has a challenge — no merge needed if it's the only HttpChallenge
+        // If the selected error is HttpChallenge, merge all collected challenges.
+        if let MiddlewareError::HttpChallenge { status, .. } = &selected {
+            if challenges.len() > 1 {
+                return Err(MiddlewareError::HttpChallenge {
+                    status: *status,
+                    www_authenticate: challenges.join(", "),
+                });
+            }
         }
-        // For a more complete merge: collect all HttpChallenge www_authenticate strings
-        // and combine. For v0.2, the selected error's challenge is sufficient since
-        // AnyOfMiddleware selects the highest-precedence HttpChallenge (first one).
 
         Err(selected)
     }
@@ -416,6 +429,102 @@ mod tests {
 
     // =========================================================
     // AnyOfMiddleware — panics with empty children
+    // =========================================================
+
+    // =========================================================
+    // AnyOfMiddleware — merged WWW-Authenticate headers
+    // =========================================================
+
+    #[tokio::test]
+    async fn anyof_multiple_http_challenges_merge_www_authenticate() {
+        let any = AnyOfMiddleware::new(vec![
+            Arc::new(FailHttpChallenge {
+                www_authenticate: "Bearer realm=\"a2a\"".into(),
+            }),
+            Arc::new(FailHttpChallenge {
+                www_authenticate: "Bearer realm=\"oidc\"".into(),
+            }),
+        ]);
+        let mut ctx = RequestContext::new();
+        let err = any.before_request(&mut ctx).await.unwrap_err();
+
+        match err {
+            MiddlewareError::HttpChallenge {
+                status,
+                www_authenticate,
+            } => {
+                assert_eq!(status, 401);
+                // Must contain BOTH challenges, comma-separated per RFC 9110 §11.6.1
+                assert!(
+                    www_authenticate.contains("Bearer realm=\"a2a\""),
+                    "Should include first challenge: {www_authenticate}"
+                );
+                assert!(
+                    www_authenticate.contains("Bearer realm=\"oidc\""),
+                    "Should include second challenge: {www_authenticate}"
+                );
+            }
+            other => panic!("Expected HttpChallenge with merged headers, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn anyof_http_challenge_tie_merges_and_returns_first() {
+        // Two HttpChallenge errors at same precedence — first wins, but headers merge
+        let any = AnyOfMiddleware::new(vec![
+            Arc::new(FailHttpChallenge {
+                www_authenticate: "ApiKey realm=\"first\"".into(),
+            }),
+            Arc::new(FailHttpChallenge {
+                www_authenticate: "Bearer realm=\"second\"".into(),
+            }),
+        ]);
+        let mut ctx = RequestContext::new();
+        let err = any.before_request(&mut ctx).await.unwrap_err();
+
+        match err {
+            MiddlewareError::HttpChallenge {
+                status,
+                www_authenticate,
+            } => {
+                assert_eq!(status, 401);
+                // Both challenges present
+                assert!(www_authenticate.contains("ApiKey realm=\"first\""));
+                assert!(www_authenticate.contains("Bearer realm=\"second\""));
+            }
+            other => panic!("Expected merged HttpChallenge, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn anyof_unauthenticated_and_http_challenge_uses_challenge_with_header() {
+        // API key (Unauthenticated) + Bearer (HttpChallenge) — HttpChallenge wins, its header preserved
+        let any = AnyOfMiddleware::new(vec![
+            Arc::new(FailUnauthenticated {
+                message: "missing X-API-Key".into(),
+            }),
+            Arc::new(FailHttpChallenge {
+                www_authenticate: "Bearer realm=\"a2a\"".into(),
+            }),
+        ]);
+        let mut ctx = RequestContext::new();
+        let err = any.before_request(&mut ctx).await.unwrap_err();
+
+        match err {
+            MiddlewareError::HttpChallenge {
+                www_authenticate, ..
+            } => {
+                assert!(
+                    www_authenticate.contains("Bearer"),
+                    "Bearer challenge should be preserved"
+                );
+            }
+            other => panic!("Expected HttpChallenge, got: {other:?}"),
+        }
+    }
+
+    // =========================================================
+    // AnyOfMiddleware — empty children
     // =========================================================
 
     #[test]
