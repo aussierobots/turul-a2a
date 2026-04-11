@@ -1,14 +1,14 @@
 [package]
 name = "echo-agent"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 publish = false
 
 [dependencies]
 turul-a2a = { path = "../../crates/turul-a2a" }
 turul-a2a-types = { path = "../../crates/turul-a2a-types" }
 turul-a2a-proto = { path = "../../crates/turul-a2a-proto" }
-async-trait = "0.1"
-tokio = { version = "1", features = ["full"] }
-tracing-subscriber = "0.3"
-uuid = { version = "1", features = ["v7"] }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
