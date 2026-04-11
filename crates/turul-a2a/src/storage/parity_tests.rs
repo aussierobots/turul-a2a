@@ -6,6 +6,8 @@
 
 use turul_a2a_types::{Artifact, Message, Part, Role, Task, TaskState, TaskStatus};
 
+use crate::streaming::StreamEvent;
+use super::event_store::A2aEventStore;
 use super::filter::TaskFilter;
 use super::traits::{A2aPushNotificationStorage, A2aTaskStorage};
 
@@ -539,4 +541,125 @@ pub async fn test_push_config_tenant_isolation(storage: &dyn A2aPushNotification
         .await
         .unwrap();
     assert!(result.is_none());
+}
+
+// =========================================================
+// Event store parity tests
+// =========================================================
+
+fn make_status_event(state: &str) -> StreamEvent {
+    StreamEvent::StatusUpdate {
+        status_update: crate::streaming::StatusUpdatePayload {
+            task_id: String::new(),
+            context_id: String::new(),
+            status: serde_json::json!({"state": state}),
+        },
+    }
+}
+
+pub async fn test_event_append_and_retrieve(storage: &dyn A2aEventStore) {
+    let seq1 = storage
+        .append_event("default", "evt-1", make_status_event("WORKING"))
+        .await
+        .unwrap();
+    assert_eq!(seq1, 1);
+
+    let seq2 = storage
+        .append_event("default", "evt-1", make_status_event("COMPLETED"))
+        .await
+        .unwrap();
+    assert_eq!(seq2, 2);
+
+    // Get all events
+    let events = storage
+        .get_events_after("default", "evt-1", 0)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].0, 1);
+    assert_eq!(events[1].0, 2);
+
+    // Get events after seq 1
+    let events = storage
+        .get_events_after("default", "evt-1", 1)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, 2);
+
+    // Get events after seq 2 (none left)
+    let events = storage
+        .get_events_after("default", "evt-1", 2)
+        .await
+        .unwrap();
+    assert!(events.is_empty());
+}
+
+pub async fn test_event_monotonic_ordering(storage: &dyn A2aEventStore) {
+    for i in 1..=5 {
+        let seq = storage
+            .append_event("default", "ord-1", make_status_event(&format!("state-{i}")))
+            .await
+            .unwrap();
+        assert_eq!(seq, i as u64);
+    }
+
+    let events = storage
+        .get_events_after("default", "ord-1", 0)
+        .await
+        .unwrap();
+    // Must be in order
+    for (i, (seq, _)) in events.iter().enumerate() {
+        assert_eq!(*seq, (i + 1) as u64);
+    }
+}
+
+pub async fn test_event_per_task_isolation(storage: &dyn A2aEventStore) {
+    // Events for task A
+    storage.append_event("default", "iso-a", make_status_event("A1")).await.unwrap();
+    storage.append_event("default", "iso-a", make_status_event("A2")).await.unwrap();
+
+    // Events for task B
+    storage.append_event("default", "iso-b", make_status_event("B1")).await.unwrap();
+
+    // Task A has 2 events
+    let a_events = storage.get_events_after("default", "iso-a", 0).await.unwrap();
+    assert_eq!(a_events.len(), 2);
+
+    // Task B has 1 event
+    let b_events = storage.get_events_after("default", "iso-b", 0).await.unwrap();
+    assert_eq!(b_events.len(), 1);
+
+    // Sequences are per-task
+    assert_eq!(a_events[0].0, 1);
+    assert_eq!(b_events[0].0, 1);
+}
+
+pub async fn test_event_tenant_isolation(storage: &dyn A2aEventStore) {
+    storage.append_event("tenant-x", "iso-t", make_status_event("X")).await.unwrap();
+    storage.append_event("tenant-y", "iso-t", make_status_event("Y")).await.unwrap();
+
+    // Same task_id, different tenants — isolated
+    let x_events = storage.get_events_after("tenant-x", "iso-t", 0).await.unwrap();
+    assert_eq!(x_events.len(), 1);
+
+    let y_events = storage.get_events_after("tenant-y", "iso-t", 0).await.unwrap();
+    assert_eq!(y_events.len(), 1);
+}
+
+pub async fn test_event_latest_sequence(storage: &dyn A2aEventStore) {
+    assert_eq!(storage.latest_sequence("default", "seq-t").await.unwrap(), 0);
+
+    storage.append_event("default", "seq-t", make_status_event("S1")).await.unwrap();
+    assert_eq!(storage.latest_sequence("default", "seq-t").await.unwrap(), 1);
+
+    storage.append_event("default", "seq-t", make_status_event("S2")).await.unwrap();
+    storage.append_event("default", "seq-t", make_status_event("S3")).await.unwrap();
+    assert_eq!(storage.latest_sequence("default", "seq-t").await.unwrap(), 3);
+}
+
+pub async fn test_event_empty_task(storage: &dyn A2aEventStore) {
+    let events = storage.get_events_after("default", "nonexistent", 0).await.unwrap();
+    assert!(events.is_empty());
+    assert_eq!(storage.latest_sequence("default", "nonexistent").await.unwrap(), 0);
 }

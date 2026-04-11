@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 use turul_a2a_types::{Artifact, Message, Task, TaskStatus};
 
+use crate::streaming::StreamEvent;
 use super::error::A2aStorageError;
+use super::event_store::A2aEventStore;
 use super::filter::{PushConfigListPage, TaskFilter, TaskListPage};
 use super::traits::{A2aPushNotificationStorage, A2aTaskStorage};
 
@@ -19,12 +21,17 @@ struct StoredTask {
 
 type TaskKey = (String, String); // (tenant, task_id)
 type PushConfigKey = (String, String, String); // (tenant, task_id, config_id)
+type EventKey = (String, String); // (tenant, task_id)
 
 /// In-memory A2A storage backend.
+/// Implements A2aTaskStorage, A2aPushNotificationStorage, AND A2aEventStore
+/// on the same struct — enforcing the same-backend requirement from ADR-009.
 #[derive(Clone)]
 pub struct InMemoryA2aStorage {
     tasks: Arc<RwLock<HashMap<TaskKey, StoredTask>>>,
     push_configs: Arc<RwLock<HashMap<PushConfigKey, turul_a2a_proto::TaskPushNotificationConfig>>>,
+    events: Arc<RwLock<HashMap<EventKey, Vec<(u64, StreamEvent)>>>>,
+    event_counters: Arc<RwLock<HashMap<EventKey, u64>>>,
 }
 
 impl InMemoryA2aStorage {
@@ -32,6 +39,8 @@ impl InMemoryA2aStorage {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             push_configs: Arc::new(RwLock::new(HashMap::new())),
+            events: Arc::new(RwLock::new(HashMap::new())),
+            event_counters: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -468,6 +477,72 @@ impl A2aPushNotificationStorage for InMemoryA2aStorage {
     }
 }
 
+#[async_trait]
+impl A2aEventStore for InMemoryA2aStorage {
+    fn backend_name(&self) -> &'static str {
+        "in-memory"
+    }
+
+    async fn append_event(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event: StreamEvent,
+    ) -> Result<u64, A2aStorageError> {
+        let key = (tenant.to_string(), task_id.to_string());
+
+        // Atomic sequence assignment
+        let mut counters = self.event_counters.write().await;
+        let counter = counters.entry(key.clone()).or_insert(0);
+        *counter += 1;
+        let seq = *counter;
+        drop(counters);
+
+        let mut events = self.events.write().await;
+        events
+            .entry(key)
+            .or_insert_with(Vec::new)
+            .push((seq, event));
+
+        Ok(seq)
+    }
+
+    async fn get_events_after(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        after_sequence: u64,
+    ) -> Result<Vec<(u64, StreamEvent)>, A2aStorageError> {
+        let key = (tenant.to_string(), task_id.to_string());
+        let events = self.events.read().await;
+        let task_events = events.get(&key);
+
+        match task_events {
+            Some(evts) => Ok(evts
+                .iter()
+                .filter(|(seq, _)| *seq > after_sequence)
+                .cloned()
+                .collect()),
+            None => Ok(vec![]),
+        }
+    }
+
+    async fn latest_sequence(
+        &self,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<u64, A2aStorageError> {
+        let key = (tenant.to_string(), task_id.to_string());
+        let counters = self.event_counters.read().await;
+        Ok(*counters.get(&key).unwrap_or(&0))
+    }
+
+    async fn cleanup_expired(&self) -> Result<u64, A2aStorageError> {
+        // In-memory: no TTL tracking. No-op.
+        Ok(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,5 +640,37 @@ mod tests {
     #[tokio::test]
     async fn test_artifact_chunk_semantics() {
         parity_tests::test_artifact_chunk_semantics(&storage()).await;
+    }
+
+    // Event store parity tests
+
+    #[tokio::test]
+    async fn test_event_append_and_retrieve() {
+        parity_tests::test_event_append_and_retrieve(&storage()).await;
+    }
+
+    #[tokio::test]
+    async fn test_event_monotonic_ordering() {
+        parity_tests::test_event_monotonic_ordering(&storage()).await;
+    }
+
+    #[tokio::test]
+    async fn test_event_per_task_isolation() {
+        parity_tests::test_event_per_task_isolation(&storage()).await;
+    }
+
+    #[tokio::test]
+    async fn test_event_tenant_isolation() {
+        parity_tests::test_event_tenant_isolation(&storage()).await;
+    }
+
+    #[tokio::test]
+    async fn test_event_latest_sequence() {
+        parity_tests::test_event_latest_sequence(&storage()).await;
+    }
+
+    #[tokio::test]
+    async fn test_event_empty_task() {
+        parity_tests::test_event_empty_task(&storage()).await;
     }
 }
