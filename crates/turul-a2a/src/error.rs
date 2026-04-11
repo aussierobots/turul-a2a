@@ -44,9 +44,6 @@ pub enum A2aError {
     #[error("Invalid request: {message}")]
     InvalidRequest { message: String },
 
-    #[error("Authentication required")]
-    Unauthenticated,
-
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -65,7 +62,6 @@ impl A2aError {
             Self::ExtensionSupportRequired { .. } => errors::HTTP_EXTENSION_SUPPORT_REQUIRED,
             Self::VersionNotSupported { .. } => errors::HTTP_VERSION_NOT_SUPPORTED,
             Self::InvalidRequest { .. } => 400,
-            Self::Unauthenticated => 401,
             Self::Internal(_) => 500,
         }
     }
@@ -86,13 +82,12 @@ impl A2aError {
             Self::ExtensionSupportRequired { .. } => errors::JSONRPC_EXTENSION_SUPPORT_REQUIRED,
             Self::VersionNotSupported { .. } => errors::JSONRPC_VERSION_NOT_SUPPORTED,
             Self::InvalidRequest { .. } => -32602, // Invalid params
-            Self::Unauthenticated => -32603,        // Internal error
             Self::Internal(_) => -32603,            // Internal error
         }
     }
 
     /// ErrorInfo reason string (UPPER_SNAKE_CASE, no "Error" suffix).
-    /// Returns `None` for non-A2A errors (InvalidRequest, Unauthenticated, Internal).
+    /// Returns `None` for non-A2A errors (InvalidRequest, Internal).
     pub fn error_reason(&self) -> Option<&'static str> {
         match self {
             Self::TaskNotFound { .. } => Some(errors::REASON_TASK_NOT_FOUND),
@@ -272,7 +267,6 @@ mod tests {
     #[test]
     fn non_a2a_errors_have_no_error_info() {
         assert!(A2aError::InvalidRequest { message: "x".into() }.error_info().is_none());
-        assert!(A2aError::Unauthenticated.error_info().is_none());
         assert!(A2aError::Internal("x".into()).error_info().is_none());
     }
 

@@ -734,6 +734,24 @@ pub(crate) async fn core_cancel_task(
     }
 }
 
+/// Verify the caller owns the task before push config operations.
+async fn verify_task_ownership(
+    state: &AppState,
+    tenant: &str,
+    owner: &str,
+    task_id: &str,
+) -> Result<(), A2aError> {
+    state
+        .task_storage
+        .get_task(tenant, task_id, owner, Some(0))
+        .await
+        .map_err(A2aError::from)?
+        .ok_or_else(|| A2aError::TaskNotFound {
+            task_id: task_id.to_string(),
+        })?;
+    Ok(())
+}
+
 pub(crate) async fn core_create_push_config(
     state: AppState,
     tenant: &str,
@@ -741,6 +759,8 @@ pub(crate) async fn core_create_push_config(
     task_id: &str,
     body: String,
 ) -> Result<Json<serde_json::Value>, A2aError> {
+    verify_task_ownership(&state, tenant, owner, task_id).await?;
+
     let mut config: turul_a2a_proto::TaskPushNotificationConfig = serde_json::from_str(&body)
         .map_err(|e| A2aError::InvalidRequest {
             message: format!("Invalid push config: {e}"),
@@ -758,6 +778,8 @@ pub(crate) async fn core_list_push_configs(
     task_id: &str,
     query: &PushConfigQuery,
 ) -> Result<Json<serde_json::Value>, A2aError> {
+    verify_task_ownership(&state, tenant, owner, task_id).await?;
+
     let page = state
         .push_storage
         .list_configs(tenant, task_id, query.page_token.as_deref(), query.page_size)
@@ -783,6 +805,8 @@ pub(crate) async fn core_get_push_config(
     task_id: &str,
     config_id: &str,
 ) -> Result<Json<serde_json::Value>, A2aError> {
+    verify_task_ownership(&state, tenant, owner, task_id).await?;
+
     let config = state
         .push_storage
         .get_config(tenant, task_id, config_id)
@@ -802,6 +826,8 @@ pub(crate) async fn core_delete_push_config(
     task_id: &str,
     config_id: &str,
 ) -> Result<Json<serde_json::Value>, A2aError> {
+    verify_task_ownership(&state, tenant, owner, task_id).await?;
+
     state
         .push_storage
         .delete_config(tenant, task_id, config_id)

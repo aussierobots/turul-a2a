@@ -185,17 +185,23 @@ fn merge_stacked_contributions(
     Ok(merged)
 }
 
-/// Semantic equality for SecurityScheme (not byte comparison).
-/// Normalizes scope lists before comparison.
+/// Semantic equality for SecurityScheme.
+///
+/// Uses structural PartialEq on proto types. This is correct for:
+/// - ApiKeySecurityScheme (no maps)
+/// - HttpAuthSecurityScheme (no maps)
+/// - MutualTlsSecurityScheme (no maps)
+///
+/// Limitation: For OAuth2SecurityScheme and OpenIdConnectSecurityScheme,
+/// scope maps (HashMap) have non-deterministic iteration order. PartialEq
+/// on HashMap compares by content (not order), so this is correct for
+/// HashMap but would need explicit normalization if proto ever uses
+/// BTreeMap or sorted structures. This is sufficient for v0.2 supported
+/// scheme types (API Key + HTTP Bearer).
 fn schemes_equivalent(
     a: &turul_a2a_proto::SecurityScheme,
     b: &turul_a2a_proto::SecurityScheme,
 ) -> bool {
-    // Compare the scheme variant and its contents
-    // Since proto types derive PartialEq, this is structural equality
-    // which is correct for non-map fields. For OAuth flows with scope maps,
-    // we'd need deeper normalization, but for API Key and HTTP Auth schemes
-    // structural equality is sufficient.
     a == b
 }
 

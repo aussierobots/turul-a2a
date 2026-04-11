@@ -214,8 +214,8 @@ async fn create_push_config_routes() {
         .header("content-type", "application/json")
         .body(Body::from("{}"))
         .unwrap();
-    let status = response_status(router, req).await;
-    assert_ne!(status, 404, "POST push config must route");
+    // 404 is from task ownership check (task doesn't exist), not from routing
+    assert_route_dispatches(router, req).await;
 }
 
 #[tokio::test]
@@ -234,8 +234,7 @@ async fn list_push_configs_routes() {
     let req = Request::get("/tasks/t1/pushNotificationConfigs")
         .body(Body::empty())
         .unwrap();
-    let status = response_status(router, req).await;
-    assert_ne!(status, 404, "GET push config list must route");
+    assert_route_dispatches(router, req).await;
 }
 
 #[tokio::test]
@@ -246,8 +245,7 @@ async fn delete_push_config_routes() {
         .uri("/tasks/t1/pushNotificationConfigs/c1")
         .body(Body::empty())
         .unwrap();
-    let status = response_status(router, req).await;
-    assert_ne!(status, 404, "DELETE push config must route");
+    assert_route_dispatches(router, req).await;
 }
 
 // =========================================================

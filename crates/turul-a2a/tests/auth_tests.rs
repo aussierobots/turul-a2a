@@ -376,3 +376,55 @@ async fn tenant_plus_auth_scoped_together() {
     let (status, _) = json_response(router, req).await;
     assert_eq!(status, 404, "Correct owner under wrong tenant should 404");
 }
+
+// =========================================================
+// Push config owner isolation
+// =========================================================
+
+#[tokio::test]
+async fn push_config_owner_isolation() {
+    let state = state_with_auth();
+
+    // user-a creates a task
+    let router = build_router(state.clone());
+    let req = Request::post("/message:send")
+        .header("content-type", "application/json")
+        .header("x-test-auth", "user-a")
+        .body(Body::from(send_body("pc-owner")))
+        .unwrap();
+    let (_, body) = json_response(router, req).await;
+    let task_id = body["task"]["id"].as_str().unwrap();
+
+    // user-a creates a push config on their task
+    let router = build_router(state.clone());
+    let config_body = serde_json::json!({
+        "taskId": task_id,
+        "url": "https://example.com/hook"
+    })
+    .to_string();
+    let req = Request::post(&format!("/tasks/{task_id}/pushNotificationConfigs"))
+        .header("content-type", "application/json")
+        .header("x-test-auth", "user-a")
+        .body(Body::from(config_body))
+        .unwrap();
+    let (status, _) = json_response(router, req).await;
+    assert_eq!(status, 200, "Owner should create push config on own task");
+
+    // user-b cannot create push config on user-a's task
+    let router = build_router(state.clone());
+    let config_body2 = serde_json::json!({
+        "taskId": task_id,
+        "url": "https://evil.com/hook"
+    })
+    .to_string();
+    let req = Request::post(&format!("/tasks/{task_id}/pushNotificationConfigs"))
+        .header("content-type", "application/json")
+        .header("x-test-auth", "user-b")
+        .body(Body::from(config_body2))
+        .unwrap();
+    let (status, _) = json_response(router, req).await;
+    assert_eq!(
+        status, 404,
+        "Non-owner should not create push config on another user's task"
+    );
+}
