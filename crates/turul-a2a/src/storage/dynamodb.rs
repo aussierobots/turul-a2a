@@ -105,11 +105,11 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .table_name(&self.config.tasks_table)
             .item("pk", AttributeValue::S(pk))
             .item("tenant", AttributeValue::S(tenant.to_string()))
-            .item("task_id", AttributeValue::S(task.id().to_string()))
+            .item("taskId", AttributeValue::S(task.id().to_string()))
             .item("owner", AttributeValue::S(owner.to_string()))
-            .item("context_id", AttributeValue::S(task.context_id().to_string()))
-            .item("status_state", AttributeValue::S(state_str))
-            .item("task_json", AttributeValue::S(json))
+            .item("contextId", AttributeValue::S(task.context_id().to_string()))
+            .item("statusState", AttributeValue::S(state_str))
+            .item("taskJson", AttributeValue::S(json))
             .send()
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
@@ -152,7 +152,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         }
 
         let json = item
-            .get("task_json")
+            .get("taskJson")
             .and_then(|v| v.as_s().ok())
             .ok_or_else(|| A2aStorageError::DatabaseError("Missing task_json".into()))?;
 
@@ -176,11 +176,11 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .table_name(&self.config.tasks_table)
             .item("pk", AttributeValue::S(pk))
             .item("tenant", AttributeValue::S(tenant.to_string()))
-            .item("task_id", AttributeValue::S(task.id().to_string()))
+            .item("taskId", AttributeValue::S(task.id().to_string()))
             .item("owner", AttributeValue::S(owner.to_string()))
-            .item("context_id", AttributeValue::S(task.context_id().to_string()))
-            .item("status_state", AttributeValue::S(state_str))
-            .item("task_json", AttributeValue::S(json))
+            .item("contextId", AttributeValue::S(task.context_id().to_string()))
+            .item("statusState", AttributeValue::S(state_str))
+            .item("taskJson", AttributeValue::S(json))
             .send()
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
@@ -229,14 +229,14 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
 
         if let Some(ref ctx) = filter.context_id {
             scan = scan
-                .filter_expression("tenant = :t AND #o = :o AND context_id = :ctx")
+                .filter_expression("tenant = :t AND #o = :o AND contextId = :ctx")
                 .expression_attribute_values(":ctx", AttributeValue::S(ctx.clone()));
         }
         if let Some(ref status) = filter.status {
             let expr = if filter.context_id.is_some() {
-                "tenant = :t AND #o = :o AND context_id = :ctx AND status_state = :st"
+                "tenant = :t AND #o = :o AND contextId = :ctx AND statusState = :st"
             } else {
-                "tenant = :t AND #o = :o AND status_state = :st"
+                "tenant = :t AND #o = :o AND statusState = :st"
             };
             scan = scan
                 .filter_expression(expr)
@@ -255,7 +255,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         let mut tasks: Vec<Task> = items
             .iter()
             .filter_map(|item| {
-                item.get("task_json")
+                item.get("taskJson")
                     .and_then(|v| v.as_s().ok())
                     .and_then(|json| Self::task_from_json(json).ok())
             })
@@ -419,9 +419,9 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
             .table_name(&self.config.push_configs_table)
             .item("pk", AttributeValue::S(pk))
             .item("tenant", AttributeValue::S(tenant.to_string()))
-            .item("task_id", AttributeValue::S(config.task_id.clone()))
-            .item("config_id", AttributeValue::S(config.id.clone()))
-            .item("config_json", AttributeValue::S(json))
+            .item("taskId", AttributeValue::S(config.task_id.clone()))
+            .item("configId", AttributeValue::S(config.id.clone()))
+            .item("configJson", AttributeValue::S(json))
             .send()
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
@@ -448,7 +448,7 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
         match result.item {
             Some(item) => {
                 let json = item
-                    .get("config_json")
+                    .get("configJson")
                     .and_then(|v| v.as_s().ok())
                     .ok_or_else(|| A2aStorageError::DatabaseError("Missing config_json".into()))?;
                 let config = serde_json::from_str(json)
@@ -472,7 +472,7 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
             .client
             .scan()
             .table_name(&self.config.push_configs_table)
-            .filter_expression("tenant = :t AND task_id = :tid")
+            .filter_expression("tenant = :t AND taskId = :tid")
             .expression_attribute_values(":t", AttributeValue::S(tenant.to_string()))
             .expression_attribute_values(":tid", AttributeValue::S(task_id.to_string()))
             .send()
@@ -483,7 +483,7 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
         let mut configs: Vec<turul_a2a_proto::TaskPushNotificationConfig> = items
             .iter()
             .filter_map(|item| {
-                item.get("config_json")
+                item.get("configJson")
                     .and_then(|v| v.as_s().ok())
                     .and_then(|json| serde_json::from_str(json).ok())
             })
