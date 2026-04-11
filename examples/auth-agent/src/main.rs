@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use turul_a2a::card_builder::{AgentCardBuilder, AgentSkillBuilder};
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
 use turul_a2a::A2aServer;
@@ -56,45 +57,20 @@ impl AgentExecutor for AuthEchoExecutor {
     }
 
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
-        turul_a2a_proto::AgentCard {
-            name: "Auth Echo Agent".into(),
-            description: "Demonstrates API Key authentication".into(),
-            supported_interfaces: vec![turul_a2a_proto::AgentInterface {
-                url: "http://localhost:3001".into(),
-                protocol_binding: "JSONRPC".into(),
-                tenant: String::new(),
-                protocol_version: "1.0".into(),
-            }],
-            provider: Some(turul_a2a_proto::AgentProvider {
-                url: "https://github.com/aussierobots/turul-a2a".into(),
-                organization: "Aussie Robots".into(),
-            }),
-            version: "0.1.0".into(),
-            documentation_url: None,
-            capabilities: Some(turul_a2a_proto::AgentCapabilities {
-                streaming: Some(false),
-                push_notifications: Some(false),
-                extensions: vec![],
-                extended_agent_card: Some(false),
-            }),
-            // Security schemes will be auto-populated by the builder from middleware
-            security_schemes: HashMap::new(),
-            security_requirements: vec![],
-            default_input_modes: vec!["text/plain".into()],
-            default_output_modes: vec!["text/plain".into()],
-            skills: vec![turul_a2a_proto::AgentSkill {
-                id: "echo".into(),
-                name: "Auth Echo".into(),
-                description: "Echoes back, requires authentication".into(),
-                tags: vec!["echo".into(), "auth".into()],
-                examples: vec![],
-                input_modes: vec![],
-                output_modes: vec![],
-                security_requirements: vec![],
-            }],
-            signatures: vec![],
-            icon_url: None,
-        }
+        // Security schemes are auto-populated from middleware by the builder
+        AgentCardBuilder::new("Auth Echo Agent", "0.1.0")
+            .description("Demonstrates API Key authentication")
+            .url("http://localhost:3001", "JSONRPC", "1.0")
+            .provider("Aussie Robots", "https://github.com/aussierobots/turul-a2a")
+            .default_input_modes(vec!["text/plain"])
+            .default_output_modes(vec!["text/plain"])
+            .skill(
+                AgentSkillBuilder::new("echo", "Auth Echo", "Echoes back, requires authentication")
+                    .tags(vec!["echo", "auth"])
+                    .build(),
+            )
+            .build()
+            .expect("Auth agent card should be valid")
     }
 }
 

@@ -5,8 +5,7 @@
 //!         -H 'Content-Type: application/json' \
 //!         -d '{"message":{"messageId":"1","role":"ROLE_USER","parts":[{"text":"hello"}]}}'
 
-use std::collections::HashMap;
-
+use turul_a2a::card_builder::{AgentCardBuilder, AgentSkillBuilder};
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
 use turul_a2a::A2aServer;
@@ -56,44 +55,21 @@ impl AgentExecutor for EchoExecutor {
     }
 
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
-        turul_a2a_proto::AgentCard {
-            name: "Echo Agent".into(),
-            description: "Echoes user messages back as artifacts".into(),
-            supported_interfaces: vec![turul_a2a_proto::AgentInterface {
-                url: "http://localhost:3000".into(),
-                protocol_binding: "JSONRPC".into(),
-                tenant: String::new(),
-                protocol_version: "1.0".into(),
-            }],
-            provider: Some(turul_a2a_proto::AgentProvider {
-                url: "https://github.com/aussierobots/turul-a2a".into(),
-                organization: "Aussie Robots".into(),
-            }),
-            version: "0.1.0".into(),
-            documentation_url: None,
-            capabilities: Some(turul_a2a_proto::AgentCapabilities {
-                streaming: Some(true),
-                push_notifications: Some(false),
-                extensions: vec![],
-                extended_agent_card: Some(false),
-            }),
-            security_schemes: HashMap::new(),
-            security_requirements: vec![],
-            default_input_modes: vec!["text/plain".into()],
-            default_output_modes: vec!["text/plain".into()],
-            skills: vec![turul_a2a_proto::AgentSkill {
-                id: "echo".into(),
-                name: "Echo".into(),
-                description: "Echoes any text input back".into(),
-                tags: vec!["echo".into(), "test".into()],
-                examples: vec!["Say hello".into()],
-                input_modes: vec![],
-                output_modes: vec![],
-                security_requirements: vec![],
-            }],
-            signatures: vec![],
-            icon_url: None,
-        }
+        AgentCardBuilder::new("Echo Agent", "0.1.0")
+            .description("Echoes user messages back as artifacts")
+            .url("http://localhost:3000", "JSONRPC", "1.0")
+            .provider("Aussie Robots", "https://github.com/aussierobots/turul-a2a")
+            .streaming(true)
+            .default_input_modes(vec!["text/plain"])
+            .default_output_modes(vec!["text/plain"])
+            .skill(
+                AgentSkillBuilder::new("echo", "Echo", "Echoes any text input back")
+                    .tags(vec!["echo", "test"])
+                    .examples(vec!["Say hello"])
+                    .build(),
+            )
+            .build()
+            .expect("Echo agent card should be valid")
     }
 }
 

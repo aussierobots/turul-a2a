@@ -1,3 +1,4 @@
+pub mod card_builder;
 pub mod error;
 pub mod executor;
 pub mod jsonrpc;
