@@ -1,21 +1,27 @@
-# ADR-008: Lambda Adapter and Streaming Coordination
+# ADR-008: Lambda Adapter and Multi-Instance Streaming Coordination
 
 - **Status:** Accepted
 - **Date:** 2026-04-11
 
 ## Context
 
-turul-a2a needs an AWS Lambda deployment path. The current SSE streaming architecture (ADR-006) uses an in-process `TaskEventBroker` (`tokio::sync::broadcast`) that is single-instance only. Lambda invocations are stateless — each gets a fresh process with no broker state. This forces a decision about streaming scope before implementing the Lambda adapter.
+turul-a2a needs an AWS Lambda deployment path. The current SSE streaming architecture (ADR-006) uses an in-process `TaskEventBroker` (`tokio::sync::broadcast`) that is **single-instance only**. This limitation is not Lambda-specific — it affects any multi-instance deployment:
 
-The turul-mcp-framework's Lambda adapter (`turul-mcp-aws-lambda`) provides a reference pattern: convert Lambda events to axum/hyper requests, delegate to the same handler infrastructure, and convert responses back.
+- Lambda (each invocation is a separate process)
+- 2+ binaries behind a load balancer
+- ECS/Fargate with multiple tasks
+- Kubernetes with multiple pods
+- Rolling deploys with concurrent instances
+
+The core issue: the in-process broker provides local live fanout to currently attached clients on the same instance. It does not provide cross-instance event delivery or replay. Shared task storage (DynamoDB, PostgreSQL) solves request/response correctness across instances, but does not solve streaming coordination.
 
 ## Decision
 
-### D2 Scope: Request/Response Only
+### D2 Scope: Request/Response Subset
 
-D2 delivers Lambda support for all **request/response** operations. Streaming endpoints are explicitly not supported on Lambda in D2.
+D2 delivers the Lambda adapter for the **request/response-compatible subset** of A2A operations. Streaming endpoints are explicitly unsupported in any multi-instance deployment until D3 provides durable streaming coordination.
 
-**Supported on Lambda (D2):**
+**Supported (D2):**
 - `POST /message:send` — full support (synchronous execution, returns `SendMessageResponse`)
 - `GET /tasks/{id}` — full support
 - `POST /tasks/{id}:cancel` — full support
@@ -25,24 +31,21 @@ D2 delivers Lambda support for all **request/response** operations. Streaming en
 - `GET /extendedAgentCard` — full support
 - `POST /jsonrpc` — all request/response methods
 
-**Not supported on Lambda (D2):**
+**Not supported (D2):**
 - `POST /message:stream` → returns `UnsupportedOperationError` (HTTP 400, JSON-RPC -32004, ErrorInfo `UNSUPPORTED_OPERATION`)
 - `GET /tasks/{id}:subscribe` → returns `UnsupportedOperationError`
 - JSON-RPC `SendStreamingMessage` / `SubscribeToTask` → returns `UnsupportedOperationError`
 
-Streaming rejection uses the existing A2A error contract — same wire format as any other unsupported operation. No Lambda-specific HTTP status codes.
-
-**Why streaming is deferred:** The in-process broker cannot coordinate across Lambda invocations. Making streaming work requires a durable event store (new DynamoDB table, new trait surface, replay semantics) — this is a design-level change, not an adapter-level change. It gets its own ADR.
+Streaming rejection uses the existing A2A error contract — same wire format as any other unsupported operation. No deployment-specific HTTP status codes.
 
 ### Adapter Architecture: Thin Wrapper
 
-The Lambda adapter wraps the existing `axum::Router` (which implements `tower::Service`) without modifying `turul-a2a` core. Zero changes to the server crate.
+The Lambda adapter wraps the existing `axum::Router` without modifying `turul-a2a` core. Zero changes to the server crate.
 
 ```
 Lambda Event (API Gateway / Function URL)
-  → classify_runtime_event()
-  → lambda_to_axum_request() (extract headers, body, authorizer context)
-  → NoStreamingLayer (rejects /message:stream and :subscribe with UnsupportedOperationError)
+  → lambda_to_axum_request() (strip spoofed headers, inject authorizer context)
+  → NoStreamingLayer (rejects streaming paths with UnsupportedOperationError)
   → TransportComplianceLayer (A2A-Version, Content-Type)
   → AuthLayer (reads headers or LambdaAuthorizerMiddleware)
   → axum Router (same handlers as local server)
@@ -54,25 +57,26 @@ Lambda Event (API Gateway / Function URL)
 
 API Gateway authorizers produce a context (e.g., `{ "userId": "user-123", "tenantId": "acme" }`). The Lambda adapter injects this as synthetic `x-authorizer-*` headers before the request reaches the Tower auth stack.
 
-**Trust boundary rule:** The adapter MUST strip any client-supplied `x-authorizer-*` headers from the incoming request before injecting authorizer context. Only data from Lambda's `requestContext.authorizer` is trusted to populate these headers. This prevents spoofing where an external caller sends fake `x-authorizer-userId` headers to bypass authentication.
+**Trust boundary rule:** The adapter MUST strip any client-supplied `x-authorizer-*` headers from the incoming request before injecting authorizer context. Only data from Lambda's `requestContext.authorizer` is trusted to populate these headers. This prevents spoofing where an external caller sends fake headers to bypass authentication.
 
 `LambdaAuthorizerMiddleware` (implements `A2aMiddleware`) reads these adapter-injected headers and constructs `AuthIdentity::Authenticated`. This does NOT bypass the auth stack — it IS a registered middleware, same as `BearerMiddleware` or `ApiKeyMiddleware`.
-
-If no authorizer is configured, standard header-based auth works as-is (Bearer token, API key headers pass through from API Gateway).
 
 ### Storage: DynamoDB (D1)
 
 Lambda uses the existing `DynamoDbA2aStorage` from D1. No new tables or traits needed for request/response operations.
 
-### Streaming Coordination: Deferred to D3
+### D3: Durable Streaming Coordination (Future — Not Lambda-Specific)
 
-Full Lambda streaming parity requires:
-1. **Durable event store** — new DynamoDB table (`a2a_task_events`, PK=taskId, SK=eventSequence) with monotonic event IDs
-2. **Replay semantics** — `Last-Event-ID` header parsing, `get_events_after(event_id)` query
-3. **Cross-instance notification** — optional SNS/EventBridge for wake/fanout (polling is acceptable alternative)
-4. **New trait** — `A2aEventStore` or extension of existing storage traits
+Cross-instance streaming requires durable event coordination that works for **any** multi-instance deployment, not just Lambda. The architecture needs:
 
-This is D3 scope and will get its own ADR when prioritized.
+1. **Durable event store** — source of truth for task events with monotonic IDs. DynamoDB table (`a2a_task_events`, PK=taskId, SK=eventSequence) or equivalent.
+2. **Replay semantics** — `Last-Event-ID` header parsing, `get_events_after(event_id)` query for reconnection catch-up.
+3. **Cross-instance notification** — optional SNS/EventBridge/Redis for wake/fanout. Polling the durable store is acceptable but higher latency.
+4. **New trait** — `A2aEventStore` or extension of existing storage traits.
+
+The in-process `TaskEventBroker` remains as a **local optimization** for attached clients on the same instance. The durable event store is the source of truth; local broadcast is a cache for live connections.
+
+D3 gets its own ADR when prioritized.
 
 ### What Is Only Optimization, Not Correctness-Critical
 
@@ -82,8 +86,8 @@ This is D3 scope and will get its own ADR when prioritized.
 
 ## Consequences
 
-- Lambda deployment works for the full request/response A2A surface (11 of 13 proto RPC methods — all except `SendStreamingMessage` and `SubscribeToTask`)
-- Streaming on Lambda is honestly scoped as "not supported" rather than silently broken
-- The adapter requires zero changes to `turul-a2a` core — it wraps the existing Router
-- Auth mapping from API Gateway authorizers uses the same middleware stack as local deployment
-- Full streaming parity is a separate, well-defined future work item with known requirements
+- Lambda deployment works for the full request/response A2A surface (11 of 13 proto RPC methods)
+- Streaming is honestly scoped as "not supported in multi-instance deployments" rather than silently broken
+- The adapter requires zero changes to `turul-a2a` core
+- Auth mapping from API Gateway authorizers uses the same middleware stack
+- Full streaming parity is a separate, well-defined future work item that applies to all multi-instance deployments, not just Lambda

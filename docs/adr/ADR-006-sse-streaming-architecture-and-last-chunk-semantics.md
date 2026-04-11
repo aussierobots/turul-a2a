@@ -16,7 +16,7 @@ In-process `TaskEventBroker` using `tokio::sync::broadcast` for multi-subscriber
 - `last_chunk` is transport-level metadata only in v0.1 -- forwarded to streaming subscribers but not persisted in storage.
 - The `append` flag IS implemented in storage: `append=true` with matching `artifact_id` appends parts to existing artifact.
 
-**Single-instance limitation:** The broker is in-process only. Multi-instance deployments (Lambda, horizontal scale) require a shared event coordination mechanism (Redis, DynamoDB, EventBridge) -- documented as future work in CLAUDE.md.
+**Single-instance limitation:** The broker is in-process only — a local optimization for attached clients on the same instance, not a cross-instance coordination mechanism. This affects any multi-instance deployment (Lambda, load-balanced binaries, ECS/Fargate, Kubernetes, rolling deploys). D3 (ADR-008) addresses this with a durable event store where the in-process broker becomes a cache, not the source of truth.
 
 ## Consequences
 

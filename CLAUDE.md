@@ -55,11 +55,12 @@ Google well-known types (`google.protobuf.Struct`, `Value`, `Timestamp`) mapped 
 - **Push notification configs** use raw `turul_a2a_proto::TaskPushNotificationConfig` in storage traits and handler signatures. This is an intentional exception — push configs are simple CRUD with no state machine or invariants that warrant a wrapper. Keep this leakage isolated; do not let raw proto types spread into general handler/router code.
 - **`last_chunk` on `append_artifact`** is transport-level metadata for SSE streaming. Storage passes it through but does not persist completion state in v0.1. The server layer forwards it to streaming subscribers.
 
-### Future Streaming Architecture Note
+### Multi-Instance Streaming Limitation
 
-- The current in-process event broker is only valid for a single server instance.
-- Before claiming production-ready streaming for multi-instance deployments or AWS Lambda, add a design task for cross-instance stream delivery and replay.
-- Candidate approaches include a shared event log (Redis, DynamoDB, EventBridge).
+- The in-process event broker (`TaskEventBroker`) provides local fanout for attached clients on the **same instance only**.
+- This is not a Lambda-specific limitation — it affects any multi-instance deployment: Lambda, load-balanced binaries, ECS/Fargate, Kubernetes, rolling deploys.
+- Shared task storage (DynamoDB, PostgreSQL) solves request/response correctness across instances but does NOT solve streaming coordination.
+- D3 (future): durable event store with monotonic IDs + replay semantics. The in-process broker becomes a local optimization, not the source of truth. See ADR-008.
 
 ### Architecture Decision Records
 
