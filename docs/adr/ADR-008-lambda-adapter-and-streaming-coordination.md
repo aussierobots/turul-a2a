@@ -84,10 +84,19 @@ D3 gets its own ADR when prioritized.
 - Local connection manager reuse
 - Instance-local broadcast (the in-process broker is inert on Lambda but harmless)
 
+## Verification Scope
+
+**D2 proves:** The Lambda adapter correctly wraps the same router/middleware stack for request/response operations in a single-instance Lambda runtime. Verified locally with cargo-lambda.
+
+**D2 does NOT prove:** Multi-instance behavior under shared storage. Cross-instance request/response (create on instance A, fetch on instance B) requires a separate distributed verification pass against a real shared backend (DynamoDB). This is a future verification task, not part of D2.
+
+**D3 proves (future):** Cross-instance streaming/subscription coordination. Subscriber on instance A + producer on instance B is the architecture gap D3 solves.
+
 ## Consequences
 
-- Lambda deployment works for the full request/response A2A surface (11 of 13 proto RPC methods)
+- Lambda adapter works for the request/response A2A surface (11 of 13 proto RPC methods) in single-instance execution
 - Streaming is honestly scoped as "not supported in multi-instance deployments" rather than silently broken
 - The adapter requires zero changes to `turul-a2a` core
 - Auth mapping from API Gateway authorizers uses the same middleware stack
-- Full streaming parity is a separate, well-defined future work item that applies to all multi-instance deployments, not just Lambda
+- Distributed multi-instance verification (two instances, shared backend, alternating requests) is a separate future task
+- Full streaming parity (D3) applies to all multi-instance deployments, not just Lambda

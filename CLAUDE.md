@@ -103,9 +103,9 @@ Tests are written from the A2A proto/spec FIRST, then implementation follows. If
 
 ### Deferred
 
-- Client library (`turul-a2a-client`)
-- AWS Lambda adapter (`turul-a2a-aws-lambda`)
-- Additional storage backends (SQLite, PostgreSQL, DynamoDB)
+- PostgreSQL storage backend (feature-gated, pass 18 parity tests)
+- Distributed multi-instance verification (two instances, shared backend, alternating requests for request/response correctness)
+- D3: durable event coordination for multi-instance streaming (new ADR needed, not Lambda-specific)
 - gRPC transport (feature-gated in `turul-a2a-proto`)
 - Skill-level `security_requirements` (agent-level only for now)
 - Shared `turul-jwt-validator` extraction (currently local, see ADR-007)
