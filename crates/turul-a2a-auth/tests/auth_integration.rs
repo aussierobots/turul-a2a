@@ -25,7 +25,7 @@ struct FakeBearerMiddleware;
 impl A2aMiddleware for FakeBearerMiddleware {
     async fn before_request(
         &self,
-        ctx: &mut RequestContext,
+        _ctx: &mut RequestContext,
     ) -> Result<(), MiddlewareError> {
         Err(MiddlewareError::HttpChallenge {
             status: 401,

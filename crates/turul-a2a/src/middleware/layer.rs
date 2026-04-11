@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
-use axum::response::IntoResponse;
 use http::{Request, Response};
 use tower::{Layer, Service};
 

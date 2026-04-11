@@ -18,8 +18,10 @@ use crate::router::AppState;
 /// POST /jsonrpc — accepts JSON-RPC 2.0 requests and dispatches to core handlers.
 pub async fn jsonrpc_dispatch_handler(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
     body: String,
 ) -> axum::response::Response {
+    let owner = ctx.identity.owner().to_string();
     // 1. Parse JSON
     let value: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
@@ -68,7 +70,7 @@ pub async fn jsonrpc_dispatch_handler(
         .to_string();
 
     // 6. Dispatch by method name
-    let result = dispatch(state, &method, &tenant, params).await;
+    let result = dispatch(state, &method, &tenant, &owner, params).await;
 
     // 7. Notifications: suppress response entirely
     if is_notification {
@@ -89,25 +91,26 @@ async fn dispatch(
     state: AppState,
     method: &str,
     tenant: &str,
+    owner: &str,
     params: Value,
 ) -> Result<Value, A2aError> {
     match method {
-        methods::SEND_MESSAGE => dispatch_send_message(state, tenant, params).await,
-        methods::GET_TASK => dispatch_get_task(state, tenant, params).await,
-        methods::LIST_TASKS => dispatch_list_tasks(state, tenant, params).await,
-        methods::CANCEL_TASK => dispatch_cancel_task(state, tenant, params).await,
+        methods::SEND_MESSAGE => dispatch_send_message(state, tenant, owner, params).await,
+        methods::GET_TASK => dispatch_get_task(state, tenant, owner, params).await,
+        methods::LIST_TASKS => dispatch_list_tasks(state, tenant, owner, params).await,
+        methods::CANCEL_TASK => dispatch_cancel_task(state, tenant, owner, params).await,
         methods::GET_EXTENDED_AGENT_CARD => dispatch_get_extended_agent_card(state).await,
         methods::CREATE_TASK_PUSH_NOTIFICATION_CONFIG => {
-            dispatch_create_push_config(state, tenant, params).await
+            dispatch_create_push_config(state, tenant, owner, params).await
         }
         methods::GET_TASK_PUSH_NOTIFICATION_CONFIG => {
-            dispatch_get_push_config(state, tenant, params).await
+            dispatch_get_push_config(state, tenant, owner, params).await
         }
         methods::LIST_TASK_PUSH_NOTIFICATION_CONFIGS => {
-            dispatch_list_push_configs(state, tenant, params).await
+            dispatch_list_push_configs(state, tenant, owner, params).await
         }
         methods::DELETE_TASK_PUSH_NOTIFICATION_CONFIG => {
-            dispatch_delete_push_config(state, tenant, params).await
+            dispatch_delete_push_config(state, tenant, owner, params).await
         }
         methods::SEND_STREAMING_MESSAGE | methods::SUBSCRIBE_TO_TASK => {
             Err(A2aError::UnsupportedOperation {
@@ -132,19 +135,21 @@ fn method_not_found(_method: &str) -> A2aError {
 async fn dispatch_send_message(
     state: AppState,
     tenant: &str,
+    owner: &str,
     params: Value,
 ) -> Result<Value, A2aError> {
     let body = serde_json::to_string(&params).map_err(|e| A2aError::InvalidRequest {
         message: format!("Invalid params: {e}"),
     })?;
     // Reuse the core handler, which returns Json<Value> with SendMessageResponse shape
-    let Json(response) = crate::router::core_send_message(state, tenant, "anonymous", body).await?;
+    let Json(response) = crate::router::core_send_message(state, tenant, owner, body).await?;
     Ok(response)
 }
 
 async fn dispatch_get_task(
     state: AppState,
     tenant: &str,
+    owner: &str,
     params: Value,
 ) -> Result<Value, A2aError> {
     let id = params
@@ -160,13 +165,14 @@ async fn dispatch_get_task(
         .and_then(|v| v.as_i64())
         .map(|v| v as i32);
 
-    let Json(response) = crate::router::core_get_task(state, tenant, "anonymous", &id, history_length).await?;
+    let Json(response) = crate::router::core_get_task(state, tenant, owner, &id, history_length).await?;
     Ok(response)
 }
 
 async fn dispatch_list_tasks(
     state: AppState,
     tenant: &str,
+    owner: &str,
     params: Value,
 ) -> Result<Value, A2aError> {
     let query = crate::router::ListTasksQuery {
@@ -178,13 +184,14 @@ async fn dispatch_list_tasks(
         include_artifacts: params.get("includeArtifacts").and_then(|v| v.as_bool()),
     };
 
-    let Json(response) = crate::router::core_list_tasks(state, tenant, "anonymous", &query).await?;
+    let Json(response) = crate::router::core_list_tasks(state, tenant, owner, &query).await?;
     Ok(response)
 }
 
 async fn dispatch_cancel_task(
     state: AppState,
     tenant: &str,
+    owner: &str,
     params: Value,
 ) -> Result<Value, A2aError> {
     let id = params
@@ -195,7 +202,7 @@ async fn dispatch_cancel_task(
         })?
         .to_string();
 
-    let Json(response) = crate::router::core_cancel_task(state, tenant, "anonymous", &id).await?;
+    let Json(response) = crate::router::core_cancel_task(state, tenant, owner, &id).await?;
     Ok(response)
 }
 
@@ -209,6 +216,7 @@ async fn dispatch_get_extended_agent_card(state: AppState) -> Result<Value, A2aE
 async fn dispatch_create_push_config(
     state: AppState,
     tenant: &str,
+    owner: &str,
     params: Value,
 ) -> Result<Value, A2aError> {
     let task_id = params
@@ -223,13 +231,14 @@ async fn dispatch_create_push_config(
         message: format!("Invalid params: {e}"),
     })?;
 
-    let Json(response) = crate::router::core_create_push_config(state, tenant, "anonymous", &task_id, body).await?;
+    let Json(response) = crate::router::core_create_push_config(state, tenant, owner, &task_id, body).await?;
     Ok(response)
 }
 
 async fn dispatch_get_push_config(
     state: AppState,
     tenant: &str,
+    owner: &str,
     params: Value,
 ) -> Result<Value, A2aError> {
     let task_id = params.get("taskId").and_then(|v| v.as_str()).ok_or(A2aError::InvalidRequest {
@@ -239,13 +248,14 @@ async fn dispatch_get_push_config(
         message: "Missing required field: id".into(),
     })?.to_string();
 
-    let Json(response) = crate::router::core_get_push_config(state, tenant, "anonymous", &task_id, &id).await?;
+    let Json(response) = crate::router::core_get_push_config(state, tenant, owner, &task_id, &id).await?;
     Ok(response)
 }
 
 async fn dispatch_list_push_configs(
     state: AppState,
     tenant: &str,
+    owner: &str,
     params: Value,
 ) -> Result<Value, A2aError> {
     let task_id = params.get("taskId").and_then(|v| v.as_str()).ok_or(A2aError::InvalidRequest {
@@ -257,13 +267,14 @@ async fn dispatch_list_push_configs(
         page_token: params.get("pageToken").and_then(|v| v.as_str()).map(|s| s.to_string()),
     };
 
-    let Json(response) = crate::router::core_list_push_configs(state, tenant, "anonymous", &task_id, &query).await?;
+    let Json(response) = crate::router::core_list_push_configs(state, tenant, owner, &task_id, &query).await?;
     Ok(response)
 }
 
 async fn dispatch_delete_push_config(
     state: AppState,
     tenant: &str,
+    owner: &str,
     params: Value,
 ) -> Result<Value, A2aError> {
     let task_id = params.get("taskId").and_then(|v| v.as_str()).ok_or(A2aError::InvalidRequest {
@@ -273,7 +284,7 @@ async fn dispatch_delete_push_config(
         message: "Missing required field: id".into(),
     })?.to_string();
 
-    let Json(response) = crate::router::core_delete_push_config(state, tenant, "anonymous", &task_id, &id).await?;
+    let Json(response) = crate::router::core_delete_push_config(state, tenant, owner, &task_id, &id).await?;
     Ok(response)
 }
 
