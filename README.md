@@ -52,11 +52,7 @@ while let Some(event) = futures::StreamExt::next(&mut stream).await {
 ## Server Usage
 
 ```rust
-use turul_a2a::server::A2aServer;
-use turul_a2a::card_builder::AgentCardBuilder;
-use turul_a2a::executor::{AgentExecutor, ExecutionContext};
-use turul_a2a::error::A2aError;
-use turul_a2a_types::{Task, Message};
+use turul_a2a::prelude::*;
 
 struct MyAgent;
 
