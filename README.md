@@ -177,4 +177,4 @@ Documented under `docs/adr/`. Key decisions: proto-first types (ADR-001), storag
 
 ## License
 
-GPL-3.0-only
+MIT OR Apache-2.0

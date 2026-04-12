@@ -17,7 +17,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 authors = ["Nick Hortovanyi <nick@aussierobots.com.au>"]
-license = "GPL-3.0-only"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/aussierobots/turul-a2a"
 
 [workspace.dependencies]
