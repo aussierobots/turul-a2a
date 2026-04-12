@@ -22,6 +22,14 @@ pub enum A2aClientError {
     /// JSON parsing error.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// SSE stream error.
+    #[error("SSE error: {0}")]
+    Sse(String),
+
+    /// SSE stream closed unexpectedly.
+    #[error("SSE stream closed")]
+    StreamClosed,
 }
 
 impl A2aClientError {

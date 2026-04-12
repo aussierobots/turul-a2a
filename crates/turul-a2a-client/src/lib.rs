@@ -2,12 +2,16 @@
 //!
 //! Independent of the server crate — depends only on turul-a2a-types and turul-a2a-proto.
 
+pub mod builders;
 mod error;
+pub mod sse;
 
 use turul_a2a_proto as pb;
 use turul_a2a_types::wire;
 
+pub use builders::MessageBuilder;
 pub use error::A2aClientError;
+pub use sse::{SseEvent, SseStream};
 
 /// Auth configuration for the client.
 #[derive(Debug, Clone)]
@@ -201,6 +205,172 @@ impl A2aClient {
         }
         let response: pb::ListTasksResponse = resp.json().await?;
         Ok(response)
+    }
+
+    // =========================================================
+    // Streaming methods
+    // =========================================================
+
+    /// Send a streaming message. Returns an SSE event stream.
+    ///
+    /// Events include status updates, artifact updates, and the initial task.
+    /// The stream closes when the task reaches a terminal state.
+    pub async fn send_streaming_message(
+        &self,
+        request: pb::SendMessageRequest,
+    ) -> Result<SseStream, A2aClientError> {
+        let url = self.url("/message:stream");
+        let resp = self
+            .request(reqwest::Method::POST, &url)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .json(&request)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(self.parse_error_from_status(resp).await);
+        }
+        Ok(SseStream::from_response(resp))
+    }
+
+    /// Subscribe to task events. Returns an SSE event stream.
+    ///
+    /// The first event is a Task object snapshot (spec §3.1.6).
+    /// Subsequent events are status/artifact updates from the durable store.
+    ///
+    /// For reconnection, pass `last_event_id` from the last received event's `id` field.
+    /// The server replays only events after that sequence.
+    pub async fn subscribe_to_task(
+        &self,
+        task_id: &str,
+        last_event_id: Option<&str>,
+    ) -> Result<SseStream, A2aClientError> {
+        let url = self.url(&format!("/tasks/{task_id}:subscribe"));
+        let mut req = self
+            .request(reqwest::Method::GET, &url)
+            .header("accept", "text/event-stream");
+
+        if let Some(lei) = last_event_id {
+            req = req.header("Last-Event-ID", lei);
+        }
+
+        let resp = req.send().await?;
+
+        if !resp.status().is_success() {
+            return Err(self.parse_error_from_status(resp).await);
+        }
+        Ok(SseStream::from_response(resp))
+    }
+
+    // =========================================================
+    // Push notification config CRUD
+    // =========================================================
+
+    /// Create a push notification config for a task.
+    pub async fn create_push_config(
+        &self,
+        task_id: &str,
+        config: pb::TaskPushNotificationConfig,
+    ) -> Result<pb::TaskPushNotificationConfig, A2aClientError> {
+        let url = self.url(&format!("/tasks/{task_id}/pushNotificationConfigs"));
+        let resp = self
+            .request(reqwest::Method::POST, &url)
+            .header("content-type", "application/json")
+            .json(&config)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(self.parse_error_from_status(resp).await);
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Get a push notification config by ID.
+    pub async fn get_push_config(
+        &self,
+        task_id: &str,
+        config_id: &str,
+    ) -> Result<pb::TaskPushNotificationConfig, A2aClientError> {
+        let url = self.url(&format!(
+            "/tasks/{task_id}/pushNotificationConfigs/{config_id}"
+        ));
+        let resp = self.request(reqwest::Method::GET, &url).send().await?;
+
+        if !resp.status().is_success() {
+            return Err(self.parse_error_from_status(resp).await);
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// List push notification configs for a task.
+    pub async fn list_push_configs(
+        &self,
+        task_id: &str,
+        page_size: Option<i32>,
+        page_token: Option<&str>,
+    ) -> Result<pb::ListTaskPushNotificationConfigsResponse, A2aClientError> {
+        let url = self.url(&format!("/tasks/{task_id}/pushNotificationConfigs"));
+        let mut req = self.request(reqwest::Method::GET, &url);
+        if let Some(ps) = page_size {
+            req = req.query(&[("pageSize", ps.to_string())]);
+        }
+        if let Some(pt) = page_token {
+            req = req.query(&[("pageToken", pt)]);
+        }
+        let resp = req.send().await?;
+
+        if !resp.status().is_success() {
+            return Err(self.parse_error_from_status(resp).await);
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Delete a push notification config.
+    pub async fn delete_push_config(
+        &self,
+        task_id: &str,
+        config_id: &str,
+    ) -> Result<(), A2aClientError> {
+        let url = self.url(&format!(
+            "/tasks/{task_id}/pushNotificationConfigs/{config_id}"
+        ));
+        let resp = self
+            .request(reqwest::Method::DELETE, &url)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(self.parse_error_from_status(resp).await);
+        }
+        Ok(())
+    }
+
+    // =========================================================
+    // Extended agent card
+    // =========================================================
+
+    /// Fetch the extended agent card (requires authentication).
+    pub async fn fetch_extended_agent_card(
+        &self,
+    ) -> Result<pb::AgentCard, A2aClientError> {
+        let url = self.url("/extendedAgentCard");
+        let resp = self.request(reqwest::Method::GET, &url).send().await?;
+
+        if !resp.status().is_success() {
+            return Err(self.parse_error_from_status(resp).await);
+        }
+        Ok(resp.json().await?)
+    }
+
+    // =========================================================
+    // Internal helpers
+    // =========================================================
+
+    /// Parse error from a non-success response (takes ownership).
+    async fn parse_error_from_status(&self, resp: reqwest::Response) -> A2aClientError {
+        self.parse_error(resp).await
     }
 
     /// Parse an error response from the server.
