@@ -7,6 +7,7 @@
 use turul_a2a_types::{Artifact, Message, Part, Role, Task, TaskState, TaskStatus};
 
 use crate::streaming::StreamEvent;
+use super::atomic::A2aAtomicStore;
 use super::event_store::A2aEventStore;
 use super::filter::TaskFilter;
 use super::traits::{A2aPushNotificationStorage, A2aTaskStorage};
@@ -662,4 +663,435 @@ pub async fn test_event_empty_task(storage: &dyn A2aEventStore) {
     let events = storage.get_events_after("default", "nonexistent", 0).await.unwrap();
     assert!(events.is_empty());
     assert_eq!(storage.latest_sequence("default", "nonexistent").await.unwrap(), 0);
+}
+
+// =========================================================
+// Atomic store parity tests (ADR-009 §10)
+// =========================================================
+
+/// Helper to create a status event for atomic tests.
+fn make_status_event_for(task_id: &str, context_id: &str, state: &str) -> StreamEvent {
+    StreamEvent::StatusUpdate {
+        status_update: crate::streaming::StatusUpdatePayload {
+            task_id: task_id.to_string(),
+            context_id: context_id.to_string(),
+            status: serde_json::json!({"state": state}),
+        },
+    }
+}
+
+/// AT-001: create_task_with_events writes task and events atomically.
+/// Both are readable after the call.
+pub async fn test_atomic_create_task_with_events(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+) {
+    let task = make_task("at-create-1", "ctx-1");
+    let evts = vec![
+        make_status_event_for("at-create-1", "ctx-1", "TASK_STATE_SUBMITTED"),
+    ];
+
+    let (created, seqs) = atomic
+        .create_task_with_events("default", "owner-1", task, evts)
+        .await
+        .unwrap();
+
+    assert_eq!(created.id(), "at-create-1");
+    assert_eq!(seqs.len(), 1);
+    assert_eq!(seqs[0], 1);
+
+    // Task is readable via task storage
+    let fetched = tasks
+        .get_task("default", "at-create-1", "owner-1", None)
+        .await
+        .unwrap()
+        .expect("Task should exist after atomic create");
+    assert_eq!(fetched.id(), "at-create-1");
+
+    // Events are readable via event store
+    let stored_events = events
+        .get_events_after("default", "at-create-1", 0)
+        .await
+        .unwrap();
+    assert_eq!(stored_events.len(), 1);
+    assert_eq!(stored_events[0].0, 1);
+}
+
+/// AT-002: update_task_status_with_events updates status and appends events atomically.
+pub async fn test_atomic_update_status_with_events(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+) {
+    // Setup: create task first
+    let task = make_task("at-status-1", "ctx-1");
+    tasks.create_task("default", "owner-1", task).await.unwrap();
+
+    // Atomic status update with event
+    let evts = vec![
+        make_status_event_for("at-status-1", "ctx-1", "TASK_STATE_WORKING"),
+    ];
+    let (updated, seqs) = atomic
+        .update_task_status_with_events(
+            "default", "at-status-1", "owner-1",
+            TaskStatus::new(TaskState::Working), evts,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(seqs.len(), 1);
+    assert_eq!(updated.status().unwrap().state().unwrap(), TaskState::Working);
+
+    // Verify via reads
+    let fetched = tasks
+        .get_task("default", "at-status-1", "owner-1", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.status().unwrap().state().unwrap(), TaskState::Working);
+
+    let stored_events = events
+        .get_events_after("default", "at-status-1", 0)
+        .await
+        .unwrap();
+    assert_eq!(stored_events.len(), 1);
+}
+
+/// AT-003: update_task_status_with_events rejects invalid transitions
+/// and neither task nor events are modified.
+pub async fn test_atomic_status_rejects_invalid_transition(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+) {
+    // Setup: create a completed task
+    let task = make_task("at-invalid-1", "ctx-1");
+    tasks.create_task("default", "owner-1", task).await.unwrap();
+    tasks
+        .update_task_status("default", "at-invalid-1", "owner-1", TaskStatus::new(TaskState::Working))
+        .await
+        .unwrap();
+    tasks
+        .update_task_status("default", "at-invalid-1", "owner-1", TaskStatus::new(TaskState::Completed))
+        .await
+        .unwrap();
+
+    // Attempt invalid transition (Completed → Working) with event
+    let evts = vec![
+        make_status_event_for("at-invalid-1", "ctx-1", "TASK_STATE_WORKING"),
+    ];
+    let result = atomic
+        .update_task_status_with_events(
+            "default", "at-invalid-1", "owner-1",
+            TaskStatus::new(TaskState::Working), evts,
+        )
+        .await;
+
+    assert!(result.is_err(), "Invalid transition should fail");
+
+    // Verify task is still Completed (not modified)
+    let fetched = tasks
+        .get_task("default", "at-invalid-1", "owner-1", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.status().unwrap().state().unwrap(), TaskState::Completed);
+
+    // Verify no events were written
+    let stored_events = events
+        .get_events_after("default", "at-invalid-1", 0)
+        .await
+        .unwrap();
+    assert!(stored_events.is_empty(), "No events should be written on failed atomic op");
+}
+
+/// AT-004: update_task_with_events replaces task and appends events atomically.
+pub async fn test_atomic_update_task_with_events(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+) {
+    // Setup: create task
+    let task = make_task("at-update-1", "ctx-1");
+    tasks.create_task("default", "owner-1", task).await.unwrap();
+
+    // Mutate task (add artifact, change status) and append events
+    let mut updated_task = tasks
+        .get_task("default", "at-update-1", "owner-1", None)
+        .await
+        .unwrap()
+        .unwrap();
+    updated_task.set_status(TaskStatus::new(TaskState::Working));
+    updated_task.push_text_artifact("art-1", "Result", "some output");
+    updated_task.complete();
+
+    let evts = vec![
+        make_status_event_for("at-update-1", "ctx-1", "TASK_STATE_WORKING"),
+        make_status_event_for("at-update-1", "ctx-1", "TASK_STATE_COMPLETED"),
+    ];
+    let seqs = atomic
+        .update_task_with_events("default", "owner-1", updated_task, evts)
+        .await
+        .unwrap();
+
+    assert_eq!(seqs.len(), 2);
+    assert_eq!(seqs[0], 1);
+    assert_eq!(seqs[1], 2);
+
+    // Verify task has updated state
+    let fetched = tasks
+        .get_task("default", "at-update-1", "owner-1", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.status().unwrap().state().unwrap(), TaskState::Completed);
+    assert!(!fetched.artifacts().is_empty());
+
+    // Verify events
+    let stored_events = events
+        .get_events_after("default", "at-update-1", 0)
+        .await
+        .unwrap();
+    assert_eq!(stored_events.len(), 2);
+}
+
+/// AT-005: Atomic operations enforce owner isolation.
+pub async fn test_atomic_owner_isolation(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+) {
+    // Create task owned by "alice"
+    let task = make_task("at-owner-1", "ctx-1");
+    tasks.create_task("default", "alice", task).await.unwrap();
+
+    // "bob" cannot update status with events
+    let evts = vec![
+        make_status_event_for("at-owner-1", "ctx-1", "TASK_STATE_WORKING"),
+    ];
+    let result = atomic
+        .update_task_status_with_events(
+            "default", "at-owner-1", "bob",
+            TaskStatus::new(TaskState::Working), evts,
+        )
+        .await;
+    assert!(result.is_err(), "Wrong owner should fail");
+
+    // "bob" cannot full-update with events
+    let mut fake_task = make_task("at-owner-1", "ctx-1");
+    fake_task.set_status(TaskStatus::new(TaskState::Working));
+    let evts = vec![
+        make_status_event_for("at-owner-1", "ctx-1", "TASK_STATE_WORKING"),
+    ];
+    let result = atomic
+        .update_task_with_events("default", "bob", fake_task, evts)
+        .await;
+    assert!(result.is_err(), "Wrong owner should fail for update_task_with_events");
+}
+
+/// AT-006: Tenant isolation for atomic operations.
+pub async fn test_atomic_tenant_isolation(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+) {
+    // Create tasks under different tenants
+    let task_a = make_task("at-tenant-1", "ctx-1");
+    let task_b = make_task("at-tenant-1", "ctx-1"); // Same task ID, different tenant
+
+    atomic
+        .create_task_with_events(
+            "tenant-a", "owner-1", task_a,
+            vec![make_status_event_for("at-tenant-1", "ctx-1", "SUBMITTED_A")],
+        )
+        .await
+        .unwrap();
+
+    atomic
+        .create_task_with_events(
+            "tenant-b", "owner-1", task_b,
+            vec![make_status_event_for("at-tenant-1", "ctx-1", "SUBMITTED_B")],
+        )
+        .await
+        .unwrap();
+
+    // Events are isolated by tenant
+    let a_events = events.get_events_after("tenant-a", "at-tenant-1", 0).await.unwrap();
+    let b_events = events.get_events_after("tenant-b", "at-tenant-1", 0).await.unwrap();
+    assert_eq!(a_events.len(), 1);
+    assert_eq!(b_events.len(), 1);
+
+    // Tasks are isolated by tenant
+    let a_task = tasks.get_task("tenant-a", "at-tenant-1", "owner-1", None).await.unwrap();
+    let b_task = tasks.get_task("tenant-b", "at-tenant-1", "owner-1", None).await.unwrap();
+    assert!(a_task.is_some());
+    assert!(b_task.is_some());
+
+    // Cross-tenant invisible
+    let cross = tasks.get_task("tenant-a", "at-tenant-1", "owner-1", None).await.unwrap();
+    assert!(cross.is_some()); // Own tenant visible
+    let wrong_tenant_events = events.get_events_after("tenant-c", "at-tenant-1", 0).await.unwrap();
+    assert!(wrong_tenant_events.is_empty()); // Non-existent tenant has no events
+}
+
+/// AT-007: create_task_with_events with empty events vec creates task but no events.
+pub async fn test_atomic_create_with_empty_events(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+) {
+    let task = make_task("at-empty-1", "ctx-1");
+    let (created, seqs) = atomic
+        .create_task_with_events("default", "owner-1", task, vec![])
+        .await
+        .unwrap();
+
+    assert_eq!(created.id(), "at-empty-1");
+    assert!(seqs.is_empty());
+
+    // Task exists
+    let fetched = tasks.get_task("default", "at-empty-1", "owner-1", None).await.unwrap();
+    assert!(fetched.is_some());
+
+    // No events
+    let stored = events.get_events_after("default", "at-empty-1", 0).await.unwrap();
+    assert!(stored.is_empty());
+}
+
+/// AT-008: Event sequences continue correctly across atomic and non-atomic operations
+/// under serial access.
+pub async fn test_atomic_sequence_continuity(
+    atomic: &dyn A2aAtomicStore,
+    events: &dyn A2aEventStore,
+) {
+    // Create task with 1 event via atomic
+    let task = make_task("at-seq-1", "ctx-1");
+    let (_, seqs) = atomic
+        .create_task_with_events(
+            "default", "owner-1", task,
+            vec![make_status_event_for("at-seq-1", "ctx-1", "SUBMITTED")],
+        )
+        .await
+        .unwrap();
+    assert_eq!(seqs, vec![1]);
+
+    // Append event directly via event store
+    let seq = events
+        .append_event("default", "at-seq-1", make_status_event("WORKING"))
+        .await
+        .unwrap();
+    assert_eq!(seq, 2);
+
+    // Atomic update with event — should continue from 3
+    let mut task2 = make_task("at-seq-1", "ctx-1");
+    task2.set_status(TaskStatus::new(TaskState::Working));
+    task2.complete();
+    let seqs2 = atomic
+        .update_task_with_events(
+            "default", "owner-1", task2,
+            vec![make_status_event_for("at-seq-1", "ctx-1", "COMPLETED")],
+        )
+        .await
+        .unwrap();
+    assert_eq!(seqs2, vec![3]);
+
+    // Verify all 3 events in order
+    let all = events.get_events_after("default", "at-seq-1", 0).await.unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].0, 1);
+    assert_eq!(all[1].0, 2);
+    assert_eq!(all[2].0, 3);
+}
+
+/// AT-009: Concurrent atomic and non-atomic event appends produce unique, monotonic sequences.
+///
+/// This test requires `Arc`-wrapped storage, so it takes concrete types
+/// rather than trait objects. Backend-specific test modules can call it
+/// with their own storage type.
+pub async fn test_atomic_concurrent_sequence_integrity<S>(storage: std::sync::Arc<S>)
+where
+    S: A2aAtomicStore + A2aEventStore + A2aTaskStorage + Send + Sync + 'static,
+{
+    // Create task first
+    let task = make_task("at-conc-1", "ctx-1");
+    storage
+        .create_task("default", "owner-1", task)
+        .await
+        .unwrap();
+
+    let total_atomic = 10usize;
+    let total_non_atomic = 10usize;
+    let mut handles = Vec::new();
+
+    // Spawn concurrent atomic event appends (via update_task_with_events)
+    for _ in 0..total_atomic {
+        let s = storage.clone();
+        handles.push(tokio::spawn(async move {
+            // Read current task, append events atomically
+            let task = s
+                .get_task("default", "at-conc-1", "owner-1", None)
+                .await
+                .unwrap()
+                .unwrap();
+            let evts = vec![make_status_event("atomic")];
+            s.update_task_with_events("default", "owner-1", task, evts)
+                .await
+                .unwrap()
+        }));
+    }
+
+    // Spawn concurrent non-atomic event appends
+    for _ in 0..total_non_atomic {
+        let s = storage.clone();
+        handles.push(tokio::spawn(async move {
+            let seq = s
+                .append_event("default", "at-conc-1", make_status_event("non-atomic"))
+                .await
+                .unwrap();
+            vec![seq]
+        }));
+    }
+
+    // Collect all assigned sequences
+    let mut all_seqs = Vec::new();
+    for handle in handles {
+        let seqs = handle.await.unwrap();
+        all_seqs.extend(seqs);
+    }
+
+    // All sequences must be unique
+    all_seqs.sort();
+    let before_dedup = all_seqs.len();
+    all_seqs.dedup();
+    assert_eq!(
+        all_seqs.len(),
+        before_dedup,
+        "All sequences must be unique — found duplicates"
+    );
+
+    // Total must match
+    assert_eq!(
+        all_seqs.len(),
+        total_atomic + total_non_atomic,
+        "Expected {} events, got {}",
+        total_atomic + total_non_atomic,
+        all_seqs.len()
+    );
+
+    // Events in store must match
+    let stored = storage
+        .get_events_after("default", "at-conc-1", 0)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), total_atomic + total_non_atomic);
+
+    // Sequences in store must be monotonically ordered
+    for window in stored.windows(2) {
+        assert!(
+            window[0].0 < window[1].0,
+            "Events must be monotonically ordered in store: {} >= {}",
+            window[0].0,
+            window[1].0,
+        );
+    }
 }

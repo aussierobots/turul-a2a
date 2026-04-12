@@ -82,14 +82,15 @@ fn test_agent_card() -> turul_a2a_proto::AgentCard {
 }
 
 fn test_state() -> AppState {
-    let storage = InMemoryA2aStorage::new();
+    let s = InMemoryA2aStorage::new();
     AppState {
         executor: Arc::new(CompletingExecutor),
-        task_storage: Arc::new(storage.clone()),
-        push_storage: Arc::new(storage),
+        task_storage: Arc::new(s.clone()),
+        push_storage: Arc::new(s.clone()),
+        event_store: std::sync::Arc::new(s.clone()),
+        atomic_store: std::sync::Arc::new(s),
         event_broker: turul_a2a::streaming::TaskEventBroker::new(),
         middleware_stack: std::sync::Arc::new(turul_a2a::middleware::MiddlewareStack::new(vec![])),
-        event_store: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
     }
 }
 

@@ -1,3 +1,4 @@
+pub mod atomic;
 pub mod error;
 pub mod event_store;
 pub mod filter;
@@ -18,6 +19,7 @@ pub mod dynamodb;
 #[cfg(test)]
 pub(crate) mod parity_tests;
 
+pub use atomic::A2aAtomicStore;
 pub use error::A2aStorageError;
 pub use event_store::A2aEventStore;
 pub use filter::{PushConfigListPage, TaskFilter, TaskListPage};

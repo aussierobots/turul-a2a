@@ -72,22 +72,23 @@ Each event gets a **monotonic sequence number per task**, assigned by the event 
 
 ```
 Producer (executor)
-  → write event to durable store (correctness-critical)
-  → publish to local in-process broker (optimization)
+  → atomic_store.update_task_with_events() (correctness-critical)
+  → event_broker.notify(task_id) (wake-up signal, fire-and-forget)
   → optionally notify cross-instance bus (optimization)
 
 Subscriber (SSE client)
-  → on connect: replay from durable store (correctness-critical)
-  → switch to live: local broker if same instance (optimization)
-  → or poll durable store periodically (correctness fallback)
-  → or receive from cross-instance bus (optimization)
+  → on connect: replay from event_store.get_events_after() (correctness-critical)
+  → subscribe to broker wake-up notifications (optimization)
+  → on wake-up: re-query event_store for new events (correctness-critical)
+  → emit SSE events with id: from store sequence (correctness-critical)
+  → on terminal event: close stream cleanly
 ```
 
-**Correctness-critical path:** durable store write + durable store replay. This alone is sufficient for correct streaming — everything else is latency optimization.
+**Correctness-critical path:** atomic store write + durable store replay. This alone is sufficient for correct streaming — everything else is latency optimization. The SSE response is always built from store data, never from broker payloads.
 
 **Optional bus/fanout layer:** SNS, EventBridge, Redis Pub/Sub, or DynamoDB Streams can provide low-latency cross-instance notification ("wake up, new event for task X"). Without this, subscribers on other instances poll the durable store at a configurable interval (e.g., 1-5 seconds). Polling is correct but higher latency.
 
-**Local broker role:** When producer and subscriber are on the same instance, the in-process `tokio::sync::broadcast` delivers events with zero additional latency. This is preserved as-is from the current architecture. It is NOT the source of truth — just a fast path.
+**Local broker role:** A wake-up signal only. When producer and subscriber are on the same instance, the broker notifies the subscriber that new data is available in the store, avoiding polling latency. The subscriber always re-reads from the store — the broker does NOT carry event data or sequence numbers. This is NOT the source of truth — just a notification mechanism.
 
 ### 5. Trait Boundary: `A2aEventStore`
 
@@ -139,19 +140,21 @@ This trait is backend-neutral. Implementations for DynamoDB, PostgreSQL, SQLite,
 - SK: `eventSequence` (Number)
 - Attributes: `tenant`, `taskId`, `eventType`, `eventData` (JSON string), `createdAt`, `ttl` (DynamoDB TTL)
 - Query: `pk = :pk AND eventSequence > :seq` with `ScanIndexForward = true`
-- Per-task sequence allocation: `UpdateItem` on a counter item (`pk = {tenant}#{taskId}#counter`, `ADD nextSequence :one`) to atomically increment and return the new value. Then `PutItem` the event with that sequence. This provides a real monotonic per-task sequence.
+- Per-task sequence allocation: counter item at `pk = {tenant}#{taskId}`, `sk = 0` (or `#counter`). `UpdateItem` with `ADD nextSequence :one` atomically increments and returns the new value.
+- **Atomic task+event commit:** `TransactWriteItems` combining: (1) counter increment, (2) event PutItem, (3) task update — all in one DynamoDB transaction. This satisfies `A2aAtomicStore`'s consistency requirement.
 
 **PostgreSQL:**
 - Table: `a2a_task_events`
 - Columns: `tenant TEXT, task_id TEXT, event_sequence BIGINT, event_type TEXT, event_data JSONB, created_at TIMESTAMPTZ DEFAULT NOW()`
 - Primary key: `(tenant, task_id, event_sequence)`
-- **Per-task sequence allocation:** `INSERT ... SELECT COALESCE(MAX(event_sequence), 0) + 1 FROM a2a_task_events WHERE tenant = $1 AND task_id = $2` within a transaction, or use `SELECT ... FOR UPDATE` on a sequence counter row in a separate `a2a_task_event_counters` table (`tenant, task_id, next_sequence`). The sequence is a real stored value, not a derived view.
+- **Per-task sequence allocation:** `SELECT COALESCE(MAX(event_sequence), 0) + 1 FROM a2a_task_events WHERE tenant = $1 AND task_id = $2 FOR UPDATE` within the same transaction that inserts the event and updates the task. The `FOR UPDATE` on the MAX query provides row-level locking against concurrent writers to the same `(tenant, task_id)`. No separate counter table needed — the events table itself is the sequence source.
 - Query: `WHERE tenant = $1 AND task_id = $2 AND event_sequence > $3 ORDER BY event_sequence`
-- The sequence is stable across retention/deletion — deleting old events does not renumber remaining events.
+- The sequence is a real persisted value on each event row, not a derived view. Stable across retention/deletion — deleting old events does not renumber remaining events.
+- **Why not BIGSERIAL / ROW_NUMBER():** A global BIGSERIAL is not per-task monotonic. ROW_NUMBER() is query-time derivation, not a persisted sequence — it changes when events are deleted and cannot serve as a stable `Last-Event-ID` cursor.
 
 **SQLite:**
 - Same schema as PostgreSQL
-- Per-task sequence: `INSERT ... SELECT COALESCE(MAX(event_sequence), 0) + 1` — safe under SQLite's single-writer model
+- Per-task sequence: `SELECT COALESCE(MAX(event_sequence), 0) + 1` within the same transaction. Safe under SQLite's single-writer model (only one write transaction at a time).
 - Suitable for single-instance and testing
 
 **In-memory:**
@@ -236,33 +239,147 @@ If the transaction fails, neither the task nor the event is persisted. The calle
 - `append_event`, `get_events_after`, `latest_sequence`, `cleanup_expired`
 - Run against in-memory, SQLite, PostgreSQL, DynamoDB
 
-### 10. What Changes in Existing Code
+### 10. Atomic Write Boundary: `A2aAtomicStore` Trait
 
-**Router (`core_send_streaming_message`, `core_subscribe_to_task`):**
-- Write events to durable store instead of (or in addition to) local broker
-- Accept `Last-Event-ID` header for replay
-- SSE response reads from durable store for catch-up, then local broker for live
+Handler-level dual writes (`event_store.append_event()` then `task_storage.update_task()`) are **not acceptable** — even with same-backend enforcement, two separate calls have no transaction boundary in the trait surface.
+
+A new trait, `A2aAtomicStore`, provides the backend-owned consistency boundary:
+
+```rust
+#[async_trait]
+pub trait A2aAtomicStore: Send + Sync {
+    fn backend_name(&self) -> &'static str;
+
+    /// Create a task and append initial events atomically.
+    async fn create_task_with_events(
+        &self, tenant: &str, owner: &str,
+        task: Task, events: Vec<StreamEvent>,
+    ) -> Result<(Task, Vec<u64>), A2aStorageError>;
+
+    /// Update a task's status and append events atomically.
+    /// Validates state machine transition.
+    async fn update_task_status_with_events(
+        &self, tenant: &str, task_id: &str, owner: &str,
+        new_status: TaskStatus, events: Vec<StreamEvent>,
+    ) -> Result<(Task, Vec<u64>), A2aStorageError>;
+
+    /// Full replacement update of a task and append events atomically.
+    async fn update_task_with_events(
+        &self, tenant: &str, owner: &str,
+        task: Task, events: Vec<StreamEvent>,
+    ) -> Result<Vec<u64>, A2aStorageError>;
+}
+```
+
+**Guarantees:**
+- No "event committed, task failed"
+- No "task committed, event failed"
+- Backend implementations own the consistency boundary
+
+**Per-backend atomicity:**
+- **In-memory:** All maps locked together for duration of operation (consistent lock ordering: tasks → event_counters → events)
+- **PostgreSQL/SQLite:** Single database transaction wrapping both table writes
+- **DynamoDB:** `TransactWriteItems` API for cross-table atomic write
+
+**Existing `A2aTaskStorage` write methods** (`create_task`, `update_task`, `update_task_status`) remain for non-streaming paths and backward compatibility. Streaming handlers exclusively use `A2aAtomicStore` for writes.
+
+### 11. Local Broker Role: Wake-Up Signal Only
+
+The in-process `TaskEventBroker` is **not the event data path**. It is a wake-up signal for same-instance subscribers.
+
+**Handler write flow:**
+1. Call `atomic_store.create_task_with_events()` or `update_task_with_events()` — persist durably, get sequences
+2. Call `event_broker.notify(task_id)` — fire-and-forget signal, no payload needed
+3. Broker does NOT carry event data or sequence numbers
+
+**Subscriber read flow:**
+1. On connect: replay from durable store using `Last-Event-ID` (or from sequence 0)
+2. Subscribe to broker wake-up notifications for the task
+3. On wake-up: query durable store for events after last-seen sequence
+4. Emit SSE events with `id: {task_id}:{sequence}` from store data
+5. On terminal event: close stream cleanly
+
+**Why not push events through the broker?**
+- Conflates "local fanout optimization" with "durable ordering" — two concerns ADR-009 explicitly separates
+- Forces sequence numbers into the broker channel type, coupling broker to store
+- Breaks existing broker tests and API surface
+- In-memory-only deployments carry meaningless metadata
+
+The broker channel may carry `()` (pure signal) or remain `StreamEvent` for backward compat — the SSE formatter must never trust broker data as authoritative. The store is always re-queried.
+
+### 12. Terminal Task Replay
+
+The current `core_subscribe_to_task` rejects terminal tasks with `UnsupportedOperation`. This **cannot survive D3**: if events exist in the store for a terminal task, a subscriber (or reconnecting client) must be able to replay them.
+
+**New semantics:**
+- Subscribe to a terminal task → replay all stored events → close stream cleanly
+- Subscribe to a non-terminal task → replay stored events → switch to live wake-ups → close on terminal event
+- Reconnect with `Last-Event-ID` on terminal task → replay events after that sequence → close
+
+**Rationale:** A subscriber that disconnects during the terminal event delivery and reconnects finds no broker channel (already cleaned up). Without terminal replay, that subscriber can never retrieve the terminal event. The store has it — serve it.
+
+### 13. D3 Scope: Coarse Events Only
+
+D3 delivers durable coordination for the **existing coarse event model**:
+- `SUBMITTED` event on task creation
+- `WORKING` event on status transition
+- Terminal event (`COMPLETED`, `FAILED`, `CANCELED`, etc.) on final state
+- `ArtifactUpdate` events as produced by the executor
+
+**Not in D3:**
+- Granular intermediate events from within executor execution
+- An `EventSink` handle passed to the executor for streaming token-by-token
+- Redesign of the `AgentExecutor` trait
+
+If finer-grained executor events are wanted later, that gets a **separate ADR** and a new `EventSink` parameter on `AgentExecutor::execute()`. D3 must not be blocked on executor redesign.
+
+### 14. Required Tests Before D3 Complete
+
+1. **Replay then live handoff** — subscribe, replay stored events, receive live event, verify no gaps
+2. **Terminal task replay** — subscribe to a completed task, receive retained events, stream closes cleanly
+3. **Reconnect with Last-Event-ID** — replay only newer events, no duplicates
+4. **Subscriber on A / producer on B** — shared durable store, verify event completeness
+5. **No broker correctness dependency** — disable local broker delivery, verify subscriber still receives all events from store
+6. **Atomicity** — verify task+event commit is all-or-nothing (fail one → neither commits)
+
+### 15. What Changes in Existing Code
+
+**New trait: `A2aAtomicStore`** in `storage/atomic.rs`:
+- Atomic task+event write operations
+- Implemented by `InMemoryA2aStorage` (and future backends)
 
 **`AppState`:**
-- Add `event_store: Arc<dyn A2aEventStore>` field
+- Add `atomic_store: Arc<dyn A2aAtomicStore>` alongside existing storage fields
+- `event_store` retained for read operations (`get_events_after`, `latest_sequence`)
 
-**`A2aServer::builder()` / `LambdaA2aServerBuilder`:**
-- Add `.event_store()` builder method
-- Default: in-memory event store (backward compatible)
+**Router (`core_send_streaming_message`, `core_subscribe_to_task`) — planned:**
+- Streaming writes will use `atomic_store`, not `task_storage` directly
+- Subscribe will read from `event_store`, with broker as wake-up signal
+- Accept `Last-Event-ID` header for replay
+- Terminal task subscribe replays from store then closes
+- SSE events include `id: {task_id}:{sequence}` from store data
+
+**`A2aServer::builder()`:**
+- Same-backend enforcement now checks 4 traits (task, push, event, atomic)
+- In practice, all 4 are on the same struct — one `backend_name()` check
 
 **`NoStreamingLayer` (Lambda):**
-- Removed once D3 is implemented — Lambda can stream if event store is DynamoDB
+- Removed once D3 is implemented — Lambda can stream via DynamoDB event store
 
 **Existing tests:**
-- All 334 existing tests continue to pass (event store defaults to in-memory)
-- New D3 tests added for cross-instance and replay scenarios
+- All existing tests continue to pass (non-streaming paths unchanged)
+- Terminal subscribe tests updated (replay instead of rejection)
+- New D3 tests for atomicity, replay, cross-instance
 
 ## Consequences
 
 - Cross-instance streaming becomes correct for any multi-instance deployment
-- The in-process broker is preserved as a latency optimization, not removed
+- The in-process broker is preserved as a latency optimization, not removed or repurposed
+- Atomic task+event writes are enforced by the type system — handlers cannot accidentally dual-write
 - Event store is a new trait with its own parity tests — same discipline as task storage
 - Lambda streaming becomes possible (event store = DynamoDB, no in-process coordination needed)
 - `Last-Event-ID` replay provides resilient reconnection
+- Terminal task replay eliminates a class of missed-event bugs
 - The implementation can be phased: durable store first, optional bus/fanout later
-- Backward compatible: existing single-instance deployments work unchanged with in-memory event store default
+- Backward compatible: existing single-instance deployments work unchanged with in-memory defaults
+- Executor redesign (EventSink) is explicitly deferred — clean scope boundary

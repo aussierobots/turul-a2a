@@ -16,7 +16,10 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client;
 use turul_a2a_types::{Artifact, Message, Task, TaskState, TaskStatus};
 
+use crate::streaming::StreamEvent;
+use super::atomic::A2aAtomicStore;
 use super::error::A2aStorageError;
+use super::event_store::A2aEventStore;
 use super::filter::{PushConfigListPage, TaskFilter, TaskListPage};
 use super::traits::{A2aPushNotificationStorage, A2aTaskStorage};
 
@@ -25,6 +28,7 @@ use super::traits::{A2aPushNotificationStorage, A2aTaskStorage};
 pub struct DynamoDbConfig {
     pub tasks_table: String,
     pub push_configs_table: String,
+    pub events_table: String,
 }
 
 impl Default for DynamoDbConfig {
@@ -32,6 +36,7 @@ impl Default for DynamoDbConfig {
         Self {
             tasks_table: "a2a_tasks".into(),
             push_configs_table: "a2a_push_configs".into(),
+            events_table: "a2a_task_events".into(),
         }
     }
 }
@@ -56,6 +61,13 @@ impl DynamoDbA2aStorage {
 
     fn task_key(tenant: &str, task_id: &str) -> String {
         format!("{tenant}#{task_id}")
+    }
+
+    fn now_iso() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("{:010}.{:03}", now.as_secs(), now.subsec_millis())
     }
 
     fn task_to_json(task: &Task) -> Result<String, A2aStorageError> {
@@ -119,6 +131,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .item("contextId", AttributeValue::S(task.context_id().to_string()))
             .item("statusState", AttributeValue::S(state_str))
             .item("taskJson", AttributeValue::S(json))
+            .item("updatedAt", AttributeValue::S(Self::now_iso()))
             .send()
             .await
             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
@@ -279,36 +292,53 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         let items = result.items.unwrap_or_default();
         let total_size = items.len() as i32;
 
-        // Sort by task_id for deterministic pagination
-        let mut tasks: Vec<Task> = items
+        // Sort by updated_at DESC, task_id DESC (spec §3.1.4 MUST)
+        let mut tasks_with_times: Vec<(Task, String)> = items
             .iter()
             .filter_map(|item| {
-                item.get("taskJson")
+                let task = item.get("taskJson")
                     .and_then(|v| v.as_s().ok())
-                    .and_then(|json| Self::task_from_json(json).ok())
+                    .and_then(|json| Self::task_from_json(json).ok())?;
+                let updated_at = item.get("updatedAt")
+                    .and_then(|v| v.as_s().ok())
+                    .cloned()
+                    .unwrap_or_default();
+                Some((task, updated_at))
             })
             .collect();
-        tasks.sort_by(|a, b| a.id().cmp(b.id()));
+        tasks_with_times.sort_by(|(a_task, a_time), (b_task, b_time)| {
+            b_time.cmp(a_time)
+                .then_with(|| b_task.id().cmp(a_task.id()))
+        });
 
-        // Apply cursor pagination
+        // Apply cursor pagination: token is "updated_at|task_id"
         let start_idx = if let Some(ref token) = filter.page_token {
-            tasks
-                .iter()
-                .position(|t| t.id() > token.as_str())
-                .unwrap_or(tasks.len())
+            if let Some((cursor_time, cursor_id)) = token.split_once('|') {
+                tasks_with_times
+                    .iter()
+                    .position(|(t, time)| (time.as_str(), t.id()) < (cursor_time, cursor_id))
+                    .unwrap_or(tasks_with_times.len())
+            } else {
+                tasks_with_times
+                    .iter()
+                    .position(|(t, _)| t.id() < token.as_str())
+                    .unwrap_or(tasks_with_times.len())
+            }
         } else {
             0
         };
 
         let include_artifacts = filter.include_artifacts.unwrap_or(false);
-        let end_idx = (start_idx + page_size as usize).min(tasks.len());
-        let page_tasks: Vec<Task> = tasks[start_idx..end_idx]
+        let end_idx = (start_idx + page_size as usize).min(tasks_with_times.len());
+        let page_tasks: Vec<Task> = tasks_with_times[start_idx..end_idx]
             .iter()
-            .map(|t| Self::trim_task(t.clone(), filter.history_length, include_artifacts))
+            .map(|(t, _)| Self::trim_task(t.clone(), filter.history_length, include_artifacts))
             .collect();
 
-        let next_page_token = if end_idx < tasks.len() {
-            page_tasks.last().map(|t| t.id().to_string()).unwrap_or_default()
+        let next_page_token = if end_idx < tasks_with_times.len() {
+            tasks_with_times.get(end_idx - 1).map(|(t, updated_at)| {
+                format!("{}|{}", updated_at, t.id())
+            }).unwrap_or_default()
         } else {
             String::new()
         };
@@ -560,6 +590,355 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
     }
 }
 
+/// Helper: query the current max event sequence for a task.
+async fn query_max_sequence(
+    client: &Client,
+    table: &str,
+    pk: &str,
+) -> Result<u64, A2aStorageError> {
+    // Query in reverse order, limit 1 to get the highest sequence
+    let result = client
+        .query()
+        .table_name(table)
+        .key_condition_expression("pk = :pk")
+        .expression_attribute_values(":pk", AttributeValue::S(pk.to_string()))
+        .scan_index_forward(false)
+        .limit(1)
+        .projection_expression("eventSequence")
+        .send()
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+
+    if let Some(items) = result.items {
+        if let Some(item) = items.first() {
+            if let Some(AttributeValue::N(n)) = item.get("eventSequence") {
+                return n.parse::<u64>().map_err(|e| A2aStorageError::DatabaseError(e.to_string()));
+            }
+        }
+    }
+    Ok(0)
+}
+
+#[async_trait]
+impl A2aEventStore for DynamoDbA2aStorage {
+    fn backend_name(&self) -> &'static str {
+        "dynamodb"
+    }
+
+    async fn append_event(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event: StreamEvent,
+    ) -> Result<u64, A2aStorageError> {
+        let pk = Self::task_key(tenant, task_id);
+        let event_data = serde_json::to_string(&event)
+            .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
+
+        let max_seq = query_max_sequence(&self.client, &self.config.events_table, &pk).await?;
+        let new_seq = max_seq + 1;
+
+        self.client
+            .put_item()
+            .table_name(&self.config.events_table)
+            .item("pk", AttributeValue::S(pk))
+            .item("eventSequence", AttributeValue::N(new_seq.to_string()))
+            .item("eventData", AttributeValue::S(event_data))
+            .condition_expression("attribute_not_exists(pk)")
+            .send()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+
+        Ok(new_seq)
+    }
+
+    async fn get_events_after(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        after_sequence: u64,
+    ) -> Result<Vec<(u64, StreamEvent)>, A2aStorageError> {
+        let pk = Self::task_key(tenant, task_id);
+
+        let result = self.client
+            .query()
+            .table_name(&self.config.events_table)
+            .key_condition_expression("pk = :pk AND eventSequence > :seq")
+            .expression_attribute_values(":pk", AttributeValue::S(pk))
+            .expression_attribute_values(":seq", AttributeValue::N(after_sequence.to_string()))
+            .scan_index_forward(true)
+            .send()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+
+        let mut events = Vec::new();
+        if let Some(items) = result.items {
+            for item in items {
+                let seq = item
+                    .get("eventSequence")
+                    .and_then(|v| if let AttributeValue::N(n) = v { Some(n) } else { None })
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .ok_or_else(|| A2aStorageError::DatabaseError("Missing eventSequence".into()))?;
+
+                let data = item
+                    .get("eventData")
+                    .and_then(|v| if let AttributeValue::S(s) = v { Some(s) } else { None })
+                    .ok_or_else(|| A2aStorageError::DatabaseError("Missing eventData".into()))?;
+
+                let event: StreamEvent = serde_json::from_str(data)
+                    .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
+                events.push((seq, event));
+            }
+        }
+        Ok(events)
+    }
+
+    async fn latest_sequence(
+        &self,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<u64, A2aStorageError> {
+        let pk = Self::task_key(tenant, task_id);
+        query_max_sequence(&self.client, &self.config.events_table, &pk).await
+    }
+
+    async fn cleanup_expired(&self) -> Result<u64, A2aStorageError> {
+        Ok(0)
+    }
+}
+
+#[async_trait]
+impl A2aAtomicStore for DynamoDbA2aStorage {
+    fn backend_name(&self) -> &'static str {
+        "dynamodb"
+    }
+
+    async fn create_task_with_events(
+        &self,
+        tenant: &str,
+        owner: &str,
+        task: Task,
+        events: Vec<StreamEvent>,
+    ) -> Result<(Task, Vec<u64>), A2aStorageError> {
+        let pk = Self::task_key(tenant, task.id());
+        let task_json = Self::task_to_json(&task)?;
+        let state_str = Self::status_state_str(&task);
+
+        // Build TransactWriteItems: task put + event puts
+        let mut items = vec![
+            aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                .put(
+                    aws_sdk_dynamodb::types::Put::builder()
+                        .table_name(&self.config.tasks_table)
+                        .item("pk", AttributeValue::S(pk.clone()))
+                        .item("owner", AttributeValue::S(owner.to_string()))
+                        .item("taskJson", AttributeValue::S(task_json))
+                        .item("contextId", AttributeValue::S(task.context_id().to_string()))
+                        .item("statusState", AttributeValue::S(state_str))
+                        .item("updatedAt", AttributeValue::S(Self::now_iso()))
+                        .build()
+                        .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
+                )
+                .build(),
+        ];
+
+        let mut sequences = Vec::with_capacity(events.len());
+        for (i, event) in events.iter().enumerate() {
+            let seq = (i + 1) as u64;
+            sequences.push(seq);
+            let event_data = serde_json::to_string(event)
+                .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
+
+            items.push(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(
+                        aws_sdk_dynamodb::types::Put::builder()
+                            .table_name(&self.config.events_table)
+                            .item("pk", AttributeValue::S(pk.clone()))
+                            .item("eventSequence", AttributeValue::N(seq.to_string()))
+                            .item("eventData", AttributeValue::S(event_data))
+                            .build()
+                            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
+                    )
+                    .build(),
+            );
+        }
+
+        self.client
+            .transact_write_items()
+            .set_transact_items(Some(items))
+            .send()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+
+        Ok((task, sequences))
+    }
+
+    async fn update_task_status_with_events(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        owner: &str,
+        new_status: TaskStatus,
+        events: Vec<StreamEvent>,
+    ) -> Result<(Task, Vec<u64>), A2aStorageError> {
+        let pk = Self::task_key(tenant, task_id);
+
+        // Read current task for validation
+        let task = self.get_task(tenant, task_id, owner, None).await?
+            .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?;
+
+        let current_state = task
+            .status()
+            .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?
+            .state()
+            .map_err(A2aStorageError::TypeError)?;
+        let new_state = new_status.state().map_err(A2aStorageError::TypeError)?;
+
+        turul_a2a_types::state_machine::validate_transition(current_state, new_state).map_err(
+            |e| match e {
+                turul_a2a_types::A2aTypeError::InvalidTransition { current, requested } => {
+                    A2aStorageError::InvalidTransition { current, requested }
+                }
+                turul_a2a_types::A2aTypeError::TerminalState(s) => A2aStorageError::TerminalState(s),
+                other => A2aStorageError::TypeError(other),
+            },
+        )?;
+
+        // Build updated task
+        let mut proto = task.as_proto().clone();
+        proto.status = Some(new_status.into_proto());
+        let updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+
+        let task_json = Self::task_to_json(&updated_task)?;
+        let state_str = Self::status_state_str(&updated_task);
+
+        // Get current max sequence for event numbering
+        let max_seq = query_max_sequence(&self.client, &self.config.events_table, &pk).await?;
+
+        // Build TransactWriteItems: task update + event puts
+        let mut items = vec![
+            aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                .put(
+                    aws_sdk_dynamodb::types::Put::builder()
+                        .table_name(&self.config.tasks_table)
+                        .item("pk", AttributeValue::S(pk.clone()))
+                        .item("owner", AttributeValue::S(owner.to_string()))
+                        .item("taskJson", AttributeValue::S(task_json))
+                        .item("contextId", AttributeValue::S(updated_task.context_id().to_string()))
+                        .item("statusState", AttributeValue::S(state_str))
+                        .item("updatedAt", AttributeValue::S(Self::now_iso()))
+                        .condition_expression("#owner = :owner")
+                        .expression_attribute_names("#owner", "owner")
+                        .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()))
+                        .build()
+                        .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
+                )
+                .build(),
+        ];
+
+        let mut sequences = Vec::with_capacity(events.len());
+        for (i, event) in events.iter().enumerate() {
+            let seq = max_seq + (i as u64) + 1;
+            sequences.push(seq);
+            let event_data = serde_json::to_string(event)
+                .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
+
+            items.push(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(
+                        aws_sdk_dynamodb::types::Put::builder()
+                            .table_name(&self.config.events_table)
+                            .item("pk", AttributeValue::S(pk.clone()))
+                            .item("eventSequence", AttributeValue::N(seq.to_string()))
+                            .item("eventData", AttributeValue::S(event_data))
+                            .condition_expression("attribute_not_exists(pk)")
+                            .build()
+                            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
+                    )
+                    .build(),
+            );
+        }
+
+        self.client
+            .transact_write_items()
+            .set_transact_items(Some(items))
+            .send()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+
+        Ok((updated_task, sequences))
+    }
+
+    async fn update_task_with_events(
+        &self,
+        tenant: &str,
+        owner: &str,
+        task: Task,
+        events: Vec<StreamEvent>,
+    ) -> Result<Vec<u64>, A2aStorageError> {
+        let pk = Self::task_key(tenant, task.id());
+        let task_json = Self::task_to_json(&task)?;
+        let state_str = Self::status_state_str(&task);
+
+        // Get current max sequence
+        let max_seq = query_max_sequence(&self.client, &self.config.events_table, &pk).await?;
+
+        // Build TransactWriteItems: task put (with owner check) + event puts
+        let mut items = vec![
+            aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                .put(
+                    aws_sdk_dynamodb::types::Put::builder()
+                        .table_name(&self.config.tasks_table)
+                        .item("pk", AttributeValue::S(pk.clone()))
+                        .item("owner", AttributeValue::S(owner.to_string()))
+                        .item("taskJson", AttributeValue::S(task_json))
+                        .item("contextId", AttributeValue::S(task.context_id().to_string()))
+                        .item("statusState", AttributeValue::S(state_str))
+                        .item("updatedAt", AttributeValue::S(Self::now_iso()))
+                        .condition_expression("#owner = :owner")
+                        .expression_attribute_names("#owner", "owner")
+                        .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()))
+                        .build()
+                        .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
+                )
+                .build(),
+        ];
+
+        let mut sequences = Vec::with_capacity(events.len());
+        for (i, event) in events.iter().enumerate() {
+            let seq = max_seq + (i as u64) + 1;
+            sequences.push(seq);
+            let event_data = serde_json::to_string(event)
+                .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
+
+            items.push(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(
+                        aws_sdk_dynamodb::types::Put::builder()
+                            .table_name(&self.config.events_table)
+                            .item("pk", AttributeValue::S(pk.clone()))
+                            .item("eventSequence", AttributeValue::N(seq.to_string()))
+                            .item("eventData", AttributeValue::S(event_data))
+                            .condition_expression("attribute_not_exists(pk)")
+                            .build()
+                            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
+                    )
+                    .build(),
+            );
+        }
+
+        self.client
+            .transact_write_items()
+            .set_transact_items(Some(items))
+            .send()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+
+        Ok(sequences)
+    }
+}
+
 /// DynamoDB parity tests require AWS credentials and DynamoDB access.
 ///
 /// Run sequentially (DynamoDB table creation is throttled):
@@ -624,6 +1003,70 @@ mod tests {
 
     const TEST_TASKS_TABLE: &str = "test_a2a_tasks";
     const TEST_PUSH_TABLE: &str = "test_a2a_push_configs";
+    const TEST_EVENTS_TABLE: &str = "test_a2a_task_events";
+
+    /// Create the events table with pk (HASH) + eventSequence (RANGE).
+    async fn create_events_table(client: &Client, table_name: &str) {
+        let result = client
+            .create_table()
+            .table_name(table_name)
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name("pk")
+                    .key_type(KeyType::Hash)
+                    .build()
+                    .unwrap(),
+            )
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name("eventSequence")
+                    .key_type(KeyType::Range)
+                    .build()
+                    .unwrap(),
+            )
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name("pk")
+                    .attribute_type(ScalarAttributeType::S)
+                    .build()
+                    .unwrap(),
+            )
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name("eventSequence")
+                    .attribute_type(ScalarAttributeType::N)
+                    .build()
+                    .unwrap(),
+            )
+            .billing_mode(aws_sdk_dynamodb::types::BillingMode::PayPerRequest)
+            .send()
+            .await;
+
+        if let Err(e) = &result {
+            let err_debug = format!("{e:?}");
+            if !err_debug.contains("ResourceInUse") && !err_debug.contains("Table already exists") {
+                panic!("Failed to create events table {table_name}: {err_debug}");
+            }
+        }
+
+        // Wait for table to become ACTIVE
+        for _ in 0..30 {
+            let desc = client
+                .describe_table()
+                .table_name(table_name)
+                .send()
+                .await;
+            if let Ok(resp) = desc {
+                if let Some(table) = resp.table {
+                    if table.table_status == Some(aws_sdk_dynamodb::types::TableStatus::Active) {
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        panic!("Events table {table_name} did not become ACTIVE in time");
+    }
 
     /// Each test gets a unique tenant prefix for data isolation.
     /// Tests can run in parallel without interfering — the PK includes
@@ -641,6 +1084,7 @@ mod tests {
         if !TABLES_CREATED.swap(true, std::sync::atomic::Ordering::SeqCst) {
             create_test_table(&client, TEST_TASKS_TABLE).await;
             create_test_table(&client, TEST_PUSH_TABLE).await;
+            create_events_table(&client, TEST_EVENTS_TABLE).await;
         }
 
         let storage = DynamoDbA2aStorage::from_client(
@@ -648,6 +1092,7 @@ mod tests {
             DynamoDbConfig {
                 tasks_table: TEST_TASKS_TABLE.into(),
                 push_configs_table: TEST_PUSH_TABLE.into(),
+                events_table: TEST_EVENTS_TABLE.into(),
             },
         );
 
@@ -763,6 +1208,50 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl A2aEventStore for TestStorage {
+        fn backend_name(&self) -> &'static str { "dynamodb-test" }
+
+        async fn append_event(&self, tenant: &str, task_id: &str, event: StreamEvent)
+            -> Result<u64, A2aStorageError> {
+            self.inner.append_event(&self.scoped_tenant(tenant), task_id, event).await
+        }
+
+        async fn get_events_after(&self, tenant: &str, task_id: &str, after_sequence: u64)
+            -> Result<Vec<(u64, StreamEvent)>, A2aStorageError> {
+            self.inner.get_events_after(&self.scoped_tenant(tenant), task_id, after_sequence).await
+        }
+
+        async fn latest_sequence(&self, tenant: &str, task_id: &str)
+            -> Result<u64, A2aStorageError> {
+            self.inner.latest_sequence(&self.scoped_tenant(tenant), task_id).await
+        }
+
+        async fn cleanup_expired(&self) -> Result<u64, A2aStorageError> {
+            self.inner.cleanup_expired().await
+        }
+    }
+
+    #[async_trait]
+    impl A2aAtomicStore for TestStorage {
+        fn backend_name(&self) -> &'static str { "dynamodb-test" }
+
+        async fn create_task_with_events(&self, tenant: &str, owner: &str, task: Task, events: Vec<StreamEvent>)
+            -> Result<(Task, Vec<u64>), A2aStorageError> {
+            self.inner.create_task_with_events(&self.scoped_tenant(tenant), owner, task, events).await
+        }
+
+        async fn update_task_status_with_events(&self, tenant: &str, task_id: &str, owner: &str, new_status: TaskStatus, events: Vec<StreamEvent>)
+            -> Result<(Task, Vec<u64>), A2aStorageError> {
+            self.inner.update_task_status_with_events(&self.scoped_tenant(tenant), task_id, owner, new_status, events).await
+        }
+
+        async fn update_task_with_events(&self, tenant: &str, owner: &str, task: Task, events: Vec<StreamEvent>)
+            -> Result<Vec<u64>, A2aStorageError> {
+            self.inner.update_task_with_events(&self.scoped_tenant(tenant), owner, task, events).await
+        }
+    }
+
     #[tokio::test]
     async fn test_create_and_retrieve() {
         parity_tests::test_create_and_retrieve(&storage().await).await;
@@ -851,5 +1340,87 @@ mod tests {
     #[tokio::test]
     async fn test_push_config_list_pagination() {
         parity_tests::test_push_config_list_pagination(&storage().await).await;
+    }
+
+    // Event store parity tests
+
+    #[tokio::test]
+    async fn test_event_append_and_retrieve() {
+        parity_tests::test_event_append_and_retrieve(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_event_monotonic_ordering() {
+        parity_tests::test_event_monotonic_ordering(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_event_per_task_isolation() {
+        parity_tests::test_event_per_task_isolation(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_event_tenant_isolation() {
+        parity_tests::test_event_tenant_isolation(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_event_latest_sequence() {
+        parity_tests::test_event_latest_sequence(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_event_empty_task() {
+        parity_tests::test_event_empty_task(&storage().await).await;
+    }
+
+    // Atomic store parity tests
+
+    #[tokio::test]
+    async fn test_atomic_create_task_with_events() {
+        let s = storage().await;
+        parity_tests::test_atomic_create_task_with_events(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_update_status_with_events() {
+        let s = storage().await;
+        parity_tests::test_atomic_update_status_with_events(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_status_rejects_invalid_transition() {
+        let s = storage().await;
+        parity_tests::test_atomic_status_rejects_invalid_transition(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_update_task_with_events() {
+        let s = storage().await;
+        parity_tests::test_atomic_update_task_with_events(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_owner_isolation() {
+        let s = storage().await;
+        parity_tests::test_atomic_owner_isolation(&s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_tenant_isolation() {
+        let s = storage().await;
+        parity_tests::test_atomic_tenant_isolation(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_create_with_empty_events() {
+        let s = storage().await;
+        parity_tests::test_atomic_create_with_empty_events(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_sequence_continuity() {
+        let s = storage().await;
+        parity_tests::test_atomic_sequence_continuity(&s, &s).await;
     }
 }

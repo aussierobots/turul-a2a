@@ -63,14 +63,15 @@ impl AgentExecutor for CompletingExecutor {
 }
 
 fn test_state() -> AppState {
-    let storage = InMemoryA2aStorage::new();
+    let s = InMemoryA2aStorage::new();
     AppState {
         executor: Arc::new(CompletingExecutor),
-        task_storage: Arc::new(storage.clone()),
-        push_storage: Arc::new(storage),
+        task_storage: Arc::new(s.clone()),
+        push_storage: Arc::new(s.clone()),
+        event_store: std::sync::Arc::new(s.clone()),
+        atomic_store: std::sync::Arc::new(s),
         event_broker: turul_a2a::streaming::TaskEventBroker::new(),
         middleware_stack: std::sync::Arc::new(turul_a2a::middleware::MiddlewareStack::new(vec![])),
-        event_store: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
     }
 }
 
@@ -230,11 +231,11 @@ async fn get_task_not_found_returns_a2a_error_with_error_info() {
 
     assert_eq!(body["error"]["code"], -32001); // JSONRPC_TASK_NOT_FOUND
     // Must have ErrorInfo in data
-    let data = body["error"]["data"].as_array().unwrap();
-    assert!(!data.is_empty());
-    assert_eq!(data[0]["@type"], "type.googleapis.com/google.rpc.ErrorInfo");
-    assert_eq!(data[0]["reason"], "TASK_NOT_FOUND");
-    assert_eq!(data[0]["domain"], "a2a-protocol.org");
+    let data = &body["error"]["data"];
+    assert!(data.is_object(), "JSON-RPC error data should be an object");
+    assert_eq!(data["@type"], "type.googleapis.com/google.rpc.ErrorInfo");
+    assert_eq!(data["reason"], "TASK_NOT_FOUND");
+    assert_eq!(data["domain"], "a2a-protocol.org");
 }
 
 // =========================================================
@@ -281,9 +282,10 @@ async fn cancel_completed_task_returns_not_cancelable_error() {
     let (_, body) = jsonrpc_call(router, &jsonrpc_request("CancelTask", params, 5)).await;
 
     assert_eq!(body["error"]["code"], -32002); // JSONRPC_TASK_NOT_CANCELABLE
-    let data = body["error"]["data"].as_array().unwrap();
-    assert_eq!(data[0]["reason"], "TASK_NOT_CANCELABLE");
-    assert_eq!(data[0]["domain"], "a2a-protocol.org");
+    let data = &body["error"]["data"];
+    assert!(data.is_object(), "JSON-RPC error data should be an object");
+    assert_eq!(data["reason"], "TASK_NOT_CANCELABLE");
+    assert_eq!(data["domain"], "a2a-protocol.org");
 }
 
 // =========================================================
@@ -298,8 +300,9 @@ async fn get_extended_agent_card_not_configured() {
         jsonrpc_call(router, &jsonrpc_request("GetExtendedAgentCard", params, 6)).await;
 
     assert_eq!(body["error"]["code"], -32007); // EXTENDED_AGENT_CARD_NOT_CONFIGURED
-    let data = body["error"]["data"].as_array().unwrap();
-    assert_eq!(data[0]["reason"], "EXTENDED_AGENT_CARD_NOT_CONFIGURED");
+    let data = &body["error"]["data"];
+    assert!(data.is_object(), "JSON-RPC error data should be an object");
+    assert_eq!(data["reason"], "EXTENDED_AGENT_CARD_NOT_CONFIGURED");
 }
 
 // =========================================================

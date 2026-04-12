@@ -1,6 +1,10 @@
 //! SSE streaming infrastructure for A2A task events.
 //!
-//! Provides multi-subscriber fan-out for task status and artifact updates.
+//! The durable event store (`A2aEventStore`) is the source of truth for events.
+//! The `TaskEventBroker` is a wake-up signal only — it notifies same-instance
+//! subscribers that new data is available in the store. Subscribers always
+//! re-read from the store; the broker carries no event data or sequences.
+//!
 //! Used by `POST /message:stream` and `GET /tasks/{id}:subscribe`.
 
 pub mod replay;
@@ -9,10 +13,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, RwLock};
-use turul_a2a_types::{Artifact, TaskStatus};
 
-/// A single streaming event.
-#[derive(Debug, Clone, serde::Serialize)]
+/// A single streaming event (persisted in the durable event store).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum StreamEvent {
     /// Task status changed.
@@ -27,7 +30,24 @@ pub enum StreamEvent {
     },
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+impl StreamEvent {
+    /// Check if this event represents a terminal task state.
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            StreamEvent::StatusUpdate { status_update } => {
+                status_update.status.get("state")
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| matches!(s,
+                        "TASK_STATE_COMPLETED" | "TASK_STATE_FAILED" |
+                        "TASK_STATE_CANCELED" | "TASK_STATE_REJECTED"
+                    ))
+            }
+            StreamEvent::ArtifactUpdate { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StatusUpdatePayload {
     #[serde(rename = "taskId")]
     pub task_id: String,
@@ -36,7 +56,7 @@ pub struct StatusUpdatePayload {
     pub status: serde_json::Value,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ArtifactUpdatePayload {
     #[serde(rename = "taskId")]
     pub task_id: String,
@@ -51,13 +71,17 @@ pub struct ArtifactUpdatePayload {
 /// Channel capacity per task.
 const CHANNEL_CAPACITY: usize = 64;
 
-/// Manages broadcast channels for streaming task events.
+/// Wake-up signal broker for streaming subscribers.
 ///
-/// Each task gets its own broadcast channel. Multiple subscribers
-/// can listen to the same task's events.
+/// Each task gets its own broadcast channel carrying `()` signals.
+/// The broker does NOT carry event data or sequence numbers — it only
+/// tells subscribers "new data is available in the store, re-read now."
+///
+/// This is a same-instance latency optimization. Cross-instance subscribers
+/// fall back to periodic store polling.
 #[derive(Clone)]
 pub struct TaskEventBroker {
-    channels: Arc<RwLock<HashMap<String, broadcast::Sender<StreamEvent>>>>,
+    channels: Arc<RwLock<HashMap<String, broadcast::Sender<()>>>>,
 }
 
 impl TaskEventBroker {
@@ -67,11 +91,11 @@ impl TaskEventBroker {
         }
     }
 
-    /// Get or create a broadcast sender for a task.
-    pub async fn get_or_create_sender(
+    /// Get or create a wake-up sender for a task.
+    async fn get_or_create_sender(
         &self,
         task_id: &str,
-    ) -> broadcast::Sender<StreamEvent> {
+    ) -> broadcast::Sender<()> {
         let mut channels = self.channels.write().await;
         channels
             .entry(task_id.to_string())
@@ -79,54 +103,21 @@ impl TaskEventBroker {
             .clone()
     }
 
-    /// Subscribe to events for a task. Returns a receiver.
+    /// Subscribe to wake-up notifications for a task.
+    /// Returns a receiver that yields `()` when new events are available in the store.
     pub async fn subscribe(
         &self,
         task_id: &str,
-    ) -> broadcast::Receiver<StreamEvent> {
+    ) -> broadcast::Receiver<()> {
         let sender = self.get_or_create_sender(task_id).await;
         sender.subscribe()
     }
 
-    /// Publish a status update event.
-    pub async fn publish_status_update(
-        &self,
-        task_id: &str,
-        context_id: &str,
-        status: &TaskStatus,
-    ) {
+    /// Notify subscribers that new event data is available in the store for this task.
+    /// Fire-and-forget — no error if there are no subscribers.
+    pub async fn notify(&self, task_id: &str) {
         let sender = self.get_or_create_sender(task_id).await;
-        let event = StreamEvent::StatusUpdate {
-            status_update: StatusUpdatePayload {
-                task_id: task_id.to_string(),
-                context_id: context_id.to_string(),
-                status: serde_json::to_value(status).unwrap_or_default(),
-            },
-        };
-        // Ignore send errors (no subscribers is fine)
-        let _ = sender.send(event);
-    }
-
-    /// Publish an artifact update event.
-    pub async fn publish_artifact_update(
-        &self,
-        task_id: &str,
-        context_id: &str,
-        artifact: &Artifact,
-        append: bool,
-        last_chunk: bool,
-    ) {
-        let sender = self.get_or_create_sender(task_id).await;
-        let event = StreamEvent::ArtifactUpdate {
-            artifact_update: ArtifactUpdatePayload {
-                task_id: task_id.to_string(),
-                context_id: context_id.to_string(),
-                artifact: serde_json::to_value(artifact).unwrap_or_default(),
-                append,
-                last_chunk,
-            },
-        };
-        let _ = sender.send(event);
+        let _ = sender.send(());
     }
 
     /// Remove a task's channel (cleanup after terminal state).
@@ -149,131 +140,92 @@ impl Default for TaskEventBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use turul_a2a_types::{Part, TaskState};
 
     // =========================================================
-    // Streaming event tests — contract before implementation
+    // Broker tests — wake-up signal semantics
     // =========================================================
 
     #[tokio::test]
-    async fn subscribe_receives_published_status_update() {
+    async fn subscriber_receives_notification() {
         let broker = TaskEventBroker::new();
         let mut rx = broker.subscribe("task-1").await;
 
-        let status = TaskStatus::new(TaskState::Working);
-        broker.publish_status_update("task-1", "ctx-1", &status).await;
+        broker.notify("task-1").await;
 
-        let event = rx.recv().await.unwrap();
-        match event {
-            StreamEvent::StatusUpdate { status_update } => {
-                assert_eq!(status_update.task_id, "task-1");
-                assert_eq!(status_update.context_id, "ctx-1");
-            }
-            _ => panic!("Expected StatusUpdate"),
-        }
+        let result = rx.recv().await;
+        assert!(result.is_ok(), "Subscriber should receive () notification");
     }
 
     #[tokio::test]
-    async fn subscribe_receives_published_artifact_update() {
+    async fn multiple_notifications_arrive_in_order() {
         let broker = TaskEventBroker::new();
         let mut rx = broker.subscribe("task-2").await;
 
-        let artifact = Artifact::new("art-1", vec![Part::text("chunk")]);
-        broker
-            .publish_artifact_update("task-2", "ctx-2", &artifact, true, false)
-            .await;
+        broker.notify("task-2").await;
+        broker.notify("task-2").await;
+        broker.notify("task-2").await;
 
-        let event = rx.recv().await.unwrap();
-        match event {
-            StreamEvent::ArtifactUpdate { artifact_update } => {
-                assert_eq!(artifact_update.task_id, "task-2");
-                assert!(artifact_update.append);
-                assert!(!artifact_update.last_chunk);
-            }
-            _ => panic!("Expected ArtifactUpdate"),
-        }
+        // All three should arrive
+        assert!(rx.recv().await.is_ok());
+        assert!(rx.recv().await.is_ok());
+        assert!(rx.recv().await.is_ok());
     }
 
     #[tokio::test]
-    async fn events_arrive_in_order() {
+    async fn multiple_subscribers_all_notified() {
         let broker = TaskEventBroker::new();
-        let mut rx = broker.subscribe("task-3").await;
+        let mut rx1 = broker.subscribe("task-3").await;
+        let mut rx2 = broker.subscribe("task-3").await;
 
-        // Publish 3 status updates with different states
-        for state in [TaskState::Working, TaskState::InputRequired, TaskState::Completed] {
-            broker
-                .publish_status_update("task-3", "ctx-3", &TaskStatus::new(state))
-                .await;
-        }
+        broker.notify("task-3").await;
 
-        // Must arrive in order
-        let e1 = rx.recv().await.unwrap();
-        let e2 = rx.recv().await.unwrap();
-        let e3 = rx.recv().await.unwrap();
-
-        match (&e1, &e2, &e3) {
-            (
-                StreamEvent::StatusUpdate { status_update: s1 },
-                StreamEvent::StatusUpdate { status_update: s2 },
-                StreamEvent::StatusUpdate { status_update: s3 },
-            ) => {
-                // Verify ordering via state values
-                assert!(s1.status["state"].as_str().unwrap().contains("WORKING"));
-                assert!(s2.status["state"].as_str().unwrap().contains("INPUT_REQUIRED"));
-                assert!(s3.status["state"].as_str().unwrap().contains("COMPLETED"));
-            }
-            _ => panic!("Expected 3 StatusUpdate events"),
-        }
+        assert!(rx1.recv().await.is_ok(), "Subscriber 1 should be notified");
+        assert!(rx2.recv().await.is_ok(), "Subscriber 2 should be notified");
     }
 
     #[tokio::test]
-    async fn multiple_subscribers_receive_same_events() {
+    async fn notify_without_subscribers_does_not_error() {
         let broker = TaskEventBroker::new();
-        let mut rx1 = broker.subscribe("task-4").await;
-        let mut rx2 = broker.subscribe("task-4").await;
-
-        broker
-            .publish_status_update("task-4", "ctx-4", &TaskStatus::new(TaskState::Working))
-            .await;
-
-        let e1 = rx1.recv().await.unwrap();
-        let e2 = rx2.recv().await.unwrap();
-
-        // Both should receive the same event
-        match (&e1, &e2) {
-            (
-                StreamEvent::StatusUpdate { status_update: s1 },
-                StreamEvent::StatusUpdate { status_update: s2 },
-            ) => {
-                assert_eq!(s1.task_id, s2.task_id);
-                assert_eq!(s1.task_id, "task-4");
-            }
-            _ => panic!("Both subscribers should get StatusUpdate"),
-        }
-    }
-
-    #[tokio::test]
-    async fn publish_without_subscribers_does_not_error() {
-        let broker = TaskEventBroker::new();
-        // Publishing with no subscribers should not panic or error
-        broker
-            .publish_status_update("task-5", "ctx-5", &TaskStatus::new(TaskState::Working))
-            .await;
+        // Should not panic or error
+        broker.notify("task-4").await;
     }
 
     #[tokio::test]
     async fn remove_cleans_up_channel() {
         let broker = TaskEventBroker::new();
-        let _rx = broker.subscribe("task-6").await;
-        assert!(broker.has_channel("task-6").await);
+        let _rx = broker.subscribe("task-5").await;
+        assert!(broker.has_channel("task-5").await);
 
-        broker.remove("task-6").await;
-        assert!(!broker.has_channel("task-6").await);
+        broker.remove("task-5").await;
+        assert!(!broker.has_channel("task-5").await);
     }
 
     #[tokio::test]
-    async fn stream_event_serialization_matches_proto() {
-        // StatusUpdate serializes with correct camelCase field names
+    async fn cross_task_isolation() {
+        let broker = TaskEventBroker::new();
+        let mut rx_a = broker.subscribe("task-a").await;
+        let mut rx_b = broker.subscribe("task-b").await;
+
+        // Notify only task-a
+        broker.notify("task-a").await;
+
+        assert!(rx_a.recv().await.is_ok(), "task-a subscriber should be notified");
+
+        // task-b should have nothing — use try_recv to avoid blocking
+        // (broadcast recv would block, so we check via a timeout)
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            rx_b.recv(),
+        ).await;
+        assert!(result.is_err(), "task-b should NOT be notified");
+    }
+
+    // =========================================================
+    // StreamEvent serialization tests (event type, not broker)
+    // =========================================================
+
+    #[test]
+    fn stream_event_serialization_matches_proto() {
         let event = StreamEvent::StatusUpdate {
             status_update: StatusUpdatePayload {
                 task_id: "t-1".to_string(),
@@ -286,7 +238,6 @@ mod tests {
         assert_eq!(json["statusUpdate"]["taskId"], "t-1");
         assert_eq!(json["statusUpdate"]["contextId"], "c-1");
 
-        // ArtifactUpdate serializes with append/lastChunk
         let event = StreamEvent::ArtifactUpdate {
             artifact_update: ArtifactUpdatePayload {
                 task_id: "t-2".to_string(),
@@ -300,5 +251,43 @@ mod tests {
         assert!(json.get("artifactUpdate").is_some());
         assert_eq!(json["artifactUpdate"]["append"], true);
         assert_eq!(json["artifactUpdate"]["lastChunk"], true);
+    }
+
+    #[test]
+    fn is_terminal_detects_terminal_states() {
+        for state in ["TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"] {
+            let event = StreamEvent::StatusUpdate {
+                status_update: StatusUpdatePayload {
+                    task_id: "t".into(), context_id: "c".into(),
+                    status: serde_json::json!({"state": state}),
+                },
+            };
+            assert!(event.is_terminal(), "{state} should be terminal");
+        }
+    }
+
+    #[test]
+    fn is_terminal_rejects_non_terminal_states() {
+        for state in ["TASK_STATE_SUBMITTED", "TASK_STATE_WORKING", "TASK_STATE_INPUT_REQUIRED"] {
+            let event = StreamEvent::StatusUpdate {
+                status_update: StatusUpdatePayload {
+                    task_id: "t".into(), context_id: "c".into(),
+                    status: serde_json::json!({"state": state}),
+                },
+            };
+            assert!(!event.is_terminal(), "{state} should NOT be terminal");
+        }
+    }
+
+    #[test]
+    fn artifact_update_is_never_terminal() {
+        let event = StreamEvent::ArtifactUpdate {
+            artifact_update: ArtifactUpdatePayload {
+                task_id: "t".into(), context_id: "c".into(),
+                artifact: serde_json::json!({}),
+                append: false, last_chunk: true,
+            },
+        };
+        assert!(!event.is_terminal());
     }
 }

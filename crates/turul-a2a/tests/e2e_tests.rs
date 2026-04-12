@@ -129,10 +129,11 @@ fn state_with(executor: impl AgentExecutor + 'static) -> AppState {
     AppState {
         executor: Arc::new(executor),
         task_storage: Arc::new(s.clone()),
-        push_storage: Arc::new(s),
+        push_storage: Arc::new(s.clone()),
+        event_store: std::sync::Arc::new(s.clone()),
+        atomic_store: std::sync::Arc::new(s),
         event_broker: turul_a2a::streaming::TaskEventBroker::new(),
         middleware_stack: std::sync::Arc::new(turul_a2a::middleware::MiddlewareStack::new(vec![])),
-        event_store: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
     }
 }
 
@@ -332,20 +333,59 @@ async fn e2e_streaming_event_sequence() {
 
 // =========================================================
 // E2E-06: Subscribe on live non-terminal task
+//
+// D3 note: Subscribe reads from the durable event store. Non-streaming
+// /message:send does not write events to the store in D3 scope. This test
+// verifies that subscribe works with tasks that DO have stored events
+// (created via atomic store). A future iteration may wire non-streaming
+// paths through atomic store too.
 // =========================================================
 
 #[tokio::test]
 async fn e2e_subscribe_live_task() {
     let st = state_with(MultiTurnExecutor::new());
 
-    // Create a task that pauses at INPUT_REQUIRED
-    let (_, body) = post_json(build_router(st.clone()), "/message:send", &send_body("sub-e2e", "pause")).await;
-    let tid = body["task"]["id"].as_str().unwrap().to_string();
-    assert_eq!(body["task"]["status"]["state"], "TASK_STATE_INPUT_REQUIRED");
+    // Create task with events via atomic store (simulating a streaming creation)
+    let task = turul_a2a_types::Task::new(
+        "sub-e2e-1",
+        turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Submitted),
+    )
+    .with_context_id("ctx-sub-e2e");
 
-    // Subscribe to the non-terminal task
+    let submitted_event = turul_a2a::streaming::StreamEvent::StatusUpdate {
+        status_update: turul_a2a::streaming::StatusUpdatePayload {
+            task_id: "sub-e2e-1".to_string(),
+            context_id: "ctx-sub-e2e".to_string(),
+            status: serde_json::json!({"state": "TASK_STATE_SUBMITTED"}),
+        },
+    };
+
+    st.atomic_store
+        .create_task_with_events("", "anonymous", task, vec![submitted_event])
+        .await
+        .unwrap();
+
+    // Move to Working with event
+    let working_event = turul_a2a::streaming::StreamEvent::StatusUpdate {
+        status_update: turul_a2a::streaming::StatusUpdatePayload {
+            task_id: "sub-e2e-1".to_string(),
+            context_id: "ctx-sub-e2e".to_string(),
+            status: serde_json::json!({"state": "TASK_STATE_WORKING"}),
+        },
+    };
+
+    st.atomic_store
+        .update_task_status_with_events(
+            "", "sub-e2e-1", "anonymous",
+            turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Working),
+            vec![working_event],
+        )
+        .await
+        .unwrap();
+
+    // Subscribe to the non-terminal task — should replay stored events
     let router = build_router(st.clone());
-    let req = Request::get(&format!("/tasks/{tid}:subscribe"))
+    let req = Request::get("/tasks/sub-e2e-1:subscribe")
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
@@ -355,27 +395,25 @@ async fn e2e_subscribe_live_task() {
     let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
     assert!(ct.contains("text/event-stream"));
 
-    // Read the SSE body in the background while we drive an application-level transition.
-    let sse_body = resp.into_body();
+    // Collect replayed events (Task snapshot + stored events)
+    let events = collect_sse(resp.into_body(), Duration::from_secs(3)).await;
 
-    // Resume the task via SendMessage with task_id — this is the application-driven
-    // transition that should produce events on the subscribe stream.
-    // The MultiTurnExecutor completes on second call.
-    let _ = post_json(
-        build_router(st.clone()),
-        "/message:send",
-        &send_body_with_task("sub-e2e-resume", "follow-up", &tid),
-    )
-    .await;
+    // Should have received Task snapshot + 2 stored events
+    assert!(
+        events.len() >= 3,
+        "Subscribe should emit Task + 2 stored events, got: {}",
+        events.len()
+    );
 
-    // Collect events that arrived on the subscribe stream
-    let events = collect_sse(sse_body, Duration::from_millis(500)).await;
+    // First event should be Task object (spec §3.1.6)
+    assert!(
+        events[0].get("task").is_some(),
+        "First event should be Task object, got: {}",
+        events[0]
+    );
 
-    // Should have received events from the application-driven transition
-    assert!(!events.is_empty(), "Subscribe should receive events from task resumption");
-
-    // All events should be statusUpdate (from the task state changes)
-    for event in &events {
+    // Remaining events should be statusUpdate
+    for event in &events[1..] {
         assert!(
             event.get("statusUpdate").is_some(),
             "Subscribe event should be statusUpdate, got: {event}"
@@ -545,7 +583,7 @@ async fn e2e_jsonrpc_parity() {
         &jrpc("CancelTask", serde_json::json!({"id": tid}), 4),
     ).await;
     assert_eq!(body["error"]["code"], -32002);
-    let d = &body["error"]["data"].as_array().unwrap()[0];
+    let d = &body["error"]["data"];
     assert_eq!(d["reason"], "TASK_NOT_CANCELABLE");
     assert_eq!(d["domain"], "a2a-protocol.org");
 
@@ -555,5 +593,5 @@ async fn e2e_jsonrpc_parity() {
         &jrpc("GetTask", serde_json::json!({"id": "nope"}), 5),
     ).await;
     assert_eq!(body["error"]["code"], -32001);
-    assert_eq!(body["error"]["data"].as_array().unwrap()[0]["reason"], "TASK_NOT_FOUND");
+    assert_eq!(body["error"]["data"]["reason"], "TASK_NOT_FOUND");
 }

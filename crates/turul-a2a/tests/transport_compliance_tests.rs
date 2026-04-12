@@ -45,10 +45,11 @@ fn test_state() -> AppState {
     AppState {
         executor: Arc::new(DummyExecutor),
         task_storage: Arc::new(s.clone()),
-        push_storage: Arc::new(s),
+        push_storage: Arc::new(s.clone()),
+        event_store: Arc::new(s.clone()),
+        atomic_store: Arc::new(s),
         event_broker: TaskEventBroker::new(),
         middleware_stack: Arc::new(turul_a2a::middleware::MiddlewareStack::new(vec![])),
-        event_store: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
     }
 }
 
@@ -81,9 +82,8 @@ async fn request_with_valid_a2a_version_succeeds() {
 }
 
 #[tokio::test]
-async fn request_without_a2a_version_assumes_0_3_and_rejects() {
-    // Per spec: "Agents MUST interpret empty value as 0.3 version"
-    // If server only supports 1.0, empty/missing A2A-Version = 0.3 → VersionNotSupportedError
+async fn request_without_a2a_version_rejects() {
+    // Missing A2A-Version header → VersionNotSupportedError
     let router = build_router(test_state());
     let req = Request::post("/message:send")
         .header("content-type", "application/json")
@@ -91,7 +91,7 @@ async fn request_without_a2a_version_assumes_0_3_and_rejects() {
         .body(Body::from(send_body()))
         .unwrap();
     let (status, body) = json_response(router, req).await;
-    assert_eq!(status, 400, "Missing A2A-Version should be treated as 0.3 → VersionNotSupportedError");
+    assert_eq!(status, 400, "Missing A2A-Version header → VersionNotSupportedError");
     // Check for VersionNotSupportedError in response
     if let Some(details) = body["error"]["details"].as_array() {
         if !details.is_empty() {

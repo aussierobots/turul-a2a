@@ -78,14 +78,15 @@ impl AgentExecutor for CompletingExecutor {
 }
 
 fn test_state() -> AppState {
-    let storage = InMemoryA2aStorage::new();
+    let s = InMemoryA2aStorage::new();
     AppState {
         executor: Arc::new(CompletingExecutor),
-        task_storage: Arc::new(storage.clone()),
-        push_storage: Arc::new(storage),
+        task_storage: Arc::new(s.clone()),
+        push_storage: Arc::new(s.clone()),
+        event_store: std::sync::Arc::new(s.clone()),
+        atomic_store: std::sync::Arc::new(s),
         event_broker: turul_a2a::streaming::TaskEventBroker::new(),
         middleware_stack: std::sync::Arc::new(turul_a2a::middleware::MiddlewareStack::new(vec![])),
-        event_store: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
     }
 }
 
@@ -119,22 +120,43 @@ async fn collect_sse_events(
     }
 }
 
+/// Parsed SSE event with both data and id.
+struct ParsedSseEvent {
+    id: Option<String>,
+    data: serde_json::Value,
+}
+
 /// Parse SSE text format into JSON data payloads.
 /// SSE format: "data: {json}\n\n" per event, with optional "event:" and "id:" lines.
 fn parse_sse_events(text: &str) -> Vec<serde_json::Value> {
+    parse_sse_events_with_ids(text)
+        .into_iter()
+        .map(|e| e.data)
+        .collect()
+}
+
+/// Parse SSE text format into events with both data and id fields.
+fn parse_sse_events_with_ids(text: &str) -> Vec<ParsedSseEvent> {
     let mut events = Vec::new();
     for chunk in text.split("\n\n") {
         let chunk = chunk.trim();
         if chunk.is_empty() {
             continue;
         }
+        let mut id = None;
+        let mut data = None;
         for line in chunk.lines() {
-            if let Some(data) = line.strip_prefix("data:") {
-                let data = data.trim();
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                    events.push(json);
+            if let Some(id_val) = line.strip_prefix("id:") {
+                id = Some(id_val.trim().to_string());
+            } else if let Some(data_val) = line.strip_prefix("data:") {
+                let data_val = data_val.trim();
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_val) {
+                    data = Some(json);
                 }
             }
+        }
+        if let Some(data) = data {
+            events.push(ParsedSseEvent { id, data });
         }
     }
     events
@@ -301,6 +323,63 @@ async fn message_stream_includes_terminal_event() {
     );
 }
 
+#[tokio::test]
+async fn message_stream_events_have_durable_ids() {
+    let state = test_state();
+    let router = build_router(state);
+    let req = Request::post("/message:stream")
+        .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
+        .body(Body::from(send_message_body("sse-ids", "check ids")))
+        .unwrap();
+
+    let resp = router.oneshot(req).await.unwrap();
+    let bytes = tokio::time::timeout(Duration::from_secs(2), async {
+        resp.into_body().collect().await.unwrap().to_bytes()
+    })
+    .await
+    .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    let events = parse_sse_events_with_ids(&text);
+
+    assert!(!events.is_empty(), "Should have events");
+
+    // Every event must have an id in {task_id}:{sequence} format
+    for (i, event) in events.iter().enumerate() {
+        let id = event.id.as_ref().unwrap_or_else(|| {
+            panic!("Event {i} missing id: field")
+        });
+        // Parse with the replay module's format
+        assert!(
+            id.contains(':'),
+            "Event id should be {{task_id}}:{{sequence}}, got: {id}"
+        );
+        let parts: Vec<&str> = id.rsplitn(2, ':').collect();
+        assert!(
+            parts[0].parse::<u64>().is_ok(),
+            "Sequence part should be numeric, got: {}",
+            parts[0]
+        );
+    }
+
+    // Sequences should be monotonically increasing
+    let sequences: Vec<u64> = events
+        .iter()
+        .filter_map(|e| e.id.as_ref())
+        .filter_map(|id| id.rsplit_once(':'))
+        .filter_map(|(_, seq)| seq.parse::<u64>().ok())
+        .collect();
+
+    for window in sequences.windows(2) {
+        assert!(
+            window[0] < window[1],
+            "Event sequences should be monotonically increasing: {} >= {}",
+            window[0],
+            window[1]
+        );
+    }
+}
+
 // =========================================================
 // POST /message:stream — tenant scoping
 // =========================================================
@@ -349,6 +428,7 @@ async fn subscribe_missing_task_returns_404() {
 
 #[tokio::test]
 async fn subscribe_terminal_task_returns_error() {
+    // Spec §3.1.6: terminal tasks return UnsupportedOperationError
     let state = test_state();
 
     // Create and complete a task via normal send
@@ -370,11 +450,10 @@ async fn subscribe_terminal_task_returns_error() {
         .body(Body::empty())
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
-    // Should be an error, not an SSE stream
-    assert_ne!(
+    assert_eq!(
         resp.status(),
-        200,
-        "Subscribe to terminal task should not return 200"
+        400,
+        "Subscribe to terminal task should return 400 (UnsupportedOperationError)"
     );
 }
 
@@ -409,53 +488,52 @@ async fn subscribe_tenant_scoped_missing_returns_404() {
 // =========================================================
 
 #[tokio::test]
-async fn subscribe_non_terminal_task_returns_sse_with_status_snapshot() {
+async fn subscribe_non_terminal_task_returns_sse_with_stored_events() {
     let state = test_state();
 
-    // Create a task directly in storage in WORKING state (non-terminal)
+    // Create task with events via atomic store (D3 model)
     let task = turul_a2a_types::Task::new(
         "sub-happy-1",
-        turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Working),
+        turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Submitted),
     )
     .with_context_id("ctx-sub-happy");
 
+    let submitted_event = turul_a2a::streaming::StreamEvent::StatusUpdate {
+        status_update: turul_a2a::streaming::StatusUpdatePayload {
+            task_id: "sub-happy-1".to_string(),
+            context_id: "ctx-sub-happy".to_string(),
+            status: serde_json::json!({"state": "TASK_STATE_SUBMITTED"}),
+        },
+    };
+
     state
-        .task_storage
-        .create_task("", "anonymous", task)
+        .atomic_store
+        .create_task_with_events("", "anonymous", task, vec![submitted_event])
         .await
         .unwrap();
 
-    // Advance to Working (it was created as Submitted internally, need to match)
-    // Actually Task::new creates with the given status directly, but storage
-    // might validate. Let me create as Submitted then advance.
-    // Re-create properly:
-    let task2 = turul_a2a_types::Task::new(
-        "sub-happy-2",
-        turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Submitted),
-    )
-    .with_context_id("ctx-sub-happy-2");
+    // Advance to Working with event
+    let working_event = turul_a2a::streaming::StreamEvent::StatusUpdate {
+        status_update: turul_a2a::streaming::StatusUpdatePayload {
+            task_id: "sub-happy-1".to_string(),
+            context_id: "ctx-sub-happy".to_string(),
+            status: serde_json::json!({"state": "TASK_STATE_WORKING"}),
+        },
+    };
 
     state
-        .task_storage
-        .create_task("", "anonymous", task2)
-        .await
-        .unwrap();
-
-    // Move to Working (non-terminal)
-    state
-        .task_storage
-        .update_task_status(
-            "",
-            "sub-happy-2",
-            "anonymous",
+        .atomic_store
+        .update_task_status_with_events(
+            "", "sub-happy-1", "anonymous",
             turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Working),
+            vec![working_event],
         )
         .await
         .unwrap();
 
-    // Subscribe — should return 200 + text/event-stream
+    // Subscribe — should return 200 + text/event-stream with replayed events
     let router = build_router(state);
-    let req = Request::get("/tasks/sub-happy-2:subscribe")
+    let req = Request::get("/tasks/sub-happy-1:subscribe")
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
@@ -473,26 +551,30 @@ async fn subscribe_non_terminal_task_returns_sse_with_status_snapshot() {
         "Subscribe should return text/event-stream, got: {content_type}"
     );
 
-    // Read the first event — should be a status snapshot
-    let events = collect_sse_events(resp.into_body(), Duration::from_secs(2)).await;
+    // Should emit Task snapshot (spec §3.1.6) + replay stored events (SUBMITTED + WORKING)
+    let events = collect_sse_events(resp.into_body(), Duration::from_secs(3)).await;
     assert!(
-        !events.is_empty(),
-        "Subscribe should emit at least one event (current status snapshot)"
+        events.len() >= 3,
+        "Subscribe should emit Task snapshot + 2 stored events, got: {}",
+        events.len()
     );
 
+    // First event MUST be a Task object (spec §3.1.6)
     let first = &events[0];
     assert!(
-        first.get("statusUpdate").is_some(),
-        "First subscribe event should be statusUpdate, got: {first}"
+        first.get("task").is_some(),
+        "First subscribe event MUST be a Task object (spec §3.1.6), got: {first}"
     );
-    let su = &first["statusUpdate"];
-    assert_eq!(su["taskId"], "sub-happy-2");
-    assert_eq!(su["contextId"], "ctx-sub-happy-2");
+    assert_eq!(
+        first["task"]["id"].as_str().unwrap_or(""),
+        "sub-happy-1",
+        "Task snapshot should contain the task ID"
+    );
+
+    // Subsequent events are stored StreamEvents
+    let second = &events[1];
     assert!(
-        su["status"]["state"]
-            .as_str()
-            .unwrap_or("")
-            .contains("WORKING"),
-        "Status snapshot should reflect current WORKING state"
+        second.get("statusUpdate").is_some(),
+        "Second event should be statusUpdate from store, got: {second}"
     );
 }

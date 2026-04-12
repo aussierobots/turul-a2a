@@ -47,6 +47,8 @@ If these conflict, the normative A2A proto wins for wire-level behavior.
 ### Version Hygiene
 
 - Always verify the current A2A version before making protocol claims.
+- Before claiming A2A compliance, protocol completeness, or "latest spec" support, perform a fresh diff between the vendored `proto/a2a.proto` and the current upstream A2A proto/spec revision being targeted.
+- If the repo is intentionally pinned to an older upstream revision, document that explicitly and do not describe the implementation as compliant with the latest spec.
 - Do not mix older `v0.1`/`v0.2`/`v0.3` field names or routes into v1.x planning.
 - Common drift risks that must be checked explicitly:
   - `.well-known/agent-card.json` vs older `.well-known/agent.json`
@@ -160,6 +162,16 @@ Tests should verify protocol behavior, not just Rust internals:
 - streaming event ordering
 - auth-required and input-required behavior
 - truthful capability advertisement
+
+### Compliance Audit Gate
+
+- A vendored proto is not, by itself, proof of current upstream compliance.
+- Before approving work that is described as "A2A compliant", "spec complete", or equivalent, verify whether the vendored proto/spec snapshot still matches the latest official upstream revision the repo claims to target.
+- If drift exists, classify it explicitly:
+  - intentional version pin
+  - local bug relative to the pinned revision
+  - latest-upstream compliance gap
+- Do not collapse those categories into one generic "spec bug" bucket.
 
 ## Review Discipline
 

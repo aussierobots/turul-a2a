@@ -8,14 +8,14 @@ Turul-a2a is a Rust implementation of the A2A (Agent-to-Agent) Protocol v1.0. Li
 
 **Proto-first architecture**: Types are generated from the normative `proto/a2a.proto` (package `lf.a2a.v1`) using `prost` + `pbjson`, then wrapped in ergonomic Rust types.
 
-**Maturity**: Single-instance and multi-instance request/response verified (334+ tests including distributed verification with shared backend). Lambda adapter verified. Cross-instance streaming/subscription deferred to D3 (ADR-009).
+**Maturity**: D3 durable event coordination complete across all deployment surfaces (359+ tests, 455 with all backends). Four parity-proven backends (in-memory, SQLite, PostgreSQL, DynamoDB) implement event store + atomic task/event writes. Cross-instance streaming verified: store is truth, broker is wake-up signal, terminal replay works, Last-Event-ID reconnection proven. Lambda streaming verified via cargo-lambda: SSE events with durable IDs, terminal replay, Last-Event-ID reconnection. Same-backend enforcement on both server and Lambda builders.
 
 ## Build & Development Commands
 
 ```bash
 cargo build --workspace                    # Build all crates
 cargo check --workspace                    # Type-check
-cargo test --workspace                     # Run all tests (334+)
+cargo test --workspace                     # Run all tests (391+)
 cargo test --workspace --features sqlite   # Include SQLite parity tests
 cargo clippy --workspace -- -D warnings    # Lint (deny warnings)
 cargo fmt --all -- --check                 # Format check
@@ -114,14 +114,32 @@ Tests are written from the A2A proto/spec FIRST, then implementation follows. If
 - Discovery: `GET /.well-known/agent-card.json`
 - JSON-RPC: `POST /jsonrpc` (all 11 methods, PascalCase)
 - TaskState: `TASK_STATE_SUBMITTED`, `TASK_STATE_WORKING`, etc.
-- Error: TaskNotFoundError → 404/-32001, TaskNotCancelableError → 409/-32002, ContentTypeNotSupportedError → 415/-32005
+- Error: TaskNotFoundError → 404/-32001, TaskNotCancelableError → 409/-32002, UnsupportedOperationError → 400/-32004, ContentTypeNotSupportedError → 415/-32005
 - All A2A errors MUST include `google.rpc.ErrorInfo` with reason + domain
+
+### Proto and Spec Compliance
+
+Our vendored `proto/a2a.proto` is byte-identical to upstream `a2aproject/A2A/specification/a2a.proto`. Per spec §1.4, the proto is "the single authoritative normative definition" for data objects and messages.
+
+**HTTP route patterns follow the proto's `google.api.http` annotations** (`/message:send`, `/tasks/{id=*}`, etc.).
+
+**Spec-aligned behaviors:**
+- SubscribeToTask: first event is Task object (spec §3.1.6), terminal tasks return UnsupportedOperationError
+- Error codes: TaskNotCancelable=409, UnsupportedOperation=400, PushNotificationNotSupported=400
+- Query params: camelCase (historyLength, pageSize, pageToken, contextId)
+- contextId/taskId mismatch rejection on continuation (spec §3.4.3)
+
+**No known spec compliance gaps remaining.** ListTasks sorts by `updated_at DESC` across all four backends. Pagination cursor encodes `updated_at|task_id` for stable iteration.
+
+**Deployment responsibilities:** TLS 1.2+ (§7.1) and gzip (§11.4) are met at the deployment layer (reverse proxy, load balancer), not framework-enforced.
+
+### Completed
+
+- **D3: Durable event coordination** — ADR-009 accepted and implemented across all deployment surfaces. Durable event store is source of truth, broker is wake-up signal only. Atomic task+event writes via `A2aAtomicStore`. Terminal replay, Last-Event-ID reconnection, cross-instance streaming all verified. Four parity-proven backends. Lambda streaming verified via cargo-lambda.
 
 ### Deferred (ordered by priority)
 
-1. **D3: Durable event coordination** — ADR-009 proposed. Enables cross-instance streaming/subscription (Lambda, load-balanced, K8s). Requires durable event store + replay. Same-backend transaction atomicity.
-2. **gRPC transport** — feature-gated in `turul-a2a-proto`
-3. **Skill-level `security_requirements`** — agent-level only for now
-4. **Shared `turul-jwt-validator` extraction** — currently local, see ADR-007
-
-Multi-instance request/response is verified. Only D3 (cross-instance streaming) remains before full scale claims.
+1. **gRPC transport** — feature-gated in `turul-a2a-proto`
+2. **Skill-level `security_requirements`** — agent-level only for now
+3. **Shared `turul-jwt-validator` extraction** — currently local, see ADR-007
+4. **Executor `EventSink`** — finer-grained streaming events from within executor, deferred per ADR-009 §13

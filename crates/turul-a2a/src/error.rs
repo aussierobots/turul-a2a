@@ -147,7 +147,7 @@ impl A2aError {
         });
 
         if let Some(info) = self.error_info() {
-            error["data"] = json!([info]);
+            error["data"] = info;
         }
 
         json!({
@@ -297,11 +297,11 @@ mod tests {
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 42);
         assert_eq!(resp["error"]["code"], errors::JSONRPC_TASK_NOT_CANCELABLE);
-        let data = resp["error"]["data"].as_array().unwrap();
-        assert_eq!(data.len(), 1);
-        assert_eq!(data[0]["@type"], errors::ERROR_INFO_TYPE);
-        assert_eq!(data[0]["reason"], errors::REASON_TASK_NOT_CANCELABLE);
-        assert_eq!(data[0]["domain"], errors::ERROR_DOMAIN);
+        let data = &resp["error"]["data"];
+        assert!(data.is_object(), "JSON-RPC error data should be an object");
+        assert_eq!(data["@type"], errors::ERROR_INFO_TYPE);
+        assert_eq!(data["reason"], errors::REASON_TASK_NOT_CANCELABLE);
+        assert_eq!(data["domain"], errors::ERROR_DOMAIN);
     }
 
     #[test]

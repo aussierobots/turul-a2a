@@ -3,6 +3,7 @@
 //! Run: cargo run -p echo-agent
 //! Test: curl -X POST http://localhost:3000/message:send \
 //!         -H 'Content-Type: application/json' \
+//!         -H 'a2a-version: 1.0' \
 //!         -d '{"message":{"messageId":"1","role":"ROLE_USER","parts":[{"text":"hello"}]}}'
 
 use turul_a2a::card_builder::{AgentCardBuilder, AgentSkillBuilder};
@@ -42,7 +43,7 @@ impl AgentExecutor for EchoExecutor {
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
         AgentCardBuilder::new("Echo Agent", "0.1.0")
             .description("Echoes user messages back as artifacts")
-            .url("http://localhost:3000", "JSONRPC", "1.0")
+            .url("http://localhost:3000/jsonrpc", "JSONRPC", "1.0")
             .provider("Aussie Robots", "https://github.com/aussierobots/turul-a2a")
             .streaming(true)
             .default_input_modes(vec!["text/plain"])
@@ -72,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("Try: curl -X POST http://localhost:3000/message:send \\");
     println!("  -H 'Content-Type: application/json' \\");
+    println!("  -H 'a2a-version: 1.0' \\");
     println!("  -d '{{\"message\":{{\"messageId\":\"1\",\"role\":\"ROLE_USER\",\"parts\":[{{\"text\":\"hello\"}}]}}}}'");
 
     server.run().await?;

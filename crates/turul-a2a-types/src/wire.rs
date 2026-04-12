@@ -260,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn task_not_cancelable_is_409_not_400() {
+    fn task_not_cancelable_is_409() {
         assert_eq!(errors::HTTP_TASK_NOT_CANCELABLE, 409);
     }
 

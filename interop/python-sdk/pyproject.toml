@@ -1,0 +1,14 @@
+[project]
+name = "turul-a2a-interop"
+version = "0.1.0"
+description = "A2A Python SDK interoperability tests against turul-a2a Rust server"
+requires-python = ">=3.10"
+dependencies = [
+    "a2a-sdk",
+    "pytest",
+    "pytest-asyncio",
+    "httpx",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

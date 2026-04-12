@@ -33,12 +33,9 @@ impl AgentExecutor for LambdaEchoExecutor {
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_http::Error> {
-    let storage = InMemoryA2aStorage::new();
-
     let handler = LambdaA2aServerBuilder::new()
         .executor(LambdaEchoExecutor)
-        .task_storage(storage.clone())
-        .push_storage(storage)
+        .storage(InMemoryA2aStorage::new())
         .build()
         .map_err(|e| lambda_http::Error::from(format!("{e}")))?;
 

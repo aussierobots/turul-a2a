@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 use turul_a2a_types::{Artifact, Message, Task, TaskStatus};
 
 use crate::streaming::StreamEvent;
+use super::atomic::A2aAtomicStore;
 use super::error::A2aStorageError;
 use super::event_store::A2aEventStore;
 use super::filter::{PushConfigListPage, TaskFilter, TaskListPage};
@@ -17,6 +18,20 @@ struct StoredTask {
     tenant: String,
     owner: String,
     task: Task,
+    /// Last update timestamp (spec §3.1.4: ListTasks sorted by last update time DESC).
+    updated_at: String,
+}
+
+/// Current UTC timestamp as ISO 8601 string.
+fn now_iso() -> String {
+    // Use a monotonic-friendly format: YYYY-MM-DDTHH:MM:SS.fffZ
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let millis = now.subsec_millis();
+    // Simple formatting without chrono dependency
+    format!("{secs:010}.{millis:03}")
 }
 
 type TaskKey = (String, String); // (tenant, task_id)
@@ -103,6 +118,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
             tenant: tenant.to_string(),
             owner: owner.to_string(),
             task: task.clone(),
+            updated_at: now_iso(),
         };
         let mut tasks = self.tasks.write().await;
         tasks.insert(key, stored);
@@ -142,6 +158,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
                         tenant: tenant.to_string(),
                         owner: owner.to_string(),
                         task,
+                        updated_at: now_iso(),
                     },
                 );
                 Ok(())
@@ -205,8 +222,12 @@ impl A2aTaskStorage for InMemoryA2aStorage {
             })
             .collect();
 
-        // Sort deterministically by task ID
-        filtered.sort_by(|a, b| a.task.id().cmp(b.task.id()));
+        // Sort by last update time descending (spec §3.1.4 MUST).
+        // Tiebreak by task_id descending for determinism.
+        filtered.sort_by(|a, b| {
+            b.updated_at.cmp(&a.updated_at)
+                .then_with(|| b.task.id().cmp(a.task.id()))
+        });
 
         let total_size = filtered.len() as i32;
         let page_size = filter
@@ -214,12 +235,23 @@ impl A2aTaskStorage for InMemoryA2aStorage {
             .map(|ps| ps.clamp(1, 100))
             .unwrap_or(50);
 
-        // Cursor-based pagination: page_token is the last task_id from previous page
+        // Cursor-based pagination: token is "updated_at|task_id" of last item.
+        // Next page starts after items that sort before this cursor.
         let start_idx = if let Some(ref token) = filter.page_token {
-            filtered
-                .iter()
-                .position(|s| s.task.id() > token.as_str())
-                .unwrap_or(filtered.len())
+            if let Some((cursor_time, cursor_id)) = token.split_once('|') {
+                filtered
+                    .iter()
+                    .position(|s| {
+                        (s.updated_at.as_str(), s.task.id()) < (cursor_time, cursor_id)
+                    })
+                    .unwrap_or(filtered.len())
+            } else {
+                // Legacy token format (task_id only) — skip past it
+                filtered
+                    .iter()
+                    .position(|s| s.task.id() < token.as_str())
+                    .unwrap_or(filtered.len())
+            }
         } else {
             0
         };
@@ -233,8 +265,11 @@ impl A2aTaskStorage for InMemoryA2aStorage {
             })
             .collect();
 
+        // Encode cursor as "updated_at|task_id"
         let next_page_token = if end_idx < filtered.len() {
-            page_tasks.last().map(|t| t.id().to_string()).unwrap_or_default()
+            filtered.get(end_idx - 1).map(|s| {
+                format!("{}|{}", s.updated_at, s.task.id())
+            }).unwrap_or_default()
         } else {
             String::new()
         };
@@ -304,6 +339,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
                 tenant: tenant.to_string(),
                 owner: owner.to_string(),
                 task: updated_task.clone(),
+                updated_at: now_iso(),
             },
         );
 
@@ -491,14 +527,16 @@ impl A2aEventStore for InMemoryA2aStorage {
     ) -> Result<u64, A2aStorageError> {
         let key = (tenant.to_string(), task_id.to_string());
 
-        // Atomic sequence assignment
+        // Hold both locks for the entire operation to prevent interleaving
+        // with atomic methods. Lock order: event_counters → events
+        // (consistent with atomic methods which acquire tasks first, then these).
         let mut counters = self.event_counters.write().await;
+        let mut events = self.events.write().await;
+
         let counter = counters.entry(key.clone()).or_insert(0);
         *counter += 1;
         let seq = *counter;
-        drop(counters);
 
-        let mut events = self.events.write().await;
         events
             .entry(key)
             .or_insert_with(Vec::new)
@@ -540,6 +578,187 @@ impl A2aEventStore for InMemoryA2aStorage {
     async fn cleanup_expired(&self) -> Result<u64, A2aStorageError> {
         // In-memory: no TTL tracking. No-op.
         Ok(0)
+    }
+}
+
+#[async_trait]
+impl A2aAtomicStore for InMemoryA2aStorage {
+    fn backend_name(&self) -> &'static str {
+        "in-memory"
+    }
+
+    async fn create_task_with_events(
+        &self,
+        tenant: &str,
+        owner: &str,
+        task: Task,
+        events: Vec<StreamEvent>,
+    ) -> Result<(Task, Vec<u64>), A2aStorageError> {
+        // Acquire all locks in consistent order: tasks → event_counters → events
+        let mut tasks = self.tasks.write().await;
+        let mut counters = self.event_counters.write().await;
+        let mut event_map = self.events.write().await;
+
+        let task_key = (tenant.to_string(), task.id().to_string());
+        let event_key = (tenant.to_string(), task.id().to_string());
+
+        // Insert task
+        tasks.insert(
+            task_key,
+            StoredTask {
+                tenant: tenant.to_string(),
+                owner: owner.to_string(),
+                task: task.clone(),
+                updated_at: now_iso(),
+            },
+        );
+
+        // Append events with atomic sequence assignment
+        let mut sequences = Vec::with_capacity(events.len());
+        let task_events = event_map.entry(event_key.clone()).or_default();
+        let counter = counters.entry(event_key).or_insert(0);
+
+        for event in events {
+            *counter += 1;
+            let seq = *counter;
+            sequences.push(seq);
+            task_events.push((seq, event));
+        }
+
+        Ok((task, sequences))
+    }
+
+    async fn update_task_status_with_events(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        owner: &str,
+        new_status: TaskStatus,
+        events: Vec<StreamEvent>,
+    ) -> Result<(Task, Vec<u64>), A2aStorageError> {
+        // Acquire all locks in consistent order: tasks → event_counters → events
+        let mut tasks = self.tasks.write().await;
+        let mut counters = self.event_counters.write().await;
+        let mut event_map = self.events.write().await;
+
+        let task_key = (tenant.to_string(), task_id.to_string());
+        let event_key = (tenant.to_string(), task_id.to_string());
+
+        // Validate task exists and owner matches
+        let stored = tasks
+            .get(&task_key)
+            .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?;
+
+        if stored.owner != owner {
+            return Err(A2aStorageError::OwnerMismatch {
+                task_id: task_id.to_string(),
+            });
+        }
+
+        // Validate state machine transition
+        let current_state = stored
+            .task
+            .status()
+            .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?
+            .state()
+            .map_err(A2aStorageError::TypeError)?;
+
+        let new_state = new_status.state().map_err(A2aStorageError::TypeError)?;
+
+        turul_a2a_types::state_machine::validate_transition(current_state, new_state).map_err(
+            |e| match e {
+                turul_a2a_types::A2aTypeError::InvalidTransition { current, requested } => {
+                    A2aStorageError::InvalidTransition { current, requested }
+                }
+                turul_a2a_types::A2aTypeError::TerminalState(s) => {
+                    A2aStorageError::TerminalState(s)
+                }
+                other => A2aStorageError::TypeError(other),
+            },
+        )?;
+
+        // Update task status
+        let mut proto = stored.task.as_proto().clone();
+        proto.status = Some(new_status.into_proto());
+        let updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+
+        tasks.insert(
+            task_key,
+            StoredTask {
+                tenant: tenant.to_string(),
+                owner: owner.to_string(),
+                task: updated_task.clone(),
+                updated_at: now_iso(),
+            },
+        );
+
+        // Append events with atomic sequence assignment
+        let mut sequences = Vec::with_capacity(events.len());
+        let task_events = event_map.entry(event_key.clone()).or_default();
+        let counter = counters.entry(event_key).or_insert(0);
+
+        for event in events {
+            *counter += 1;
+            let seq = *counter;
+            sequences.push(seq);
+            task_events.push((seq, event));
+        }
+
+        Ok((updated_task, sequences))
+    }
+
+    async fn update_task_with_events(
+        &self,
+        tenant: &str,
+        owner: &str,
+        task: Task,
+        events: Vec<StreamEvent>,
+    ) -> Result<Vec<u64>, A2aStorageError> {
+        // Acquire all locks in consistent order: tasks → event_counters → events
+        let mut tasks = self.tasks.write().await;
+        let mut counters = self.event_counters.write().await;
+        let mut event_map = self.events.write().await;
+
+        let task_key = (tenant.to_string(), task.id().to_string());
+        let event_key = (tenant.to_string(), task.id().to_string());
+
+        // Validate task exists and owner matches
+        match tasks.get(&task_key) {
+            Some(stored) if stored.owner == owner => {}
+            Some(_) => {
+                return Err(A2aStorageError::OwnerMismatch {
+                    task_id: task.id().to_string(),
+                });
+            }
+            None => {
+                return Err(A2aStorageError::TaskNotFound(task.id().to_string()));
+            }
+        }
+
+        // Replace task
+        tasks.insert(
+            task_key,
+            StoredTask {
+                tenant: tenant.to_string(),
+                owner: owner.to_string(),
+                task,
+                updated_at: now_iso(),
+            },
+        );
+
+        // Append events with atomic sequence assignment
+        let mut sequences = Vec::with_capacity(events.len());
+        let task_events = event_map.entry(event_key.clone()).or_default();
+        let counter = counters.entry(event_key).or_insert(0);
+
+        for event in events {
+            *counter += 1;
+            let seq = *counter;
+            sequences.push(seq);
+            task_events.push((seq, event));
+        }
+
+        Ok(sequences)
     }
 }
 
@@ -672,5 +891,61 @@ mod tests {
     #[tokio::test]
     async fn test_event_empty_task() {
         parity_tests::test_event_empty_task(&storage()).await;
+    }
+
+    // Atomic store parity tests
+
+    #[tokio::test]
+    async fn test_atomic_create_task_with_events() {
+        let s = storage();
+        parity_tests::test_atomic_create_task_with_events(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_update_status_with_events() {
+        let s = storage();
+        parity_tests::test_atomic_update_status_with_events(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_status_rejects_invalid_transition() {
+        let s = storage();
+        parity_tests::test_atomic_status_rejects_invalid_transition(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_update_task_with_events() {
+        let s = storage();
+        parity_tests::test_atomic_update_task_with_events(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_owner_isolation() {
+        let s = storage();
+        parity_tests::test_atomic_owner_isolation(&s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_tenant_isolation() {
+        let s = storage();
+        parity_tests::test_atomic_tenant_isolation(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_create_with_empty_events() {
+        let s = storage();
+        parity_tests::test_atomic_create_with_empty_events(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_sequence_continuity() {
+        let s = storage();
+        parity_tests::test_atomic_sequence_continuity(&s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_concurrent_sequence_integrity() {
+        let s = std::sync::Arc::new(storage());
+        parity_tests::test_atomic_concurrent_sequence_integrity(s).await;
     }
 }

@@ -38,3 +38,6 @@ sqlx = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
+turul-a2a-client = { path = "../turul-a2a-client" }
+turul-a2a-auth = { path = "../turul-a2a-auth" }
+reqwest = { workspace = true }

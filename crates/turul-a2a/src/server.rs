@@ -7,7 +7,7 @@ use crate::error::A2aError;
 use crate::executor::AgentExecutor;
 use crate::middleware::{A2aMiddleware, MiddlewareStack, SecurityContribution};
 use crate::router::{build_router, AppState};
-use crate::storage::{A2aPushNotificationStorage, A2aTaskStorage, InMemoryA2aStorage};
+use crate::storage::{A2aAtomicStore, A2aPushNotificationStorage, A2aTaskStorage, InMemoryA2aStorage};
 use crate::streaming::TaskEventBroker;
 
 /// Builder for configuring and running an A2A server.
@@ -16,6 +16,7 @@ pub struct A2aServerBuilder {
     task_storage: Option<Arc<dyn A2aTaskStorage>>,
     push_storage: Option<Arc<dyn A2aPushNotificationStorage>>,
     event_store: Option<Arc<dyn crate::storage::A2aEventStore>>,
+    atomic_store: Option<Arc<dyn A2aAtomicStore>>,
     bind_addr: SocketAddr,
     middleware: Vec<Arc<dyn A2aMiddleware>>,
 }
@@ -27,6 +28,7 @@ impl A2aServerBuilder {
             task_storage: None,
             push_storage: None,
             event_store: None,
+            atomic_store: None,
             bind_addr: ([0, 0, 0, 0], 3000).into(),
             middleware: vec![],
         }
@@ -38,26 +40,48 @@ impl A2aServerBuilder {
     }
 
     /// Set all storage from a single backend instance.
-    /// This is the preferred method — enforces same-backend requirement (ADR-009).
-    pub fn storage(mut self, storage: InMemoryA2aStorage) -> Self {
+    ///
+    /// This is the **preferred** method — a single struct implementing all storage
+    /// traits guarantees the same-backend requirement (ADR-009). Works with any
+    /// backend: `InMemoryA2aStorage`, `SqliteA2aStorage`, `PostgresA2aStorage`,
+    /// `DynamoDbA2aStorage`, etc.
+    pub fn storage<S>(mut self, storage: S) -> Self
+    where
+        S: A2aTaskStorage
+            + A2aPushNotificationStorage
+            + crate::storage::A2aEventStore
+            + A2aAtomicStore
+            + Clone
+            + 'static,
+    {
         self.task_storage = Some(Arc::new(storage.clone()));
         self.push_storage = Some(Arc::new(storage.clone()));
-        self.event_store = Some(Arc::new(storage));
+        self.event_store = Some(Arc::new(storage.clone()));
+        self.atomic_store = Some(Arc::new(storage));
         self
     }
 
+    /// Set task storage individually. Prefer `.storage()` for ADR-009 compliance.
     pub fn task_storage(mut self, storage: impl A2aTaskStorage + 'static) -> Self {
         self.task_storage = Some(Arc::new(storage));
         self
     }
 
+    /// Set push notification storage individually. Prefer `.storage()` for ADR-009 compliance.
     pub fn push_storage(mut self, storage: impl A2aPushNotificationStorage + 'static) -> Self {
         self.push_storage = Some(Arc::new(storage));
         self
     }
 
+    /// Set event store individually. Prefer `.storage()` for ADR-009 compliance.
     pub fn event_store(mut self, store: impl crate::storage::A2aEventStore + 'static) -> Self {
         self.event_store = Some(Arc::new(store));
+        self
+    }
+
+    /// Set atomic store individually. Prefer `.storage()` for ADR-009 compliance.
+    pub fn atomic_store(mut self, store: impl A2aAtomicStore + 'static) -> Self {
+        self.atomic_store = Some(Arc::new(store));
         self
     }
 
@@ -87,7 +111,26 @@ impl A2aServerBuilder {
             .unwrap_or_else(|| Arc::new(default_storage.clone()));
         let event_store: Arc<dyn crate::storage::A2aEventStore> = self
             .event_store
+            .unwrap_or_else(|| Arc::new(default_storage.clone()));
+        let atomic_store: Arc<dyn A2aAtomicStore> = self
+            .atomic_store
             .unwrap_or_else(|| Arc::new(default_storage));
+
+        // Same-backend enforcement (ADR-009): all storage traits must share the same backend.
+        let task_backend = task_storage.backend_name();
+        let push_backend = push_storage.backend_name();
+        let event_backend = event_store.backend_name();
+        let atomic_backend = atomic_store.backend_name();
+        if task_backend != push_backend
+            || task_backend != event_backend
+            || task_backend != atomic_backend
+        {
+            return Err(A2aError::Internal(format!(
+                "Storage backend mismatch: task={task_backend}, push={push_backend}, \
+                 event={event_backend}, atomic={atomic_backend}. \
+                 ADR-009 requires all storage traits to share the same backend."
+            )));
+        }
 
         // Collect and merge security contributions
         let contributions: Vec<SecurityContribution> = self
@@ -103,6 +146,7 @@ impl A2aServerBuilder {
                 task_storage,
                 push_storage,
                 event_store,
+                atomic_store,
                 event_broker: TaskEventBroker::new(),
                 middleware_stack: Arc::new(MiddlewareStack::new(self.middleware)),
             },
@@ -259,6 +303,7 @@ impl A2aServer {
             task_storage: self.state.task_storage,
             push_storage: self.state.push_storage,
             event_store: self.state.event_store,
+            atomic_store: self.state.atomic_store,
             event_broker: self.state.event_broker,
             middleware_stack: self.state.middleware_stack,
         };
@@ -373,5 +418,94 @@ mod tests {
             .build()
             .unwrap();
         let _ = server.into_router();
+    }
+
+    /// Fake event store with a different backend_name for mismatch testing.
+    struct FakeEventStore;
+
+    #[async_trait::async_trait]
+    impl crate::storage::A2aEventStore for FakeEventStore {
+        fn backend_name(&self) -> &'static str { "fake-backend" }
+        async fn append_event(&self, _t: &str, _tid: &str, _e: crate::streaming::StreamEvent) -> Result<u64, crate::storage::A2aStorageError> { Ok(0) }
+        async fn get_events_after(&self, _t: &str, _tid: &str, _s: u64) -> Result<Vec<(u64, crate::streaming::StreamEvent)>, crate::storage::A2aStorageError> { Ok(vec![]) }
+        async fn latest_sequence(&self, _t: &str, _tid: &str) -> Result<u64, crate::storage::A2aStorageError> { Ok(0) }
+        async fn cleanup_expired(&self) -> Result<u64, crate::storage::A2aStorageError> { Ok(0) }
+    }
+
+    #[test]
+    fn mixed_backend_rejected_at_build() {
+        // Task + push = in-memory, event = fake-backend → should fail
+        let result = A2aServer::builder()
+            .executor(DummyExecutor)
+            .event_store(FakeEventStore)
+            .build();
+
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("backend mismatch") || msg.contains("Storage backend mismatch"),
+                    "Error should mention backend mismatch: {msg}"
+                );
+            }
+            Ok(_) => panic!("Mixed backends should be rejected"),
+        }
+    }
+
+    /// Fake atomic store with a different backend_name for mismatch testing.
+    struct FakeAtomicStore;
+
+    #[async_trait::async_trait]
+    impl crate::storage::A2aAtomicStore for FakeAtomicStore {
+        fn backend_name(&self) -> &'static str { "fake-atomic" }
+        async fn create_task_with_events(&self, _t: &str, _o: &str, task: turul_a2a_types::Task, _e: Vec<crate::streaming::StreamEvent>) -> Result<(turul_a2a_types::Task, Vec<u64>), crate::storage::A2aStorageError> { Ok((task, vec![])) }
+        async fn update_task_status_with_events(&self, _t: &str, _tid: &str, _o: &str, _s: turul_a2a_types::TaskStatus, _e: Vec<crate::streaming::StreamEvent>) -> Result<(turul_a2a_types::Task, Vec<u64>), crate::storage::A2aStorageError> { unimplemented!() }
+        async fn update_task_with_events(&self, _t: &str, _o: &str, _task: turul_a2a_types::Task, _e: Vec<crate::streaming::StreamEvent>) -> Result<Vec<u64>, crate::storage::A2aStorageError> { Ok(vec![]) }
+    }
+
+    #[test]
+    fn mixed_atomic_backend_rejected_at_build() {
+        // Task + push + event = in-memory, atomic = fake-atomic → should fail
+        let result = A2aServer::builder()
+            .executor(DummyExecutor)
+            .atomic_store(FakeAtomicStore)
+            .build();
+
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("backend mismatch") || msg.contains("Storage backend mismatch"),
+                    "Error should mention backend mismatch: {msg}"
+                );
+            }
+            Ok(_) => panic!("Mixed atomic backend should be rejected"),
+        }
+    }
+
+    #[test]
+    fn same_backend_accepted() {
+        // All four from the same InMemoryA2aStorage — should succeed
+        let storage = InMemoryA2aStorage::new();
+        let result = A2aServer::builder()
+            .executor(DummyExecutor)
+            .task_storage(storage.clone())
+            .push_storage(storage.clone())
+            .event_store(storage.clone())
+            .atomic_store(storage)
+            .build();
+
+        assert!(result.is_ok(), "Same backend should be accepted");
+    }
+
+    #[test]
+    fn unified_storage_accepted() {
+        // Single .storage() call — the preferred path
+        let result = A2aServer::builder()
+            .executor(DummyExecutor)
+            .storage(InMemoryA2aStorage::new())
+            .build();
+
+        assert!(result.is_ok(), "Unified .storage() should be accepted");
     }
 }

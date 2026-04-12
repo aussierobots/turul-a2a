@@ -62,17 +62,20 @@ where
 
             // 1. A2A-Version validation (skip for discovery)
             if !is_version_exempt(&path) {
-                let version = req
-                    .headers()
-                    .get("a2a-version")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("0.3"); // Per spec: empty = 0.3
-
-                if version != SUPPORTED_VERSION {
-                    let err = A2aError::VersionNotSupported {
-                        version: version.to_string(),
-                    };
-                    return Ok(err.into_response_body());
+                match req.headers().get("a2a-version").and_then(|v| v.to_str().ok()) {
+                    Some(v) if v == SUPPORTED_VERSION => {} // OK
+                    Some(v) => {
+                        let err = A2aError::VersionNotSupported {
+                            version: v.to_string(),
+                        };
+                        return Ok(err.into_response_body());
+                    }
+                    None => {
+                        let err = A2aError::VersionNotSupported {
+                            version: "missing (A2A-Version header is required)".to_string(),
+                        };
+                        return Ok(err.into_response_body());
+                    }
                 }
             }
 
