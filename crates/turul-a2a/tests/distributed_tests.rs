@@ -24,7 +24,7 @@ struct TestExecutor;
 
 #[async_trait::async_trait]
 impl AgentExecutor for TestExecutor {
-    async fn execute(&self, task: &mut Task, _msg: &Message) -> Result<(), A2aError> {
+    async fn execute(&self, task: &mut Task, _msg: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
         task.push_text_artifact("dist-art", "Result", "distributed result");
         task.complete();
         Ok(())

@@ -15,7 +15,7 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::A2aError;
-use crate::executor::AgentExecutor;
+use crate::executor::{AgentExecutor, ExecutionContext};
 use crate::storage::{A2aAtomicStore, A2aEventStore, A2aPushNotificationStorage, A2aStorageError, A2aTaskStorage, TaskFilter, TaskListPage};
 use crate::streaming::{StreamEvent, replay};
 use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
@@ -426,7 +426,15 @@ pub(crate) async fn core_send_streaming_message(
                 .flatten()
                 .unwrap_or_else(|| Task::new(&exec_task_id, TaskStatus::new(TaskState::Working)));
 
-            let _ = exec_state.executor.execute(&mut task, &exec_message).await;
+            let exec_ctx = ExecutionContext {
+                owner: exec_owner.clone(),
+                tenant: if exec_tenant.is_empty() { None } else { Some(exec_tenant.clone()) },
+                task_id: exec_task_id.clone(),
+                context_id: Some(exec_context_id.clone()),
+                claims: None, // TODO: thread claims from RequestContext when needed
+                cancellation: tokio_util::sync::CancellationToken::new(),
+            };
+            let _ = exec_state.executor.execute(&mut task, &exec_message, &exec_ctx).await;
 
             // Atomic: persist final state + terminal event
             let final_status = task.status().unwrap_or_else(|| TaskStatus::new(TaskState::Completed));
@@ -748,7 +756,15 @@ pub(crate) async fn core_send_message(
             .map_err(A2aError::from)?;
 
         let mut task = task;
-        state.executor.execute(&mut task, &message).await?;
+        let ctx = ExecutionContext {
+            owner: owner.to_string(),
+            tenant: if tenant.is_empty() { None } else { Some(tenant.to_string()) },
+            task_id: task_id.clone(),
+            context_id: Some(task.context_id().to_string()),
+            claims: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+        state.executor.execute(&mut task, &message, &ctx).await?;
 
         state
             .task_storage
@@ -784,7 +800,15 @@ pub(crate) async fn core_send_message(
             .map_err(A2aError::from)?;
 
         let mut task = task;
-        state.executor.execute(&mut task, &message).await?;
+        let ctx = ExecutionContext {
+            owner: owner.to_string(),
+            tenant: if tenant.is_empty() { None } else { Some(tenant.to_string()) },
+            task_id: task_id.clone(),
+            context_id: Some(context_id.clone()),
+            claims: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+        state.executor.execute(&mut task, &message, &ctx).await?;
 
         state
             .task_storage

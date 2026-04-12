@@ -22,7 +22,7 @@ struct CompletingExecutor;
 
 #[async_trait::async_trait]
 impl AgentExecutor for CompletingExecutor {
-    async fn execute(&self, task: &mut Task, _message: &Message) -> Result<(), A2aError> {
+    async fn execute(&self, task: &mut Task, _message: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
         // Move to Working, then Completed
         let mut proto = task.as_proto().clone();
         proto.status = Some(turul_a2a_proto::TaskStatus {

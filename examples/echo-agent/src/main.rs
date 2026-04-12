@@ -16,7 +16,7 @@ struct EchoExecutor;
 
 #[async_trait::async_trait]
 impl AgentExecutor for EchoExecutor {
-    async fn execute(&self, task: &mut Task, message: &Message) -> Result<(), A2aError> {
+    async fn execute(&self, task: &mut Task, message: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
         // Echo the user's message back as an artifact
         let user_text = message
             .as_proto()

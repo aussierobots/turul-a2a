@@ -41,6 +41,7 @@ pbjson-types = "0.9"
 axum = { version = "0.8", features = ["json"] }
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = "0.7"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 hyper = "1"

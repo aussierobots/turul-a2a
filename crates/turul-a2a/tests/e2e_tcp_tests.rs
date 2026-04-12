@@ -21,7 +21,7 @@ struct CompletingExecutor;
 
 #[async_trait::async_trait]
 impl AgentExecutor for CompletingExecutor {
-    async fn execute(&self, task: &mut Task, _msg: &Message) -> Result<(), A2aError> {
+    async fn execute(&self, task: &mut Task, _msg: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
         task.push_text_artifact("tcp-art", "Result", "tcp e2e result");
         task.complete();
         Ok(())
@@ -42,7 +42,7 @@ struct PausingExecutor;
 
 #[async_trait::async_trait]
 impl AgentExecutor for PausingExecutor {
-    async fn execute(&self, task: &mut Task, _msg: &Message) -> Result<(), A2aError> {
+    async fn execute(&self, task: &mut Task, _msg: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
         // First call: pause at INPUT_REQUIRED
         // Second call (continuation): complete
         if task.history().len() <= 1 {

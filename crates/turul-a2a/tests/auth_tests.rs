@@ -29,7 +29,7 @@ struct TestExecutor;
 
 #[async_trait]
 impl AgentExecutor for TestExecutor {
-    async fn execute(&self, task: &mut Task, _msg: &Message) -> Result<(), A2aError> {
+    async fn execute(&self, task: &mut Task, _msg: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
         let mut p = task.as_proto().clone();
         p.status = Some(turul_a2a_proto::TaskStatus {
             state: turul_a2a_proto::TaskState::Completed.into(),

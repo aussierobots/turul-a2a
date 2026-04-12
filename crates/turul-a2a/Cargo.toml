@@ -29,6 +29,7 @@ tower = { workspace = true }
 http = { workspace = true }
 futures = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 sqlx = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }

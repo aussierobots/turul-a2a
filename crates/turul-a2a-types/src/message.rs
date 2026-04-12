@@ -63,6 +63,30 @@ impl Part {
         self
     }
 
+    /// Returns the text content if this is a text part.
+    pub fn as_text(&self) -> Option<&str> {
+        match &self.inner.content {
+            Some(pb::part::Content::Text(t)) => Some(t.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Returns the URL if this is a URL part.
+    pub fn as_url(&self) -> Option<&str> {
+        match &self.inner.content {
+            Some(pb::part::Content::Url(u)) => Some(u.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Returns the raw bytes if this is a raw/binary part.
+    pub fn as_raw(&self) -> Option<&[u8]> {
+        match &self.inner.content {
+            Some(pb::part::Content::Raw(r)) => Some(r.as_slice()),
+            _ => None,
+        }
+    }
+
     pub fn as_proto(&self) -> &pb::Part {
         &self.inner
     }
@@ -162,6 +186,26 @@ impl Message {
 
     pub fn message_id(&self) -> &str {
         &self.inner.message_id
+    }
+
+    /// Returns individual text parts, preserving part boundaries.
+    /// This is the primary safe accessor for message text content.
+    /// Callers decide how to combine parts.
+    pub fn text_parts(&self) -> Vec<&str> {
+        self.inner
+            .parts
+            .iter()
+            .filter_map(|p| match &p.content {
+                Some(pb::part::Content::Text(t)) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Convenience: joins all text parts with a single space.
+    /// Use `text_parts()` when part boundaries matter (e.g., multi-part prompts).
+    pub fn joined_text(&self) -> String {
+        self.text_parts().join(" ")
     }
 
     pub fn as_proto(&self) -> &pb::Message {

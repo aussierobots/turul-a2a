@@ -24,6 +24,7 @@ impl AgentExecutor for TestExecutor {
         &self,
         _task: &mut Task,
         _message: &Message,
+        _ctx: &turul_a2a::executor::ExecutionContext,
     ) -> Result<(), turul_a2a::error::A2aError> {
         Ok(())
     }

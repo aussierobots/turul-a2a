@@ -338,8 +338,9 @@ impl AgentExecutor for SecurityAugmentedExecutor {
         &self,
         task: &mut turul_a2a_types::Task,
         msg: &turul_a2a_types::Message,
+        ctx: &crate::executor::ExecutionContext,
     ) -> Result<(), A2aError> {
-        self.inner.execute(task, msg).await
+        self.inner.execute(task, msg, ctx).await
     }
 
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
@@ -385,7 +386,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AgentExecutor for DummyExecutor {
-        async fn execute(&self, _task: &mut Task, _msg: &Message) -> Result<(), A2aError> {
+        async fn execute(&self, _task: &mut Task, _msg: &Message, _ctx: &crate::executor::ExecutionContext) -> Result<(), A2aError> {
             Ok(())
         }
         fn agent_card(&self) -> turul_a2a_proto::AgentCard {

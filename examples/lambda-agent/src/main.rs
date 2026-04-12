@@ -14,7 +14,7 @@ struct LambdaEchoExecutor;
 
 #[async_trait::async_trait]
 impl AgentExecutor for LambdaEchoExecutor {
-    async fn execute(&self, task: &mut Task, _msg: &Message) -> Result<(), A2aError> {
+    async fn execute(&self, task: &mut Task, _msg: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
         task.push_text_artifact("lambda-result", "Lambda Echo", "Hello from Lambda!");
         task.complete();
         Ok(())

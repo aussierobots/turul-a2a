@@ -29,7 +29,7 @@ struct DummyExecutor;
 
 #[async_trait]
 impl AgentExecutor for DummyExecutor {
-    async fn execute(&self, _task: &mut Task, _msg: &Message) -> Result<(), A2aError> {
+    async fn execute(&self, _task: &mut Task, _msg: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
         Ok(())
     }
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
