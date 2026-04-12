@@ -59,6 +59,13 @@ cargo lambda watch -p lambda-agent         # Lambda agent via cargo-lambda
 - `turul-a2a-client` — Independent A2A client: discovery, send, get, cancel, list, auth, tenant.
 - `turul-a2a-aws-lambda` — Lambda adapter: thin wrapper over same Router, request/response only (ADR-008).
 
+### Preludes
+
+- `turul_a2a::prelude::*` — server/agent authoring: `A2aServer`, `AgentExecutor`, `ExecutionContext`, `A2aError`, `AgentCardBuilder`, `Task`, `Message`, `Part`, `Artifact`, `TaskState`, `TaskStatus`
+- `turul_a2a_client::prelude::*` — client/caller: `A2aClient`, `ClientAuth`, `MessageBuilder`, `SseEvent`, `SseStream`, `A2aClientError`, `ListTasksParams`
+
+These are separate by design. Only add types that are genuinely part of the common happy path — do not turn preludes into "export everything."
+
 ### Proto Build Pipeline
 
 `proto/a2a.proto` → `prost-build` (generates Rust structs) + `pbjson-build` (generates serde impls with camelCase JSON) → `turul-a2a-proto` crate → wrapped by `turul-a2a-types`
