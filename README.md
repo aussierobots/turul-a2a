@@ -53,6 +53,7 @@ while let Some(event) = futures::StreamExt::next(&mut stream).await {
 
 ```rust
 use turul_a2a::server::A2aServer;
+use turul_a2a::card_builder::AgentCardBuilder;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
 use turul_a2a::error::A2aError;
 use turul_a2a_types::{Task, Message};
@@ -65,7 +66,7 @@ impl AgentExecutor for MyAgent {
         &self,
         task: &mut Task,
         message: &Message,
-        ctx: &ExecutionContext,
+        _ctx: &ExecutionContext,
     ) -> Result<(), A2aError> {
         let input = message.joined_text();
         task.push_text_artifact("result", "Response", format!("You said: {input}"));
@@ -74,8 +75,13 @@ impl AgentExecutor for MyAgent {
     }
 
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
-        // Build your agent card...
-        # todo!()
+        AgentCardBuilder::new("My Agent", "1.0.0")
+            .description("An example A2A agent")
+            .url("http://localhost:3000/jsonrpc", "JSONRPC", "1.0")
+            .default_input_modes(vec!["text/plain"])
+            .default_output_modes(vec!["text/plain"])
+            .build()
+            .unwrap()
     }
 }
 
