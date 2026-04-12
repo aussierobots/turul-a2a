@@ -433,3 +433,281 @@ async fn null_params_treated_as_empty_object() {
     let (_, body) = jsonrpc_call(router, &req_body).await;
     assert!(body.get("error").is_none(), "null params should be accepted as empty");
 }
+
+// =========================================================
+// JSON-RPC Streaming Tests
+// =========================================================
+
+/// Collect SSE events from a streaming response body with a timeout.
+async fn collect_jsonrpc_sse(
+    body: Body,
+    timeout: std::time::Duration,
+) -> Vec<serde_json::Value> {
+    let mut body = body;
+    let mut buf = String::new();
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() { break; }
+
+        match tokio::time::timeout(remaining, http_body_util::BodyExt::frame(&mut body)).await {
+            Ok(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    buf.push_str(&String::from_utf8_lossy(data));
+                }
+            }
+            _ => break,
+        }
+    }
+
+    // Parse SSE data lines as JSON
+    let mut events = Vec::new();
+    for chunk in buf.split("\n\n") {
+        for line in chunk.lines() {
+            if let Some(data) = line.strip_prefix("data:") {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data.trim()) {
+                    events.push(json);
+                }
+            }
+        }
+    }
+    events
+}
+
+#[tokio::test]
+async fn jsonrpc_send_streaming_message_returns_sse_with_envelopes() {
+    let state = test_state();
+    let router = build_router(state);
+
+    let req_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "SendStreamingMessage",
+        "params": {
+            "message": {
+                "messageId": "jrpc-stream-1",
+                "role": "ROLE_USER",
+                "parts": [{"text": "stream test"}]
+            }
+        },
+        "id": 99
+    })
+    .to_string();
+
+    let req = Request::post("/jsonrpc")
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .header("a2a-version", "1.0")
+        .body(Body::from(req_body))
+        .unwrap();
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let content_type = resp.headers().get("content-type")
+        .and_then(|v| v.to_str().ok()).unwrap_or("");
+    assert!(content_type.contains("text/event-stream"),
+        "JSON-RPC streaming should return text/event-stream, got: {content_type}");
+
+    let events = collect_jsonrpc_sse(resp.into_body(), std::time::Duration::from_secs(3)).await;
+    assert!(!events.is_empty(), "Should receive streaming events");
+
+    // Every event should be a JSON-RPC envelope with the original request id
+    for (i, event) in events.iter().enumerate() {
+        assert_eq!(event["jsonrpc"], "2.0", "Event {i} should have jsonrpc field");
+        assert_eq!(event["id"], 99, "Event {i} should carry original request id");
+        assert!(event.get("result").is_some(), "Event {i} should have result field");
+    }
+
+    // Should see terminal event (COMPLETED)
+    let has_completed = events.iter().any(|e| {
+        e["result"].get("statusUpdate")
+            .and_then(|su| su.get("status"))
+            .and_then(|s| s.get("state"))
+            .and_then(|s| s.as_str())
+            .is_some_and(|s| s == "TASK_STATE_COMPLETED")
+    });
+    assert!(has_completed, "Stream should include COMPLETED event");
+}
+
+#[tokio::test]
+async fn jsonrpc_subscribe_to_task_returns_task_snapshot_first() {
+    let state = test_state();
+
+    // Create a non-terminal task with events via atomic store
+    let task = turul_a2a_types::Task::new(
+        "jrpc-sub-1",
+        turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Submitted),
+    ).with_context_id("ctx-jrpc-sub");
+
+    let submitted_event = turul_a2a::streaming::StreamEvent::StatusUpdate {
+        status_update: turul_a2a::streaming::StatusUpdatePayload {
+            task_id: "jrpc-sub-1".to_string(),
+            context_id: "ctx-jrpc-sub".to_string(),
+            status: serde_json::json!({"state": "TASK_STATE_SUBMITTED"}),
+        },
+    };
+
+    state.atomic_store
+        .create_task_with_events("", "anonymous", task, vec![submitted_event])
+        .await
+        .unwrap();
+
+    let working_event = turul_a2a::streaming::StreamEvent::StatusUpdate {
+        status_update: turul_a2a::streaming::StatusUpdatePayload {
+            task_id: "jrpc-sub-1".to_string(),
+            context_id: "ctx-jrpc-sub".to_string(),
+            status: serde_json::json!({"state": "TASK_STATE_WORKING"}),
+        },
+    };
+
+    state.atomic_store
+        .update_task_status_with_events(
+            "", "jrpc-sub-1", "anonymous",
+            turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Working),
+            vec![working_event],
+        )
+        .await
+        .unwrap();
+
+    // Subscribe via JSON-RPC
+    let router = build_router(state);
+    let req_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "SubscribeToTask",
+        "params": {"id": "jrpc-sub-1"},
+        "id": 77
+    })
+    .to_string();
+
+    let req = Request::post("/jsonrpc")
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .header("a2a-version", "1.0")
+        .body(Body::from(req_body))
+        .unwrap();
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let events = collect_jsonrpc_sse(resp.into_body(), std::time::Duration::from_secs(3)).await;
+    assert!(events.len() >= 3, "Should get Task snapshot + 2 events, got {}", events.len());
+
+    // First event should be Task snapshot in JSON-RPC envelope
+    let first = &events[0];
+    assert_eq!(first["jsonrpc"], "2.0");
+    assert_eq!(first["id"], 77);
+    assert!(first["result"].get("task").is_some(),
+        "First event should be Task snapshot, got: {}", first["result"]);
+}
+
+#[tokio::test]
+async fn jsonrpc_subscribe_terminal_task_returns_error() {
+    let state = test_state();
+
+    // Create and complete a task
+    let task = turul_a2a_types::Task::new(
+        "jrpc-term-1",
+        turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Submitted),
+    ).with_context_id("ctx-jrpc-term");
+
+    state.atomic_store
+        .create_task_with_events("", "anonymous", task, vec![])
+        .await
+        .unwrap();
+
+    // Move to completed
+    let mut task = state.task_storage
+        .get_task("", "jrpc-term-1", "anonymous", None).await.unwrap().unwrap();
+    task.set_status(turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Working));
+    task.complete();
+    state.atomic_store
+        .update_task_with_events("", "anonymous", task, vec![])
+        .await
+        .unwrap();
+
+    // Subscribe to terminal task via JSON-RPC
+    let router = build_router(state);
+    let req_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "SubscribeToTask",
+        "params": {"id": "jrpc-term-1"},
+        "id": 88
+    })
+    .to_string();
+
+    let (_, body) = jsonrpc_call(router, &req_body).await;
+
+    // Should get JSON-RPC error (UnsupportedOperation), not an SSE stream
+    assert!(body.get("error").is_some(), "Terminal subscribe should return error: {body}");
+}
+
+#[tokio::test]
+async fn jsonrpc_subscribe_with_last_event_id_resumes() {
+    let state = test_state();
+
+    // Create a non-terminal task with 2 events
+    let task = turul_a2a_types::Task::new(
+        "jrpc-lei-1",
+        turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Submitted),
+    ).with_context_id("ctx-jrpc-lei");
+
+    state.atomic_store
+        .create_task_with_events("", "anonymous", task, vec![
+            turul_a2a::streaming::StreamEvent::StatusUpdate {
+                status_update: turul_a2a::streaming::StatusUpdatePayload {
+                    task_id: "jrpc-lei-1".to_string(),
+                    context_id: "ctx-jrpc-lei".to_string(),
+                    status: serde_json::json!({"state": "TASK_STATE_SUBMITTED"}),
+                },
+            },
+        ])
+        .await
+        .unwrap();
+
+    state.atomic_store
+        .update_task_status_with_events(
+            "", "jrpc-lei-1", "anonymous",
+            turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Working),
+            vec![turul_a2a::streaming::StreamEvent::StatusUpdate {
+                status_update: turul_a2a::streaming::StatusUpdatePayload {
+                    task_id: "jrpc-lei-1".to_string(),
+                    context_id: "ctx-jrpc-lei".to_string(),
+                    status: serde_json::json!({"state": "TASK_STATE_WORKING"}),
+                },
+            }],
+        )
+        .await
+        .unwrap();
+
+    // Subscribe with Last-Event-ID to skip first event (Turul extension)
+    let router = build_router(state);
+    let req_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "SubscribeToTask",
+        "params": {"id": "jrpc-lei-1"},
+        "id": 55
+    })
+    .to_string();
+
+    let req = Request::post("/jsonrpc")
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .header("a2a-version", "1.0")
+        .header("Last-Event-ID", "jrpc-lei-1:1") // skip past sequence 1
+        .body(Body::from(req_body))
+        .unwrap();
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let events = collect_jsonrpc_sse(resp.into_body(), std::time::Duration::from_secs(3)).await;
+
+    // Should get only event at sequence 2 (skipped sequence 1)
+    // No Task snapshot on reconnect (Last-Event-ID > 0)
+    assert_eq!(events.len(), 1, "Reconnect should return only events after sequence 1, got {}", events.len());
+    assert_eq!(events[0]["id"], 55);
+    // Should NOT have a Task snapshot as first event (reconnecting)
+    assert!(events[0]["result"].get("task").is_none(),
+        "Reconnect should not include Task snapshot");
+}

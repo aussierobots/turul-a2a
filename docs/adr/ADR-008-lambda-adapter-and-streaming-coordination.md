@@ -31,12 +31,12 @@ D2 delivers the Lambda adapter for the **request/response-compatible subset** of
 - `GET /extendedAgentCard` — full support
 - `POST /jsonrpc` — all request/response methods
 
-**Not supported (D2):**
-- `POST /message:stream` → returns `UnsupportedOperationError` (HTTP 400, JSON-RPC -32004, ErrorInfo `UNSUPPORTED_OPERATION`)
-- `GET /tasks/{id}:subscribe` → returns `UnsupportedOperationError`
-- JSON-RPC `SendStreamingMessage` / `SubscribeToTask` → returns `UnsupportedOperationError`
+**Streaming (now supported via D3 durable event store):**
+- `POST /message:stream` — SSE via durable store (buffered on Lambda)
+- `GET /tasks/{id}:subscribe` — SSE replay from durable store
+- JSON-RPC `SendStreamingMessage` / `SubscribeToTask` — SSE with JSON-RPC envelopes
 
-Streaming rejection uses the existing A2A error contract — same wire format as any other unsupported operation. No deployment-specific HTTP status codes.
+Lambda streaming is request-scoped (buffered SSE, not persistent channels). The durable event store ensures events survive across invocations. See ADR-009.
 
 ### Adapter Architecture: Thin Wrapper
 
@@ -45,7 +45,7 @@ The Lambda adapter wraps the existing `axum::Router` without modifying `turul-a2
 ```
 Lambda Event (API Gateway / Function URL)
   → lambda_to_axum_request() (strip spoofed headers, inject authorizer context)
-  → NoStreamingLayer (rejects streaming paths with UnsupportedOperationError)
+  → (streaming supported via durable event store since D3)
   → TransportComplianceLayer (A2A-Version, Content-Type)
   → AuthLayer (reads headers or LambdaAuthorizerMiddleware)
   → axum Router (same handlers as local server)
