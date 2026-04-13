@@ -120,13 +120,34 @@ pub fn artifact_text(task: &Task) -> String {
         .join(" ")
 }
 
-/// Extract the first data artifact's value from a Task as JSON.
+/// Extract the first data artifact's value from a Task as JSON (raw, no normalization).
 pub fn first_data_artifact(task: &Task) -> Option<serde_json::Value> {
     for artifact in task.artifacts() {
         for part in &artifact.parts {
             if let Some(pb::part::Content::Data(proto_struct)) = &part.content {
                 if let Ok(value) = serde_json::to_value(proto_struct) {
                     return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract and deserialize the first data artifact into `T`.
+///
+/// Normalizes proto f64 integers before deserializing, so `u32`/`i32` fields work.
+/// Returns `None` if no data artifact exists, `Err` if deserialization fails.
+pub fn first_data_artifact_as<T: serde::de::DeserializeOwned>(
+    task: &Task,
+) -> Option<Result<T, A2aClientError>> {
+    // Walk artifacts looking for a Data part, use Part wrapper's parse_data
+    for artifact in task.artifacts() {
+        for proto_part in &artifact.parts {
+            if matches!(&proto_part.content, Some(pb::part::Content::Data(_))) {
+                let part = turul_a2a_types::Part::from(proto_part.clone());
+                if let Some(result) = part.parse_data::<T>() {
+                    return Some(result.map_err(|e| A2aClientError::Conversion(e.to_string())));
                 }
             }
         }

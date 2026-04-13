@@ -15,4 +15,6 @@ pub enum A2aTypeError {
     InvalidState,
     #[error("Missing required field: {0}")]
     MissingField(&'static str),
+    #[error("Deserialization error: {0}")]
+    Deserialization(String),
 }

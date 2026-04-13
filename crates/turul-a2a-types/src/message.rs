@@ -87,6 +87,33 @@ impl Part {
         }
     }
 
+    /// Raw JSON view of a Data part. No number normalization.
+    /// Returns `None` if this is not a Data part.
+    pub fn as_data(&self) -> Option<serde_json::Value> {
+        match &self.inner.content {
+            Some(pb::part::Content::Data(proto_struct)) => {
+                serde_json::to_value(proto_struct).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Deserialize a Data part into `T`, normalizing proto f64 integers first.
+    ///
+    /// Protobuf `Value` uses f64 for all numbers, so `25544` becomes `25544.0`.
+    /// This normalizes whole-number f64s back to integers before deserializing,
+    /// so `u32`/`i32`/`u8` fields work correctly.
+    ///
+    /// Returns `None` if not a Data part. Returns `Err` if deserialization fails.
+    pub fn parse_data<T: serde::de::DeserializeOwned>(&self) -> Option<Result<T, crate::error::A2aTypeError>> {
+        let json = self.as_data()?;
+        let normalized = normalize_proto_numbers_for_deser(json);
+        Some(
+            serde_json::from_value(normalized)
+                .map_err(|e| crate::error::A2aTypeError::Deserialization(e.to_string()))
+        )
+    }
+
     pub fn as_proto(&self) -> &pb::Part {
         &self.inner
     }
@@ -208,6 +235,38 @@ impl Message {
         self.text_parts().join(" ")
     }
 
+    /// Raw JSON data parts (no number normalization).
+    pub fn data_parts(&self) -> Vec<serde_json::Value> {
+        self.inner
+            .parts
+            .iter()
+            .filter_map(|p| match &p.content {
+                Some(pb::part::Content::Data(proto_struct)) => {
+                    serde_json::to_value(proto_struct).ok()
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Deserialize the first Data part into `T`, normalizing proto f64 integers.
+    ///
+    /// Returns `None` if no Data part exists. Returns `Err` if deserialization fails.
+    pub fn parse_first_data<T: serde::de::DeserializeOwned>(&self) -> Option<Result<T, crate::error::A2aTypeError>> {
+        for part in &self.inner.parts {
+            if let Some(pb::part::Content::Data(proto_struct)) = &part.content {
+                if let Ok(json) = serde_json::to_value(proto_struct) {
+                    let normalized = normalize_proto_numbers_for_deser(json);
+                    return Some(
+                        serde_json::from_value(normalized)
+                            .map_err(|e| crate::error::A2aTypeError::Deserialization(e.to_string()))
+                    );
+                }
+            }
+        }
+        None
+    }
+
     pub fn as_proto(&self) -> &pb::Message {
         &self.inner
     }
@@ -247,6 +306,41 @@ impl<'de> Deserialize<'de> for Message {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let proto = pb::Message::deserialize(deserializer)?;
         Message::try_from(proto).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Normalize proto f64 whole numbers to integers for typed deserialization.
+///
+/// Protobuf `Value.number_value` is always f64. This converts finite whole-number
+/// f64s back to JSON integers so serde can deserialize into u32/i32/u8/etc.
+/// Fractional values and out-of-range numbers are left unchanged.
+///
+/// Internal — callers use `Part::parse_data::<T>()` or `Message::parse_first_data::<T>()`.
+fn normalize_proto_numbers_for_deser(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Number(n) => {
+            if let Some(f) = n.as_f64() {
+                if f.is_finite() && f.fract() == 0.0 {
+                    if f >= 0.0 && f <= u64::MAX as f64 {
+                        return serde_json::Value::Number((f as u64).into());
+                    } else if f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+                        return serde_json::Value::Number((f as i64).into());
+                    }
+                }
+            }
+            serde_json::Value::Number(n)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(normalize_proto_numbers_for_deser).collect())
+        }
+        serde_json::Value::Object(map) => {
+            serde_json::Value::Object(
+                map.into_iter()
+                    .map(|(k, v)| (k, normalize_proto_numbers_for_deser(v)))
+                    .collect(),
+            )
+        }
+        other => other,
     }
 }
 
@@ -402,5 +496,99 @@ mod tests {
         let json = r#"{"messageId":"m-bad","role":"ROLE_UNSPECIFIED","parts":[]}"#;
         let result: Result<Message, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    // =========================================================
+    // Proto number normalization tests
+    // =========================================================
+
+    #[test]
+    fn as_data_returns_raw_json_without_normalization() {
+        let part = Part::data(serde_json::json!({"count": 25544}));
+        let json = part.as_data().unwrap();
+        // Proto f64: 25544 → 25544.0 in raw JSON
+        let count = json.get("count").unwrap();
+        assert!(count.is_f64() || count.is_u64(), "Raw JSON may be f64 from proto: {count}");
+    }
+
+    #[test]
+    fn parse_data_normalizes_integers_for_typed_deser() {
+        #[derive(serde::Deserialize)]
+        struct MyData {
+            count: u32,
+            name: String,
+        }
+
+        let part = Part::data(serde_json::json!({"count": 25544, "name": "test"}));
+        let result: MyData = part.parse_data().unwrap().unwrap();
+        assert_eq!(result.count, 25544);
+        assert_eq!(result.name, "test");
+    }
+
+    #[test]
+    fn parse_data_preserves_fractional_numbers() {
+        #[derive(serde::Deserialize)]
+        struct MyData {
+            ratio: f64,
+        }
+
+        let part = Part::data(serde_json::json!({"ratio": 1.5}));
+        let result: MyData = part.parse_data().unwrap().unwrap();
+        assert!((result.ratio - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_data_handles_nested_structures() {
+        #[derive(serde::Deserialize)]
+        struct Inner {
+            value: u16,
+        }
+        #[derive(serde::Deserialize)]
+        struct Outer {
+            items: Vec<Inner>,
+        }
+
+        let part = Part::data(serde_json::json!({
+            "items": [{"value": 42}, {"value": 100}]
+        }));
+        let result: Outer = part.parse_data().unwrap().unwrap();
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.items[0].value, 42);
+        assert_eq!(result.items[1].value, 100);
+    }
+
+    #[test]
+    fn parse_data_returns_none_for_non_data_part() {
+        let part = Part::text("hello");
+        assert!(part.parse_data::<serde_json::Value>().is_none());
+    }
+
+    #[test]
+    fn message_parse_first_data_works() {
+        #[derive(serde::Deserialize)]
+        struct Req {
+            id: u32,
+        }
+
+        let msg = Message::new(
+            "m-1",
+            Role::User,
+            vec![
+                Part::text("some text"),
+                Part::data(serde_json::json!({"id": 12345})),
+            ],
+        );
+
+        let result: Req = msg.parse_first_data().unwrap().unwrap();
+        assert_eq!(result.id, 12345);
+    }
+
+    #[test]
+    fn normalize_whole_numbers_to_integers() {
+        let input = serde_json::json!({"a": 25544.0, "b": 1.5, "c": -10.0});
+        let output = normalize_proto_numbers_for_deser(input);
+        assert!(output["a"].is_u64(), "25544.0 should become integer");
+        assert!(output["b"].is_f64(), "1.5 should stay f64");
+        assert!(output["c"].is_i64(), "-10.0 should become negative integer");
     }
 }
