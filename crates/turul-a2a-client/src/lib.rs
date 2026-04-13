@@ -120,9 +120,55 @@ impl A2aClient {
         req
     }
 
-    /// Send a message to the agent.
-    /// Returns `SendMessageResponse` (oneof: Task | Message).
+    // =========================================================
+    // Primary API — wrapper-first
+    // =========================================================
+
+    /// Send a message to the agent. Returns a wrapper `SendResponse`.
     pub async fn send_message(
+        &self,
+        request: pb::SendMessageRequest,
+    ) -> Result<crate::response::SendResponse, A2aClientError> {
+        let proto_resp = self.send_message_proto(request).await?;
+        crate::response::SendResponse::try_from(proto_resp)
+    }
+
+    /// Get a task by ID. Returns a wrapper `Task`.
+    pub async fn get_task(
+        &self,
+        task_id: &str,
+        history_length: Option<i32>,
+    ) -> Result<turul_a2a_types::Task, A2aClientError> {
+        let proto_task = self.get_task_proto(task_id, history_length).await?;
+        turul_a2a_types::Task::try_from(proto_task)
+            .map_err(|e| A2aClientError::Conversion(e.to_string()))
+    }
+
+    /// Cancel a task. Returns a wrapper `Task`.
+    pub async fn cancel_task(
+        &self,
+        task_id: &str,
+    ) -> Result<turul_a2a_types::Task, A2aClientError> {
+        let proto_task = self.cancel_task_proto(task_id).await?;
+        turul_a2a_types::Task::try_from(proto_task)
+            .map_err(|e| A2aClientError::Conversion(e.to_string()))
+    }
+
+    /// List tasks. Returns a wrapper `ListResponse` with wrapper `Task`s.
+    pub async fn list_tasks(
+        &self,
+        params: &ListTasksParams,
+    ) -> Result<crate::response::ListResponse, A2aClientError> {
+        let proto_resp = self.list_tasks_proto(params).await?;
+        crate::response::ListResponse::try_from(proto_resp)
+    }
+
+    // =========================================================
+    // Proto-level escape hatches
+    // =========================================================
+
+    /// Send a message, returning the raw proto response.
+    pub async fn send_message_proto(
         &self,
         request: pb::SendMessageRequest,
     ) -> Result<pb::SendMessageResponse, A2aClientError> {
@@ -141,8 +187,8 @@ impl A2aClient {
         Ok(response)
     }
 
-    /// Get a task by ID.
-    pub async fn get_task(
+    /// Get a task by ID, returning the raw proto Task.
+    pub async fn get_task_proto(
         &self,
         task_id: &str,
         history_length: Option<i32>,
@@ -161,8 +207,8 @@ impl A2aClient {
         Ok(task)
     }
 
-    /// Cancel a task.
-    pub async fn cancel_task(
+    /// Cancel a task, returning the raw proto Task.
+    pub async fn cancel_task_proto(
         &self,
         task_id: &str,
     ) -> Result<pb::Task, A2aClientError> {
@@ -180,8 +226,8 @@ impl A2aClient {
         Ok(task)
     }
 
-    /// List tasks with optional filtering.
-    pub async fn list_tasks(
+    /// List tasks, returning the raw proto response.
+    pub async fn list_tasks_proto(
         &self,
         params: &ListTasksParams,
     ) -> Result<pb::ListTasksResponse, A2aClientError> {

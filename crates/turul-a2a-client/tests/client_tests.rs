@@ -91,16 +91,8 @@ async fn send_message_returns_send_message_response() {
     };
 
     let response = client.send_message(request).await.unwrap();
-    // SendMessageResponse has oneof: task or message
-    assert!(response.payload.is_some());
-    match response.payload.unwrap() {
-        turul_a2a_proto::send_message_response::Payload::Task(task) => {
-            assert_eq!(task.id, "task-1");
-        }
-        turul_a2a_proto::send_message_response::Payload::Message(_) => {
-            // Also valid
-        }
-    }
+    let task = response.into_task().expect("Expected Task");
+    assert_eq!(task.id(), "task-1");
 }
 
 // =========================================================
@@ -124,7 +116,7 @@ async fn get_task_returns_task() {
 
     let client = A2aClient::new(&server.uri());
     let task = client.get_task("task-42", None).await.unwrap();
-    assert_eq!(task.id, "task-42");
+    assert_eq!(task.id(), "task-42");
 }
 
 #[tokio::test]
@@ -394,10 +386,10 @@ fn message_builder_mixed_methods() {
 // =========================================================
 
 #[test]
-fn response_task_extracts_wrapper_task() {
-    use turul_a2a_client::response;
+fn send_response_extracts_wrapper_task() {
+    use turul_a2a_client::response::SendResponse;
 
-    let resp = turul_a2a_proto::SendMessageResponse {
+    let proto_resp = turul_a2a_proto::SendMessageResponse {
         payload: Some(turul_a2a_proto::send_message_response::Payload::Task(
             turul_a2a_proto::Task {
                 id: "task-1".into(),
@@ -412,39 +404,51 @@ fn response_task_extracts_wrapper_task() {
         )),
     };
 
-    let task = response::response_task(&resp).unwrap();
+    let resp = SendResponse::try_from(proto_resp).unwrap();
+    assert!(resp.is_task());
+    let task = resp.into_task().unwrap();
     assert_eq!(task.id(), "task-1");
 }
 
 #[test]
-fn response_task_id_extracts_id() {
-    use turul_a2a_client::response;
+fn send_response_task_accessor() {
+    use turul_a2a_client::response::SendResponse;
 
-    let resp = turul_a2a_proto::SendMessageResponse {
+    let proto_resp = turul_a2a_proto::SendMessageResponse {
         payload: Some(turul_a2a_proto::send_message_response::Payload::Task(
             turul_a2a_proto::Task {
                 id: "task-2".into(),
+                status: Some(turul_a2a_proto::TaskStatus {
+                    state: turul_a2a_proto::TaskState::Completed.into(),
+                    message: None,
+                    timestamp: None,
+                }),
                 ..Default::default()
             },
         )),
     };
 
-    assert_eq!(response::response_task_id(&resp), Some("task-2"));
+    let resp = SendResponse::try_from(proto_resp).unwrap();
+    assert_eq!(resp.task().unwrap().id(), "task-2");
 }
 
 #[test]
-fn response_helpers_return_none_for_message_payload() {
-    use turul_a2a_client::response;
+fn send_response_message_variant() {
+    use turul_a2a_client::response::SendResponse;
 
-    let resp = turul_a2a_proto::SendMessageResponse {
+    let proto_resp = turul_a2a_proto::SendMessageResponse {
         payload: Some(turul_a2a_proto::send_message_response::Payload::Message(
-            turul_a2a_proto::Message::default(),
+            turul_a2a_proto::Message {
+                role: turul_a2a_proto::Role::Agent.into(),
+                ..Default::default()
+            },
         )),
     };
 
-    assert!(response::response_task(&resp).is_none());
-    assert!(response::response_task_id(&resp).is_none());
-    assert!(!response::response_is_task(&resp));
+    let resp = SendResponse::try_from(proto_resp).unwrap();
+    assert!(!resp.is_task());
+    assert!(resp.task().is_none());
+    assert!(resp.message().is_some());
 }
 
 #[test]

@@ -23,6 +23,10 @@ pub enum A2aClientError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// Proto-to-wrapper type conversion error.
+    #[error("Type conversion error: {0}")]
+    Conversion(String),
+
     /// SSE stream error.
     #[error("SSE error: {0}")]
     Sse(String),
