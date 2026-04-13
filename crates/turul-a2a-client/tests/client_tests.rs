@@ -322,3 +322,139 @@ async fn a2a_version_header_sent_on_all_requests() {
     let client = A2aClient::new(&server.uri());
     client.get_task("check-version", None).await.unwrap();
 }
+
+// =========================================================
+// MessageBuilder — wrapper part methods
+// =========================================================
+
+#[test]
+fn message_builder_data_produces_valid_request() {
+    use turul_a2a_client::MessageBuilder;
+
+    let request = MessageBuilder::new()
+        .data(json!({"key": "value"}))
+        .build();
+
+    let msg = request.message.unwrap();
+    assert_eq!(msg.parts.len(), 1);
+    // Data part should have structured data content
+    assert!(msg.parts[0].content.is_some());
+}
+
+#[test]
+fn message_builder_part_accepts_wrapper_part() {
+    use turul_a2a_client::MessageBuilder;
+    use turul_a2a_types::Part;
+
+    let request = MessageBuilder::new()
+        .part(Part::text("hello"))
+        .part(Part::url("https://example.com", "text/html"))
+        .build();
+
+    let msg = request.message.unwrap();
+    assert_eq!(msg.parts.len(), 2);
+}
+
+#[test]
+fn message_builder_parts_accepts_iterator() {
+    use turul_a2a_client::MessageBuilder;
+    use turul_a2a_types::Part;
+
+    let parts = vec![
+        Part::text("one"),
+        Part::text("two"),
+        Part::text("three"),
+    ];
+
+    let request = MessageBuilder::new()
+        .parts(parts)
+        .build();
+
+    let msg = request.message.unwrap();
+    assert_eq!(msg.parts.len(), 3);
+}
+
+#[test]
+fn message_builder_mixed_methods() {
+    use turul_a2a_client::MessageBuilder;
+    use turul_a2a_types::Part;
+
+    let request = MessageBuilder::new()
+        .text("plain text")
+        .data(json!({"structured": true}))
+        .part(Part::raw(vec![1, 2, 3], "application/octet-stream"))
+        .build();
+
+    let msg = request.message.unwrap();
+    assert_eq!(msg.parts.len(), 3);
+}
+
+// =========================================================
+// Response helpers
+// =========================================================
+
+#[test]
+fn response_task_extracts_wrapper_task() {
+    use turul_a2a_client::response;
+
+    let resp = turul_a2a_proto::SendMessageResponse {
+        payload: Some(turul_a2a_proto::send_message_response::Payload::Task(
+            turul_a2a_proto::Task {
+                id: "task-1".into(),
+                context_id: "ctx-1".into(),
+                status: Some(turul_a2a_proto::TaskStatus {
+                    state: turul_a2a_proto::TaskState::Completed.into(),
+                    message: None,
+                    timestamp: None,
+                }),
+                ..Default::default()
+            },
+        )),
+    };
+
+    let task = response::response_task(&resp).unwrap();
+    assert_eq!(task.id(), "task-1");
+}
+
+#[test]
+fn response_task_id_extracts_id() {
+    use turul_a2a_client::response;
+
+    let resp = turul_a2a_proto::SendMessageResponse {
+        payload: Some(turul_a2a_proto::send_message_response::Payload::Task(
+            turul_a2a_proto::Task {
+                id: "task-2".into(),
+                ..Default::default()
+            },
+        )),
+    };
+
+    assert_eq!(response::response_task_id(&resp), Some("task-2"));
+}
+
+#[test]
+fn response_helpers_return_none_for_message_payload() {
+    use turul_a2a_client::response;
+
+    let resp = turul_a2a_proto::SendMessageResponse {
+        payload: Some(turul_a2a_proto::send_message_response::Payload::Message(
+            turul_a2a_proto::Message::default(),
+        )),
+    };
+
+    assert!(response::response_task(&resp).is_none());
+    assert!(response::response_task_id(&resp).is_none());
+    assert!(!response::response_is_task(&resp));
+}
+
+#[test]
+fn artifact_text_extracts_text_from_task() {
+    use turul_a2a_client::response;
+    use turul_a2a_types::{Task, TaskState, TaskStatus};
+
+    let mut task = Task::new("t-1", TaskStatus::new(TaskState::Completed));
+    task.push_text_artifact("a-1", "Result", "hello world");
+
+    let text = response::artifact_text(&task);
+    assert_eq!(text, "hello world");
+}

@@ -12,6 +12,7 @@ use turul_a2a::executor::AgentExecutor;
 use turul_a2a::storage::InMemoryA2aStorage;
 use futures::StreamExt;
 use turul_a2a_client::{A2aClient, A2aClientError, ClientAuth, ListTasksParams, MessageBuilder};
+use turul_a2a_client::response::{response_task, response_task_id};
 use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
 
 // =========================================================
@@ -187,15 +188,10 @@ async fn e2e_tcp_send_message_creates_task() {
     let resp = client.send_message(send_request("tcp-send-1", "hello")).await.unwrap();
 
     // Response should contain a task
-    let task = resp.payload.as_ref().unwrap();
-    match task {
-        turul_a2a_proto::send_message_response::Payload::Task(t) => {
-            assert!(!t.id.is_empty());
-            assert_eq!(t.status.as_ref().unwrap().state, i32::from(turul_a2a_proto::TaskState::Completed));
-            assert!(!t.artifacts.is_empty());
-        }
-        _ => panic!("Expected Task payload"),
-    }
+    let task = response_task(&resp).expect("Expected Task payload");
+    assert!(!task.id().is_empty());
+    assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Completed);
+    assert!(!task.artifacts().is_empty());
 }
 
 #[tokio::test]
@@ -204,10 +200,7 @@ async fn e2e_tcp_get_task_after_send() {
     let client = A2aClient::new(&url);
 
     let resp = client.send_message(send_request("tcp-get-1", "create")).await.unwrap();
-    let task_id = match resp.payload.as_ref().unwrap() {
-        turul_a2a_proto::send_message_response::Payload::Task(t) => t.id.clone(),
-        _ => panic!("Expected Task"),
-    };
+    let task_id = response_task_id(&resp).unwrap().to_string();
 
     // Get with no history limit
     let task = client.get_task(&task_id, None).await.unwrap();
@@ -235,10 +228,7 @@ async fn e2e_tcp_cancel_completed_task() {
     let client = A2aClient::new(&url);
 
     let resp = client.send_message(send_request("tcp-cancel-1", "complete")).await.unwrap();
-    let task_id = match resp.payload.as_ref().unwrap() {
-        turul_a2a_proto::send_message_response::Payload::Task(t) => t.id.clone(),
-        _ => panic!("Expected Task"),
-    };
+    let task_id = response_task_id(&resp).unwrap().to_string();
 
     let err = client.cancel_task(&task_id).await.unwrap_err();
     assert_eq!(err.status(), Some(409));
@@ -300,13 +290,9 @@ async fn e2e_tcp_multi_turn_continuation() {
 
     // First send: pauses at INPUT_REQUIRED
     let resp = client.send_message(send_request("tcp-multi-1", "start")).await.unwrap();
-    let task_id = match resp.payload.as_ref().unwrap() {
-        turul_a2a_proto::send_message_response::Payload::Task(t) => {
-            assert_eq!(t.status.as_ref().unwrap().state, i32::from(turul_a2a_proto::TaskState::InputRequired));
-            t.id.clone()
-        }
-        _ => panic!("Expected Task"),
-    };
+    let task = response_task(&resp).expect("Expected Task");
+    assert_eq!(task.status().unwrap().state().unwrap(), TaskState::InputRequired);
+    let task_id = task.id().to_string();
 
     // Second send with same task_id: completes
     let resp = client
@@ -314,13 +300,9 @@ async fn e2e_tcp_multi_turn_continuation() {
         .await
         .unwrap();
 
-    match resp.payload.as_ref().unwrap() {
-        turul_a2a_proto::send_message_response::Payload::Task(t) => {
-            assert_eq!(t.id, task_id);
-            assert_eq!(t.status.as_ref().unwrap().state, i32::from(turul_a2a_proto::TaskState::Completed));
-        }
-        _ => panic!("Expected Task"),
-    }
+    let task = response_task(&resp).expect("Expected Task");
+    assert_eq!(task.id(), task_id);
+    assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Completed);
 }
 
 #[tokio::test]
@@ -332,10 +314,7 @@ async fn e2e_tcp_tenant_isolation() {
 
     // Create task under alpha
     let resp = client_alpha.send_message(send_request("tcp-tenant-1", "alpha task")).await.unwrap();
-    let task_id = match resp.payload.as_ref().unwrap() {
-        turul_a2a_proto::send_message_response::Payload::Task(t) => t.id.clone(),
-        _ => panic!("Expected Task"),
-    };
+    let task_id = response_task_id(&resp).unwrap().to_string();
 
     // Alpha can see it
     let task = client_alpha.get_task(&task_id, None).await.unwrap();
@@ -366,12 +345,8 @@ async fn e2e_tcp_api_key_auth_accepted() {
     });
 
     let resp = client.send_message(send_request("tcp-auth-1", "authed")).await.unwrap();
-    match resp.payload.as_ref().unwrap() {
-        turul_a2a_proto::send_message_response::Payload::Task(t) => {
-            assert_eq!(t.status.as_ref().unwrap().state, i32::from(turul_a2a_proto::TaskState::Completed));
-        }
-        _ => panic!("Expected Task"),
-    }
+    let task = response_task(&resp).expect("Expected Task");
+    assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Completed);
 }
 
 #[tokio::test]
@@ -446,10 +421,7 @@ async fn e2e_tcp_subscribe_to_non_terminal_task() {
     // Create a task that pauses at INPUT_REQUIRED
     let request = MessageBuilder::new().text("pause").build();
     let resp = client.send_message(request).await.unwrap();
-    let task_id = match resp.payload.as_ref().unwrap() {
-        turul_a2a_proto::send_message_response::Payload::Task(t) => t.id.clone(),
-        _ => panic!("Expected Task"),
-    };
+    let task_id = response_task_id(&resp).unwrap().to_string();
 
     // Subscribe — should get Task snapshot as first event
     let mut stream = client.subscribe_to_task(&task_id, None).await.unwrap();
@@ -482,10 +454,7 @@ async fn e2e_tcp_subscribe_terminal_task_returns_error() {
     // Create and complete a task
     let request = MessageBuilder::new().text("complete").build();
     let resp = client.send_message(request).await.unwrap();
-    let task_id = match resp.payload.as_ref().unwrap() {
-        turul_a2a_proto::send_message_response::Payload::Task(t) => t.id.clone(),
-        _ => panic!("Expected Task"),
-    };
+    let task_id = response_task_id(&resp).unwrap().to_string();
 
     // Subscribe to terminal task — should error
     match client.subscribe_to_task(&task_id, None).await {
@@ -507,10 +476,6 @@ async fn e2e_tcp_message_builder_ergonomics() {
         .build();
 
     let resp = client.send_message(request).await.unwrap();
-    match resp.payload.as_ref().unwrap() {
-        turul_a2a_proto::send_message_response::Payload::Task(t) => {
-            assert!(!t.id.is_empty());
-        }
-        _ => panic!("Expected Task"),
-    }
+    let task = response_task(&resp).expect("Expected Task");
+    assert!(!task.id().is_empty());
 }

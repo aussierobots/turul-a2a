@@ -5,6 +5,7 @@
 pub mod builders;
 mod error;
 pub mod prelude;
+pub mod response;
 pub mod sse;
 
 use turul_a2a_proto as pb;

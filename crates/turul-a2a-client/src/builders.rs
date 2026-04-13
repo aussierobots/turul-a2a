@@ -3,6 +3,7 @@
 //! Hides proto nesting so callers don't construct raw `SendMessageRequest`.
 
 use turul_a2a_proto as pb;
+use turul_a2a_types::Part;
 
 /// Builder for `SendMessageRequest`.
 ///
@@ -39,6 +40,27 @@ impl MessageBuilder {
             filename: String::new(),
             media_type: String::new(),
         });
+        self
+    }
+
+    /// Add a structured JSON data part to the message.
+    pub fn data(mut self, value: serde_json::Value) -> Self {
+        self.parts.push(Part::data(value).into_proto());
+        self
+    }
+
+    /// Add a wrapper `Part` to the message. The builder handles proto conversion.
+    pub fn part(mut self, part: Part) -> Self {
+        self.parts.push(part.into_proto());
+        self
+    }
+
+    /// Add multiple wrapper `Part`s to the message.
+    pub fn parts<I>(mut self, parts: I) -> Self
+    where
+        I: IntoIterator<Item = Part>,
+    {
+        self.parts.extend(parts.into_iter().map(|p| p.into_proto()));
         self
     }
 
