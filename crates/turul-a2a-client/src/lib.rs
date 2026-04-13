@@ -125,11 +125,13 @@ impl A2aClient {
     // =========================================================
 
     /// Send a message to the agent. Returns a wrapper `SendResponse`.
+    ///
+    /// Accepts `MessageBuilder` directly (no `.build()` needed) or a raw proto request.
     pub async fn send_message(
         &self,
-        request: pb::SendMessageRequest,
+        request: impl Into<pb::SendMessageRequest>,
     ) -> Result<crate::response::SendResponse, A2aClientError> {
-        let proto_resp = self.send_message_proto(request).await?;
+        let proto_resp = self.send_message_proto(request.into()).await?;
         crate::response::SendResponse::try_from(proto_resp)
     }
 
@@ -265,8 +267,9 @@ impl A2aClient {
     /// The stream closes when the task reaches a terminal state.
     pub async fn send_streaming_message(
         &self,
-        request: pb::SendMessageRequest,
+        request: impl Into<pb::SendMessageRequest>,
     ) -> Result<SseStream, A2aClientError> {
+        let request = request.into();
         let url = self.url("/message:stream");
         let resp = self
             .request(reqwest::Method::POST, &url)

@@ -65,8 +65,9 @@ impl MessageBuilder {
     }
 
     /// Set the message role (default: User).
-    pub fn role(mut self, role: pb::Role) -> Self {
-        self.role = role.into();
+    /// Accepts the wrapper `Role` type from `turul_a2a_types`.
+    pub fn role(mut self, role: turul_a2a_types::Role) -> Self {
+        self.role = pb::Role::from(role).into();
         self
     }
 
@@ -105,6 +106,12 @@ impl MessageBuilder {
             metadata: None,
             tenant: String::new(),
         }
+    }
+}
+
+impl From<MessageBuilder> for pb::SendMessageRequest {
+    fn from(builder: MessageBuilder) -> Self {
+        builder.build()
     }
 }
 
