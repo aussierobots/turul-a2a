@@ -46,6 +46,7 @@ cargo lambda watch -p lambda-agent         # Lambda agent via cargo-lambda
 
 - Commit messages: succinct, no Co-Authored-By attribution
 - Do not push unless explicitly asked
+- Version bumps: minor = 0.0.x (e.g., 0.1.0 → 0.1.1), major = 0.x.0
 
 ## Architecture
 
