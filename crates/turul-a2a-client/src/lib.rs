@@ -13,7 +13,7 @@ use turul_a2a_types::wire;
 
 pub use builders::MessageBuilder;
 pub use error::A2aClientError;
-pub use sse::{SseEvent, SseStream};
+pub use sse::{SseEvent, SseStream, StreamEvent, TypedSseEvent, TypedSseStream};
 
 /// Auth configuration for the client.
 #[derive(Debug, Clone)]
@@ -261,11 +261,33 @@ impl A2aClient {
     // Streaming methods
     // =========================================================
 
-    /// Send a streaming message. Returns an SSE event stream.
+    /// Send a streaming message. Returns a typed event stream.
     ///
-    /// Events include status updates, artifact updates, and the initial task.
+    /// Events are `StreamEvent` variants: `Task`, `Message`, `StatusUpdate`, `ArtifactUpdate`.
     /// The stream closes when the task reaches a terminal state.
     pub async fn send_streaming_message(
+        &self,
+        request: impl Into<pb::SendMessageRequest>,
+    ) -> Result<TypedSseStream, A2aClientError> {
+        let raw = self.send_streaming_message_raw(request).await?;
+        Ok(TypedSseStream::from_raw(raw))
+    }
+
+    /// Subscribe to task events. Returns a typed event stream.
+    ///
+    /// The first event is a `StreamEvent::Task` snapshot (spec §3.1.6).
+    /// Subsequent events are `StatusUpdate` / `ArtifactUpdate` from the durable store.
+    pub async fn subscribe_to_task(
+        &self,
+        task_id: &str,
+        last_event_id: Option<&str>,
+    ) -> Result<TypedSseStream, A2aClientError> {
+        let raw = self.subscribe_to_task_raw(task_id, last_event_id).await?;
+        Ok(TypedSseStream::from_raw(raw))
+    }
+
+    /// Send a streaming message, returning raw SSE events (untyped JSON).
+    pub async fn send_streaming_message_raw(
         &self,
         request: impl Into<pb::SendMessageRequest>,
     ) -> Result<SseStream, A2aClientError> {
@@ -285,14 +307,8 @@ impl A2aClient {
         Ok(SseStream::from_response(resp))
     }
 
-    /// Subscribe to task events. Returns an SSE event stream.
-    ///
-    /// The first event is a Task object snapshot (spec §3.1.6).
-    /// Subsequent events are status/artifact updates from the durable store.
-    ///
-    /// For reconnection, pass `last_event_id` from the last received event's `id` field.
-    /// The server replays only events after that sequence.
-    pub async fn subscribe_to_task(
+    /// Subscribe to task events, returning raw SSE events (untyped JSON).
+    pub async fn subscribe_to_task_raw(
         &self,
         task_id: &str,
         last_event_id: Option<&str>,

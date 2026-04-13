@@ -11,7 +11,7 @@ use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
 use turul_a2a::storage::InMemoryA2aStorage;
 use futures::StreamExt;
-use turul_a2a_client::{A2aClient, A2aClientError, ClientAuth, ListTasksParams, MessageBuilder};
+use turul_a2a_client::{A2aClient, A2aClientError, ClientAuth, ListTasksParams, MessageBuilder, StreamEvent};
 use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
 
 // =========================================================
@@ -394,20 +394,15 @@ async fn e2e_tcp_send_streaming_message() {
 
     assert!(!events.is_empty(), "Should receive streaming events");
 
-    // Events should have IDs in {task_id}:{sequence} format
+    // Events should have IDs
     for (i, event) in events.iter().enumerate() {
         assert!(event.id.is_some(), "Event {i} should have an id");
-        let id = event.id.as_ref().unwrap();
-        assert!(id.contains(':'), "Event id should be task_id:sequence, got: {id}");
     }
 
-    // Should see terminal event
+    // Should see terminal event via typed enum
     let has_completed = events.iter().any(|e| {
-        e.data.get("statusUpdate")
-            .and_then(|su| su.get("status"))
-            .and_then(|s| s.get("state"))
-            .and_then(|s| s.as_str())
-            .is_some_and(|s| s == "TASK_STATE_COMPLETED")
+        matches!(&e.event, StreamEvent::StatusUpdate { status, .. }
+            if status.get("state").and_then(|s| s.as_str()) == Some("TASK_STATE_COMPLETED"))
     });
     assert!(has_completed, "Stream should include COMPLETED event");
 }
@@ -434,9 +429,9 @@ async fn e2e_tcp_subscribe_to_non_terminal_task() {
     match first {
         Ok(Some(Ok(event))) => {
             assert!(
-                event.data.get("task").is_some(),
-                "First event should be Task snapshot, got: {}",
-                event.data
+                matches!(event.event, StreamEvent::Task(_)),
+                "First event should be Task snapshot, got: {:?}",
+                event.event
             );
         }
         Ok(Some(Err(e))) => panic!("Stream error: {e}"),

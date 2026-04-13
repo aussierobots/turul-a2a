@@ -7,6 +7,8 @@ use futures::stream::{Stream, StreamExt};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use turul_a2a_types::{Artifact, Message, Task, TaskStatus};
+
 use crate::A2aClientError;
 
 /// A parsed SSE event from the server.
@@ -116,6 +118,124 @@ fn parse_sse_event(text: &str) -> Option<SseEvent> {
     }
 
     data.map(|d| SseEvent { id, data: d })
+}
+
+// =========================================================
+// Typed streaming events (Phase 3)
+// =========================================================
+
+/// A typed streaming event from the server.
+///
+/// Replaces raw `serde_json::Value` navigation with concrete variants
+/// matching the proto `StreamResponse` oneof.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum StreamEvent {
+    /// Full task snapshot (first event in subscribe streams).
+    Task(Task),
+    /// Direct message from the agent.
+    Message(Message),
+    /// Task status changed.
+    StatusUpdate {
+        task_id: String,
+        context_id: String,
+        status: serde_json::Value,
+    },
+    /// Artifact produced or updated.
+    ArtifactUpdate {
+        task_id: String,
+        context_id: String,
+        artifact: serde_json::Value,
+        append: bool,
+        last_chunk: bool,
+    },
+}
+
+/// A typed SSE event with parsed event data.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct TypedSseEvent {
+    /// SSE event ID. Format: `{task_id}:{sequence}`.
+    pub id: Option<String>,
+    /// Parsed and typed event data.
+    pub event: StreamEvent,
+}
+
+/// Parse a raw `SseEvent` into a typed `TypedSseEvent`.
+///
+/// Inspects the JSON keys to determine the variant:
+/// `task` → Task, `message` → Message, `statusUpdate` → StatusUpdate, `artifactUpdate` → ArtifactUpdate
+fn parse_stream_event(raw: &SseEvent) -> Result<TypedSseEvent, A2aClientError> {
+    let data = &raw.data;
+
+    let event = if let Some(task_json) = data.get("task") {
+        let proto: turul_a2a_proto::Task = serde_json::from_value(task_json.clone())
+            .map_err(|e| A2aClientError::Conversion(format!("Invalid Task: {e}")))?;
+        let task = Task::try_from(proto)
+            .map_err(|e| A2aClientError::Conversion(e.to_string()))?;
+        StreamEvent::Task(task)
+    } else if let Some(msg_json) = data.get("message") {
+        let proto: turul_a2a_proto::Message = serde_json::from_value(msg_json.clone())
+            .map_err(|e| A2aClientError::Conversion(format!("Invalid Message: {e}")))?;
+        let msg = Message::try_from(proto)
+            .map_err(|e| A2aClientError::Conversion(e.to_string()))?;
+        StreamEvent::Message(msg)
+    } else if let Some(su) = data.get("statusUpdate") {
+        StreamEvent::StatusUpdate {
+            task_id: su.get("taskId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            context_id: su.get("contextId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            status: su.get("status").cloned().unwrap_or_default(),
+        }
+    } else if let Some(au) = data.get("artifactUpdate") {
+        StreamEvent::ArtifactUpdate {
+            task_id: au.get("taskId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            context_id: au.get("contextId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            artifact: au.get("artifact").cloned().unwrap_or_default(),
+            append: au.get("append").and_then(|v| v.as_bool()).unwrap_or(false),
+            last_chunk: au.get("lastChunk").and_then(|v| v.as_bool()).unwrap_or(false),
+        }
+    } else {
+        return Err(A2aClientError::Conversion(
+            format!("Unknown stream event shape: {data}")
+        ));
+    };
+
+    Ok(TypedSseEvent {
+        id: raw.id.clone(),
+        event,
+    })
+}
+
+/// Async stream of typed SSE events.
+///
+/// Wraps `SseStream` and parses raw JSON events into typed `StreamEvent` variants.
+pub struct TypedSseStream {
+    inner: Pin<Box<dyn Stream<Item = Result<TypedSseEvent, A2aClientError>> + Send>>,
+}
+
+impl TypedSseStream {
+    pub(crate) fn from_raw(raw: SseStream) -> Self {
+        let typed = futures::stream::unfold(raw, |mut raw_stream| async move {
+            match raw_stream.next().await? {
+                Ok(raw_event) => {
+                    let typed = parse_stream_event(&raw_event);
+                    Some((typed, raw_stream))
+                }
+                Err(e) => Some((Err(e), raw_stream)),
+            }
+        });
+        Self {
+            inner: Box::pin(typed),
+        }
+    }
+}
+
+impl Stream for TypedSseStream {
+    type Item = Result<TypedSseEvent, A2aClientError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
 }
 
 #[cfg(test)]
