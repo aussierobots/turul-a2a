@@ -30,11 +30,18 @@ struct AuthEchoExecutor;
 
 #[async_trait::async_trait]
 impl AgentExecutor for AuthEchoExecutor {
-    async fn execute(&self, task: &mut Task, _message: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
+    async fn execute(&self, task: &mut Task, _message: &Message, ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
+        // Use ExecutionContext to access caller identity
+        let response = format!(
+            "Authenticated as: {} (tenant: {})",
+            ctx.owner,
+            ctx.tenant.as_deref().unwrap_or("default"),
+        );
+
         task.push_text_artifact(
             uuid::Uuid::now_v7().to_string(),
             "Auth Echo",
-            "Authenticated echo response",
+            response,
         );
         task.complete();
         Ok(())
@@ -44,7 +51,7 @@ impl AgentExecutor for AuthEchoExecutor {
         // Security schemes are auto-populated from middleware by the builder
         AgentCardBuilder::new("Auth Echo Agent", "0.1.0")
             .description("Demonstrates API Key authentication")
-            .url("http://localhost:3001", "JSONRPC", "1.0")
+            .url("http://localhost:3001/jsonrpc", "JSONRPC", "1.0")
             .provider("Aussie Robots", "https://github.com/aussierobots/turul-a2a")
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])

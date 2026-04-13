@@ -188,6 +188,95 @@ func TestGetTaskNotFound(t *testing.T) {
 }
 
 // =========================================================
+// B7: SendStreamingMessage via SDK
+// =========================================================
+
+func TestSendStreamingMessage(t *testing.T) {
+	client := newClient(t)
+	defer client.Destroy()
+
+	events := client.SendStreamingMessage(ctx(), &a2a.SendMessageRequest{
+		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("stream from Go SDK")),
+	})
+
+	var collected []a2a.Event
+	for event, err := range events {
+		if err != nil {
+			t.Fatalf("Streaming error: %v", err)
+		}
+		collected = append(collected, event)
+	}
+
+	if len(collected) == 0 {
+		t.Fatal("SendStreamingMessage should produce events")
+	}
+
+	// Should see status updates progressing to completion
+	var sawCompleted bool
+	for _, event := range collected {
+		if su, ok := event.(*a2a.TaskStatusUpdateEvent); ok {
+			t.Logf("Status event: %s", su.Status.State)
+			if su.Status.State == a2a.TaskStateCompleted {
+				sawCompleted = true
+			}
+		}
+	}
+
+	if !sawCompleted {
+		t.Error("Stream should include COMPLETED status event")
+	}
+
+	t.Logf("Received %d streaming events", len(collected))
+}
+
+// =========================================================
+// B8: SubscribeToTask via SDK
+// =========================================================
+
+func TestSubscribeToTask(t *testing.T) {
+	client := newClient(t)
+	defer client.Destroy()
+
+	// First create a task that will complete
+	result, err := client.SendMessage(ctx(), &a2a.SendMessageRequest{
+		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("for subscribe test")),
+	})
+	if err != nil {
+		t.Fatalf("SendMessage failed: %v", err)
+	}
+
+	task, ok := result.(*a2a.Task)
+	if !ok {
+		t.Fatalf("Expected Task, got %T", result)
+	}
+
+	// Subscribe to the completed task — should get UnsupportedOperation error
+	// (spec §3.1.6: terminal tasks return error)
+	events := client.SubscribeToTask(ctx(), &a2a.SubscribeToTaskRequest{ID: task.ID})
+
+	var gotError bool
+	var eventCount int
+	for event, err := range events {
+		if err != nil {
+			gotError = true
+			t.Logf("Subscribe error (expected for terminal task): %v", err)
+			break
+		}
+		eventCount++
+		t.Logf("Unexpected event: %T", event)
+	}
+
+	if !gotError && eventCount == 0 {
+		// Iterator completed without events or errors — the JSON-RPC error
+		// was returned as a non-SSE response, so the stream was empty.
+		// This is also acceptable terminal-task behavior.
+		t.Log("Subscribe returned empty stream for terminal task (error was non-SSE)")
+	} else if !gotError {
+		t.Error("SubscribeToTask on completed task should return error or empty stream")
+	}
+}
+
+// =========================================================
 // Helper: create SDK client via discovery
 // =========================================================
 

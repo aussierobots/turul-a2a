@@ -17,19 +17,9 @@ struct EchoExecutor;
 #[async_trait::async_trait]
 impl AgentExecutor for EchoExecutor {
     async fn execute(&self, task: &mut Task, message: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
-        // Echo the user's message back as an artifact
-        let user_text = message
-            .as_proto()
-            .parts
-            .iter()
-            .filter_map(|p| match &p.content {
-                Some(turul_a2a_proto::part::Content::Text(t)) => Some(t.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let echo_text = format!("Echo: {user_text}");
+        // Echo the user's text parts back as an artifact
+        let parts = message.text_parts();
+        let echo_text = format!("Echo: {}", parts.join(" "));
 
         task.push_text_artifact(
             uuid::Uuid::now_v7().to_string(),

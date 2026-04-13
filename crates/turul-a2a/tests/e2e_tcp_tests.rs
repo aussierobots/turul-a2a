@@ -10,7 +10,8 @@ use turul_a2a::card_builder::AgentCardBuilder;
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
 use turul_a2a::storage::InMemoryA2aStorage;
-use turul_a2a_client::{A2aClient, A2aClientError, ClientAuth, ListTasksParams};
+use futures::StreamExt;
+use turul_a2a_client::{A2aClient, A2aClientError, ClientAuth, ListTasksParams, MessageBuilder};
 use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
 
 // =========================================================
@@ -396,5 +397,120 @@ async fn e2e_tcp_error_envelope_format() {
             assert_eq!(reason.as_deref(), Some("TASK_NOT_FOUND"));
         }
         other => panic!("Expected A2aError, got: {other}"),
+    }
+}
+
+// =========================================================
+// Streaming tests
+// =========================================================
+
+#[tokio::test]
+async fn e2e_tcp_send_streaming_message() {
+    let url = start_server(CompletingExecutor).await;
+    let client = A2aClient::new(&url);
+
+    let request = MessageBuilder::new().text("stream me").build();
+    let mut stream = client.send_streaming_message(request).await.unwrap();
+
+    let mut events = Vec::new();
+    while let Some(result) = stream.next().await {
+        let event = result.unwrap();
+        events.push(event);
+    }
+
+    assert!(!events.is_empty(), "Should receive streaming events");
+
+    // Events should have IDs in {task_id}:{sequence} format
+    for (i, event) in events.iter().enumerate() {
+        assert!(event.id.is_some(), "Event {i} should have an id");
+        let id = event.id.as_ref().unwrap();
+        assert!(id.contains(':'), "Event id should be task_id:sequence, got: {id}");
+    }
+
+    // Should see terminal event
+    let has_completed = events.iter().any(|e| {
+        e.data.get("statusUpdate")
+            .and_then(|su| su.get("status"))
+            .and_then(|s| s.get("state"))
+            .and_then(|s| s.as_str())
+            .is_some_and(|s| s == "TASK_STATE_COMPLETED")
+    });
+    assert!(has_completed, "Stream should include COMPLETED event");
+}
+
+#[tokio::test]
+async fn e2e_tcp_subscribe_to_non_terminal_task() {
+    let url = start_server(PausingExecutor).await;
+    let client = A2aClient::new(&url);
+
+    // Create a task that pauses at INPUT_REQUIRED
+    let request = MessageBuilder::new().text("pause").build();
+    let resp = client.send_message(request).await.unwrap();
+    let task_id = match resp.payload.as_ref().unwrap() {
+        turul_a2a_proto::send_message_response::Payload::Task(t) => t.id.clone(),
+        _ => panic!("Expected Task"),
+    };
+
+    // Subscribe — should get Task snapshot as first event
+    let mut stream = client.subscribe_to_task(&task_id, None).await.unwrap();
+
+    // Collect first event (Task snapshot)
+    let first = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        stream.next(),
+    ).await;
+
+    match first {
+        Ok(Some(Ok(event))) => {
+            assert!(
+                event.data.get("task").is_some(),
+                "First event should be Task snapshot, got: {}",
+                event.data
+            );
+        }
+        Ok(Some(Err(e))) => panic!("Stream error: {e}"),
+        Ok(None) => panic!("Stream ended without events"),
+        Err(_) => panic!("Timeout waiting for first event"),
+    }
+}
+
+#[tokio::test]
+async fn e2e_tcp_subscribe_terminal_task_returns_error() {
+    let url = start_server(CompletingExecutor).await;
+    let client = A2aClient::new(&url);
+
+    // Create and complete a task
+    let request = MessageBuilder::new().text("complete").build();
+    let resp = client.send_message(request).await.unwrap();
+    let task_id = match resp.payload.as_ref().unwrap() {
+        turul_a2a_proto::send_message_response::Payload::Task(t) => t.id.clone(),
+        _ => panic!("Expected Task"),
+    };
+
+    // Subscribe to terminal task — should error
+    match client.subscribe_to_task(&task_id, None).await {
+        Err(err) => {
+            assert_eq!(err.status(), Some(400), "Terminal subscribe should return 400");
+        }
+        Ok(_) => panic!("Subscribe to terminal task should return error"),
+    }
+}
+
+#[tokio::test]
+async fn e2e_tcp_message_builder_ergonomics() {
+    let url = start_server(CompletingExecutor).await;
+    let client = A2aClient::new(&url);
+
+    // MessageBuilder hides proto nesting
+    let request = MessageBuilder::new()
+        .text("hello from builder")
+        .build();
+
+    let resp = client.send_message(request).await.unwrap();
+    match resp.payload.as_ref().unwrap() {
+        turul_a2a_proto::send_message_response::Payload::Task(t) => {
+            assert!(!t.id.is_empty());
+        }
+        _ => panic!("Expected Task"),
     }
 }
