@@ -7,7 +7,7 @@ use futures::stream::{Stream, StreamExt};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use turul_a2a_types::{Artifact, Message, Task, TaskStatus};
+use turul_a2a_types::{Message, Task};
 
 use crate::A2aClientError;
 

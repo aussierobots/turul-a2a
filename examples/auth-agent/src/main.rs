@@ -5,11 +5,13 @@
 //! Test (no auth → 401):
 //!   curl -s http://localhost:3001/message:send \
 //!     -H 'Content-Type: application/json' \
+//!     -H 'a2a-version: 1.0' \
 //!     -d '{"message":{"messageId":"1","role":"ROLE_USER","parts":[{"text":"hello"}]}}'
 //!
 //! Test (with auth → 200):
 //!   curl -s http://localhost:3001/message:send \
 //!     -H 'Content-Type: application/json' \
+//!     -H 'a2a-version: 1.0' \
 //!     -H 'X-API-Key: demo-key-alice' \
 //!     -d '{"message":{"messageId":"1","role":"ROLE_USER","parts":[{"text":"hello"}]}}'
 //!
@@ -91,11 +93,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Without auth (should 401):");
     println!("  curl -s http://localhost:3001/message:send \\");
     println!("    -H 'Content-Type: application/json' \\");
+    println!("    -H 'a2a-version: 1.0' \\");
     println!("    -d '{{\"message\":{{\"messageId\":\"1\",\"role\":\"ROLE_USER\",\"parts\":[{{\"text\":\"hello\"}}]}}}}'");
     println!();
     println!("With auth (should 200):");
     println!("  curl -s http://localhost:3001/message:send \\");
     println!("    -H 'Content-Type: application/json' \\");
+    println!("    -H 'a2a-version: 1.0' \\");
     println!("    -H 'X-API-Key: demo-key-alice' \\");
     println!("    -d '{{\"message\":{{\"messageId\":\"1\",\"role\":\"ROLE_USER\",\"parts\":[{{\"text\":\"hello\"}}]}}}}'");
 
