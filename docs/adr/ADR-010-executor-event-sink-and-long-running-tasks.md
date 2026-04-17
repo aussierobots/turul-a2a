@@ -1,7 +1,8 @@
 # ADR-010: Executor EventSink and Long-Running Task Lifecycle
 
-- **Status:** Proposed
+- **Status:** Proposed (rev 2)
 - **Date:** 2026-04-17
+- **Supersedes:** ADR-009 §12 "Terminal Task Replay" — terminal subscribe returns `UnsupportedOperationError` per A2A v1.0 §3.1.6 / §9.4.6, no replay carve-out. See §4.3 below.
 
 ## Context
 
@@ -32,10 +33,14 @@ Lifecycle transitions are split between framework and executor:
 **Executor-owned transitions** (emitted via EventSink):
 - `WORKING` once execution actually begins (the framework emits this lazily if the executor does not).
 - `INPUT_REQUIRED` / `AUTH_REQUIRED` — interrupted states where the executor yields back to the client.
-- `COMPLETED` / `FAILED` / `CANCELED` as natural outcomes of the executor's own logic.
+- `COMPLETED` / `FAILED` / `CANCELED` / `REJECTED` as natural outcomes of the executor's own logic.
 - All `ArtifactUpdate` events.
 
-**Single-terminal-writer invariant**: for a given `(tenant, task_id)`, the atomic store accepts **exactly one** terminal event. If the executor emits `COMPLETED` and the framework has already committed `CANCELED` from a cancel request, the executor's emit resolves to a no-op at the atomic store layer (see §3 ordering rules). Conversely, if the executor's `COMPLETED` commits first, a concurrent `CancelTask` returns `TaskNotCancelable` (409). This is the same cancel-on-terminal rule that already exists — just extended to cover the live-execution window.
+**On REJECTED vs FAILED**: the proto defines both as distinct terminal states (`a2a.proto:189–207`, enum value 7 for REJECTED, 4 for FAILED). They MUST NOT be conflated on the wire. Semantic distinction: `REJECTED` is "executor declines — will not perform this task" (policy refusal, guardrail, malformed-request rejection detected by the executor). `FAILED` is "executor tried and could not" (tool error, timeout, network failure). The EventSink has separate methods for each (§2).
+
+**Single-terminal-writer invariant — enforced as a storage contract** (§3 and §7.1): for a given `(tenant, task_id)`, `A2aAtomicStore::update_task_status_with_events` MUST reject any write attempting to set a terminal state when the task is already in a terminal state, returning `A2aStorageError::TerminalStateAlreadySet { current_state }`. The check and the write occur within the same transaction on each backend. This is not a prose invariant — it is an enforced trait contract with parity tests across all four backends. Concurrent terminal emits resolve to exactly one winner; losers surface an explicit error their caller can distinguish from illegal state-machine transitions.
+
+If the executor emits `COMPLETED` and the framework has already committed `CANCELED` from a cancel request, the executor's emit returns `A2aError::InvalidRequest { message: "EventSink is closed" }` (because the sink detects terminal-already-set via the storage error and closes itself). Conversely, if the executor's `COMPLETED` commits first, a concurrent `CancelTask` returns `TaskNotCancelable` (409). This extends the existing cancel-on-terminal rule to cover the live-execution window without changing wire semantics.
 
 **Split rationale**: giving the executor full lifecycle control would leak framework responsibilities (initial persistence, auth/tenant scoping, request-timeout enforcement) into every executor. Giving the framework full control rules out executor-driven progress, which is the whole point of this ADR.
 
@@ -73,12 +78,19 @@ impl EventSink {
     /// Emit terminal COMPLETED. Subsequent emits on this sink return EventSinkClosed.
     pub async fn complete(&self, final_message: Option<Message>) -> Result<u64, A2aError>;
 
-    /// Emit terminal FAILED with an error message.
+    /// Emit terminal FAILED with an error message. Use when the executor tried to
+    /// perform the task and could not (tool error, network failure, exhausted retries).
     pub async fn fail(&self, error: A2aError) -> Result<u64, A2aError>;
 
     /// Emit terminal CANCELED. Normally the framework calls this; executors call it when
     /// they observe cancellation via ctx.cancellation.is_cancelled() and choose to acknowledge.
     pub async fn cancelled(&self, reason: Option<String>) -> Result<u64, A2aError>;
+
+    /// Emit terminal REJECTED. Use when the executor declines to perform the task —
+    /// policy refusal, guardrail trip, malformed task detected by executor logic.
+    /// Semantically distinct from `fail()`: REJECTED means "will not do this", not
+    /// "tried and could not". Maps to proto TASK_STATE_REJECTED (a2a.proto enum value 7).
+    pub async fn reject(&self, reason: Option<String>) -> Result<u64, A2aError>;
 
     /// Emit interrupted state INPUT_REQUIRED (convenience — same as set_status with that state).
     pub async fn require_input(&self, prompt: Option<Message>) -> Result<u64, A2aError>;
@@ -91,7 +103,7 @@ impl EventSink {
 }
 ```
 
-**Proto-defined variants only.** There is no escape hatch for custom event types, no `emit_custom(serde_json::Value)` method. This preserves spec compliance: every event that leaves `EventSink` maps to a proto `StreamResponse` variant (`StreamResponse` in the proto). The compliance agent can mechanically verify this.
+**Proto-defined variants only.** There is no escape hatch for custom event types, no `emit_custom(serde_json::Value)` method. This preserves spec compliance: every event that leaves `EventSink` maps to a proto `StreamResponse` variant (`StreamResponse` in the proto). The four terminal emits (`complete`, `fail`, `cancelled`, `reject`) map to the four proto terminal states (`COMPLETED`, `FAILED`, `CANCELED`, `REJECTED`). The compliance agent mechanically verifies this.
 
 **Returns**: each method returns the assigned `event_sequence: u64` on success — useful for executors that want to correlate later operations with emitted events, and for tests.
 
@@ -100,6 +112,8 @@ impl EventSink {
 ### 3. Ordering and Durability
 
 **Every `EventSink` call writes through `A2aAtomicStore` before returning.** No in-memory buffering, no broker-first, no "maybe we'll flush later." The contract: when `sink.emit_artifact(…).await` returns `Ok(seq)`, that event is persisted, sequence number `seq` is assigned, and replay from `Last-Event-ID < seq` will include it.
+
+**Terminal emits participate in the single-terminal-writer contract from §7.1.** The four terminal sink methods (`complete`, `fail`, `cancelled`, `reject`) go through `A2aAtomicStore::update_task_status_with_events`, which MUST return `TerminalStateAlreadySet` if the task is already terminal. The sink translates this error into `A2aError::InvalidRequest { message: "EventSink is closed: terminal already set" }` and sets `is_closed() = true`. No two terminal events can ever appear in the durable store for the same task.
 
 **Broker notification is fire-and-forget after durable write.** The flow inside each sink method:
 
@@ -133,9 +147,24 @@ Behavior:
 4. Signal fires when **any** of: (a) executor emits a terminal or interrupted event through its sink, (b) executor returns `Err` and framework writes terminal `FAILED`, (c) framework writes terminal `CANCELED` due to a cancel request, (d) configured long-running timeout elapses and framework writes `FAILED`.
 5. Framework returns the final task snapshot via `get_task(tenant, task_id, owner)`.
 
-**Timeout**: deployment-configurable via `A2aServer::builder().blocking_task_timeout(Duration)`. Default: 30 seconds. Applies only to blocking sends. On timeout the framework commits a **real terminal `FAILED` event** to the durable store via `A2aAtomicStore::update_task_status_with_events` — this satisfies the proto's "MUST wait until terminal" rule because the task IS terminal at return time. The reason on the status is `"blocking task timed out after {duration}"`.
+**Timeout — two-deadline cancellation policy**. Deployment-configurable via:
+- `A2aServer::builder().blocking_task_timeout(Duration)` — soft deadline, default 30 seconds.
+- `A2aServer::builder().timeout_abort_grace(Duration)` — grace between soft and hard deadline, default 5 seconds.
 
-**Zombie executor caveat**: timeout does NOT trip `ctx.cancellation` — the cancellation token is a separate cooperative signal (see §5). The executor's background task continues running after the timeout-induced terminal commit. The store's single-terminal-writer invariant (§1) means any subsequent sink emit from that zombie executor returns `A2aError::InvalidRequest { message: "EventSink is closed" }`; the store already has a terminal event and rejects further mutations. Deployments that want timeout to also cancel should configure a shorter blocking timeout and explicitly trip cancellation via the in-flight registry — this is documented clearly in the `blocking_task_timeout` builder method.
+Sequence on timeout:
+
+1. **Soft deadline elapses**: framework trips `handle.cancellation.cancel()` (same token passed into `ctx.cancellation`). The in-flight handle is **kept**, not removed. The blocking-send's completion oneshot has not fired yet.
+2. **Cooperative window**: executor observes cancellation, calls `sink.cancelled(Some("blocking timeout — executor cancelled"))` or similar, terminal commits, `JoinHandle` resolves, registry entry removed, completion oneshot fires.
+3. **Hard deadline elapses** (soft + grace, default 35s): if the executor has not yet terminated by then, framework calls `handle.spawned.abort()` on the `JoinHandle`, waits briefly for the drop-guard to fire, then commits `A2aAtomicStore::update_task_status_with_events(FAILED, reason = "blocking task timed out and did not respond to cancellation")`. Registry entry is removed when the aborted task's `JoinHandle` resolves.
+4. **Return**: blocking-send returns the final task snapshot. At this point, regardless of path, the executor is no longer running.
+
+**No zombies by design**. Every timeout path terminates the executor task either cooperatively (preferred) or by `JoinHandle::abort()` (fallback). In-flight entries persist until the `JoinHandle` actually exits, not merely until a terminal event commits — this bounds registry memory to "count of genuinely alive executor tasks."
+
+**Why cooperation first**. `JoinHandle::abort()` is a force-unwind at the next `.await` point — fine for most async code but hostile to executors holding external resources (open file handles, in-progress HTTP requests with dangling connections, uncommitted DB transactions). The cooperative window gives well-behaved executors a chance to clean up. Misbehaving or unresponsive executors still get killed at the hard deadline; they don't get to starve the server.
+
+**Configurable expectations**. Deployments running long LLM or agent-tool chains should set `blocking_task_timeout` deliberately (minutes, not 30s). Deployments running only short synchronous tasks can reduce it. The defaults are conservative, not prescriptive.
+
+**Interrupted states** (`INPUT_REQUIRED`, `AUTH_REQUIRED`) count as completion for blocking sends: the request returns with the task in that state. The executor has yielded back to the client.
 
 Interrupted states (`INPUT_REQUIRED`, `AUTH_REQUIRED`) count as completion for blocking sends: the request returns with the task in that state. The executor has yielded back to the client.
 
@@ -164,19 +193,27 @@ Behavior:
 
 `SubscribeToTask` on a still-running task works identically — it attaches to the same durable event stream. Replay-then-live-handoff from ADR-009 §4 already covers this.
 
-`SubscribeToTask` on a **terminal** task continues to follow ADR-009 §12 + existing §8 rule: replay all stored events and close cleanly (if events remain within TTL). `SubscribeToTask` on a **terminal task whose events are expired / evicted** continues to return `UnsupportedOperationError`. ADR-010 does not change this contract — the new in-flight spawn path MUST NOT accept subscriptions for already-terminal tasks outside the ADR-009 replay window.
+`SubscribeToTask` on a **terminal** task returns `UnsupportedOperationError` (HTTP 400, JSON-RPC −32004). This aligns with A2A v1.0 §3.1.6 / §9.4.6: *"SubscribeToTask is used to reconnect to the event stream of a task that is not in a terminal state. If the task is already in a terminal state, the server MUST return UnsupportedOperationError."* This is also the current implementation per CLAUDE.md.
+
+**ADR-010 explicitly supersedes ADR-009 §12 "Terminal Task Replay"**. That section proposed that terminal tasks could be subscribed to for event replay if events remained within TTL. This was never implemented, and is out of spec with A2A v1.0. It is withdrawn. `Last-Event-ID` replay applies only to streams that were active while the task was non-terminal — if a client disconnects after terminal event delivery and then reconnects with `Last-Event-ID ≥ terminal_sequence`, the server returns `UnsupportedOperationError`. Clients that need to know the terminal state after disconnection MUST either (a) track the terminal locally before disconnecting, or (b) call `GetTask` for a snapshot (which remains valid on terminal tasks). This is a history API, not a stream API.
+
+**In-flight implication**: the new spawn-and-track path MUST check task state before accepting a `SubscribeToTask` request. Non-terminal → attach to stream. Terminal → reject with `UnsupportedOperationError`. The check runs against task storage (`get_task`), not the in-flight registry (which is only populated while the executor is alive — absence from the registry does not imply terminal).
 
 #### 4.4 Tracked Executor Handle
 
 A new internal `AppState::in_flight: DashMap<(tenant, task_id), InFlightHandle>` is added. `InFlightHandle` holds:
 
-- `cancellation: CancellationToken` — the one passed into `ExecutionContext`. Tripped by the cancel handler.
-- `completion: tokio::sync::oneshot::Sender<TerminalState>` — fired by the framework when a terminal event commits.
+- `cancellation: CancellationToken` — the one passed into `ExecutionContext`. Tripped by the cancel handler or by timeout.
+- `completion: tokio::sync::oneshot::Sender<TerminalState>` — fired by a supervisor task when the executor's `JoinHandle` resolves (cooperative exit or abort).
 - `spawned: JoinHandle<()>` — the executor's background task handle.
 
-On terminal commit (any source: sink-emitted, executor-error, cancel, timeout), the framework fires the oneshot and removes the entry from the map. Blocking sends await this oneshot; non-blocking and streaming sends observe completion via the durable event stream.
+**Entry lifetime**: entries persist from `spawn` until the `JoinHandle` actually resolves (task exits — cooperatively, via panic, or via `abort()`). They do NOT get removed merely because a terminal event has committed to storage. This is the critical fix relative to earlier drafts: the invariant "entry present ⇒ executor task is alive" must hold so that timeout can still reach into the handle to call `abort()`.
 
-Memory bound: entries are removed on terminal. Upper bound is "count of concurrently running tasks", not "count of all tasks ever". Under healthy operation this stays small.
+**Supervisor task per spawn**: for each executor spawn, the framework also spawns a supervisor that `.await`s the `JoinHandle`. When the handle resolves, the supervisor: (1) inspects task state — if non-terminal, commits framework `FAILED` with reason `"executor exited without terminal event"`, (2) fires the completion oneshot, (3) removes the registry entry. This guarantees cleanup on every exit path without requiring the executor to be well-behaved.
+
+**On terminal event commit** (any source): the completion oneshot is not fired yet — it fires when the `JoinHandle` resolves, which for cooperative executors happens naturally shortly after their final sink call returns. For aborted executors, the `JoinHandle` resolves after the abort unwinds. Blocking sends await the oneshot; non-blocking and streaming sends observe completion via the durable event stream (which fires the moment the terminal commits, not when the executor exits).
+
+**Memory bound**: entries are removed when the `JoinHandle` resolves. Upper bound is "count of concurrently alive executor tasks", not "count of tasks in non-terminal state in storage." Under healthy operation with the two-deadline timeout policy (§4.1), no entry survives longer than `blocking_task_timeout + timeout_abort_grace` after its natural completion point.
 
 ### 5. Cancellation Integration (ADR-012 Preview)
 
@@ -210,7 +247,26 @@ ADR-011 will define a delivery worker that subscribes to the same `A2aEventStore
 
 This ADR commits to one thing: **`EventSink` emits and framework-owned transitions are the only sources of events**, and both write through the same atomic store. ADR-011 builds on that — it does not need a new event channel.
 
-### 7. Trait Evolution — Additive, No Breaking Change
+### 7.1 Storage Contract — `A2aAtomicStore` Terminal-Write Semantics
+
+ADR-010 adds an **explicit contract clause** to the existing `A2aAtomicStore::update_task_status_with_events` trait method. No new method is added; no method signature changes. What changes:
+
+1. **New error variant** `A2aStorageError::TerminalStateAlreadySet { task_id: String, current_state: String }`. This is additive to the existing error enum.
+
+2. **Contract clause** on the method's docstring (normative): *"If the task is already in a terminal state when this method is called, the implementation MUST return `TerminalStateAlreadySet` without persisting any events or mutating task state. The check and the write MUST occur within the same transaction (or equivalent atomic boundary on the backend), such that concurrent terminal-write attempts resolve to exactly one winner."*
+
+3. **Per-backend implementation**:
+   - **In-memory**: lock check + write in one critical section.
+   - **SQLite / PostgreSQL**: `UPDATE a2a_tasks ... WHERE task_id = $1 AND tenant = $2 AND status_state NOT IN ('TASK_STATE_COMPLETED', 'TASK_STATE_FAILED', 'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED')`. Row count == 0 → terminal already set → return error, roll back event inserts.
+   - **DynamoDB**: `TransactWriteItems` with `ConditionExpression` on the task item: `attribute_not_exists(statusState) OR statusState IN (:submitted, :working, :input_required, :auth_required)`. Condition failure → return `TerminalStateAlreadySet`.
+
+4. **Distinguished from state-machine violations**: existing state-machine errors (e.g. `SUBMITTED → INPUT_REQUIRED` where INPUT_REQUIRED is not a valid next-state) remain `InvalidStateTransition` errors. `TerminalStateAlreadySet` is specifically the "you lost the race" signal, not "you tried an illegal transition."
+
+5. **Parity tests** gate acceptance: each backend ships a parity test that spawns N concurrent callers racing to write different terminal states. Assertion: exactly one caller returns `Ok`, N−1 callers return `TerminalStateAlreadySet`, the event store contains exactly one terminal event, and the task's persisted state matches the winning caller's write. See §9 test #12.
+
+6. **EventSink integration**: when `EventSink::complete/fail/cancelled/reject` receives `TerminalStateAlreadySet` from the atomic store, it translates to `A2aError::InvalidRequest { message: "EventSink is closed: terminal already set" }` to the executor and marks `is_closed() = true`. The executor can choose to bail out quietly or continue processing with the understanding that further emits will fail.
+
+### 7.2 Trait Evolution — Additive, No Breaking Change
 
 `AgentExecutor::execute` signature does **not** change:
 
@@ -276,27 +332,48 @@ These tests gate ADR-010 acceptance and phase-2 completion. All must be green on
 10. **Failed executor emits FAILED terminal**
     Executor returns `Err(A2aError::Internal { … })` without touching sink. Framework writes terminal `FAILED` with the error message. Assert: terminal event is `FAILED` and wire response to blocking send contains the task in FAILED state.
 
-11. **Blocking timeout writes FAILED**
-    Executor that sleeps forever. Blocking send configured with 500ms timeout. Assert: request returns within 700ms with task in FAILED state, terminal event is `FAILED` with reason mentioning timeout, executor's background task is still running (timeout does not cancel).
+11. **Blocking timeout trips cancellation, then hard-aborts if needed**
+    Two sub-cases:
+    - **Cooperative**: executor loops checking `ctx.cancellation.is_cancelled()` with a 50ms tick. Blocking send configured with soft=500ms, grace=1000ms. Assert: request returns within 700ms, terminal event is `CANCELED` (executor acknowledged), `JoinHandle` has resolved, registry entry is gone.
+    - **Abort fallback**: executor ignores cancellation and sleeps forever. Same timeout config. Assert: request returns within soft+grace+200ms (≤1700ms), terminal event is `FAILED` with reason mentioning timeout, `JoinHandle::abort()` was invoked, supervisor fires completion oneshot after unwind, registry entry is gone. Critically: after the test returns, poll tokio for the executor task existence — must be absent.
+
+12. **Single-terminal-writer parity across backends**
+    For each of in-memory, SQLite, PostgreSQL, DynamoDB: spawn 10 concurrent callers each attempting a different terminal write (`COMPLETED`, `FAILED`, `CANCELED`, `REJECTED`) on the same `(tenant, task_id)` that starts in WORKING. Assert: exactly one returns `Ok`, the other 9 return `A2aStorageError::TerminalStateAlreadySet` (not a generic error, not `InvalidStateTransition`). The event store contains exactly one terminal event. The persisted task state matches the winning caller's write.
+
+13. **Subscribe on terminal task returns UnsupportedOperationError**
+    Create task, complete it (any path). Client calls `SubscribeToTask` on the terminal task id. Assert: response is `UnsupportedOperationError` (HTTP 400, JSON-RPC −32004), `google.rpc.ErrorInfo.reason = "UNSUPPORTED_OPERATION"`, body references subscribe on terminal task. Verify **no** events are replayed. This test validates the §4.3 supersession of ADR-009 §12.
+
+14. **Executor REJECTED via EventSink::reject**
+    Executor calls `ctx.events.reject(Some("policy: not permitted")).await?`. Assert: terminal event state is `TASK_STATE_REJECTED` (wire name), persisted task status state is REJECTED, message contains the reason, blocking-send wire response has the task in REJECTED state. Verify this is distinct from FAILED on the wire (proto enum integer value 7, not 4).
+
+15. **EventSink methods reject writes after terminal**
+    Executor calls `sink.complete(None).await?`, then `sink.emit_artifact(...).await`. Assert: the second call returns `A2aError::InvalidRequest { message: "EventSink is closed: terminal already set" }`, no new event persists, `sink.is_closed()` returns true.
 
 ### 10. What Changes in Existing Code
 
 **New**:
-- `crates/turul-a2a/src/executor.rs`: `EventSink` struct, methods, error variants.
-- `crates/turul-a2a/src/server/in_flight.rs`: `InFlightRegistry`, `InFlightHandle`, spawn-and-track logic.
-- `crates/turul-a2a/src/router.rs`: blocking vs non-blocking vs streaming entry-point handlers call the registry.
+- `crates/turul-a2a/src/executor.rs`: `EventSink` struct with the 9 public methods from §2, including `reject`.
+- `crates/turul-a2a/src/server/in_flight.rs`: `InFlightRegistry`, `InFlightHandle`, spawn-and-track logic, supervisor task, two-deadline timeout enforcement.
+- `crates/turul-a2a/src/storage/error.rs`: new `A2aStorageError::TerminalStateAlreadySet { task_id, current_state }` variant (additive to existing enum).
+- Storage parity tests for concurrent terminal writes (§9 test #12) — one file per backend.
+- Router-level: subscribe-on-terminal rejection path (§4.3).
 - Tests: per §9 list.
 
 **Modified**:
 - `ExecutionContext`: add `events: EventSink` field. Factory constructors (`anonymous`, and the production one used by the router) populate it.
-- `A2aServer::Builder`: add `blocking_task_timeout`, `cancellation_grace`, both optional.
-- `router.rs` handlers for `message:send`, `message:stream`, `tasks:cancel`: use `InFlightRegistry`.
+- `A2aServer::Builder`: add `blocking_task_timeout` (default 30s), `timeout_abort_grace` (default 5s), `cancellation_grace` (default 5s for user-initiated cancel), all optional.
+- `router.rs` handlers for `message:send`, `message:stream`, `tasks:cancel`, `tasks:subscribe`: use `InFlightRegistry`; subscribe checks task state for terminal and rejects per §4.3.
+- `A2aAtomicStore::update_task_status_with_events` — **contract clause added to docstring** (normative). No signature change. All four backend implementations gain: conditional-write/lock-check to reject terminal-to-terminal writes with `TerminalStateAlreadySet`. See §7.1 for per-backend detail.
+- `EventSink::complete/fail/cancelled/reject` — translate `TerminalStateAlreadySet` from the atomic store into `A2aError::InvalidRequest { message: "EventSink is closed: terminal already set" }` and mark the sink closed.
 
 **Unchanged**:
 - `AgentExecutor` trait signature.
-- `A2aAtomicStore`, `A2aEventStore`, `A2aTaskStorage` trait shapes — existing methods handle everything the sink needs.
-- All existing SSE / streaming tests.
+- `A2aAtomicStore`, `A2aEventStore`, `A2aTaskStorage` method signatures — only docstring contracts and error variants change.
+- All existing SSE / streaming tests (beyond the one that tested terminal-replay, which is updated per §4.3).
 - Wire format — `EventSink` emits events that map 1:1 to the existing `StreamEvent` variants.
+
+**ADR-009 deltas**:
+- §12 "Terminal Task Replay" is superseded by ADR-010 §4.3. Document this in ADR-009 with a deprecation note pointing here, then re-mark ADR-009 as amended.
 
 ### 11. Risks and Mitigations
 
@@ -306,25 +383,34 @@ These tests gate ADR-010 acceptance and phase-2 completion. All must be green on
 
 **R3 — `DashMap` contention under high concurrency**. Mitigation: per-entry locks are short (insert on spawn, remove on terminal). Reads from `:cancel` are O(1). If profiling shows contention, switch to a sharded map. Not a launch blocker.
 
-**R4 — Timeout not propagating cancellation surprises executors**. This is intentional (timeout is a framework fail-safe, not a cooperative signal). Documented clearly. Executors that want cooperative cancellation on timeout can wire their own additional token or use the blocking-timeout field on the builder to get a shorter timeout *plus* a manual cancel.
+**R4 — Timeout and executor cleanup**. Earlier drafts allowed timeout to leave executors running as detached background tasks. That is rejected in this revision. The two-deadline policy (§4.1) guarantees: (a) executors always get a cooperative cancellation signal on timeout, (b) unresponsive executors are force-aborted via `JoinHandle::abort()`, (c) in-flight registry entries persist until the `JoinHandle` resolves, not just until a terminal event commits. Result: no zombies, no detached work, no resource leak. Tests #11a and #11b verify both paths.
 
-**R5 — Pre-existing test executors break**. They don't. The detection rule in §7 preserves exact legacy behavior. The compliance agent will verify this during review of the phase-2 PR.
+**R5 — Pre-existing test executors break**. They don't. The detection rule in §7.2 preserves exact legacy behavior. The compliance agent will verify this during review of the phase-2 PR.
+
+**R6 — Single-terminal-writer contract not enforced uniformly across backends**. Mitigated by making the contract explicit in `A2aAtomicStore::update_task_status_with_events`'s docstring (§7.1), by naming the specific backend mechanism (conditional `UPDATE` / condition expression / lock-under-write), and by gating acceptance on parity tests (§9 test #12). If a future backend implementer skips the conditional-write, the parity tests fail — not a prose TODO that can be forgotten.
+
+**R7 — ADR-009 §12 implementation gap not surfaced earlier**. ADR-009 §12 proposed terminal-replay; CLAUDE.md and the current code reject terminal subscriptions per spec. The gap was that no one reconciled the two when ADR-009 shipped. ADR-010 closes the gap by explicit supersession and requires an amending entry on ADR-009 (see §10 "ADR-009 deltas"). Going forward, when an ADR proposes a behavior that the implementation then doesn't adopt, the ADR must be revised to reflect reality rather than documenting aspiration.
 
 ## Consequences
 
 **Positive**:
 - A2A proto's `return_immediately` semantics are correctly implemented for the first time.
 - Long-running agents, streaming executors, and real cancellation all become usable.
+- REJECTED becomes a first-class terminal on the sink, distinct from FAILED — spec-compliant and semantically correct.
+- Timeouts no longer produce zombie executors — every path cleans up the spawned task.
+- Single-terminal-writer is enforced as a storage contract with parity tests, not a prose invariant.
+- Terminal subscribe aligns with A2A v1.0 §3.1.6 / §9.4.6; the ADR-009 §12 aspiration is withdrawn cleanly.
 - The same durable event store that already exists is the single source of truth for every adopter-observable signal — no new event channels, no coherence worries.
 - ADR-011 (push) and ADR-012 (cancel) can build on a fixed runtime model without re-litigating ownership.
 
 **Negative**:
 - New public API surface (`EventSink`) to maintain. Mitigated by `#[non_exhaustive]` on `ExecutionContext` and by proto-defined variants only on sink methods.
-- Slightly more state in `AppState` (the in-flight registry). Memory-bounded, not a scaling concern.
+- Slightly more state in `AppState` (the in-flight registry with supervisor tasks). Bounded by live executor count; hard ceiling enforced by `blocking_task_timeout + timeout_abort_grace`.
 - One more moving piece for adopters to learn. Mitigated by the fact that legacy executors work unchanged — the sink is only relevant for executors that want new behavior.
+- A new `A2aStorageError` variant and a new contract clause on `A2aAtomicStore` change what existing backend implementations must do on terminal-to-terminal writes. Migration path: each of the four bundled backends gets the conditional-write implementation as part of phase 2.
 
 **Neutral**:
-- Blocking-timeout policy is new but optional. Default of 30s is conservative; deployments can override.
+- Two-deadline timeout policy (soft + abort grace) is new but optional. Defaults are conservative; deployments can override. Deployments running long agent chains should set them deliberately — the ADR documents this expectation.
 
 ## Follow-Up ADRs
 
