@@ -17,7 +17,9 @@ use turul_jwt_validator::JwtValidator;
 fn generate_rsa_keypair(kid: &str) -> (String, serde_json::Value) {
     use rsa::RsaPrivateKey;
 
-    let mut rng = rand::thread_rng();
+    // rsa 0.9 uses rand_core 0.6's CryptoRngCore; the workspace-level rand 0.10
+    // is not compatible. Use rsa's re-exported OsRng to avoid version skew.
+    let mut rng = rsa::rand_core::OsRng;
     let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
     let private_pem = private_key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap();
 

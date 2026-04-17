@@ -2,8 +2,14 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto_file = "../../proto/a2a.proto";
-    let proto_includes = &["../../proto"];
+    // Proto files live inside this crate so they travel with `cargo package`.
+    // A workspace-root symlink (`proto/` → `crates/turul-a2a-proto/proto/`)
+    // preserves the historical path referenced in docs.
+    let proto_file = "proto/a2a.proto";
+    let proto_includes = &["proto"];
+
+    // Rebuild if any proto changes.
+    println!("cargo:rerun-if-changed=proto");
 
     let descriptor_path =
         PathBuf::from(env::var("OUT_DIR")?).join("a2a_descriptor.bin");

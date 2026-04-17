@@ -86,6 +86,7 @@ pub async fn jsonrpc_dispatch_handler(
     let id = value.get("id").cloned().unwrap_or(Value::Null);
 
     // 4. Validate params: must be object, null, or absent. Arrays/scalars are -32602.
+    #[cfg_attr(not(feature = "compat-v03"), allow(unused_mut))]
     let mut params = match value.get("params") {
         None => json!({}),
         Some(Value::Null) => json!({}),
@@ -144,6 +145,7 @@ pub async fn jsonrpc_dispatch_handler(
     // 9. Build response
     match result {
         Ok(value) => {
+            #[cfg_attr(not(feature = "compat-v03"), allow(unused_mut))]
             let mut response = jsonrpc_success(id, value);
             // A2A v0.3 compat: normalize response envelope + enums
             #[cfg(feature = "compat-v03")]
