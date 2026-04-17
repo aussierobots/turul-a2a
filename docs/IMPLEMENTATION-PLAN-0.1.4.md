@@ -1,6 +1,6 @@
 # Implementation Plan — 0.1.4 Advanced Task Lifecycle
 
-- **Status:** Proposed (awaiting review before code)
+- **Status:** Accepted (2026-04-18, after one review cycle)
 - **Date:** 2026-04-18
 - **Covers ADRs:** 010 (EventSink + long-running), 011 (push delivery), 012 (cancellation propagation)
 - **Release target:** 0.1.4 (additive, no breaking trait changes)
@@ -13,17 +13,64 @@ The original phase numbering (phase 1 cancellation → phase 2 EventSink → pha
 
 Correct ordering: **shared runtime substrate first**, then **atomic store CAS**, then the three vertical feature slices (cancellation, EventSink, push delivery), then **E2E compliance reference**, then **release**.
 
+## Cross-Phase Policies (resolved before phase A)
+
+### Transitional feature flags
+
+Every landing-time flag is short-lived with a defined lifecycle:
+
+1. **During active development** — flag exists, defaults to **off**. Implementation lives behind `#[cfg(feature = "…")]`. Default builds and default test runs see zero behavior change.
+2. **During acceptance-testing** — the acceptance tests for that phase run with the flag on (via `cargo test --features …`). The old behavior path is still available.
+3. **Once acceptance criteria are met** — a single commit flips the flag default **on**. Default builds now exercise the new path. Legacy path may remain for one additional commit for audit.
+4. **Before phase G** — the flag is **removed**. `#[cfg]` gates deleted; legacy path deleted; feature no longer listed in `Cargo.toml`.
+
+**No transitional flag ships to crates.io.** The 0.1.4 release artifact has no `strict-terminal-cas`, no `cancel-propagation`, no `event-sink`, no `push-delivery`. These are internal landing aids, not supported API surface. The only user-visible feature flags in 0.1.4 are the pre-existing ones (`in-memory`, `sqlite`, `postgres`, `dynamodb`, `compat-v03`).
+
+### E2E release gate
+
+`#[ignore]` on a lifecycle E2E test is a **development-only** escape hatch. Phase G is blocked until:
+
+- All E2E tests in `crates/turul-a2a/tests/e2e_lifecycle.rs` are enabled (no `#[ignore]`).
+- All E2E tests are green on default features.
+- The reference agent (`examples/reference-agent/`) builds cleanly and passes its own `cargo check`.
+
+If the reference agent is too broken to fix within phase F's budget, phase G delays until phase F is reworked. The framework **does not ship 0.1.4 without the lifecycle compliance proof**. Phase F is a release gate, not an optional example.
+
+### Observability contract
+
+0.1.4 uses **structured tracing events** via `tracing` crate, already a workspace dep. No `metrics-rs`, no `opentelemetry-sdk`. Decision defers a metrics backend to 0.2.x when real production consumers emerge.
+
+**Event pattern**: framework emits structured events with stable `target = "turul_a2a::…"`, stable `event = "…"` field names, and typed fields (`task_id`, `tenant`, `config_id`, etc.). Adopters who need metrics wire a `tracing-subscriber` layer that translates events to their backend.
+
+**Test pattern**: tests use `tracing-subscriber` with a capturing layer (custom or via `tracing-test` crate) to intercept events and assert on field values. No counter increments — assertions match event occurrence + fields. Example: phase A's supervisor-panic test asserts that *an* event with `target = "turul_a2a::supervisor_panic"` and field `task_id = …` fired, rather than `framework.supervisor_panics` incremented by 1.
+
+The mental model everywhere in this plan: when the plan says "metric X incremented," read it as "a structured event X was emitted." The wire of observation is tracing events.
+
+### ExecutionContext evolution policy
+
+`ExecutionContext` changes **exactly once** in this release, in phase D, when `EventSink` gets its full API simultaneously. Phase A does **not** add the `events` field. Rationale: exposing a stub field in phase A leaks a not-yet-stable contract — every executor author who reads the struct would see the field and might attempt to use it. Deferring to phase D ensures the field and its API land together.
+
+### Cancellation + EventSink integration gate
+
+Phase C (cancellation) and phase D (EventSink) may be developed in parallel branches **after phase A+B land on `main`**. They MUST NOT be merged independently. The integration gate is:
+
+- All ADR-010 §9 race tests (single-terminal-writer, cancel-vs-complete, cancel-vs-reject, etc.) pass on a branch that includes both C and D.
+- All ADR-012 §11 race tests (cancel-vs-cancel, orphan, cross-instance, cancel-vs-complete) pass on the same combined branch.
+- No test flake tolerated — all race tests must be green on three consecutive runs.
+
+**Why**: C and D both write terminal states. Merging C with passing tests, then finding D breaks the terminal CAS invariant the tests asserted, is exactly the re-design-twice failure mode this plan exists to prevent. Combined integration proves the substrate holds under both callers simultaneously.
+
 ## Phase Summary
 
-| Phase | Name | Estimated | Blocks | Feature-flaggable |
+| Phase | Name | Estimated | Blocks | Landing flag (short-lived, removed before G) |
 |---|---|---|---|---|
-| **A** | Shared Runtime Substrate | 1 day | B, C, D, E | No — additive |
-| **B** | Atomic Store Terminal CAS | 1 day | C, D, E | No — additive error variant |
-| **C** | Cancellation Vertical Slice | 1.5 days | D, E | Yes (transition) |
-| **D** | EventSink + Long-Running | 3 days | E, F | Yes (`event-sink` flag) |
-| **E** | Push Delivery | 2 days | F | Yes (`push-delivery` flag) |
-| **F** | E2E Compliance Reference Agent | 1 day | G | No |
-| **G** | Release 0.1.4 | 0.5 day | — | N/A |
+| **A** | Shared Runtime Substrate | 1 day | B, C, D, E | None — additive-only to internal APIs |
+| **B** | Atomic Store Terminal CAS | 1 day | C, D, E | None — landing commit series contains audit + flip in one PR |
+| **C** | Cancellation Vertical Slice | 1.5 days | D/E integration | `cancel-propagation` (dev-time only) |
+| **D** | EventSink + Long-Running | 3 days | C/D integration | `event-sink` (dev-time only) |
+| **E** | Push Delivery | 2 days | F | `push-delivery` (dev-time only) |
+| **F** | E2E Compliance Reference Agent | 1 day | G | None; `#[ignore]` permitted only during F development |
+| **G** | Release 0.1.4 | 0.5 day | — | All transitional flags **deleted** before publish |
 
 Total estimated effort: ~10 focused days. Phases A and B ship no user-visible feature; they're invariants. Phases C/D/E are the features.
 
@@ -38,23 +85,24 @@ Scaffold `InFlightRegistry`, `SupervisorSentinel`, `ExecutionContext` evolution,
 ### Files touched
 
 - **New**:
-  - `crates/turul-a2a/src/server/in_flight.rs` — `InFlightRegistry`, `InFlightHandle`, `SupervisorSentinel` drop-guard
-  - `crates/turul-a2a/src/secret.rs` — `Secret<String>` newtype with redacting `Debug` / `Display`
-  - `crates/turul-a2a/src/metrics.rs` — metric constant declarations (names only, emissions land per phase)
-  - `crates/turul-a2a/tests/runtime_substrate_tests.rs` — 6 tests below
+  - `crates/turul-a2a/src/server/in_flight.rs` — `InFlightRegistry`, `InFlightHandle` (with `cancellation`, `yielded`, `yielded_fired`, `spawned`), `SupervisorSentinel` drop-guard
+  - `crates/turul-a2a/src/server/obs.rs` — tracing-event constants (`target` strings, `event` field names) for supervisor-panic and future framework events. Pure declarations — no emitter logic.
+  - `crates/turul-a2a/tests/runtime_substrate_tests.rs` — 6 tests below (using a capturing tracing subscriber)
 - **Modified**:
-  - `crates/turul-a2a/src/executor.rs` — `ExecutionContext.events: EventSink` field added; `EventSink` is a stub type in phase A (real methods land in phase D)
-  - `crates/turul-a2a/src/server/app_state.rs` — new fields: `in_flight: Arc<InFlightRegistry>`, placeholders for `cancellation_supervisor` and `push_delivery_store` (wired to stubs)
-  - `crates/turul-a2a/src/server/builder.rs` — new config fields (all optional, all documented with default and rationale): `blocking_task_timeout`, `timeout_abort_grace`, `cancel_handler_grace`, `cancel_handler_poll_interval`, `cross_instance_cancel_poll_interval`, `push_max_attempts`, `push_backoff_base`, `push_backoff_cap`, `push_backoff_jitter`, `push_request_timeout`, `push_connect_timeout`, `push_read_timeout`, `push_claim_expiry`, `push_config_cache_ttl`, `push_failed_delivery_retention`, `push_max_payload_bytes`, `allow_insecure_push_urls`, `outbound_url_validator`
+  - `crates/turul-a2a/Cargo.toml` — add `secrecy = "0.10"` dependency (NOT workspace dep — stays in `turul-a2a` only so `turul-a2a-types` remains lightweight)
+  - `crates/turul-a2a/src/lib.rs` — add `pub use secrecy::{Secret, ExposeSecret}` re-export for internal consumers + shallow wrapper docs
+  - `crates/turul-a2a/src/server/app_state.rs` — new field: `in_flight: Arc<InFlightRegistry>`. Placeholders for `cancellation_supervisor: Arc<dyn A2aCancellationSupervisor>` and `push_delivery_store: Arc<dyn A2aPushDeliveryStore>` are NOT added yet — those fields land with their respective phases (C and E) so `AppState`'s public shape doesn't accrete stub fields
+  - `crates/turul-a2a/src/server/builder.rs` — new config fields (all optional, all documented with default and rationale): `blocking_task_timeout`, `timeout_abort_grace`, `cancel_handler_grace`, `cancel_handler_poll_interval`, `cross_instance_cancel_poll_interval`, `push_max_attempts`, `push_backoff_base`, `push_backoff_cap`, `push_backoff_jitter`, `push_request_timeout`, `push_connect_timeout`, `push_read_timeout`, `push_claim_expiry`, `push_config_cache_ttl`, `push_failed_delivery_retention`, `push_max_payload_bytes`, `allow_insecure_push_urls`, `outbound_url_validator` (typed as `Arc<dyn OutboundUrlValidator + Send + Sync>` — trait, not closure; see phase E for trait definition).
+  - **`ExecutionContext` is NOT modified in phase A**. The `events: EventSink` field is added in phase D along with the full `EventSink` API. This avoids exposing a stub contract.
 
 ### Tests (all internal, no wire behavior)
 
 1. `in_flight_registry_insert_remove_roundtrip` — basic entry lifecycle.
 2. `supervisor_sentinel_drops_on_normal_exit_removes_entry_and_joinhandle` — happy path.
 3. `supervisor_sentinel_drops_on_panic_still_cleans_up` — uses `tokio::spawn` that panics; assert JoinHandle aborted, entry removed.
-4. `supervisor_sentinel_panic_increments_metric` — `framework.supervisor_panics` counter visible to test.
+4. `supervisor_panic_emits_structured_event` — install a capturing `tracing-subscriber` layer. Trigger a supervisor panic. Assert: one event emitted with `target = "turul_a2a::supervisor_panic"`, `level = ERROR`, field `task_id = <expected>`, field `tenant = <expected>`. This is the observability-contract test — future phases reuse the same capturing-layer helper for their own event assertions.
 5. `yielded_oneshot_fires_once_under_concurrent_triggers` — spawn 10 tasks all trying to fire yielded; exactly one send succeeds via CAS on `yielded_fired`.
-6. `secret_newtype_never_leaks_in_debug_or_display` — `format!("{:?}", secret)` contains `[REDACTED]`, does NOT contain the underlying string.
+6. `secrecy_newtype_never_leaks_in_debug_or_display` — using `secrecy::Secret<String>`, assert `format!("{:?}", secret)` contains `[REDACTED]` (secrecy's default) and does NOT contain the underlying string. Verifies the secrecy crate's redaction works as documented and our consumption pattern is correct.
 
 ### ADR acceptance tests satisfied
 
@@ -116,9 +164,16 @@ Enforce `TerminalStateAlreadySet` on `A2aAtomicStore::update_task_status_with_ev
 
 ### Rollback boundary
 
-Phase B can ship alone. Existing non-terminal writes are unchanged. Existing terminal writes that used to silently succeed on re-write now surface `TerminalStateAlreadySet`. **Audit required**: no existing test or production path relies on silently-successful terminal-to-terminal writes. Verify before merge.
+Phase B lands as a **single atomic PR** — no transitional feature flag. Rationale: the change is an additive error variant + a docstring clause + parity tests; the per-backend conditional-write implementations are self-contained. Risk of breaking existing behavior is localized to terminal-to-terminal writes, which the audit below covers.
 
-**Kill-switch**: add a temporary `#[cfg(feature = "strict-terminal-cas")]` feature flag that gates the new error path; default off during audit, flip on once all callers are clean. Can be removed in phase C.
+**Pre-merge audit** (mandatory, per CLAUDE.md TDD discipline):
+1. `git grep update_task_status_with_events crates/` — enumerate every caller.
+2. For each, verify: either the caller only writes from non-terminal → terminal states, OR the caller already handles/expects a failure on the second write.
+3. Audit output committed as a brief note in the phase B PR description.
+
+**Kill-switch if post-merge breakage surfaces**: revert the PR. The changeset is small enough to clean-revert without dragging uninvolved code. No in-tree feature flag is retained.
+
+**Dependencies on later phases**: phases C, D, and E all rely on `TerminalStateAlreadySet` being the distinct error class. If phase B is reverted, phases C/D/E cannot proceed.
 
 ---
 
@@ -170,9 +225,15 @@ Phase B can ship alone. Existing non-terminal writes are unchanged. Existing ter
 
 ### Rollback boundary
 
-New `core_cancel_task` can be gated behind a transient feature flag (`cancel-propagation`) for the landing window. With the flag off, the handler falls back to the current direct-atomic-write behavior. Once all tests pass with the flag on by default, delete the flag and the legacy code.
+Landing sequence per the cross-phase transitional-flag policy:
 
-**Feature-flag removal criterion**: all 14 tests green on default features; at least one integration run on PostgreSQL and DynamoDB backends.
+1. **Development commits**: new `core_cancel_task` lives behind `#[cfg(feature = "cancel-propagation")]`. Flag defaults **off**. Legacy synchronous-cancel path remains default. Phase C acceptance tests run with `cargo test --features cancel-propagation`.
+2. **Flip commit**: once all 14 tests green on `--features cancel-propagation`, a single commit flips the flag to default-on. CI runs both configurations to verify nothing regressed.
+3. **Cleanup commit** (before phase G): remove the `#[cfg]` gates, delete legacy `core_cancel_task` code, remove the `cancel-propagation` feature from `Cargo.toml`.
+
+**Flip-to-default-on criterion**: all 14 tests green on default features; integration run passes on PostgreSQL AND DynamoDB (matching phase B discipline). Three consecutive CI runs green, no flakes.
+
+**C/D integration**: this phase is landed on a feature branch. Merging to `main` requires the combined C+D integration gate (see cross-phase policies): combined branch passes all ADR-010 §9 race tests AND all ADR-012 §11 race tests.
 
 ---
 
@@ -185,10 +246,10 @@ Executor can emit progress, interrupted, and terminal events via `ctx.events`. T
 ### Files touched
 
 - **New**:
-  - `crates/turul-a2a/src/event_sink.rs` — implementation of `EventSink` public methods (phase A declared the type; phase D fills in bodies)
+  - `crates/turul-a2a/src/event_sink.rs` — `EventSink` type and full public API introduced here (nothing in phase A)
   - `crates/turul-a2a/tests/long_running_tests.rs` — 15 tests
 - **Modified**:
-  - `crates/turul-a2a/src/executor.rs` — `EventSink` API: `set_status`, `emit_artifact`, `complete`, `fail`, `cancelled`, `reject`, `require_input`, `require_auth`, `is_closed`
+  - `crates/turul-a2a/src/executor.rs` — introduces `ExecutionContext.events: EventSink` field (first and only change to `ExecutionContext` in this release). `EventSink` API: `set_status`, `emit_artifact`, `complete`, `fail`, `cancelled`, `reject`, `require_input`, `require_auth`, `is_closed`
   - `crates/turul-a2a/src/server/in_flight.rs` — atomic-store commit hook fires `InFlightHandle.yielded` on first terminal/interrupted write
   - `crates/turul-a2a/src/router.rs` — rewrite `message:send` (blocking and `return_immediately = true` paths), `message:stream`, using the in-flight registry and spawn-and-supervise pattern
   - `crates/turul-a2a/src/streaming/mod.rs` — stream events from durable store include executor-emitted sink events (via existing ADR-009 infrastructure; no new channel)
@@ -226,9 +287,15 @@ Executor can emit progress, interrupted, and terminal events via `ctx.events`. T
 
 ### Rollback boundary
 
-`event-sink` feature flag (default on) gates the new send-mode handlers and EventSink method bodies. With flag off, router falls back to current synchronous execute-then-write behavior. Legacy executors work regardless (the detection rule in ADR-010 §7.2 handles both paths).
+Landing sequence (same transitional-flag policy as phase C):
 
-**Feature-flag removal criterion**: all 15 tests green; reference agent in phase F uses EventSink end-to-end; echo-agent still works unchanged.
+1. **Development commits**: `ExecutionContext.events` field, new `message:send` / `message:stream` handlers, and `EventSink` API all live behind `#[cfg(feature = "event-sink")]`. Flag defaults **off**. Legacy synchronous executor path is default. Phase D tests run with `--features event-sink`.
+2. **Flip commit**: flag defaults **on**. Legacy path still available for rollback.
+3. **Cleanup commit** (before phase G): remove `#[cfg]` gates, delete legacy handler paths that bypassed `InFlightRegistry`, remove `event-sink` feature from `Cargo.toml`.
+
+**Flip-to-default-on criterion**: all 15 tests green on default features; echo-agent example still works unchanged (legacy fallback per ADR-010 §7.2); at least one manual smoke run of `cargo run -p echo-agent` confirms the binary.
+
+**C/D integration**: this phase and phase C share the combined C+D integration gate: merged branch must pass all ADR-010 §9 + ADR-012 §11 race tests together, on three consecutive CI runs.
 
 ---
 
@@ -295,9 +362,15 @@ Webhooks actually fire. Background dispatcher + per-config delivery tasks. At-le
 
 ### Rollback boundary
 
-`push-delivery` feature flag (default on) gates the `PushDeliveryWorker` spawn. With flag off, configs are stored but never fire — current 0.1.3 behavior. CRUD continues to work either way.
+Landing sequence:
 
-**Feature-flag removal criterion**: all 23 tests green; secret redaction test verified; cross-instance dedup demonstrated on PostgreSQL or DynamoDB.
+1. **Development commits**: `PushDeliveryWorker` spawn, `A2aPushDeliveryStore` trait, `push/` module, and SSRF guards all behind `#[cfg(feature = "push-delivery")]`. Flag defaults **off**. Configs are stored but never fire — exactly 0.1.3 behavior. Tests run with `--features push-delivery`.
+2. **Flip commit**: flag defaults **on**. Worker spawns at startup by default.
+3. **Cleanup commit** (before phase G): remove `#[cfg]` gates, remove `push-delivery` feature from `Cargo.toml`.
+
+**Flip-to-default-on criterion**: all 23 tests green on default features; secret-redaction test (#16) passes with sentinel credentials never appearing in any captured output; cross-instance dedup (#20) verified on PostgreSQL or DynamoDB; retry horizon (#22) exercised at least once end-to-end (slow CI may use short-horizon config and scale-test separately).
+
+**Dependency on D**: push delivery's framework-committed-CANCELED delivery test (#13) depends on the cancellation fallback path from phase C, and the event-commit hook from phase D. Phase E lands strictly **after** the combined C+D merge to `main`.
 
 ---
 
@@ -354,7 +427,19 @@ The reference agent implements a single `AgentExecutor` with routing-by-first-me
 
 ### Rollback boundary
 
-Reference agent is a separate example crate. If it's buggy, it does not affect the framework crates. Worst case: delete `examples/reference-agent/` and move on. The E2E tests in `crates/turul-a2a/tests/e2e_lifecycle.rs` depend on the reference agent being built; they can be `#[ignore]`d if the example is broken while still shipping the framework.
+Phase F is a **release gate for 0.1.4**, not an optional polish pass. The E2E tests ARE the compliance proof for the new lifecycle behavior — without them green, we have no end-to-end evidence that ADR-010/011/012's contracts hold under real HTTP + real storage + real client.
+
+**Permitted during active F development**: individual E2E tests MAY carry `#[ignore]` if a specific test is blocking on incidental harness work (e.g., wiremock setup for a SSRF test). Ignored tests are expected to be temporary and tracked in the phase F PR description.
+
+**Not permitted at phase G entry**: zero `#[ignore]` annotations on any E2E test in `crates/turul-a2a/tests/e2e_lifecycle.rs`. Zero. Phase G entry is gated on:
+
+- All 10 E2E tests enabled and green on default features.
+- `examples/reference-agent/` builds with `cargo check --all-features` clean.
+- At least one manual `cargo run -p reference-agent` smoke confirming the binary starts.
+
+If phase F budget is exhausted before these gates are met, phase G is **delayed**. The framework does NOT ship 0.1.4 without its compliance proof. Precedent: this matches how phase C/D's integration gate blocks single-phase merges — the E2E suite is 0.1.4's cross-phase gate.
+
+**Escape hatch only for emergency releases**: if a critical CVE or data-loss bug is found in 0.1.3 requiring an immediate release, 0.1.4 can skip phase F (but must still include B at minimum) and the release notes explicitly call out the reduced compliance coverage. This is a last-resort option, not a normal path.
 
 ---
 
@@ -435,32 +520,57 @@ Publish 0.1.4 to crates.io following the CLAUDE.md-documented workflow.
 
 ## Rollback Boundaries (summary)
 
-| Phase | If phase is broken mid-merge | Smallest rollback unit |
+| Phase | Landing strategy | If broken post-merge |
 |---|---|---|
-| A | Revert commit — no one depends yet. | One commit. |
-| B | Feature-flag `strict-terminal-cas`, default off. | Feature flag. |
-| C | Feature-flag `cancel-propagation`, default off. | Feature flag. |
-| D | Feature-flag `event-sink`, default off. | Feature flag. |
-| E | Feature-flag `push-delivery`, default off. | Feature flag. |
-| F | Mark E2E tests `#[ignore]`; framework ships without them. | Test annotations. |
-| G | Don't publish. Tag can be deleted before push. | No-op. |
+| A | Single atomic PR. | Revert commit — no downstream dependencies yet. |
+| B | Single atomic PR with pre-merge audit (every `update_task_status_with_events` caller verified). | Revert PR. Phases C/D/E cannot proceed until re-landed. |
+| C | Landing behind `cancel-propagation` (default off) → flip on → cleanup. Three commit series. | Revert the flip commit; flag-off restores legacy path. Full revert if deeper issue. |
+| D | Landing behind `event-sink` (default off) → flip on → cleanup. Three commit series. Combined C+D integration gate before merge to `main`. | Revert the flip commit; `ExecutionContext.events` field remains but is inert. Full revert if deeper issue. |
+| E | Landing behind `push-delivery` (default off) → flip on → cleanup. Three commit series. | Revert the flip commit; worker doesn't spawn. Full revert if deeper issue. |
+| F | E2E tests MUST be un-ignored at phase G entry (release gate). | If reference agent is broken, phase G delays until fixed. |
+| G | Pre-publish checks in CLAUDE.md; transitional flags deleted; publish per dep order. | Don't push the tag. Unpublished commits can be amended. |
 
-## Open Questions (to surface before starting phase A)
+**Note on transitional flags**: `cancel-propagation`, `event-sink`, `push-delivery` are **never shipped to crates.io**. All three are deleted from `Cargo.toml` in the phase G pre-publish cleanup. The 0.1.4 release artifact's `[features]` section is identical to 0.1.3's: `in-memory`, `sqlite`, `postgres`, `dynamodb`, `compat-v03`.
 
-1. **Metric backend**: 0.1.x has no committed metric library. Structured logs for now, or commit to a specific metrics crate (metrics-rs, opentelemetry-sdk)? Impacts phase A module structure.
-2. **`Secret<String>` crate choice**: `secrecy` crate (small, well-known) vs in-crate newtype? `secrecy` adds a dep; in-crate is more code. Recommend `secrecy` for less code and better ecosystem signaling.
-3. **Claim table migration strategy for existing SQL deployments**: additive migrations are safe but need explicit migration SQL. Ship migration files in the crate or require adopters to apply manually? Recommend crate-embedded migrations via sqlx-migrate (already in-graph via sqlx).
-4. **Test isolation between phases**: phase B parity tests verify concurrent writes. Phase C builds on those. If phase B parity tests flake (e.g., DynamoDB Local clock skew), do phase C's tests block? Recommend treating flakes as phase B regressions, not phase C problems.
-5. **`outbound_url_validator` API ergonomics**: currently typed as `Arc<dyn Fn(&url::Url) -> Result<(), String> + Send + Sync>`. Workable but verbose. Consider a thin wrapper trait `OutboundUrlValidator` for discoverability. Recommend trait wrapper.
+## Resolved Design Decisions (decided before phase A)
 
-## Review Gate
+1. **Observability backend**: structured `tracing` events. **NOT** `metrics-rs`, **NOT** `opentelemetry-sdk`. Tests assert event occurrence + fields via capturing `tracing-subscriber` layer. A metrics-crate migration can happen in 0.2.x when real production consumers emerge. See "Observability contract" in cross-phase policies.
 
-Do not start phase A until this plan is reviewed and accepted. Specifically, confirm:
+2. **Secret newtype**: `secrecy` crate as a `turul-a2a`-only dependency (NOT added to `turul-a2a-types` — protocol/types remain lightweight). Rust ecosystem already recognizes `secrecy::Secret<T>` as the canonical redacting wrapper; writing our own just for this use case would be reinventing. Dependency footprint is small (no transitive deps beyond `zeroize`).
 
-- [ ] Phase-ordering rationale is sound (substrate + CAS before vertical features).
-- [ ] Rollback boundaries are acceptable.
-- [ ] Feature-flag strategy for transitional phases is acceptable.
-- [ ] Deferred items list is accurate and nothing essential has slipped.
-- [ ] Open questions have answers or are acceptable as-is.
+3. **SQL migrations**: **embedded via `sqlx-migrate`** (sqlx is already in-graph for SQLite/PostgreSQL backends) **plus committed `.sql` artifacts** under `crates/turul-a2a/migrations/`. Embedded migrations run automatically at first connection; `.sql` files are source-of-truth that adopters can inspect, run manually, or include in their own migration tooling. Both paths describe the same DDL.
 
-After acceptance, phase A begins.
+4. **DynamoDB parity flake policy**: phase B parity tests are **blockers**. CAS is a foundational invariant, not a best-effort behavior. If DynamoDB Local is unreliable for concurrent-write tests, CI runs them against real DynamoDB (test account, single-digit-dollar monthly cost) rather than accepting flakes. Phase C/D/E race tests that depend on CAS semantics are hard-blocked by phase B parity stability.
+
+5. **`outbound_url_validator` API**: **trait**, not raw closure. Defined as:
+
+   ```rust
+   pub trait OutboundUrlValidator: Send + Sync + std::fmt::Debug {
+       fn validate(&self, url: &url::Url) -> Result<(), String>;
+   }
+   ```
+
+   Builder accepts `Arc<dyn OutboundUrlValidator>`. Rationale (per review): easier to document, mock in tests, extend with DNS/allowlist state, and produce meaningful `Debug` output in diagnostic dumps. Closure shorthand (`|url| …`) can be offered as a blanket impl over `Fn` if ergonomics demand it, but the trait is the canonical API.
+
+## Review Gate — Accepted
+
+Reviewed and accepted 2026-04-18. Four P2 concerns raised in review:
+
+- **P2-a — feature-flag inconsistency**: fixed. Unified "cross-phase transitional flags" policy added; every flag is short-lived, default-off during landing, default-on after acceptance tests, deleted before phase G. No transitional flag ships to crates.io.
+- **P2-b — ignored E2E as release path**: fixed. Phase F rewritten to make lifecycle E2E tests a release gate. `#[ignore]` permitted only during active F development, zero tolerated at phase G entry. Emergency-release escape hatch explicitly narrow.
+- **P2-c — metric visibility before backend decision**: fixed. Observability contract decided upfront (structured tracing events, no metrics crate). Phase A's supervisor-panic test rewritten to assert on a captured tracing event, not a counter increment.
+- **P2-d — stub `ExecutionContext.events` leaks contract**: fixed. Phase A no longer touches `ExecutionContext`. Field added atomically in phase D alongside the full `EventSink` API.
+
+Plus one additional gate adopted from the review:
+
+- **C/D integration gate**: cancellation and EventSink branches may be developed in parallel but merged together. Combined branch must pass all ADR-010 §9 + ADR-012 §11 race tests on three consecutive CI runs.
+
+Five open questions resolved:
+
+- [x] Observability backend → structured tracing events.
+- [x] Secret newtype → `secrecy` crate, in `turul-a2a` only.
+- [x] SQL migrations → embedded via `sqlx-migrate` + committed `.sql` artifacts.
+- [x] DynamoDB parity flakes → blockers; escalate to real DynamoDB if Local unreliable.
+- [x] Outbound URL validator → trait, not closure.
+
+Phase A may begin.
