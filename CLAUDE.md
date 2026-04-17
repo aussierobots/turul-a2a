@@ -48,6 +48,43 @@ cargo lambda watch -p lambda-agent         # Lambda agent via cargo-lambda
 - Do not push unless explicitly asked
 - Version bumps: minor = 0.0.x (e.g., 0.1.0 → 0.1.1), major = 0.x.0
 
+## Release & Publish (crates.io)
+
+The workspace publishes 7 crates. The workflow is:
+
+1. **Pre-publish gate (always run, every release):**
+   - `cargo test --workspace` must be green — including `--features compat-v03` spot check.
+   - `cargo package -p <crate> --no-verify --allow-dirty` must be warning-free for every crate.
+   - `cargo doc --no-deps` must build without warnings on crates with `//!` docs.
+
+2. **Authorization is per-`cargo publish` call.** Publishing is irreversible (yank only hides; never deletes). Never run `cargo publish` without explicit user instruction in this session — a prior "go ahead" does not authorize future releases.
+
+3. **Publish in dependency order** (hard requirement — later crates won't resolve otherwise):
+   1. `turul-a2a-proto`
+   2. `turul-a2a-types`
+   3. `turul-jwt-validator`
+   4. `turul-a2a`
+   5. `turul-a2a-client`, `turul-a2a-auth`, `turul-a2a-aws-lambda` (parallelizable — none depend on each other)
+
+4. **crates.io rate limit** is the #1 practical obstacle:
+   - New-crate registrations: ~5 per 30-minute window, then one new crate per ~10 minutes.
+   - Re-publishes of *existing* crates are effectively unthrottled.
+   - On HTTP 429, cargo returns the exact reset time. Use `ScheduleWakeup` (Claude Code) and wait — do not retry sooner. The limit is account-wide across the registry.
+
+5. **Version discipline:**
+   - Bump only `[workspace.package].version` in root `Cargo.toml`; every crate inherits via `version.workspace = true`.
+   - Intra-workspace deps keep `{ version = "X.Y.Z", path = "..." }` (both fields — crates.io rejects path-only).
+   - Workspace-root `[workspace.dependencies]` internal refs (`turul-a2a-proto`, `turul-a2a-types`) also get bumped to the new version.
+
+6. **Tag after successful publish** with annotated tags:
+   - `git tag -a vX.Y.Z -m "Release X.Y.Z — <one-liner>"`
+   - `git push origin vX.Y.Z`
+   - This matches the CHANGELOG release-link convention (`/releases/tag/vX.Y.Z`) and populates GitHub's Releases UI.
+
+7. **Proto file location:** `crates/turul-a2a-proto/proto/` is the canonical location so `cargo package` includes it. A workspace-root `proto/` symlink preserves historical paths in ADRs and docs — do not replace it with a real directory.
+
+8. **Commit the release-prep changes** before running `cargo publish` — cargo will complain about dirty state otherwise. Never use `--allow-dirty` on real publishes, only on `cargo package` dry-runs.
+
 ## Architecture
 
 ### Crate Structure
