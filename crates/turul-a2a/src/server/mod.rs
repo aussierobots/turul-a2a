@@ -25,11 +25,15 @@ use crate::streaming::TaskEventBroker;
 /// - `cancel_handler_*`, `cross_instance_cancel_poll_interval`: phase C.
 /// - `push_*`, `allow_insecure_push_urls`: phase E.
 ///
-/// Exposed via builder setters rather than direct field access. The struct
-/// itself is `pub(crate)` to allow re-shaping under semver without breaking
-/// downstream consumers that only use the builder setters.
+/// Exposed publicly so tests and advanced consumers can construct
+/// [`crate::router::AppState`] directly (e.g., router/transport-level
+/// integration tests). The `#[non_exhaustive]` marker reserves the right
+/// to add fields in patch releases; callers should use
+/// [`RuntimeConfig::default()`] as the construction base and modify
+/// specific fields rather than struct-literal construction.
 #[derive(Debug, Clone)]
-pub(crate) struct RuntimeConfig {
+#[non_exhaustive]
+pub struct RuntimeConfig {
     pub blocking_task_timeout: Duration,
     pub timeout_abort_grace: Duration,
     pub cancel_handler_grace: Duration,
@@ -345,6 +349,7 @@ impl A2aServerBuilder {
                 atomic_store,
                 event_broker: TaskEventBroker::new(),
                 middleware_stack: Arc::new(MiddlewareStack::new(self.middleware)),
+                runtime_config: self.runtime_config,
             },
             merged_security: merged,
             bind_addr: self.bind_addr,
@@ -502,6 +507,7 @@ impl A2aServer {
             atomic_store: self.state.atomic_store,
             event_broker: self.state.event_broker,
             middleware_stack: self.state.middleware_stack,
+            runtime_config: self.state.runtime_config,
         };
 
         build_router(augmented_state)
@@ -704,5 +710,71 @@ mod tests {
             .build();
 
         assert!(result.is_ok(), "Unified .storage() should be accepted");
+    }
+
+    #[test]
+    fn runtime_config_setters_survive_build() {
+        // Invariant: builder setters for runtime-config knobs must propagate
+        // into the built server's AppState so that phases C/D/E can read
+        // them via `state.runtime_config`. This test exists to prevent the
+        // regression where setters silently become no-ops (the blocker
+        // identified in phase A review).
+        let server = A2aServer::builder()
+            .executor(DummyExecutor)
+            // One representative setter per phase-consumer bucket.
+            .blocking_task_timeout(Duration::from_secs(42))           // phase D
+            .timeout_abort_grace(Duration::from_secs(7))               // phase D
+            .cancel_handler_grace(Duration::from_secs(3))              // phase C
+            .cancel_handler_poll_interval(Duration::from_millis(50))   // phase C
+            .cross_instance_cancel_poll_interval(Duration::from_secs(2)) // phase C
+            .push_max_attempts(17)                                     // phase E
+            .push_backoff_base(Duration::from_millis(500))             // phase E
+            .push_backoff_cap(Duration::from_secs(90))                 // phase E
+            .push_backoff_jitter(0.5)                                  // phase E
+            .push_request_timeout(Duration::from_secs(20))             // phase E
+            .push_connect_timeout(Duration::from_secs(3))              // phase E
+            .push_read_timeout(Duration::from_secs(15))                // phase E
+            .push_claim_expiry(Duration::from_secs(20 * 60))           // phase E
+            .push_config_cache_ttl(Duration::from_secs(10))            // phase E
+            .push_failed_delivery_retention(Duration::from_secs(48 * 60 * 60)) // phase E
+            .push_max_payload_bytes(2 * 1024 * 1024)                   // phase E
+            .allow_insecure_push_urls(true)                            // phase E
+            .build()
+            .expect("build must succeed");
+
+        let cfg = &server.state.runtime_config;
+        assert_eq!(cfg.blocking_task_timeout, Duration::from_secs(42));
+        assert_eq!(cfg.timeout_abort_grace, Duration::from_secs(7));
+        assert_eq!(cfg.cancel_handler_grace, Duration::from_secs(3));
+        assert_eq!(cfg.cancel_handler_poll_interval, Duration::from_millis(50));
+        assert_eq!(cfg.cross_instance_cancel_poll_interval, Duration::from_secs(2));
+        assert_eq!(cfg.push_max_attempts, 17);
+        assert_eq!(cfg.push_backoff_base, Duration::from_millis(500));
+        assert_eq!(cfg.push_backoff_cap, Duration::from_secs(90));
+        assert!((cfg.push_backoff_jitter - 0.5).abs() < f32::EPSILON);
+        assert_eq!(cfg.push_request_timeout, Duration::from_secs(20));
+        assert_eq!(cfg.push_connect_timeout, Duration::from_secs(3));
+        assert_eq!(cfg.push_read_timeout, Duration::from_secs(15));
+        assert_eq!(cfg.push_claim_expiry, Duration::from_secs(20 * 60));
+        assert_eq!(cfg.push_config_cache_ttl, Duration::from_secs(10));
+        assert_eq!(cfg.push_failed_delivery_retention, Duration::from_secs(48 * 60 * 60));
+        assert_eq!(cfg.push_max_payload_bytes, 2 * 1024 * 1024);
+        assert!(cfg.allow_insecure_push_urls);
+    }
+
+    #[test]
+    fn runtime_config_defaults_reach_built_server() {
+        // Second half of the contract: when no setters are called, the
+        // documented defaults land in AppState.
+        let server = A2aServer::builder()
+            .executor(DummyExecutor)
+            .build()
+            .expect("build must succeed");
+
+        let cfg = &server.state.runtime_config;
+        let defaults = RuntimeConfig::default();
+        assert_eq!(cfg.blocking_task_timeout, defaults.blocking_task_timeout);
+        assert_eq!(cfg.push_max_attempts, defaults.push_max_attempts);
+        assert_eq!(cfg.allow_insecure_push_urls, defaults.allow_insecure_push_urls);
     }
 }

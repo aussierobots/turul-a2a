@@ -64,6 +64,7 @@ fn single_instance_state() -> AppState {
         atomic_store: Arc::new(s),
         event_broker: TaskEventBroker::new(),
         middleware_stack: Arc::new(MiddlewareStack::new(vec![])),
+        runtime_config: turul_a2a::server::RuntimeConfig::default(),
     }
 }
 
@@ -78,6 +79,7 @@ fn two_instances() -> (AppState, AppState) {
         atomic_store: Arc::new(s.clone()),
         event_broker: TaskEventBroker::new(),
         middleware_stack: Arc::new(MiddlewareStack::new(vec![])),
+        runtime_config: turul_a2a::server::RuntimeConfig::default(),
     };
     (make(&s), make(&s))
 }
@@ -373,6 +375,7 @@ async fn d3_no_broker_correctness_dependency() {
         atomic_store: Arc::new(s),
         event_broker: TaskEventBroker::new(),
         middleware_stack: Arc::new(MiddlewareStack::new(vec![])),
+        runtime_config: turul_a2a::server::RuntimeConfig::default(),
     };
 
     // Create non-terminal task with events — NO broker.notify()

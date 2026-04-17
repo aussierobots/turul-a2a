@@ -21,7 +21,9 @@ use tracing::Level;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use turul_a2a::server::in_flight::{InFlightHandle, InFlightKey, InFlightRegistry, SupervisorSentinel};
+use turul_a2a::server::in_flight::{
+    InFlightHandle, InFlightKey, InFlightRegistry, InsertCollision, SupervisorSentinel,
+};
 use turul_a2a::server::obs::TARGET_SUPERVISOR_PANIC;
 use turul_a2a_types::Task;
 
@@ -134,7 +136,7 @@ fn dummy_task(task_id: &str) -> Task {
 // Tests (6 total, per plan).
 // ---------------------------------------------------------------------------
 
-/// Test 1: basic insert/get/remove round-trip on the registry.
+/// Test 1: basic try_insert/get/remove_if_current round-trip on the registry.
 #[tokio::test]
 async fn in_flight_registry_insert_remove_roundtrip() {
     let registry = Arc::new(InFlightRegistry::new());
@@ -153,7 +155,9 @@ async fn in_flight_registry_insert_remove_roundtrip() {
         spawned,
     ));
 
-    registry.insert(key.clone(), Arc::clone(&handle));
+    registry
+        .try_insert(key.clone(), Arc::clone(&handle))
+        .expect("first insert on empty key must succeed");
     assert!(registry.get(&key).is_some(), "entry should be present after insert");
 
     // Release the spawned task and let it resolve.
@@ -161,8 +165,8 @@ async fn in_flight_registry_insert_remove_roundtrip() {
     let taken = handle.take_spawned().expect("JoinHandle should still be in the handle");
     taken.await.expect("spawned task should complete cleanly");
 
-    let removed = registry.remove(&key);
-    assert!(removed.is_some(), "remove should return the handle");
+    let removed = registry.remove_if_current(&key, &handle);
+    assert!(removed, "remove_if_current should succeed for the owning handle");
     assert!(registry.get(&key).is_none(), "entry must be gone after remove");
 }
 
@@ -186,7 +190,9 @@ async fn supervisor_sentinel_drops_on_normal_exit_removes_entry() {
         yielded_tx,
         spawned,
     ));
-    registry.insert(key.clone(), Arc::clone(&handle));
+    registry
+        .try_insert(key.clone(), Arc::clone(&handle))
+        .expect("first insert must succeed");
 
     // Simulate the supervisor body. The sentinel is a local; it drops when
     // this block exits, running the cleanup path.
@@ -227,7 +233,9 @@ async fn supervisor_sentinel_drops_on_panic_still_cleans_up() {
         yielded_tx,
         spawned,
     ));
-    registry.insert(key.clone(), Arc::clone(&handle));
+    registry
+        .try_insert(key.clone(), Arc::clone(&handle))
+        .expect("first insert must succeed");
 
     let registry_for_task = Arc::clone(&registry);
     let key_for_task = key.clone();
@@ -294,7 +302,9 @@ async fn supervisor_panic_emits_structured_event() {
         yielded_tx,
         spawned,
     ));
-    registry.insert(key.clone(), Arc::clone(&handle));
+    registry
+        .try_insert(key.clone(), Arc::clone(&handle))
+        .expect("first insert must succeed");
 
     let registry_for_task = Arc::clone(&registry);
     let key_for_task = key.clone();
@@ -463,4 +473,222 @@ async fn secrecy_newtype_never_leaks_in_debug_or_display() {
         debug_wrapper.contains("webhook-1"),
         "non-secret fields should still appear in Debug, got: {debug_wrapper}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Collision-safety tests (blocker fix from phase A review).
+// ---------------------------------------------------------------------------
+
+/// Helper: construct a handle wrapping a tokio task that waits on the given
+/// receiver then exits. Returns the handle, its abort handle, and the
+/// sender that releases the task.
+fn make_waiting_handle() -> (Arc<InFlightHandle>, tokio::task::AbortHandle, oneshot::Sender<()>) {
+    let (exit_tx, exit_rx) = oneshot::channel::<()>();
+    let spawned = tokio::spawn(async move {
+        let _ = exit_rx.await;
+    });
+    let abort_handle = spawned.abort_handle();
+    let (yielded_tx, _yielded_rx) = oneshot::channel::<Task>();
+    let handle = Arc::new(InFlightHandle::new(
+        CancellationToken::new(),
+        yielded_tx,
+        spawned,
+    ));
+    (handle, abort_handle, exit_tx)
+}
+
+/// Test 7: duplicate `try_insert` for the same key is rejected and does
+/// NOT overwrite the existing handle. Both the returned error and a
+/// subsequent `get()` reference the original handle via `Arc::ptr_eq`.
+#[tokio::test]
+async fn try_insert_rejects_duplicate_without_overwrite() {
+    let registry = Arc::new(InFlightRegistry::new());
+    let key = make_key("tenant-dup", "task-dup");
+
+    let (handle_a, abort_a, exit_a) = make_waiting_handle();
+    let (handle_b, abort_b, exit_b) = make_waiting_handle();
+
+    registry
+        .try_insert(key.clone(), Arc::clone(&handle_a))
+        .expect("first insert must succeed");
+
+    let collision: InsertCollision = registry
+        .try_insert(key.clone(), Arc::clone(&handle_b))
+        .expect_err("duplicate insert for same key must fail");
+
+    // Returned existing handle is the original A, not B.
+    assert!(
+        Arc::ptr_eq(&collision.existing, &handle_a),
+        "collision.existing must be the original handle, not the rejected one"
+    );
+    assert_eq!(collision.key, key, "collision reports the conflicting key");
+
+    // Registry still contains A — B was rejected and not inserted.
+    let current = registry.get(&key).expect("entry should still be present");
+    assert!(
+        Arc::ptr_eq(&current, &handle_a),
+        "registry must still hold the original handle; duplicate did not overwrite"
+    );
+
+    // Error message is well-formed (useful in server startup panics / logs).
+    let msg = collision.to_string();
+    assert!(msg.contains("tenant-dup"), "error should mention tenant");
+    assert!(msg.contains("task-dup"), "error should mention task_id");
+
+    // Cleanup: release both spawned tasks so the test doesn't leak them.
+    let _ = exit_a.send(());
+    let _ = exit_b.send(());
+    if let Some(h) = handle_a.take_spawned() {
+        let _ = h.await;
+    }
+    if let Some(h) = handle_b.take_spawned() {
+        let _ = h.await;
+    }
+    drop(abort_a);
+    drop(abort_b);
+}
+
+/// Test 8 (the core collision-safety invariant): a stale sentinel for
+/// handle A must NOT remove a newer handle B that now occupies the same
+/// `(tenant, task_id)` key. Sequence:
+///
+/// 1. Insert handle A for key K.
+/// 2. Remove A via `remove_if_current`.
+/// 3. Insert handle B for key K (same key, different Arc).
+/// 4. Drop a sentinel that was constructed with A as its handle.
+/// 5. Assert B is still in the registry.
+///
+/// Without the `Arc::ptr_eq` identity check in `remove_if_current`, step 4
+/// would remove B by key, leaving B untracked.
+#[tokio::test]
+async fn stale_sentinel_does_not_remove_newer_handle_for_same_key() {
+    let registry = Arc::new(InFlightRegistry::new());
+    let key = make_key("tenant-reuse", "task-reuse");
+
+    let (handle_a, abort_a, exit_a) = make_waiting_handle();
+    let (handle_b, abort_b, exit_b) = make_waiting_handle();
+
+    // Step 1: insert A.
+    registry
+        .try_insert(key.clone(), Arc::clone(&handle_a))
+        .expect("A insert must succeed");
+
+    // Step 2: remove A from the registry BUT keep the handle and construct
+    // a sentinel that references it (simulating a stale sentinel that
+    // outlives the registry entry — e.g. the supervisor's sentinel is
+    // still on the stack but the registry has already cycled).
+    let removed_a = registry.remove_if_current(&key, &handle_a);
+    assert!(removed_a, "A must be removable while it is the current entry");
+
+    // Step 3: install B under the same key.
+    registry
+        .try_insert(key.clone(), Arc::clone(&handle_b))
+        .expect("B insert must succeed after A was removed");
+
+    // Step 4: drop a sentinel that holds A. Inside its Drop, it will call
+    // `remove_if_current(&key, &handle_a)`. Since the registry now holds
+    // B (Arc::ptr_eq == false), the call must be a no-op on the registry.
+    {
+        let _stale_sentinel = SupervisorSentinel::new(
+            Arc::clone(&registry),
+            key.clone(),
+            Arc::clone(&handle_a),
+        );
+        // scope exit → Drop → remove_if_current(&key, &handle_a) → no-op
+    }
+
+    // Step 5: B must still be present.
+    let current = registry
+        .get(&key)
+        .expect("B must still be in the registry; stale sentinel must not have removed it");
+    assert!(
+        Arc::ptr_eq(&current, &handle_b),
+        "registry must still hold B after the stale sentinel dropped"
+    );
+
+    // Cleanup.
+    let _ = exit_a.send(());
+    let _ = exit_b.send(());
+    if let Some(h) = handle_a.take_spawned() {
+        let _ = h.await;
+    }
+    if let Some(h) = handle_b.take_spawned() {
+        let _ = h.await;
+    }
+    drop(abort_a);
+    drop(abort_b);
+}
+
+/// Test 9: a stale sentinel still aborts its OWN spawned task even though
+/// it does not remove the registry entry (because that entry now contains
+/// a different handle). Invariant: each sentinel is responsible for its
+/// own JoinHandle — independent of whether it still "owns" the registry
+/// entry at Drop time.
+#[tokio::test]
+async fn stale_sentinel_still_aborts_own_spawned_handle() {
+    let registry = Arc::new(InFlightRegistry::new());
+    let key = make_key("tenant-abort", "task-abort");
+
+    let (handle_a, abort_a, _keep_exit_a) = make_waiting_handle();
+    let (handle_b, abort_b, exit_b) = make_waiting_handle();
+
+    registry
+        .try_insert(key.clone(), Arc::clone(&handle_a))
+        .expect("A insert must succeed");
+    assert!(registry.remove_if_current(&key, &handle_a));
+    registry
+        .try_insert(key.clone(), Arc::clone(&handle_b))
+        .expect("B insert must succeed");
+
+    assert!(
+        !abort_a.is_finished(),
+        "precondition: A's spawned task should still be running"
+    );
+
+    // Dropping a sentinel wrapped around A triggers A's abort path, even
+    // though the registry entry now belongs to B.
+    {
+        let _stale_sentinel = SupervisorSentinel::new(
+            Arc::clone(&registry),
+            key.clone(),
+            Arc::clone(&handle_a),
+        );
+    }
+
+    // `abort()` schedules a cancel wake for the aborted task; the task's
+    // `is_finished` flips once the task's next poll observes cancellation.
+    // We yield the runtime a bounded number of times to let that propagate.
+    // Deterministic in practice: one yield suffices on the default
+    // multi-threaded runtime, but we allow a few more for safety in
+    // debug builds / slow CI.
+    for _ in 0..16 {
+        if abort_a.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        abort_a.is_finished(),
+        "stale sentinel must abort its own spawned task (even after 16 yields)"
+    );
+
+    // B remains untouched: still in registry, spawned task still running.
+    assert!(
+        registry.get(&key).is_some(),
+        "B must still be in the registry"
+    );
+    assert!(
+        !abort_b.is_finished(),
+        "B's spawned task must NOT be aborted by A's sentinel"
+    );
+
+    // Cleanup: release B and await its natural exit.
+    let _ = exit_b.send(());
+    if let Some(h) = handle_b.take_spawned() {
+        let _ = h.await;
+    }
+    // A was aborted — its take_spawned returns the already-aborted handle.
+    if let Some(h) = handle_a.take_spawned() {
+        let _ = h.await; // JoinError::cancelled — swallowed.
+    }
 }

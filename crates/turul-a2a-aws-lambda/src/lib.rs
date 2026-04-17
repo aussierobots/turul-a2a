@@ -154,6 +154,9 @@ impl LambdaA2aServerBuilder {
             atomic_store,
             event_broker: TaskEventBroker::new(),
             middleware_stack: Arc::new(MiddlewareStack::new(self.middleware)),
+            // Lambda adapter uses framework defaults for runtime config;
+            // future phases may expose adapter-level overrides.
+            runtime_config: turul_a2a::server::RuntimeConfig::default(),
         };
 
         let router = build_router(state);

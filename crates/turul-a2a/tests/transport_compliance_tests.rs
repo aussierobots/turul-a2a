@@ -50,6 +50,7 @@ fn test_state() -> AppState {
         atomic_store: Arc::new(s),
         event_broker: TaskEventBroker::new(),
         middleware_stack: Arc::new(turul_a2a::middleware::MiddlewareStack::new(vec![])),
+        runtime_config: turul_a2a::server::RuntimeConfig::default(),
     }
 }
 

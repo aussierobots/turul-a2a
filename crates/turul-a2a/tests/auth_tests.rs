@@ -135,6 +135,7 @@ fn state_no_auth() -> AppState {
         push_storage: Arc::new(s.clone()),
         event_broker: TaskEventBroker::new(),
         middleware_stack: Arc::new(MiddlewareStack::new(vec![])),
+        runtime_config: turul_a2a::server::RuntimeConfig::default(),
         event_store: Arc::new(s.clone()),
         atomic_store: Arc::new(s),
     }
@@ -152,6 +153,7 @@ fn state_with_auth() -> AppState {
         middleware_stack: Arc::new(MiddlewareStack::new(vec![
             Arc::new(TestAuthMiddleware),
         ])),
+        runtime_config: turul_a2a::server::RuntimeConfig::default(),
     }
 }
 

@@ -30,6 +30,15 @@ pub struct AppState {
     pub atomic_store: Arc<dyn A2aAtomicStore>,
     pub event_broker: crate::streaming::TaskEventBroker,
     pub middleware_stack: Arc<crate::middleware::MiddlewareStack>,
+    /// Runtime configuration preserved from `A2aServerBuilder`. Consumed
+    /// in phases C (cancellation), D (EventSink / long-running), and E
+    /// (push delivery). Phase A threads it through so setter values
+    /// survive `.build()` — future phases read via `state.runtime_config`.
+    ///
+    /// When constructing `AppState` directly (e.g., in tests or an
+    /// AWS Lambda adapter that bypasses the builder), use
+    /// `crate::server::RuntimeConfig::default()`.
+    pub runtime_config: crate::server::RuntimeConfig,
 }
 
 /// Build the axum router with all proto-defined routes.

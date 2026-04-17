@@ -134,6 +134,7 @@ fn state_with(executor: impl AgentExecutor + 'static) -> AppState {
         atomic_store: std::sync::Arc::new(s),
         event_broker: turul_a2a::streaming::TaskEventBroker::new(),
         middleware_stack: std::sync::Arc::new(turul_a2a::middleware::MiddlewareStack::new(vec![])),
+        runtime_config: turul_a2a::server::RuntimeConfig::default(),
     }
 }
 

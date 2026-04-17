@@ -26,10 +26,22 @@
 //!    ERROR-level tracing event with `tenant` + `task_id` fields.
 //! 3. **`yielded` fires exactly once**: an `AtomicBool` CAS guards the
 //!    oneshot sender. Concurrent triggers resolve to exactly one winner.
+//! 4. **Registry insertion is collision-safe**: [`InFlightRegistry::try_insert`]
+//!    rejects duplicate `(tenant, task_id)` keys instead of silently
+//!    overwriting. Duplicate-spawn-for-same-task is a framework-level
+//!    invariant violation; callers propagate the error up as an internal
+//!    error rather than clobbering a live handle.
+//! 5. **Sentinel Drop does not remove entries it does not own**: a sentinel
+//!    for handle A must not remove a registry entry that now contains
+//!    handle B — [`InFlightRegistry::remove_if_current`] uses [`Arc::ptr_eq`]
+//!    to verify identity before removing. This protects against stale
+//!    sentinels that outlive the logical spawn and helps make the registry
+//!    robust under code paths that reuse task IDs after a prior completion.
 //!
 //! See `tests/runtime_substrate_tests.rs` for the invariant coverage.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -173,13 +185,28 @@ impl InFlightRegistry {
         Self::default()
     }
 
-    /// Insert an entry. Overwrites any previous entry for the same key —
-    /// which should not happen in practice (spawns have unique `task_id`).
-    pub fn insert(&self, key: InFlightKey, handle: Arc<InFlightHandle>) {
-        self.map
-            .write()
-            .expect("InFlightRegistry RwLock poisoned")
-            .insert(key, handle);
+    /// Insert an entry if no entry exists for this key. Returns
+    /// [`InsertCollision`] if one already exists — callers treat this as an
+    /// internal error at spawn time. Silent overwrites are NOT permitted:
+    /// overwriting a live handle would lose track of an executor we are
+    /// responsible for aborting on cleanup.
+    pub fn try_insert(
+        &self,
+        key: InFlightKey,
+        handle: Arc<InFlightHandle>,
+    ) -> Result<(), InsertCollision> {
+        use std::collections::hash_map::Entry;
+        let mut map = self.map.write().expect("InFlightRegistry RwLock poisoned");
+        match map.entry(key) {
+            Entry::Occupied(occ) => Err(InsertCollision {
+                key: occ.key().clone(),
+                existing: occ.get().clone(),
+            }),
+            Entry::Vacant(vac) => {
+                vac.insert(handle);
+                Ok(())
+            }
+        }
     }
 
     /// Get a cloned Arc to the handle, if present.
@@ -191,12 +218,26 @@ impl InFlightRegistry {
             .cloned()
     }
 
-    /// Remove and return the handle, if present. Idempotent.
-    pub fn remove(&self, key: &InFlightKey) -> Option<Arc<InFlightHandle>> {
-        self.map
-            .write()
-            .expect("InFlightRegistry RwLock poisoned")
-            .remove(key)
+    /// Remove the entry ONLY IF it still contains the given handle by
+    /// [`Arc::ptr_eq`] identity. Returns `true` if the entry was removed,
+    /// `false` if the key was absent or contained a different handle.
+    ///
+    /// This is the canonical removal path for
+    /// [`SupervisorSentinel::drop`]: a stale sentinel for a prior handle
+    /// must not remove a newer, live handle for the same
+    /// `(tenant, task_id)`. Even with [`Self::try_insert`]'s
+    /// collision-safety, a `remove`-then-`try_insert` sequence on the same
+    /// key could, in principle, race with a late sentinel Drop — identity
+    /// check closes that window.
+    pub fn remove_if_current(&self, key: &InFlightKey, handle: &Arc<InFlightHandle>) -> bool {
+        let mut map = self.map.write().expect("InFlightRegistry RwLock poisoned");
+        match map.get(key) {
+            Some(existing) if Arc::ptr_eq(existing, handle) => {
+                map.remove(key);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Count of entries — diagnostic only.
@@ -212,6 +253,41 @@ impl InFlightRegistry {
         self.len() == 0
     }
 }
+
+/// Error returned by [`InFlightRegistry::try_insert`] when the key is
+/// already occupied. The existing handle is returned so the caller can
+/// log or inspect it for diagnostics; the caller MUST NOT proceed as if
+/// the insert succeeded.
+pub struct InsertCollision {
+    pub key: InFlightKey,
+    pub existing: Arc<InFlightHandle>,
+}
+
+// Manual Debug — `InFlightHandle` holds non-Debug fields (oneshot sender,
+// JoinHandle) so we can't derive. Print identity-only info: Arc pointer
+// and key. That's enough for log diagnostics and doesn't risk leaking
+// any state from within the handle.
+impl fmt::Debug for InsertCollision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InsertCollision")
+            .field("key", &self.key)
+            .field("existing_ptr", &Arc::as_ptr(&self.existing))
+            .finish()
+    }
+}
+
+impl fmt::Display for InsertCollision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (tenant, task_id) = &self.key;
+        write!(
+            f,
+            "in-flight registry collision for tenant={tenant}, task_id={task_id}; \
+             a spawn for this key is already active"
+        )
+    }
+}
+
+impl std::error::Error for InsertCollision {}
 
 // ---------------------------------------------------------------------------
 // SupervisorSentinel — drop-guard for panic-safe cleanup
@@ -263,25 +339,29 @@ impl Drop for SupervisorSentinel {
         // panic case.
         let panicking = std::thread::panicking();
 
-        // 1. Abort the spawned task if the supervisor's normal path didn't
-        //    take and await it. This is the load-bearing panic-safety
-        //    guarantee — a panicked supervisor cannot leave a live executor.
+        // 1. Abort THIS sentinel's spawned task if the supervisor's normal
+        //    path didn't take and await it. Load-bearing panic-safety
+        //    guarantee: a panicked supervisor cannot leave a live executor.
+        //    This runs regardless of whether the registry still owns the
+        //    entry — each sentinel is responsible for cleaning up its own
+        //    JoinHandle.
         if let Some(handle) = self.handle.take_spawned() {
             if !handle.is_finished() {
                 handle.abort();
             }
         }
 
-        // 2. Remove the registry entry. Idempotent if the supervisor's
-        //    normal path already removed it.
-        self.registry.remove(&self.key);
+        // 2. Remove the registry entry ONLY if it still contains our
+        //    handle. A stale sentinel must not remove a newer handle that
+        //    happens to share the same `(tenant, task_id)` key. Uses
+        //    Arc::ptr_eq via `remove_if_current`.
+        self.registry.remove_if_current(&self.key, &self.handle);
 
         // 3. If the unwind was a panic, emit the observability signal. Note:
         //    tracing macros during panic unwind are safe — tracing's
         //    Dispatch acquires no locks that could be poisoned, and the
-        //    current subscriber is looked up via thread-local / WithSubscriber
-        //    context that remains live until the future's state is fully
-        //    dropped.
+        //    current subscriber is looked up via thread-local / global
+        //    default that remains live until the test binary exits.
         if panicking {
             let (tenant, task_id) = &self.key;
             tracing::error!(
