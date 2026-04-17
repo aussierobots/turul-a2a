@@ -1,7 +1,8 @@
 # ADR-009: Durable Event Coordination for Multi-Instance Streaming
 
-- **Status:** Accepted
+- **Status:** Accepted (§12 amended by ADR-010, 2026-04-17)
 - **Date:** 2026-04-11
+- **Amendments:** §12 "Terminal Task Replay" is superseded by ADR-010 §4.3. The proposed terminal-replay carve-out was never implemented and is out of spec with A2A v1.0 §3.1.6 / §9.4.6. Terminal SubscribeToTask returns `UnsupportedOperationError`. The rest of ADR-009 (durable event store, atomic writes, replay for non-terminal tasks, broker-as-wake-up, parity requirements) remains authoritative.
 
 ## Context
 
@@ -307,16 +308,20 @@ The in-process `TaskEventBroker` is **not the event data path**. It is a wake-up
 
 The broker channel may carry `()` (pure signal) or remain `StreamEvent` for backward compat — the SSE formatter must never trust broker data as authoritative. The store is always re-queried.
 
-### 12. Terminal Task Replay
+### 12. Terminal Task Replay — **SUPERSEDED by ADR-010 §4.3 (2026-04-17)**
 
-The current `core_subscribe_to_task` rejects terminal tasks with `UnsupportedOperation`. This **cannot survive D3**: if events exist in the store for a terminal task, a subscriber (or reconnecting client) must be able to replay them.
+> **Status**: This section is superseded and retained for historical context only. The proposal below was never implemented and is out of spec with A2A v1.0 §3.1.6 / §9.4.6. Current and future behavior: terminal SubscribeToTask returns `UnsupportedOperationError` (HTTP 400 / JSON-RPC −32004). `Last-Event-ID` replay applies only to streams attached while the task is non-terminal. See ADR-010 §4.3.
 
-**New semantics:**
-- Subscribe to a terminal task → replay all stored events → close stream cleanly
-- Subscribe to a non-terminal task → replay stored events → switch to live wake-ups → close on terminal event
-- Reconnect with `Last-Event-ID` on terminal task → replay events after that sequence → close
+~~The current `core_subscribe_to_task` rejects terminal tasks with `UnsupportedOperation`. This **cannot survive D3**: if events exist in the store for a terminal task, a subscriber (or reconnecting client) must be able to replay them.~~
 
-**Rationale:** A subscriber that disconnects during the terminal event delivery and reconnects finds no broker channel (already cleaned up). Without terminal replay, that subscriber can never retrieve the terminal event. The store has it — serve it.
+~~**Proposed (superseded) semantics:**~~
+- ~~Subscribe to a terminal task → replay all stored events → close stream cleanly~~
+- Subscribe to a non-terminal task → replay stored events → switch to live wake-ups → close on terminal event (this part remains in force; non-terminal replay is ADR-009's core contribution)
+- ~~Reconnect with `Last-Event-ID` on terminal task → replay events after that sequence → close~~
+
+~~**Proposed (superseded) rationale:** A subscriber that disconnects during the terminal event delivery and reconnects finds no broker channel (already cleaned up). Without terminal replay, that subscriber can never retrieve the terminal event. The store has it — serve it.~~
+
+**Actual behavior (per ADR-010 §4.3)**: clients MUST either (a) track terminal state locally before disconnecting, or (b) call `GetTask` on the task to retrieve its final state. `GetTask` remains valid on terminal tasks indefinitely (until task TTL expiry). The `SubscribeToTask` API is a stream API, not a history API.
 
 ### 13. D3 Scope: Coarse Events Only
 

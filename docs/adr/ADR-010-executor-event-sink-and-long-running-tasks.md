@@ -1,7 +1,8 @@
 # ADR-010: Executor EventSink and Long-Running Task Lifecycle
 
-- **Status:** Proposed (rev 3)
+- **Status:** Accepted
 - **Date:** 2026-04-17
+- **Accepted after:** three rev cycles; final review by `a2a-spec-compliance` agent and human product owner.
 - **Supersedes:** ADR-009 §12 "Terminal Task Replay" — terminal subscribe returns `UnsupportedOperationError` per A2A v1.0 §3.1.6 / §9.4.6, no replay carve-out. See §4.3 below.
 
 ## Context
@@ -172,8 +173,6 @@ Sequence on timeout:
 **No zombies, no FAILED on top of cooperative CANCELED**. The force-abort always terminates the executor task (via `abort()` at the next `.await`). The race-aware FAILED commit preserves the single-terminal-writer invariant from §1/§7.1.
 
 **Interrupted states** (`INPUT_REQUIRED`, `AUTH_REQUIRED`) also fire `yielded` per §3.2.2. Blocking send returns with the task in that state. The executor ought to return from `execute()` promptly after emitting an interrupt; if it doesn't, the supervisor eventually handles cleanup. But blocking send has already returned — the client is not held hostage to executor cleanup discipline.
-
-**No zombies by design**. Every timeout path terminates the executor task either cooperatively (preferred) or by `JoinHandle::abort()` (fallback). In-flight entries persist until the `JoinHandle` actually exits, not merely until a terminal event commits — this bounds registry memory to "count of genuinely alive executor tasks."
 
 **Why cooperation first**. `JoinHandle::abort()` is a force-unwind at the next `.await` point — fine for most async code but hostile to executors holding external resources (open file handles, in-progress HTTP requests with dangling connections, uncommitted DB transactions). The cooperative window gives well-behaved executors a chance to clean up. Misbehaving or unresponsive executors still get killed at the hard deadline; they don't get to starve the server.
 

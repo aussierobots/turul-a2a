@@ -35,9 +35,13 @@
 //!
 //! Task state and streaming events are written atomically via
 //! [`storage::A2aAtomicStore`]. The in-process event broker is a local
-//! wake-up signal; the storage backend is the source of truth. This enables
-//! terminal replay and Last-Event-ID reconnection across instances when the
-//! same backend is used (e.g., shared DynamoDB or PostgreSQL).
+//! wake-up signal; the storage backend is the source of truth. Subscribers
+//! attached while a task is non-terminal receive replay of prior events and
+//! then live delivery, supporting `Last-Event-ID` reconnection across
+//! instances when the same backend is used (e.g., shared DynamoDB or
+//! PostgreSQL). Subscribing to an already-terminal task returns
+//! `UnsupportedOperationError` per A2A v1.0 §3.1.6 — use [`storage`] or
+//! `GetTask` to retrieve the final state.
 //!
 //! # Multi-instance streaming
 //!
