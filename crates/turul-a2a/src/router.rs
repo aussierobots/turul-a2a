@@ -62,11 +62,14 @@ pub fn build_router(state: AppState) -> Router {
                 .delete(tenant_task_delete_dispatch),
         );
 
-    // JSON-RPC endpoint
-    let router = router.route(
-        "/jsonrpc",
-        post(crate::jsonrpc::jsonrpc_dispatch_handler),
-    );
+    // JSON-RPC dispatch: /jsonrpc is the canonical endpoint
+    let router = router.route("/jsonrpc", post(crate::jsonrpc::jsonrpc_dispatch_handler));
+
+    // A2A v0.3 compat: root POST route for a2a-sdk 0.3.x clients that POST
+    // to the agent card URL (base URL) rather than /message:send.
+    // Removal condition: when a2a-sdk supports v1.0 routing.
+    #[cfg(feature = "compat-v03")]
+    let router = router.route("/", post(crate::jsonrpc::jsonrpc_dispatch_handler));
 
     // Wrap with auth Tower layer (runs second — after transport compliance)
     let auth_layer = crate::middleware::AuthLayer::new(state.middleware_stack.clone());
@@ -308,14 +311,22 @@ async fn dispatch_task_delete(
 // =========================================================
 
 async fn agent_card_handler(State(state): State<AppState>) -> impl IntoResponse {
-    Json(serde_json::to_value(state.executor.agent_card()).unwrap_or_default())
+    let card = serde_json::to_value(state.executor.agent_card()).unwrap_or_default();
+    #[cfg(feature = "compat-v03")]
+    let card = crate::compat_v03::inject_agent_card_compat(card);
+    Json(card)
 }
 
 async fn extended_agent_card_handler(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, A2aError> {
     match state.executor.extended_agent_card(None) {
-        Some(card) => Ok(Json(serde_json::to_value(card).unwrap_or_default())),
+        Some(extended) => {
+            let card = serde_json::to_value(extended).unwrap_or_default();
+            #[cfg(feature = "compat-v03")]
+            let card = crate::compat_v03::inject_agent_card_compat(card);
+            Ok(Json(card))
+        }
         None => Err(A2aError::ExtendedAgentCardNotConfigured),
     }
 }
@@ -1103,4 +1114,6 @@ mod tests {
     fn parse_invalid_path() {
         assert_eq!(parse_task_path("a/b/c/d"), None);
     }
+
+    // v0.3 compat tests live in compat_v03.rs
 }

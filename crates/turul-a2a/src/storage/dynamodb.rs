@@ -29,7 +29,16 @@ pub struct DynamoDbConfig {
     pub tasks_table: String,
     pub push_configs_table: String,
     pub events_table: String,
+    /// TTL for task items in seconds. 0 = no expiry. Default: 7 days (604800).
+    pub task_ttl_seconds: u64,
+    /// TTL for event items in seconds. 0 = no expiry. Default: 24 hours (86400).
+    pub event_ttl_seconds: u64,
 }
+
+/// 7 days in seconds.
+const DEFAULT_TASK_TTL: u64 = 7 * 24 * 3600;
+/// 24 hours in seconds.
+const DEFAULT_EVENT_TTL: u64 = 24 * 3600;
 
 impl Default for DynamoDbConfig {
     fn default() -> Self {
@@ -37,6 +46,8 @@ impl Default for DynamoDbConfig {
             tasks_table: "a2a_tasks".into(),
             push_configs_table: "a2a_push_configs".into(),
             events_table: "a2a_task_events".into(),
+            task_ttl_seconds: DEFAULT_TASK_TTL,
+            event_ttl_seconds: DEFAULT_EVENT_TTL,
         }
     }
 }
@@ -68,6 +79,21 @@ impl DynamoDbA2aStorage {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
         format!("{:010}.{:03}", now.as_secs(), now.subsec_millis())
+    }
+
+    fn now_epoch() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    /// Compute TTL epoch for a given TTL duration. Returns None if ttl_seconds is 0.
+    fn ttl_epoch(ttl_seconds: u64) -> Option<AttributeValue> {
+        if ttl_seconds == 0 {
+            return None;
+        }
+        Some(AttributeValue::N((Self::now_epoch() + ttl_seconds).to_string()))
     }
 
     fn task_to_json(task: &Task) -> Result<String, A2aStorageError> {
@@ -121,7 +147,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         let json = Self::task_to_json(&task)?;
         let state_str = Self::status_state_str(&task);
 
-        self.client
+        let mut req = self.client
             .put_item()
             .table_name(&self.config.tasks_table)
             .item("pk", AttributeValue::S(pk))
@@ -131,8 +157,11 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .item("contextId", AttributeValue::S(task.context_id().to_string()))
             .item("statusState", AttributeValue::S(state_str))
             .item("taskJson", AttributeValue::S(json))
-            .item("updatedAt", AttributeValue::S(Self::now_iso()))
-            .send()
+            .item("updatedAt", AttributeValue::S(Self::now_iso()));
+        if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
+            req = req.item("ttl", ttl);
+        }
+        req.send()
             .await
             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
 
@@ -194,7 +223,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
 
         // Conditional write: only succeeds if the item exists AND owner matches.
         // This prevents ownership transfer and ensures isolation.
-        let result = self
+        let mut req = self
             .client
             .put_item()
             .table_name(&self.config.tasks_table)
@@ -210,9 +239,11 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .expression_attribute_values(
                 ":expected_owner",
                 AttributeValue::S(owner.to_string()),
-            )
-            .send()
-            .await;
+            );
+        if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
+            req = req.item("ttl", ttl);
+        }
+        let result = req.send().await;
 
         match result {
             Ok(_) => Ok(()),
@@ -472,15 +503,18 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
         let json = serde_json::to_string(&config)
             .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
 
-        self.client
+        let mut req = self.client
             .put_item()
             .table_name(&self.config.push_configs_table)
             .item("pk", AttributeValue::S(pk))
             .item("tenant", AttributeValue::S(tenant.to_string()))
             .item("taskId", AttributeValue::S(config.task_id.clone()))
             .item("configId", AttributeValue::S(config.id.clone()))
-            .item("configJson", AttributeValue::S(json))
-            .send()
+            .item("configJson", AttributeValue::S(json));
+        if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
+            req = req.item("ttl", ttl);
+        }
+        req.send()
             .await
             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
 
@@ -638,14 +672,17 @@ impl A2aEventStore for DynamoDbA2aStorage {
         let max_seq = query_max_sequence(&self.client, &self.config.events_table, &pk).await?;
         let new_seq = max_seq + 1;
 
-        self.client
+        let mut req = self.client
             .put_item()
             .table_name(&self.config.events_table)
             .item("pk", AttributeValue::S(pk))
             .item("eventSequence", AttributeValue::N(new_seq.to_string()))
             .item("eventData", AttributeValue::S(event_data))
-            .condition_expression("attribute_not_exists(pk)")
-            .send()
+            .condition_expression("attribute_not_exists(pk)");
+        if let Some(ttl) = Self::ttl_epoch(self.config.event_ttl_seconds) {
+            req = req.item("ttl", ttl);
+        }
+        req.send()
             .await
             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
 
@@ -725,18 +762,23 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let state_str = Self::status_state_str(&task);
 
         // Build TransactWriteItems: task put + event puts
+        let mut task_put = aws_sdk_dynamodb::types::Put::builder()
+            .table_name(&self.config.tasks_table)
+            .item("pk", AttributeValue::S(pk.clone()))
+            .item("tenant", AttributeValue::S(tenant.to_string()))
+            .item("taskId", AttributeValue::S(task.id().to_string()))
+            .item("owner", AttributeValue::S(owner.to_string()))
+            .item("taskJson", AttributeValue::S(task_json))
+            .item("contextId", AttributeValue::S(task.context_id().to_string()))
+            .item("statusState", AttributeValue::S(state_str))
+            .item("updatedAt", AttributeValue::S(Self::now_iso()));
+        if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
+            task_put = task_put.item("ttl", ttl);
+        }
         let mut items = vec![
             aws_sdk_dynamodb::types::TransactWriteItem::builder()
                 .put(
-                    aws_sdk_dynamodb::types::Put::builder()
-                        .table_name(&self.config.tasks_table)
-                        .item("pk", AttributeValue::S(pk.clone()))
-                        .item("owner", AttributeValue::S(owner.to_string()))
-                        .item("taskJson", AttributeValue::S(task_json))
-                        .item("contextId", AttributeValue::S(task.context_id().to_string()))
-                        .item("statusState", AttributeValue::S(state_str))
-                        .item("updatedAt", AttributeValue::S(Self::now_iso()))
-                        .build()
+                    task_put.build()
                         .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
                 )
                 .build(),
@@ -749,15 +791,18 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             let event_data = serde_json::to_string(event)
                 .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
 
+            let mut event_put = aws_sdk_dynamodb::types::Put::builder()
+                .table_name(&self.config.events_table)
+                .item("pk", AttributeValue::S(pk.clone()))
+                .item("eventSequence", AttributeValue::N(seq.to_string()))
+                .item("eventData", AttributeValue::S(event_data));
+            if let Some(ttl) = Self::ttl_epoch(self.config.event_ttl_seconds) {
+                event_put = event_put.item("ttl", ttl);
+            }
             items.push(
                 aws_sdk_dynamodb::types::TransactWriteItem::builder()
                     .put(
-                        aws_sdk_dynamodb::types::Put::builder()
-                            .table_name(&self.config.events_table)
-                            .item("pk", AttributeValue::S(pk.clone()))
-                            .item("eventSequence", AttributeValue::N(seq.to_string()))
-                            .item("eventData", AttributeValue::S(event_data))
-                            .build()
+                        event_put.build()
                             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
                     )
                     .build(),
@@ -885,21 +930,26 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let max_seq = query_max_sequence(&self.client, &self.config.events_table, &pk).await?;
 
         // Build TransactWriteItems: task put (with owner check) + event puts
+        let mut task_put = aws_sdk_dynamodb::types::Put::builder()
+            .table_name(&self.config.tasks_table)
+            .item("pk", AttributeValue::S(pk.clone()))
+            .item("tenant", AttributeValue::S(tenant.to_string()))
+            .item("taskId", AttributeValue::S(task.id().to_string()))
+            .item("owner", AttributeValue::S(owner.to_string()))
+            .item("taskJson", AttributeValue::S(task_json))
+            .item("contextId", AttributeValue::S(task.context_id().to_string()))
+            .item("statusState", AttributeValue::S(state_str))
+            .item("updatedAt", AttributeValue::S(Self::now_iso()))
+            .condition_expression("#owner = :owner")
+            .expression_attribute_names("#owner", "owner")
+            .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()));
+        if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
+            task_put = task_put.item("ttl", ttl);
+        }
         let mut items = vec![
             aws_sdk_dynamodb::types::TransactWriteItem::builder()
                 .put(
-                    aws_sdk_dynamodb::types::Put::builder()
-                        .table_name(&self.config.tasks_table)
-                        .item("pk", AttributeValue::S(pk.clone()))
-                        .item("owner", AttributeValue::S(owner.to_string()))
-                        .item("taskJson", AttributeValue::S(task_json))
-                        .item("contextId", AttributeValue::S(task.context_id().to_string()))
-                        .item("statusState", AttributeValue::S(state_str))
-                        .item("updatedAt", AttributeValue::S(Self::now_iso()))
-                        .condition_expression("#owner = :owner")
-                        .expression_attribute_names("#owner", "owner")
-                        .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()))
-                        .build()
+                    task_put.build()
                         .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
                 )
                 .build(),
@@ -912,16 +962,19 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             let event_data = serde_json::to_string(event)
                 .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
 
+            let mut event_put = aws_sdk_dynamodb::types::Put::builder()
+                .table_name(&self.config.events_table)
+                .item("pk", AttributeValue::S(pk.clone()))
+                .item("eventSequence", AttributeValue::N(seq.to_string()))
+                .item("eventData", AttributeValue::S(event_data))
+                .condition_expression("attribute_not_exists(pk)");
+            if let Some(ttl) = Self::ttl_epoch(self.config.event_ttl_seconds) {
+                event_put = event_put.item("ttl", ttl);
+            }
             items.push(
                 aws_sdk_dynamodb::types::TransactWriteItem::builder()
                     .put(
-                        aws_sdk_dynamodb::types::Put::builder()
-                            .table_name(&self.config.events_table)
-                            .item("pk", AttributeValue::S(pk.clone()))
-                            .item("eventSequence", AttributeValue::N(seq.to_string()))
-                            .item("eventData", AttributeValue::S(event_data))
-                            .condition_expression("attribute_not_exists(pk)")
-                            .build()
+                        event_put.build()
                             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
                     )
                     .build(),

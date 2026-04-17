@@ -267,6 +267,38 @@ impl Message {
         None
     }
 
+    /// Deserialize from the first Data part, falling back to parsing the first
+    /// Text part as JSON.
+    ///
+    /// A2A protocol v0.3 clients (e.g., Strands `A2AAgent` via a2a-sdk) send
+    /// typed JSON as a text part (`{"kind":"text","text":"{...}"}`), while
+    /// Turul clients send it as a data part. This method handles both.
+    ///
+    /// Preference order: Data part (proto struct) → Text part (JSON string).
+    /// Returns `None` if no Data or parseable Text part exists.
+    pub fn parse_first_data_or_text<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> Option<Result<T, crate::error::A2aTypeError>> {
+        // Try Data part first (Turul clients)
+        if let Some(result) = self.parse_first_data() {
+            return Some(result);
+        }
+
+        // Fall back to first Text part parsed as JSON (a2a-sdk / Strands clients)
+        for part in &self.inner.parts {
+            if let Some(pb::part::Content::Text(text)) = &part.content {
+                if text.trim_start().starts_with('{') {
+                    return Some(
+                        serde_json::from_str(text)
+                            .map_err(|e| crate::error::A2aTypeError::Deserialization(e.to_string()))
+                    );
+                }
+            }
+        }
+
+        None
+    }
+
     pub fn as_proto(&self) -> &pb::Message {
         &self.inner
     }
@@ -590,5 +622,57 @@ mod tests {
         assert!(output["a"].is_u64(), "25544.0 should become integer");
         assert!(output["b"].is_f64(), "1.5 should stay f64");
         assert!(output["c"].is_i64(), "-10.0 should become negative integer");
+    }
+
+    #[test]
+    fn parse_first_data_or_text_prefers_data() {
+        #[derive(serde::Deserialize)]
+        struct Req {
+            id: u32,
+        }
+
+        let msg = Message::new(
+            "m-1",
+            Role::User,
+            vec![
+                Part::text(r#"{"id": 99}"#),
+                Part::data(serde_json::json!({"id": 42})),
+            ],
+        );
+
+        // Data part (id=42) should be preferred over text part (id=99)
+        let result: Req = msg.parse_first_data_or_text().unwrap().unwrap();
+        assert_eq!(result.id, 42);
+    }
+
+    #[test]
+    fn parse_first_data_or_text_falls_back_to_text() {
+        // Simulates Strands A2AAgent sending JSON as a text part
+        #[derive(serde::Deserialize)]
+        struct Req {
+            skill: String,
+            version: String,
+        }
+
+        let msg = Message::new(
+            "m-1",
+            Role::User,
+            vec![Part::text(r#"{"skill": "solar_elevation", "version": "1.0"}"#)],
+        );
+
+        let result: Req = msg.parse_first_data_or_text().unwrap().unwrap();
+        assert_eq!(result.skill, "solar_elevation");
+        assert_eq!(result.version, "1.0");
+    }
+
+    #[test]
+    fn parse_first_data_or_text_ignores_non_json_text() {
+        let msg = Message::new(
+            "m-1",
+            Role::User,
+            vec![Part::text("hello world")],
+        );
+
+        assert!(msg.parse_first_data_or_text::<serde_json::Value>().is_none());
     }
 }

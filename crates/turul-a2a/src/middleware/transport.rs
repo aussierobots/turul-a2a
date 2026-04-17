@@ -71,10 +71,15 @@ where
                         return Ok(err.into_response_body());
                     }
                     None => {
-                        let err = A2aError::VersionNotSupported {
-                            version: "missing (A2A-Version header is required)".to_string(),
-                        };
-                        return Ok(err.into_response_body());
+                        // compat-v03: accept missing header (a2a-sdk 0.3.x doesn't send it)
+                        // strict v1.0: reject missing header
+                        #[cfg(not(feature = "compat-v03"))]
+                        {
+                            let err = A2aError::VersionNotSupported {
+                                version: "missing (A2A-Version header is required)".to_string(),
+                            };
+                            return Ok(err.into_response_body());
+                        }
                     }
                 }
             }

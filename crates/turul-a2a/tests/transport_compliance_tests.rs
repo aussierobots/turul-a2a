@@ -82,17 +82,30 @@ async fn request_with_valid_a2a_version_succeeds() {
 }
 
 #[tokio::test]
-async fn request_without_a2a_version_rejects() {
-    // Missing A2A-Version header → VersionNotSupportedError
+#[cfg(feature = "compat-v03")]
+async fn request_without_a2a_version_accepted_with_compat() {
+    // With compat-v03: missing A2A-Version header is accepted.
+    // a2a-sdk 0.3.x clients do not send this header.
     let router = build_router(test_state());
     let req = Request::post("/message:send")
         .header("content-type", "application/json")
-        // No A2A-Version header
+        .body(Body::from(send_body()))
+        .unwrap();
+    let (status, _body) = json_response(router, req).await;
+    assert_ne!(status, 400, "Missing A2A-Version must not be rejected (v0.3 compat)");
+}
+
+#[tokio::test]
+#[cfg(not(feature = "compat-v03"))]
+async fn request_without_a2a_version_rejects_strict() {
+    // Without compat-v03: missing A2A-Version header → VersionNotSupportedError
+    let router = build_router(test_state());
+    let req = Request::post("/message:send")
+        .header("content-type", "application/json")
         .body(Body::from(send_body()))
         .unwrap();
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 400, "Missing A2A-Version header → VersionNotSupportedError");
-    // Check for VersionNotSupportedError in response
     if let Some(details) = body["error"]["details"].as_array() {
         if !details.is_empty() {
             assert_eq!(details[0]["reason"], "VERSION_NOT_SUPPORTED");

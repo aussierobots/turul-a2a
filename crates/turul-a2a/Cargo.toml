@@ -9,6 +9,10 @@ license.workspace = true
 [features]
 default = ["in-memory"]
 in-memory = []
+# A2A v0.3 compatibility path for a2a-sdk 0.3.x / Strands clients.
+# Opt-in: enables method normalization, root POST route, optional A2A-Version header.
+# Removal condition: when a2a-sdk ships v1.0 support.
+compat-v03 = []
 sqlite = ["sqlx"]
 postgres = ["sqlx"]
 dynamodb = ["aws-config", "aws-sdk-dynamodb"]

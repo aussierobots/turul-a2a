@@ -18,9 +18,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(&[proto_file], proto_includes)?;
 
     // Step 2: Generate pbjson serde impls (camelCase JSON matching proto JSON mapping)
+    // ignore_unknown_fields: allows v1.0 clients to deserialize agent cards that
+    // include additive v0.3 compat fields (url, protocolVersion, additionalInterfaces)
+    // without rejecting them as unknown. This is standard proto forward-compat behavior.
     let descriptor_bytes = std::fs::read(&descriptor_path)?;
     pbjson_build::Builder::new()
         .register_descriptors(&descriptor_bytes)?
+        .ignore_unknown_fields()
         .build(&[".lf.a2a.v1"])?;
 
     Ok(())

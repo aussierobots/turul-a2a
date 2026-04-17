@@ -1,7 +1,10 @@
 //! JSON-RPC 2.0 dispatch layer.
 //!
 //! Routes JSON-RPC method calls to the same core handler functions used by HTTP routes.
-//! Method names match `turul_a2a_types::wire::jsonrpc` constants (PascalCase).
+//! Method names match `turul_a2a_types::wire::jsonrpc` constants (PascalCase, A2A v1.0).
+//!
+//! A2A v0.3 compatibility: method name normalization is delegated to
+//! `compat_v03::normalize_jsonrpc_method` — see that module for details.
 //!
 //! Streaming methods (`SendStreamingMessage`, `SubscribeToTask`) return SSE responses
 //! with each event wrapped in a JSON-RPC response envelope.
@@ -51,20 +54,39 @@ pub async fn jsonrpc_dispatch_handler(
         return Json(jsonrpc_error(id, -32600, "Invalid Request: missing or wrong jsonrpc version", None)).into_response();
     }
 
-    let method = match value.get("method").and_then(|v| v.as_str()) {
-        Some(m) => m.to_string(),
+    let raw_method = match value.get("method").and_then(|v| v.as_str()) {
+        Some(m) => m,
         None => {
             let id = value.get("id").cloned().unwrap_or(Value::Null);
             return Json(jsonrpc_error(id, -32600, "Invalid Request: missing method", None)).into_response();
         }
     };
 
+    // Method resolution: canonical v1.0 pass-through, or v0.3 compat normalization
+    #[cfg(feature = "compat-v03")]
+    let method = {
+        let mode = crate::compat_v03::detect_compat_mode(raw_method, &headers);
+        if mode == crate::compat_v03::CompatMode::V03 {
+            let normalized = crate::compat_v03::maybe_normalize_method(raw_method, mode);
+            tracing::info!(
+                raw_method = %raw_method,
+                normalized_method = %normalized,
+                "A2A v0.3 compatibility mode activated"
+            );
+            normalized
+        } else {
+            raw_method.to_string()
+        }
+    };
+    #[cfg(not(feature = "compat-v03"))]
+    let method = raw_method.to_string();
+
     // 3. Check if this is a notification (no "id" field = notification, must not reply)
     let is_notification = !value.as_object().map_or(false, |o| o.contains_key("id"));
     let id = value.get("id").cloned().unwrap_or(Value::Null);
 
     // 4. Validate params: must be object, null, or absent. Arrays/scalars are -32602.
-    let params = match value.get("params") {
+    let mut params = match value.get("params") {
         None => json!({}),
         Some(Value::Null) => json!({}),
         Some(Value::Object(_)) => value.get("params").cloned().unwrap(),
@@ -75,6 +97,13 @@ pub async fn jsonrpc_dispatch_handler(
             return Json(jsonrpc_error(id, -32602, "Invalid params: params must be an object", None)).into_response();
         }
     };
+
+    // A2A v0.3 compat: normalize params (role enums, part formats) before dispatch
+    #[cfg(feature = "compat-v03")]
+    {
+        let mode = crate::compat_v03::detect_compat_mode(raw_method, &headers);
+        crate::compat_v03::maybe_normalize_params(&mut params, mode);
+    }
 
     // 5. Extract tenant from params
     let tenant = params
@@ -114,7 +143,16 @@ pub async fn jsonrpc_dispatch_handler(
 
     // 9. Build response
     match result {
-        Ok(value) => Json(jsonrpc_success(id, value)).into_response(),
+        Ok(value) => {
+            let mut response = jsonrpc_success(id, value);
+            // A2A v0.3 compat: normalize response envelope + enums
+            #[cfg(feature = "compat-v03")]
+            {
+                let mode = crate::compat_v03::detect_compat_mode(raw_method, &headers);
+                crate::compat_v03::maybe_normalize_response(&mut response, mode);
+            }
+            Json(response).into_response()
+        }
         Err(ref e) if matches!(e, A2aError::InvalidRequest { message } if message == "Method not found") => {
             Json(jsonrpc_error(id, -32601, "Method not found", None)).into_response()
         }
