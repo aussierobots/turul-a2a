@@ -1,7 +1,11 @@
 //! A2aServer builder and runtime.
 
+pub mod in_flight;
+pub mod obs;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::error::A2aError;
 use crate::executor::AgentExecutor;
@@ -9,6 +13,66 @@ use crate::middleware::{A2aMiddleware, MiddlewareStack, SecurityContribution};
 use crate::router::{build_router, AppState};
 use crate::storage::{A2aAtomicStore, A2aPushNotificationStorage, A2aTaskStorage, InMemoryA2aStorage};
 use crate::streaming::TaskEventBroker;
+
+// ---------------------------------------------------------------------------
+// Runtime configuration (phase A — substrate only; consumers land in C/D/E).
+// ---------------------------------------------------------------------------
+
+/// Runtime tuning knobs for advanced task lifecycle behaviors.
+///
+/// Phase A declares these as scaffolding. Consumers land in later phases:
+/// - `blocking_task_timeout`, `timeout_abort_grace`: phase D (long-running).
+/// - `cancel_handler_*`, `cross_instance_cancel_poll_interval`: phase C.
+/// - `push_*`, `allow_insecure_push_urls`: phase E.
+///
+/// Exposed via builder setters rather than direct field access. The struct
+/// itself is `pub(crate)` to allow re-shaping under semver without breaking
+/// downstream consumers that only use the builder setters.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeConfig {
+    pub blocking_task_timeout: Duration,
+    pub timeout_abort_grace: Duration,
+    pub cancel_handler_grace: Duration,
+    pub cancel_handler_poll_interval: Duration,
+    pub cross_instance_cancel_poll_interval: Duration,
+
+    pub push_max_attempts: usize,
+    pub push_backoff_base: Duration,
+    pub push_backoff_cap: Duration,
+    pub push_backoff_jitter: f32,
+    pub push_request_timeout: Duration,
+    pub push_connect_timeout: Duration,
+    pub push_read_timeout: Duration,
+    pub push_claim_expiry: Duration,
+    pub push_config_cache_ttl: Duration,
+    pub push_failed_delivery_retention: Duration,
+    pub push_max_payload_bytes: usize,
+    pub allow_insecure_push_urls: bool,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            blocking_task_timeout: Duration::from_secs(30),
+            timeout_abort_grace: Duration::from_secs(5),
+            cancel_handler_grace: Duration::from_secs(5),
+            cancel_handler_poll_interval: Duration::from_millis(100),
+            cross_instance_cancel_poll_interval: Duration::from_secs(1),
+            push_max_attempts: 8,
+            push_backoff_base: Duration::from_secs(2),
+            push_backoff_cap: Duration::from_secs(60),
+            push_backoff_jitter: 0.25,
+            push_request_timeout: Duration::from_secs(30),
+            push_connect_timeout: Duration::from_secs(5),
+            push_read_timeout: Duration::from_secs(30),
+            push_claim_expiry: Duration::from_secs(10 * 60),
+            push_config_cache_ttl: Duration::from_secs(5),
+            push_failed_delivery_retention: Duration::from_secs(7 * 24 * 60 * 60),
+            push_max_payload_bytes: 1024 * 1024,
+            allow_insecure_push_urls: false,
+        }
+    }
+}
 
 /// Builder for configuring and running an A2A server.
 pub struct A2aServerBuilder {
@@ -19,6 +83,7 @@ pub struct A2aServerBuilder {
     atomic_store: Option<Arc<dyn A2aAtomicStore>>,
     bind_addr: SocketAddr,
     middleware: Vec<Arc<dyn A2aMiddleware>>,
+    runtime_config: RuntimeConfig,
 }
 
 impl A2aServerBuilder {
@@ -31,7 +96,138 @@ impl A2aServerBuilder {
             atomic_store: None,
             bind_addr: ([0, 0, 0, 0], 3000).into(),
             middleware: vec![],
+            runtime_config: RuntimeConfig::default(),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Runtime-config setters (phase A — declared now, consumed in phases
+    // C/D/E as described on each field).
+    //
+    // Each setter updates the internal [`RuntimeConfig`] and returns
+    // `self`. Defaults are in [`RuntimeConfig::default`].
+    //
+    // Note: the values set here do NOT take effect in 0.1.3. They are
+    // read by the handlers added in phases C (cancellation), D
+    // (EventSink + blocking timeout), and E (push delivery). Setting
+    // them in 0.1.3 is a no-op; setting them in 0.1.4 shapes behavior
+    // per-phase.
+    // -----------------------------------------------------------------
+
+    /// Soft timeout for blocking `SendMessage` requests. On expiry the
+    /// framework trips the executor's cancellation token and waits up to
+    /// [`Self::timeout_abort_grace`] for cooperative exit. Consumer: phase D.
+    pub fn blocking_task_timeout(mut self, d: Duration) -> Self {
+        self.runtime_config.blocking_task_timeout = d;
+        self
+    }
+
+    /// Grace window between soft cancellation and hard `JoinHandle::abort()`.
+    /// Consumer: phase D.
+    pub fn timeout_abort_grace(mut self, d: Duration) -> Self {
+        self.runtime_config.timeout_abort_grace = d;
+        self
+    }
+
+    /// How long the `CancelTask` handler waits for cancellation to resolve
+    /// before force-committing CANCELED itself. Consumer: phase C.
+    pub fn cancel_handler_grace(mut self, d: Duration) -> Self {
+        self.runtime_config.cancel_handler_grace = d;
+        self
+    }
+
+    /// Poll interval used inside the `CancelTask` handler's grace window to
+    /// re-read task state from storage. Consumer: phase C.
+    pub fn cancel_handler_poll_interval(mut self, d: Duration) -> Self {
+        self.runtime_config.cancel_handler_poll_interval = d;
+        self
+    }
+
+    /// How often the in-flight supervisor batch-polls the cancel marker
+    /// across in-flight tasks for cross-instance cancel propagation.
+    /// Consumer: phase C.
+    pub fn cross_instance_cancel_poll_interval(mut self, d: Duration) -> Self {
+        self.runtime_config.cross_instance_cancel_poll_interval = d;
+        self
+    }
+
+    /// Maximum retry attempts (including first) per push delivery.
+    /// Consumer: phase E.
+    pub fn push_max_attempts(mut self, n: usize) -> Self {
+        self.runtime_config.push_max_attempts = n;
+        self
+    }
+
+    /// Base delay before the second push attempt; doubles up to
+    /// [`Self::push_backoff_cap`]. Consumer: phase E.
+    pub fn push_backoff_base(mut self, d: Duration) -> Self {
+        self.runtime_config.push_backoff_base = d;
+        self
+    }
+
+    /// Maximum single-wait in the push retry schedule. Consumer: phase E.
+    pub fn push_backoff_cap(mut self, d: Duration) -> Self {
+        self.runtime_config.push_backoff_cap = d;
+        self
+    }
+
+    /// Jitter fraction applied to push retry waits. Consumer: phase E.
+    pub fn push_backoff_jitter(mut self, j: f32) -> Self {
+        self.runtime_config.push_backoff_jitter = j;
+        self
+    }
+
+    /// Total per-request timeout for a push POST. Consumer: phase E.
+    pub fn push_request_timeout(mut self, d: Duration) -> Self {
+        self.runtime_config.push_request_timeout = d;
+        self
+    }
+
+    /// Connect-phase timeout for a push POST. Consumer: phase E.
+    pub fn push_connect_timeout(mut self, d: Duration) -> Self {
+        self.runtime_config.push_connect_timeout = d;
+        self
+    }
+
+    /// Read-phase timeout for a push POST. Consumer: phase E.
+    pub fn push_read_timeout(mut self, d: Duration) -> Self {
+        self.runtime_config.push_read_timeout = d;
+        self
+    }
+
+    /// Claim expiry for the push delivery claim table. Must exceed the
+    /// retry horizon implied by `push_max_attempts` + `push_backoff_cap`.
+    /// Consumer: phase E. Validation happens in phase E's builder.build().
+    pub fn push_claim_expiry(mut self, d: Duration) -> Self {
+        self.runtime_config.push_claim_expiry = d;
+        self
+    }
+
+    /// Push-config cache TTL inside the delivery worker. Consumer: phase E.
+    pub fn push_config_cache_ttl(mut self, d: Duration) -> Self {
+        self.runtime_config.push_config_cache_ttl = d;
+        self
+    }
+
+    /// Retention for failed push delivery records (operator inspection).
+    /// Consumer: phase E.
+    pub fn push_failed_delivery_retention(mut self, d: Duration) -> Self {
+        self.runtime_config.push_failed_delivery_retention = d;
+        self
+    }
+
+    /// Maximum serialized Task body size for a push POST. Consumer: phase E.
+    pub fn push_max_payload_bytes(mut self, bytes: usize) -> Self {
+        self.runtime_config.push_max_payload_bytes = bytes;
+        self
+    }
+
+    /// Dev-only escape hatch: permit `http://` webhook URLs AND bypass the
+    /// private-IP blocklist. Required for localhost wiremock testing.
+    /// Default false. Consumer: phase E.
+    pub fn allow_insecure_push_urls(mut self, allow: bool) -> Self {
+        self.runtime_config.allow_insecure_push_urls = allow;
+        self
     }
 
     pub fn executor(mut self, executor: impl AgentExecutor + 'static) -> Self {

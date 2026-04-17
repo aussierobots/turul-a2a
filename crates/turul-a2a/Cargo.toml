@@ -42,6 +42,9 @@ tokio-util = { workspace = true }
 sqlx = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
+# Secret redaction for credentials/tokens used by later phases.
+# Scoped to turul-a2a only; NOT added to turul-a2a-types.
+secrecy = { workspace = true }
 
 [dev-dependencies]
 sqlx = { workspace = true }
@@ -51,3 +54,5 @@ hyper = { workspace = true }
 turul-a2a-client = { path = "../turul-a2a-client" }
 turul-a2a-auth = { path = "../turul-a2a-auth" }
 reqwest = { workspace = true }
+# Structured-event capture for observability-contract tests (phase A onward).
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,466 @@
+//! Phase A — Shared runtime substrate tests.
+//!
+//! Covers `InFlightRegistry`, `InFlightHandle`, `SupervisorSentinel`, and the
+//! `secrecy` integration. All synchronization is explicit (oneshots,
+//! [`Notify`]) — no sleeps, no polling for side effects.
+//!
+//! Observability contract: supervisor panics emit a structured tracing event
+//! at `turul_a2a::supervisor_panic`. Tests capture events via a thread-safe
+//! `tracing_subscriber::Layer` so assertions run against event occurrence +
+//! field values, not counter increments. This is the canonical capture
+//! pattern for later phases.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use secrecy::{ExposeSecret, SecretBox};
+use tokio::sync::oneshot;
+use tokio::sync::Notify;  // used by normal-exit test
+use tokio_util::sync::CancellationToken;
+use tracing::Level;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+use turul_a2a::server::in_flight::{InFlightHandle, InFlightKey, InFlightRegistry, SupervisorSentinel};
+use turul_a2a::server::obs::TARGET_SUPERVISOR_PANIC;
+use turul_a2a_types::Task;
+
+// ---------------------------------------------------------------------------
+// Test harness — capturing tracing layer.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct CapturedEvent {
+    target: String,
+    level: Level,
+    fields: HashMap<String, String>,
+}
+
+#[derive(Default, Clone)]
+struct EventCapture {
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
+}
+
+impl EventCapture {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn events(&self) -> Vec<CapturedEvent> {
+        self.events.lock().unwrap().clone()
+    }
+
+    fn filter_target(&self, target: &str) -> Vec<CapturedEvent> {
+        self.events()
+            .into_iter()
+            .filter(|e| e.target == target)
+            .collect()
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let metadata = event.metadata();
+        let mut visitor = FieldVisitor(HashMap::new());
+        event.record(&mut visitor);
+        self.events.lock().unwrap().push(CapturedEvent {
+            target: metadata.target().to_string(),
+            level: *metadata.level(),
+            fields: visitor.0,
+        });
+    }
+}
+
+struct FieldVisitor(HashMap<String, String>);
+
+impl tracing::field::Visit for FieldVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_string(), format!("{value:?}"));
+    }
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+}
+
+/// Global capturing subscriber — installed exactly once per test binary.
+///
+/// `WithSubscriber` on a spawned future does NOT reliably survive panic
+/// unwind in tokio: the RAII dispatcher guard may already have unwound by
+/// the time drop-guards inside the panicking frame run. A
+/// `set_global_default` subscriber is active on every thread for the
+/// lifetime of the process, so `tracing::error!` from inside a drop-guard
+/// during panic unwind reliably delivers.
+///
+/// Tests filter the captured events by a unique `task_id` per test to
+/// avoid cross-test contamination.
+static GLOBAL_CAPTURE: OnceLock<EventCapture> = OnceLock::new();
+
+fn global_capture() -> &'static EventCapture {
+    GLOBAL_CAPTURE.get_or_init(|| {
+        let capture = EventCapture::new();
+        tracing_subscriber::registry()
+            .with(capture.clone())
+            .try_init()
+            .expect("set_global_default must succeed on first call");
+        capture
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Test fixtures.
+// ---------------------------------------------------------------------------
+
+fn make_key(tenant: &str, task_id: &str) -> InFlightKey {
+    (tenant.to_string(), task_id.to_string())
+}
+
+/// Build a minimal Task suitable for firing `yielded`.
+fn dummy_task(task_id: &str) -> Task {
+    use turul_a2a_types::{TaskState, TaskStatus};
+    Task::new(task_id.to_string(), TaskStatus::new(TaskState::Submitted))
+        .with_context_id("ctx-1")
+}
+
+// ---------------------------------------------------------------------------
+// Tests (6 total, per plan).
+// ---------------------------------------------------------------------------
+
+/// Test 1: basic insert/get/remove round-trip on the registry.
+#[tokio::test]
+async fn in_flight_registry_insert_remove_roundtrip() {
+    let registry = Arc::new(InFlightRegistry::new());
+    let key = make_key("tenant-1", "task-1");
+
+    // Task that waits for an explicit signal then exits — no sleep.
+    let (exit_tx, exit_rx) = oneshot::channel::<()>();
+    let spawned = tokio::spawn(async move {
+        let _ = exit_rx.await;
+    });
+
+    let (yielded_tx, _yielded_rx) = oneshot::channel::<Task>();
+    let handle = Arc::new(InFlightHandle::new(
+        CancellationToken::new(),
+        yielded_tx,
+        spawned,
+    ));
+
+    registry.insert(key.clone(), Arc::clone(&handle));
+    assert!(registry.get(&key).is_some(), "entry should be present after insert");
+
+    // Release the spawned task and let it resolve.
+    let _ = exit_tx.send(());
+    let taken = handle.take_spawned().expect("JoinHandle should still be in the handle");
+    taken.await.expect("spawned task should complete cleanly");
+
+    let removed = registry.remove(&key);
+    assert!(removed.is_some(), "remove should return the handle");
+    assert!(registry.get(&key).is_none(), "entry must be gone after remove");
+}
+
+/// Test 2: sentinel Drop on normal exit path removes the registry entry and
+/// leaves a finished JoinHandle in its wake.
+#[tokio::test]
+async fn supervisor_sentinel_drops_on_normal_exit_removes_entry() {
+    let registry = Arc::new(InFlightRegistry::new());
+    let key = make_key("tenant-1", "task-1");
+
+    let exit_notify = Arc::new(Notify::new());
+    let exit_notify_task = Arc::clone(&exit_notify);
+    let spawned = tokio::spawn(async move {
+        exit_notify_task.notified().await;
+    });
+    let abort_handle = spawned.abort_handle();
+
+    let (yielded_tx, _yielded_rx) = oneshot::channel::<Task>();
+    let handle = Arc::new(InFlightHandle::new(
+        CancellationToken::new(),
+        yielded_tx,
+        spawned,
+    ));
+    registry.insert(key.clone(), Arc::clone(&handle));
+
+    // Simulate the supervisor body. The sentinel is a local; it drops when
+    // this block exits, running the cleanup path.
+    {
+        let _sentinel = SupervisorSentinel::new(
+            Arc::clone(&registry),
+            key.clone(),
+            Arc::clone(&handle),
+        );
+
+        // Release the spawned task and await its resolution explicitly.
+        exit_notify.notify_one();
+        let taken = handle.take_spawned().expect("spawned handle present");
+        taken.await.expect("spawned task should complete cleanly");
+    }
+
+    assert!(registry.get(&key).is_none(), "registry entry must be removed on sentinel Drop");
+    assert!(abort_handle.is_finished(), "spawned task must be finished");
+}
+
+/// Test 3: sentinel Drop on panic unwind still cleans up the registry entry
+/// AND aborts the spawned task (which would otherwise hang forever).
+#[tokio::test]
+async fn supervisor_sentinel_drops_on_panic_still_cleans_up() {
+    let registry = Arc::new(InFlightRegistry::new());
+    let key = make_key("tenant-panic", "task-panic");
+
+    // Spawned task that will never exit on its own — relies on abort.
+    let (_trap_tx, trap_rx) = oneshot::channel::<()>();
+    let spawned = tokio::spawn(async move {
+        let _ = trap_rx.await;
+    });
+    let abort_handle = spawned.abort_handle();
+
+    let (yielded_tx, _yielded_rx) = oneshot::channel::<Task>();
+    let handle = Arc::new(InFlightHandle::new(
+        CancellationToken::new(),
+        yielded_tx,
+        spawned,
+    ));
+    registry.insert(key.clone(), Arc::clone(&handle));
+
+    let registry_for_task = Arc::clone(&registry);
+    let key_for_task = key.clone();
+    let handle_for_task = Arc::clone(&handle);
+
+    // Spawn a supervisor task that panics while holding the sentinel.
+    let supervisor_handle = tokio::spawn(async move {
+        let _sentinel = SupervisorSentinel::new(registry_for_task, key_for_task, handle_for_task);
+        panic!("simulated supervisor panic");
+    });
+
+    // Join the supervisor; its JoinError is expected (panic is caught at task boundary).
+    let result = supervisor_handle.await;
+    assert!(result.is_err(), "supervisor task should have panicked");
+    let join_error = result.unwrap_err();
+    assert!(join_error.is_panic(), "JoinError should reflect panic, not cancellation");
+
+    // Cleanup must have run via Drop during unwind.
+    assert!(
+        registry.get(&key).is_none(),
+        "registry entry must be removed on sentinel Drop during panic unwind"
+    );
+
+    // The spawned task was aborted by the sentinel; is_finished returns true
+    // as soon as abort() is called (even before the task has actually unwound).
+    assert!(
+        abort_handle.is_finished(),
+        "spawned task must be aborted by sentinel during panic cleanup"
+    );
+}
+
+/// Test 4 (observability contract): sentinel Drop during panic unwind emits a
+/// structured event at `turul_a2a::supervisor_panic` with ERROR level and
+/// `task_id` / `tenant` fields.
+///
+/// Capture strategy: a `set_global_default` subscriber is installed once per
+/// test binary via [`global_capture`]. This is reliable during panic unwind
+/// (unlike `WithSubscriber`, where the RAII dispatcher guard may already have
+/// unwound by the time drop-guards in the panicking frame run). Cross-test
+/// isolation is achieved by filtering captured events by a unique `task_id`
+/// prefix per test.
+///
+/// This is the canonical pattern for subsequent phases' observability tests.
+#[tokio::test]
+async fn supervisor_panic_emits_structured_event() {
+    let capture = global_capture();
+
+    // Unique task_id prefix guarantees no cross-test contamination in the
+    // shared global capture.
+    let tenant = "tenant-obs-unique-b8a3";
+    let task_id = "task-obs-unique-b8a3";
+
+    let registry = Arc::new(InFlightRegistry::new());
+    let key = make_key(tenant, task_id);
+
+    let (_trap_tx, trap_rx) = oneshot::channel::<()>();
+    let spawned = tokio::spawn(async move {
+        let _ = trap_rx.await;
+    });
+
+    let (yielded_tx, _yielded_rx) = oneshot::channel::<Task>();
+    let handle = Arc::new(InFlightHandle::new(
+        CancellationToken::new(),
+        yielded_tx,
+        spawned,
+    ));
+    registry.insert(key.clone(), Arc::clone(&handle));
+
+    let registry_for_task = Arc::clone(&registry);
+    let key_for_task = key.clone();
+    let handle_for_task = Arc::clone(&handle);
+
+    let supervisor_handle = tokio::spawn(async move {
+        let _sentinel = SupervisorSentinel::new(registry_for_task, key_for_task, handle_for_task);
+        panic!("observable panic");
+    });
+
+    let result = supervisor_handle.await;
+    assert!(result.is_err(), "supervisor should have panicked");
+
+    // Filter by both target and our unique task_id for isolation from
+    // parallel tests using the same global subscriber.
+    let panic_events: Vec<_> = capture
+        .filter_target(TARGET_SUPERVISOR_PANIC)
+        .into_iter()
+        .filter(|e| e.fields.get("task_id").map(String::as_str) == Some(task_id))
+        .collect();
+
+    assert_eq!(
+        panic_events.len(),
+        1,
+        "exactly one supervisor_panic event for task_id={task_id} expected, got {}",
+        panic_events.len(),
+    );
+
+    let evt = &panic_events[0];
+    assert_eq!(evt.level, Level::ERROR, "supervisor_panic should be ERROR level");
+    assert_eq!(
+        evt.fields.get("tenant").map(String::as_str),
+        Some(tenant),
+        "tenant field must match"
+    );
+    assert_eq!(
+        evt.fields.get("task_id").map(String::as_str),
+        Some(task_id),
+        "task_id field must match"
+    );
+
+    // Invariant check: no secret-looking substrings in this event's fields.
+    // Phase A has no secrets yet, but this is the template used by phase E.
+    for value in evt.fields.values() {
+        assert!(
+            !value.contains("BEGIN PRIVATE KEY"),
+            "captured field value unexpectedly contains PEM header: {value}"
+        );
+    }
+}
+
+/// Test 5: the `yielded` signal fires exactly once under concurrent
+/// triggers. Uses an `AtomicBool` CAS inside `InFlightHandle::fire_yielded`
+/// as the single source of truth. Synchronization is via
+/// [`tokio::sync::Barrier`] — deterministic rendezvous with no sleeps and
+/// no spawn-race against `Notify::notify_waiters`.
+#[tokio::test]
+async fn yielded_oneshot_fires_once_under_concurrent_triggers() {
+    const N_TRIGGERS: usize = 16;
+
+    let (yielded_tx, mut yielded_rx) = oneshot::channel::<Task>();
+    let handle = Arc::new(InFlightHandle::new(
+        CancellationToken::new(),
+        yielded_tx,
+        tokio::spawn(async {}),
+    ));
+
+    // Barrier: N trigger tasks + 1 main thread = N+1 parties. All block
+    // at `.wait().await` until the last party arrives, then all release
+    // simultaneously. No spawn-race: the main thread only calls `.wait()`
+    // after kicking off every spawn, so all spawns have already polled
+    // their own `.wait()` by the time the main thread is blocked.
+    let barrier = Arc::new(tokio::sync::Barrier::new(N_TRIGGERS + 1));
+    let results = Arc::new(Mutex::new(Vec::with_capacity(N_TRIGGERS)));
+
+    let mut joins = Vec::with_capacity(N_TRIGGERS);
+    for i in 0..N_TRIGGERS {
+        let handle = Arc::clone(&handle);
+        let barrier = Arc::clone(&barrier);
+        let results = Arc::clone(&results);
+        joins.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let task = dummy_task(&format!("task-{i}"));
+            let did_fire = handle.fire_yielded(task);
+            results.lock().unwrap().push(did_fire);
+        }));
+    }
+
+    // The main thread is the (N+1)th party. Arrival here releases everyone.
+    barrier.wait().await;
+
+    for join in joins {
+        join.await.expect("trigger task should not panic");
+    }
+
+    let did_fire_count = results.lock().unwrap().iter().filter(|v| **v).count();
+    assert_eq!(
+        did_fire_count, 1,
+        "exactly one fire_yielded call must win the CAS; got {did_fire_count}"
+    );
+
+    // Recv must succeed exactly once with one of the tasks.
+    let received = yielded_rx
+        .try_recv()
+        .expect("yielded oneshot must have been fired exactly once");
+    assert!(
+        received.id().starts_with("task-"),
+        "received task id should be one of task-0..task-{N_TRIGGERS}, got {}",
+        received.id()
+    );
+
+    // Subsequent attempt on the sender side is a no-op.
+    let task = dummy_task("task-after");
+    assert!(!handle.fire_yielded(task), "after-terminal attempt must NOT fire");
+}
+
+/// Test 6 (secret handling): `secrecy::SecretBox<String>` redacts in Debug
+/// and Display. Validates the invariant that future phases (push delivery,
+/// etc.) can rely on: formatting a secret never leaks the underlying value.
+#[tokio::test]
+async fn secrecy_newtype_never_leaks_in_debug_or_display() {
+    let sentinel_value = "SECRET-VALUE-DO-NOT-LEAK-48a9f7b3";
+    let secret: SecretBox<String> = SecretBox::new(Box::new(sentinel_value.to_string()));
+
+    // Debug
+    let debug_formatted = format!("{secret:?}");
+    assert!(
+        !debug_formatted.contains(sentinel_value),
+        "SecretBox::Debug must not contain the underlying value, got: {debug_formatted}"
+    );
+    assert!(
+        debug_formatted.contains("REDACTED") || debug_formatted.contains("[REDACTED"),
+        "SecretBox::Debug should contain a redaction marker, got: {debug_formatted}"
+    );
+
+    // Explicit expose still works — this is the intended escape hatch.
+    assert_eq!(
+        secret.expose_secret(),
+        sentinel_value,
+        "expose_secret should return the underlying value"
+    );
+
+    // Inside a struct that uses default-derived Debug. The `#[allow(dead_code)]`
+    // pragma is because the fields are only used via Debug formatting — the
+    // compiler can't tell that Debug "reads" them. The test assertion on the
+    // Debug output is what proves both the redaction invariant (token hidden)
+    // and the normal-field visibility (name present).
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    struct Wrapper {
+        name: String,
+        token: SecretBox<String>,
+    }
+
+    let wrapper = Wrapper {
+        name: "webhook-1".to_string(),
+        token: SecretBox::new(Box::new(sentinel_value.to_string())),
+    };
+
+    let debug_wrapper = format!("{wrapper:?}");
+    assert!(
+        !debug_wrapper.contains(sentinel_value),
+        "Wrapper::Debug must not leak the wrapped secret, got: {debug_wrapper}"
+    );
+    assert!(
+        debug_wrapper.contains("webhook-1"),
+        "non-secret fields should still appear in Debug, got: {debug_wrapper}"
+    );
+}
