@@ -1,6 +1,6 @@
 # ADR-012: Cancellation Propagation to Executors
 
-- **Status:** Proposed
+- **Status:** Proposed (rev 2)
 - **Date:** 2026-04-17
 - **Refines:** ADR-010 §5 (cancellation integration sketch)
 - **Related:** ADR-009 (durable event coordination), ADR-010 (executor EventSink and long-running lifecycle)
@@ -74,6 +74,42 @@ The `InFlightHandle` from ADR-010 §4.4 already holds a `cancellation: Cancellat
 The poll is per-tenant: each tick issues one query per tenant with active in-flight tasks. Storage load is O(tenants_with_alive_tasks) per polling interval, not O(alive_tasks).
 
 **Path interaction**: both paths can trip the token. `CancellationToken::cancel()` is idempotent; multiple trips are harmless. If same-instance sets marker AND trips local token AND cross-instance poll observes marker on the same instance (rare: shouldn't happen — the registry is per-instance), the second trip is a no-op.
+
+**Supervisor panic safety — `SupervisorSentinel` drop-guard**: the supervisor task cannot be allowed to leak registry entries or leave executors un-aborted if it panics. The supervisor is wrapped around a sentinel that owns the cleanup responsibilities and runs them on all exit paths (normal, error, panic unwind) via `Drop`:
+
+```rust
+struct SupervisorSentinel {
+    registry: Arc<InFlightRegistry>,
+    key: (String, String),             // (tenant, task_id)
+    spawned: Option<JoinHandle<()>>,   // the executor
+    yielded_fired: Arc<AtomicBool>,
+    // ... minimal state needed for cleanup ...
+}
+
+impl Drop for SupervisorSentinel {
+    fn drop(&mut self) {
+        // Runs on normal exit AND panic unwind — tokio task panics
+        // unwind the task, which drops locals, which fires this.
+        if let Some(handle) = self.spawned.take() {
+            if !handle.is_finished() {
+                handle.abort();  // guarantees executor cleanup
+            }
+        }
+        self.registry.remove(&self.key);  // guarantees registry entry cleanup
+        // `yielded` is NOT fired from the drop path — if the supervisor
+        // panicked before a terminal committed, blocking send stays waiting
+        // until its own timeout fires. Firing from here would require the
+        // sentinel to hold the yielded sender, which we don't trust a
+        // panicked context to do correctly.
+    }
+}
+```
+
+The supervisor task body runs "above" the sentinel. If the body completes normally (executor exited, state inspected, yielded fired), the sentinel's drop still runs and does cleanup — which is idempotent because the handle is already finished and the registry entry may already have been removed. If the body panics, the sentinel's drop is the floor — the executor gets aborted, the registry entry is removed, and the panic is caught by tokio's default (task aborts, does not propagate to the server).
+
+**Observability**: supervisor panics MUST be logged at ERROR level with task_id context and MUST increment a `framework.supervisor_panics` metric. Panics indicate framework bugs and should surface loudly — they are not normal operation. See R5 for the full policy.
+
+This pattern guarantees: *a supervisor panic leaks nothing, aborts the executor, and makes noise.*
 
 ### 4. Cross-Instance Correctness Without Infrastructure Dependency
 
@@ -154,9 +190,11 @@ ADR-010 §4.1 defines `timeout_abort_grace` for blocking-send timeouts. ADR-012 
 
 Separate config fields so deployments can tune independently. Defaults share 5s where the spirit of the wait is the same ("give the executor 5 seconds to be reasonable").
 
-### 10. Trait Evolution — Additive
+### 10. Trait Evolution — Two Traits, Split by Authorization Scope
 
-`A2aTaskStorage` gains three additive methods. No breaking changes. No existing method signatures modified.
+The cancel-marker storage is split across **two traits** by the authorization scope of their methods. Backends implement both. Splitting prevents handler code from accidentally calling owner-unscoped reads — a real footgun if everything lived on `A2aTaskStorage`.
+
+**`A2aTaskStorage` (public, handler-callable)** gains one additive owner-scoped method:
 
 ```rust
 #[async_trait]
@@ -164,6 +202,7 @@ pub trait A2aTaskStorage: Send + Sync {
     // ... existing methods unchanged ...
 
     /// Set the cancel-requested marker on a non-terminal task.
+    /// Enforces owner match: wrong owner returns `TaskNotFound` (anti-enumeration).
     /// Returns `TaskNotCancelable` if the task is terminal, `TaskNotFound`
     /// if the task doesn't exist or owner doesn't match.
     /// The marker is idempotent — setting it on a task where it's already
@@ -174,11 +213,32 @@ pub trait A2aTaskStorage: Send + Sync {
         task_id: &str,
         owner: &str,
     ) -> Result<(), A2aStorageError>;
+}
+```
 
-    /// Read the cancel-requested marker for a single task. Returns false if
-    /// the marker is not set OR the task is terminal (caller should treat
-    /// terminal and "not cancelling" identically for supervisor purposes).
-    async fn get_cancel_requested(
+**`A2aCancellationSupervisor` (new trait, framework-internal)** holds the unscoped read methods. Handler code cannot reach these; the supervisor reaches them because its in-flight registry entries are already owner-validated at spawn time (ADR-010 §4.4):
+
+```rust
+/// Supervisor-only cancel-marker reads. NOT for request handlers.
+///
+/// Authorization invariant: callers MUST operate only on task_ids that
+/// are already in their own in-flight registry. Those entries were
+/// owner-validated at spawn time. These methods do NOT re-check owner
+/// because doing so would require the supervisor to carry per-task
+/// owner strings into every poll tick — a pure overhead for a guarantee
+/// that is already enforced upstream.
+///
+/// External backend implementers implement this trait alongside
+/// `A2aTaskStorage` + `A2aEventStore` + `A2aAtomicStore`. Handler code
+/// does not hold `Arc<dyn A2aCancellationSupervisor>` — only
+/// `InFlightRegistry` and its supervisor task hold it.
+#[async_trait]
+pub trait A2aCancellationSupervisor: Send + Sync {
+    /// Read the cancel-requested marker for a single task.
+    /// Returns false if the marker is not set OR the task is already
+    /// terminal (supervisor treats these identically — no cancellation
+    /// needed). No owner check; caller guarantees authorization.
+    async fn supervisor_get_cancel_requested(
         &self,
         tenant: &str,
         task_id: &str,
@@ -186,15 +246,17 @@ pub trait A2aTaskStorage: Send + Sync {
 
     /// Batch-read: returns the subset of the given task IDs that have the
     /// cancel-requested marker set AND are not terminal. Scoped to tenant
-    /// for efficient indexing and auth isolation. Used by the in-flight
-    /// supervisor to poll for cross-instance cancels.
-    async fn list_cancel_requested(
+    /// for efficient indexing. Used by the in-flight supervisor's poll tick.
+    /// No owner check; caller guarantees authorization.
+    async fn supervisor_list_cancel_requested(
         &self,
         tenant: &str,
         task_ids: &[String],
     ) -> Result<Vec<String>, A2aStorageError>;
 }
 ```
+
+**AppState wiring**: `AppState::cancellation_supervisor: Arc<dyn A2aCancellationSupervisor>` is a separate field from `task_storage`. In practice, the same backend type satisfies both traits; the builder wires a single `Arc` into both fields. Cross-type safety: `AppState` does not expose `cancellation_supervisor` to handler code — it is used only by the `InFlightRegistry` constructor and the supervisor task body.
 
 **Per-backend implementation notes**:
 - **In-memory**: new `cancel_requested` field on the task record, checked under the same write lock.
@@ -244,15 +306,31 @@ These gate ADR-012 acceptance and phase-1 completion.
 12. **Cross-instance poll load under N in-flight tasks**
     Benchmark-style test (may be feature-gated): spawn N=100 in-flight tasks on one instance, verify that supervisor polling does not exceed 1 storage query per tenant per `cross_instance_cancel_poll_interval`. Regression test for poll efficiency.
 
+13. **Supervisor panic cleanup via SupervisorSentinel**
+    Test hook: supervisor wrapped with a deliberate panic injector that panics at a controlled point (mid-loop, before observing executor exit). Spawn an executor that sleeps for 10s. Trigger the supervisor panic. Assert:
+    - The `framework.supervisor_panics` metric incremented by 1.
+    - An ERROR-level log entry was emitted with the task_id + tenant.
+    - The in-flight registry entry for this task was removed within 100ms of the panic.
+    - The executor's `JoinHandle` was aborted (it does not continue sleeping; `is_finished()` returns true after abort unwind).
+    - The server remains healthy — a subsequent unrelated request succeeds.
+    - A subsequent `GetTask` on the task returns a non-terminal snapshot (the executor was aborted mid-run; nothing committed a terminal). A subsequent `CancelTask` on that task takes the §5 orphan-cancel path and resolves it to CANCELED.
+
+14. **Supervisor-unscoped reads are not on `A2aTaskStorage`**
+    Compile-time test: handler code path attempts to call `get_cancel_requested` via `Arc<dyn A2aTaskStorage>`. Assert: code does not compile (method is on `A2aCancellationSupervisor`, not `A2aTaskStorage`). This is a structural guarantee, verified once by a build-time negative test or inspection of the public handler API surface.
+
 ### 12. What Changes in Existing Code
 
 **New**:
 - `A2aStorageError` gains no new variants — existing `TaskNotCancelable` and `TaskNotFound` cover the cancel paths. `TerminalStateAlreadySet` from ADR-010 §7.1 remains the single-terminal-writer signal.
-- `crates/turul-a2a/src/storage/traits.rs`: three new methods on `A2aTaskStorage` (§10).
-- `crates/turul-a2a/src/storage/{memory,sqlite,postgres,dynamodb}.rs`: implementations of the new methods.
-- `crates/turul-a2a/src/storage/parity_tests.rs`: parity tests for `set_/get_/list_cancel_requested`.
-- `crates/turul-a2a/src/server/in_flight.rs` (added by ADR-010): cross-instance poll loop in the supervisor.
+- `crates/turul-a2a/src/storage/traits.rs`:
+  - One new method on `A2aTaskStorage`: `set_cancel_requested` (owner-scoped, handler-callable).
+  - New trait `A2aCancellationSupervisor` with two methods: `supervisor_get_cancel_requested`, `supervisor_list_cancel_requested` (owner-unscoped, supervisor-internal).
+- `crates/turul-a2a/src/storage/{memory,sqlite,postgres,dynamodb}.rs`: each backend implements BOTH traits. Single struct, two `impl` blocks.
+- `crates/turul-a2a/src/storage/parity_tests.rs`: parity tests covering all three methods + the supervisor-only-scope invariant.
+- `crates/turul-a2a/src/server/in_flight.rs` (added by ADR-010): cross-instance poll loop in the supervisor; `SupervisorSentinel` drop-guard (§3).
 - `crates/turul-a2a/src/server/builder.rs`: new config fields `cancel_handler_grace`, `cancel_handler_poll_interval`, `cross_instance_cancel_poll_interval`.
+- `crates/turul-a2a/src/server/state.rs`: new `cancellation_supervisor: Arc<dyn A2aCancellationSupervisor>` field on `AppState`, wired by the builder from the same backend instance that satisfies `A2aTaskStorage`. Handler code paths do NOT see this field on `AppState`'s public surface.
+- `framework.supervisor_panics` metric registered at startup (or structured log field, per deployment telemetry preference).
 
 **Modified**:
 - `crates/turul-a2a/src/router.rs`: `core_cancel_task` rewritten for the sequence in §2. Validation, marker write, local wake-up, grace wait with poll, race-aware fallback. The current direct-atomic-write is replaced.
@@ -269,13 +347,23 @@ These gate ADR-012 acceptance and phase-1 completion.
 
 **R1 — Cross-instance polling load scales with in-flight count**. Mitigated by batch query (one per tenant per tick), not one query per task. Default 1s interval is conservative; deployments with low cancel traffic can raise to 5s or 10s. Storage backends with push notification (e.g., DynamoDB Streams) could short-circuit the poll entirely in a future optimization.
 
-**R2 — Handler blocking up to 5s ties up connection pool**. Bounded by `cancel_handler_grace`. Deployments that see heavy concurrent cancel load can tune it down (e.g., 1s) at the cost of occasionally returning non-terminal state for slow executors. The grace is per-handler, not global, so this doesn't starve other request types.
+**R2 — Handler blocking up to 5s ties up connection pool**. Bounded by `cancel_handler_grace`. Deployments that see heavy concurrent cancel load can tune it down (e.g., 1s). The trade-off is **not** "occasionally returns non-terminal state" — the designed fallback (§2.5) always commits a terminal (framework-authored `CANCELED`, or whatever wins the race) before the handler returns. The trade-off is: **lower grace means more framework-forced CANCELED terminals and fewer executor-acknowledged terminals.** Slow-cooperative executors that need more than `grace` time to emit their own `sink.cancelled(reason)` get race-lost at the atomic store (§2.5(b)) — their late emit returns `EventSink is closed`. Clients always see a terminal task; the only visible difference is that framework-committed `CANCELED` carries `message = None` (§8) while executor-acknowledged `CANCELED` may carry a message explaining the cancel reason. The grace is per-handler, not global, so tuning it doesn't starve other request types.
 
 **R3 — Storage migration for SQLite/PostgreSQL**. Adding a `cancel_requested` column is additive and compatible with existing data (DEFAULT FALSE). Migrations SHOULD ship with the crate version that adds the column. DynamoDB needs no migration (attributes are schemaless).
 
 **R4 — Cancel-vs-complete near boundary is non-deterministic**. Expected behavior. Both are legitimate outcomes; clients that care about distinguishing can inspect the terminal message. ADR documents this explicitly; tests cover both directions (test #4).
 
-**R5 — Supervisor polling leaks if supervisor task panics**. Each in-flight registry entry has its own supervisor (spawned alongside the executor per ADR-010 §4.4). The framework's supervisor task pattern already handles panic via tokio's default (panic aborts the task, does not propagate). If the supervisor for a specific task panics, that in-flight entry is effectively orphaned — but the orphan-cancel path in §5 still resolves it. Deployments should log supervisor panics; they indicate framework bugs, not cancel-specific issues.
+**R5 — Supervisor task panic must not leak registry entries or zombie executors**. The orphan-cancel path in §5 resolves *storage state* only — it does not stop a running executor or free a leaked `InFlightHandle`. Leaving panicked supervisors silently orphaned would undermine ADR-010's cleanup guarantees. Mitigated as follows:
+
+1. **`SupervisorSentinel` drop-guard** (§3): the supervisor task body is wrapped around a sentinel whose `Drop` impl runs on all exit paths — normal completion, error, AND panic unwind. The sentinel aborts the executor's `JoinHandle` (if still running) and removes the in-flight registry entry. This is the floor: a panicked supervisor still cleans up via unwind semantics.
+
+2. **Panic is a framework invariant violation, surfaced loudly**: supervisor panics are logged at ERROR level with task_id + tenant context; a `framework.supervisor_panics` metric is incremented. Deployments SHOULD alert on this metric being non-zero. The process does not crash (tokio's default catches panics at the task boundary) but the panic is not hidden.
+
+3. **Storage state handling after supervisor panic**: the sentinel does NOT fire `yielded` from its drop path — a panicked context is untrusted for that delicate signal. Blocking sends still waiting on `yielded` fall through to their own `blocking_task_timeout`-based fallback (ADR-010 §4.1 timeout path), which ALSO runs via a sentinel so that the blocking send's own cleanup is panic-safe. If the task is non-terminal at the time of supervisor panic, subsequent `CancelTask` or `GetTask` calls see the non-terminal state; the §5 orphan-cancel path can finalize it.
+
+4. **What this is NOT a replacement for**: a supervisor panic is a framework bug. The sentinel ensures no leak, but we must still find and fix the underlying cause. Acceptable as a safety net; not acceptable as a normal code path.
+
+Taken together: panicked supervisors do not leak registry entries, do not leave zombie executors, do not silently stall blocking sends, and do not hide the bug that caused the panic. The explicit invariants are: *(a) cleanup always runs, (b) the panic is never silent, (c) other tasks are unaffected*.
 
 **R6 — Marker set on task that subsequently terminates naturally before handler grace expires**. Handler's grace-expiry CANCELED attempt gets `TerminalStateAlreadySet { current_state: "TASK_STATE_COMPLETED" }` (or other). Handler returns the actual persisted state. Client sees the task completed despite having called cancel. This is correct behavior — the cancel request arrived but the task was already going to terminate; whichever happened first at the store wins. Same pattern as ADR-010 §7.1.
 
@@ -293,7 +381,8 @@ These gate ADR-012 acceptance and phase-1 completion.
 - New storage column / attribute on all four backends (additive migration for SQL-based backends).
 - Handler blocks up to 5 seconds in the worst case. Configurable; sane default.
 - Cross-instance polling adds a new source of periodic storage load (one batch query per tenant per second by default).
-- Storage trait surface grows by three methods. Backend implementers must now implement seven methods (was four) for full `A2aTaskStorage`.
+- Storage trait surface grows: `A2aTaskStorage` gains one method; a new `A2aCancellationSupervisor` trait adds two more. Backend implementers now implement five `A2aTaskStorage` methods (was four) plus two `A2aCancellationSupervisor` methods. The split is a feature, not a cost — it prevents handler code from accidentally bypassing owner checks.
+- Supervisor invariant surface is larger: `SupervisorSentinel` drop-guard requires careful state management to avoid double-free and to be safe in panic-unwind contexts. Mitigated by keeping sentinel state minimal (§3).
 
 **Neutral**:
 - The existing `core_cancel_task` implementation is replaced. The wire contract (response type, error codes, status codes) is preserved exactly — per ADR-004 and ADR-010 compliance.
