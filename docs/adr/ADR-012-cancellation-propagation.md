@@ -1,7 +1,7 @@
 # ADR-012: Cancellation Propagation to Executors
 
-- **Status:** Proposed (rev 2)
-- **Date:** 2026-04-17
+- **Status:** Accepted
+- **Date:** 2026-04-17 (accepted 2026-04-18, after two rev cycles)
 - **Refines:** ADR-010 §5 (cancellation integration sketch)
 - **Related:** ADR-009 (durable event coordination), ADR-010 (executor EventSink and long-running lifecycle)
 
@@ -67,9 +67,9 @@ The `InFlightHandle` from ADR-010 §4.4 already holds a `cancellation: Cancellat
 
 **Cross-instance path**: handler on instance B writes the marker via `set_cancel_requested`. The supervisor on instance A (where the executor is actually running) observes the marker via one of two mechanisms:
 
-1. **Broker wake-up** (optional, fast path): if the local broker's notification for this task arrives (e.g., another event on the same task triggers it, or an optional cross-instance pub/sub propagates the cancel-request), the supervisor performs an ad-hoc marker check via `get_cancel_requested(tenant, task_id)`. If true, trips `handle.cancellation`.
+1. **Broker wake-up** (optional, fast path): if the local broker's notification for this task arrives (e.g., another event on the same task triggers it, or an optional cross-instance pub/sub propagates the cancel-request), the supervisor performs an ad-hoc marker check via `A2aCancellationSupervisor::supervisor_get_cancel_requested(tenant, task_id)`. If true, trips `handle.cancellation`.
 
-2. **Poll fallback** (always available): supervisor batch-polls all in-flight task IDs in its local registry at `cross_instance_cancel_poll_interval` (default 1 second) via `A2aTaskStorage::list_cancel_requested(tenant, task_ids: &[String]) -> Vec<String>`. One query per tick returns the IDs with marker set; supervisor trips each matching in-flight handle's token.
+2. **Poll fallback** (always available): supervisor batch-polls all in-flight task IDs in its local registry at `cross_instance_cancel_poll_interval` (default 1 second) via `A2aCancellationSupervisor::supervisor_list_cancel_requested(tenant, task_ids: &[String]) -> Vec<String>`. One query per tick returns the IDs with marker set; supervisor trips each matching in-flight handle's token.
 
 The poll is per-tenant: each tick issues one query per tenant with active in-flight tasks. Storage load is O(tenants_with_alive_tasks) per polling interval, not O(alive_tasks).
 
@@ -160,7 +160,7 @@ Beyond the ADR-010 §7.1 single-terminal-writer contract:
 All cancellation operations enforce owner match:
 
 - `set_cancel_requested` takes `owner` and the backend implementation checks the owner on the target task record (via `WHERE owner = $1` on SQL backends or a `ConditionExpression` on DynamoDB). A wrong owner surfaces as `TaskNotFound` to the caller — same anti-enumeration pattern used by `get_task`, `update_task`, and `delete_task`.
-- The supervisor's `list_cancel_requested` batch query does NOT re-check owner. Correctness comes from the fact that the supervisor only polls task IDs already in its own in-flight registry, and those entries were populated at spawn time from owner-validated requests. The query scope is `(tenant, task_id IN supervisor_set)`; authorization was enforced upstream.
+- The supervisor's `supervisor_list_cancel_requested` batch query does NOT re-check owner. Correctness comes from the fact that the supervisor only polls task IDs already in its own in-flight registry, and those entries were populated at spawn time from owner-validated requests. The query scope is `(tenant, task_id IN supervisor_set)`; authorization was enforced upstream.
 
 Authorization model stays identical to current behavior: the handler authenticates, validates ownership at marker-write time, and operates. Cross-instance propagation rides the existing owner-scoped storage contract.
 
@@ -291,8 +291,8 @@ These gate ADR-012 acceptance and phase-1 completion.
 7. **Cancel by wrong owner returns TaskNotFound**
    Owner A creates task. Owner B's `CancelTask` returns 404 `TaskNotFound` (not 403 — consistent with anti-enumeration auth pattern). Marker is not set.
 
-8. **Batch list_cancel_requested parity**
-   For each of in-memory, SQLite, PostgreSQL, DynamoDB: set cancel-requested on a subset of N=20 tasks across 2 tenants. Call `list_cancel_requested(tenant_A, all_20_ids)` — returns exactly the tenant_A subset with marker set. Terminal tasks with marker set are excluded. Storage parity test.
+8. **Batch `supervisor_list_cancel_requested` parity**
+   For each of in-memory, SQLite, PostgreSQL, DynamoDB: set cancel-requested on a subset of N=20 tasks across 2 tenants. Call `supervisor_list_cancel_requested(tenant_A, all_20_ids)` — returns exactly the tenant_A subset with marker set. Terminal tasks with marker set are excluded. Storage parity test.
 
 9. **Marker write is conditional on non-terminal**
    Task in COMPLETED state. `set_cancel_requested` → returns `A2aStorageError::TaskNotCancelable` (or equivalent terminal error). Marker remains false in storage.
@@ -316,7 +316,7 @@ These gate ADR-012 acceptance and phase-1 completion.
     - A subsequent `GetTask` on the task returns a non-terminal snapshot (the executor was aborted mid-run; nothing committed a terminal). A subsequent `CancelTask` on that task takes the §5 orphan-cancel path and resolves it to CANCELED.
 
 14. **Supervisor-unscoped reads are not on `A2aTaskStorage`**
-    Compile-time test: handler code path attempts to call `get_cancel_requested` via `Arc<dyn A2aTaskStorage>`. Assert: code does not compile (method is on `A2aCancellationSupervisor`, not `A2aTaskStorage`). This is a structural guarantee, verified once by a build-time negative test or inspection of the public handler API surface.
+    Compile-time test: handler code path attempts to call `supervisor_get_cancel_requested` via `Arc<dyn A2aTaskStorage>`. Assert: code does not compile (method is on `A2aCancellationSupervisor`, not `A2aTaskStorage`). This is a structural guarantee, verified once by a build-time negative test (e.g., `trybuild`) or inspection of the public handler API surface.
 
 ### 12. What Changes in Existing Code
 
