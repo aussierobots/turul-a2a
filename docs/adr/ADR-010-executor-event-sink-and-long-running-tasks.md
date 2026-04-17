@@ -1,6 +1,6 @@
 # ADR-010: Executor EventSink and Long-Running Task Lifecycle
 
-- **Status:** Proposed (rev 2)
+- **Status:** Proposed (rev 3)
 - **Date:** 2026-04-17
 - **Supersedes:** ADR-009 §12 "Terminal Task Replay" — terminal subscribe returns `UnsupportedOperationError` per A2A v1.0 §3.1.6 / §9.4.6, no replay carve-out. See §4.3 below.
 
@@ -142,31 +142,42 @@ Wire: `POST /message:send` with no `returnImmediately` field, or `false`.
 
 Behavior:
 1. Framework creates task (SUBMITTED via `A2aAtomicStore::create_task_with_events`).
-2. Framework spawns the executor on a tracked task handle, passes an `EventSink`.
-3. Request future awaits a `DashMap<task_id, oneshot::Receiver<TerminalState>>` completion signal registered at spawn time.
-4. Signal fires when **any** of: (a) executor emits a terminal or interrupted event through its sink, (b) executor returns `Err` and framework writes terminal `FAILED`, (c) framework writes terminal `CANCELED` due to a cancel request, (d) configured long-running timeout elapses and framework writes `FAILED`.
-5. Framework returns the final task snapshot via `get_task(tenant, task_id, owner)`.
+2. Framework spawns the executor on a tracked handle (§4.4), passes an `EventSink`.
+3. Request future awaits `InFlightHandle.yielded` — fires on first commit of a terminal OR interrupted event (§4.4). Does NOT wait for executor exit.
+4. `yielded` fires when **any** of: (a) executor emits terminal/interrupted through its sink (`complete`, `fail`, `cancelled`, `reject`, `require_input`, `require_auth`), (b) executor returns `Err` and framework writes terminal `FAILED`, (c) framework writes terminal `CANCELED` due to a cancel request that the executor didn't acknowledge within grace, (d) hard-timeout force-abort resolves the race (framework commits `FAILED` OR reads the executor-committed terminal — see timeout sequence below).
+5. Framework returns the task snapshot delivered via `yielded`.
 
-**Timeout — two-deadline cancellation policy**. Deployment-configurable via:
+**Blocking return signal**: blocking `SendMessage` completion does NOT depend on executor exit. It depends on **first commit** of a terminal or interrupted event (`COMPLETED`, `FAILED`, `CANCELED`, `REJECTED`, `INPUT_REQUIRED`, `AUTH_REQUIRED`) per A2A v1.0 §3.2.2. The framework exposes this as `InFlightHandle.yielded: oneshot::Sender<Task>` (see §4.4). As soon as the atomic store commits one of these states, the framework fires `yielded` with the persisted task snapshot; blocking send returns immediately. Registry cleanup continues independently until the `JoinHandle` resolves — this decoupling is load-bearing.
+
+**Why the split matters**: a well-behaved executor emits `complete()` and returns promptly; both signals coincide. But (a) an executor that emits `complete()` then does 3s of telemetry flushing before returning, and (b) an executor that emits `require_input()` and stays alive internally waiting for the next message — both would delay or hang blocking send under a single-signal design. The split guarantees spec behavior regardless of executor hygiene.
+
+**Timeout — two-deadline policy with race-aware loser handling**. Deployment-configurable via:
 - `A2aServer::builder().blocking_task_timeout(Duration)` — soft deadline, default 30 seconds.
 - `A2aServer::builder().timeout_abort_grace(Duration)` — grace between soft and hard deadline, default 5 seconds.
 
 Sequence on timeout:
 
-1. **Soft deadline elapses**: framework trips `handle.cancellation.cancel()` (same token passed into `ctx.cancellation`). The in-flight handle is **kept**, not removed. The blocking-send's completion oneshot has not fired yet.
-2. **Cooperative window**: executor observes cancellation, calls `sink.cancelled(Some("blocking timeout — executor cancelled"))` or similar, terminal commits, `JoinHandle` resolves, registry entry removed, completion oneshot fires.
-3. **Hard deadline elapses** (soft + grace, default 35s): if the executor has not yet terminated by then, framework calls `handle.spawned.abort()` on the `JoinHandle`, waits briefly for the drop-guard to fire, then commits `A2aAtomicStore::update_task_status_with_events(FAILED, reason = "blocking task timed out and did not respond to cancellation")`. Registry entry is removed when the aborted task's `JoinHandle` resolves.
-4. **Return**: blocking-send returns the final task snapshot. At this point, regardless of path, the executor is no longer running.
+1. **Soft deadline elapses**: framework trips `handle.cancellation.cancel()` (same token passed into `ctx.cancellation`). In-flight handle is kept. Blocking send still awaiting `yielded`.
+2. **Cooperative window (soft→hard)**: executor observes cancellation, calls `sink.cancelled(Some("blocking timeout — executor cancelled"))`. Cancelled event commits, framework fires `yielded` with the CANCELED snapshot, blocking send returns CANCELED. Supervisor task still awaits `JoinHandle` to finish unwinding. If the executor instead emits `complete()` or another terminal, same flow with that state.
+3. **Hard deadline elapses** (soft + grace): if `yielded` has not yet fired, framework proceeds to force-abort.
+4. **Force-abort path — race-aware**:
+   a. Call `handle.spawned.abort()` on the `JoinHandle`. Abort is queued; takes effect at the next `.await` in the executor.
+   b. Attempt `A2aAtomicStore::update_task_status_with_events(FAILED, reason = "blocking task timed out and did not respond to cancellation")`.
+   c. Three possible outcomes:
+      - **`Ok(_)` — framework wins the race**: the persisted terminal is `FAILED`. Framework fires `yielded` with the FAILED snapshot. Blocking send returns FAILED.
+      - **`Err(TerminalStateAlreadySet { current_state })` — executor wins at the wire**: a cooperative terminal committed between the hard deadline firing and the framework's `update_task_status_with_events` landing at the store. This is normal race resolution, NOT an error. Framework reads the current task via `get_task(tenant, task_id, owner)` to get the actual persisted state (CANCELED, COMPLETED, or whatever the executor emitted) and fires `yielded` with that snapshot. Blocking send returns that state. Framework does NOT retry a FAILED write; the single-terminal-writer contract makes the loser's outcome the wire truth.
+      - **`Err(other)` — storage error**: log, fire `yielded` with a best-effort snapshot (via `get_task`) so blocking send can return something, propagate the error to the supervisor.
+5. **Cleanup**: supervisor task (§4.4) awaits `JoinHandle` resolution — regardless of cooperative-vs-abort path — and removes the registry entry on exit. Blocking send has already returned; cleanup does not block the client.
+
+**No zombies, no FAILED on top of cooperative CANCELED**. The force-abort always terminates the executor task (via `abort()` at the next `.await`). The race-aware FAILED commit preserves the single-terminal-writer invariant from §1/§7.1.
+
+**Interrupted states** (`INPUT_REQUIRED`, `AUTH_REQUIRED`) also fire `yielded` per §3.2.2. Blocking send returns with the task in that state. The executor ought to return from `execute()` promptly after emitting an interrupt; if it doesn't, the supervisor eventually handles cleanup. But blocking send has already returned — the client is not held hostage to executor cleanup discipline.
 
 **No zombies by design**. Every timeout path terminates the executor task either cooperatively (preferred) or by `JoinHandle::abort()` (fallback). In-flight entries persist until the `JoinHandle` actually exits, not merely until a terminal event commits — this bounds registry memory to "count of genuinely alive executor tasks."
 
 **Why cooperation first**. `JoinHandle::abort()` is a force-unwind at the next `.await` point — fine for most async code but hostile to executors holding external resources (open file handles, in-progress HTTP requests with dangling connections, uncommitted DB transactions). The cooperative window gives well-behaved executors a chance to clean up. Misbehaving or unresponsive executors still get killed at the hard deadline; they don't get to starve the server.
 
 **Configurable expectations**. Deployments running long LLM or agent-tool chains should set `blocking_task_timeout` deliberately (minutes, not 30s). Deployments running only short synchronous tasks can reduce it. The defaults are conservative, not prescriptive.
-
-**Interrupted states** (`INPUT_REQUIRED`, `AUTH_REQUIRED`) count as completion for blocking sends: the request returns with the task in that state. The executor has yielded back to the client.
-
-Interrupted states (`INPUT_REQUIRED`, `AUTH_REQUIRED`) count as completion for blocking sends: the request returns with the task in that state. The executor has yielded back to the client.
 
 #### 4.2 Non-Blocking `SendMessage` (`return_immediately = true`)
 
@@ -201,19 +212,52 @@ Behavior:
 
 #### 4.4 Tracked Executor Handle
 
-A new internal `AppState::in_flight: DashMap<(tenant, task_id), InFlightHandle>` is added. `InFlightHandle` holds:
+A new internal `AppState::in_flight: DashMap<(tenant, task_id), InFlightHandle>` is added. `InFlightHandle` holds **two independent signals**, decoupled by design:
 
-- `cancellation: CancellationToken` — the one passed into `ExecutionContext`. Tripped by the cancel handler or by timeout.
-- `completion: tokio::sync::oneshot::Sender<TerminalState>` — fired by a supervisor task when the executor's `JoinHandle` resolves (cooperative exit or abort).
-- `spawned: JoinHandle<()>` — the executor's background task handle.
+```rust
+struct InFlightHandle {
+    /// Tripped by the cancel handler or by soft timeout. Delivered to the
+    /// executor via ExecutionContext::cancellation (clone of this token).
+    cancellation: CancellationToken,
 
-**Entry lifetime**: entries persist from `spawn` until the `JoinHandle` actually resolves (task exits — cooperatively, via panic, or via `abort()`). They do NOT get removed merely because a terminal event has committed to storage. This is the critical fix relative to earlier drafts: the invariant "entry present ⇒ executor task is alive" must hold so that timeout can still reach into the handle to call `abort()`.
+    /// Fires once, on first commit of a terminal OR interrupted event
+    /// (COMPLETED, FAILED, CANCELED, REJECTED, INPUT_REQUIRED, AUTH_REQUIRED).
+    /// Payload: the persisted task snapshot at the moment of commit.
+    /// Awaited by blocking SendMessage to return to the client per spec §3.2.2.
+    /// INDEPENDENT of executor exit — fires even if the executor keeps running.
+    yielded: oneshot::Sender<Task>,
 
-**Supervisor task per spawn**: for each executor spawn, the framework also spawns a supervisor that `.await`s the `JoinHandle`. When the handle resolves, the supervisor: (1) inspects task state — if non-terminal, commits framework `FAILED` with reason `"executor exited without terminal event"`, (2) fires the completion oneshot, (3) removes the registry entry. This guarantees cleanup on every exit path without requiring the executor to be well-behaved.
+    /// True once `yielded` has been consumed. Prevents double-sends when
+    /// multiple commit paths race (e.g., executor's cooperative terminal
+    /// concurrent with hard-timeout's FAILED attempt). First commit wins;
+    /// others observe this flag and skip the send.
+    yielded_fired: Arc<AtomicBool>,
 
-**On terminal event commit** (any source): the completion oneshot is not fired yet — it fires when the `JoinHandle` resolves, which for cooperative executors happens naturally shortly after their final sink call returns. For aborted executors, the `JoinHandle` resolves after the abort unwinds. Blocking sends await the oneshot; non-blocking and streaming sends observe completion via the durable event stream (which fires the moment the terminal commits, not when the executor exits).
+    /// The executor's background task handle. Watched by a separate
+    /// supervisor task for cleanup and abort-on-hard-timeout.
+    /// INDEPENDENT of blocking-send signal path.
+    spawned: JoinHandle<()>,
+}
+```
 
-**Memory bound**: entries are removed when the `JoinHandle` resolves. Upper bound is "count of concurrently alive executor tasks", not "count of tasks in non-terminal state in storage." Under healthy operation with the two-deadline timeout policy (§4.1), no entry survives longer than `blocking_task_timeout + timeout_abort_grace` after its natural completion point.
+**Two signal paths, fully independent**:
+
+1. **`yielded` (blocking-send return)**: fired by the atomic-store commit hook. After any successful `update_task_status_with_events` where the new state is terminal or interrupted, the framework checks `yielded_fired.compare_exchange(false, true, …)` and on success sends the task snapshot through the oneshot. This is latency-critical and spec-mandated (§3.2.2). It fires without waiting for executor exit.
+
+2. **`spawned` cleanup (via supervisor task)**: each executor spawn co-spawns a supervisor. The supervisor:
+   a. Awaits `spawned` (the `JoinHandle`).
+   b. On resolution, inspects persisted task state via `get_task`.
+   c. If persisted state is still non-terminal AND `yielded_fired == false`: the executor exited early without emitting any terminal or interrupt. Framework commits `FAILED` with reason `"executor exited without terminal event"` and fires `yielded` with that snapshot. (Only relevant if blocking send is still waiting.)
+   d. If persisted state is terminal/interrupted but `yielded_fired == false`: the terminal committed but the fire-`yielded` hook somehow missed (shouldn't happen; defensive). Fire `yielded` with the current snapshot.
+   e. Removes the registry entry.
+
+The supervisor's only job is cleanup. It does NOT participate in the blocking-send return path — that path fires on event commit, not on executor exit.
+
+**Entry lifetime**: entries persist from spawn until the `JoinHandle` resolves. Blocking send can return long before that (right after terminal/interrupt commits). Registry memory is bounded by "count of alive executor tasks," not "count of currently-blocking requests."
+
+**Why this is load-bearing**: an executor that emits `complete()` and then does 3s of telemetry cleanup — blocking send returns in milliseconds; the registry entry persists for 3s doing cleanup work. An executor that emits `require_input()` and stays alive (misuse, but possible) — blocking send returns immediately with INPUT_REQUIRED; the registry entry is held for supervisor until the `JoinHandle` eventually resolves (which it must, since the executor is not permitted to await forever; hard-timeout provides the backstop even for INPUT_REQUIRED sessions that exceed the configured ceiling).
+
+**Memory bound**: entries are removed when the `JoinHandle` resolves, which is hard-bounded by `blocking_task_timeout + timeout_abort_grace` for any executor that exceeds its deadline. Under healthy operation, entries live roughly as long as the natural executor lifetime.
 
 ### 5. Cancellation Integration (ADR-012 Preview)
 
@@ -311,8 +355,8 @@ These tests gate ADR-010 acceptance and phase-2 completion. All must be green on
 3. **Streaming receives executor progress in order**
    Executor emits `WORKING`, `ArtifactUpdate#1`, `ArtifactUpdate#2`, `COMPLETED`. SSE client receives Task snapshot + those four events in exactly that order, with strictly increasing sequence numbers.
 
-4. **Subscribe replay includes executor-emitted events**
-   Executor emits 3 events via sink. Task completes. New client calls `SubscribeToTask` (without `Last-Event-ID`). Assert: replay delivers Task snapshot + all 4 durable events (including the 3 sink-emitted ones) + stream closes cleanly.
+4. **Subscribe-while-running replays prior sink events and delivers live events**
+   Executor is gated by a test-only channel: emits `WORKING` + `ArtifactUpdate#1` + `ArtifactUpdate#2` on startup, then awaits the channel before emitting terminal. Client's `SendMessage` (non-blocking) kicks off the executor. After the three events are confirmed in the durable store (via `get_events_after` probe), client calls `SubscribeToTask` — task is still non-terminal. Assert: subscriber receives Task snapshot + the 3 replayed sink events. Test releases the channel; executor emits `ArtifactUpdate#3` + `COMPLETED`. Assert: subscriber receives those 2 live events in order + stream closes cleanly. No events duplicated, no events skipped, sequence strictly increasing. This exercises replay-then-live-handoff with sink-emitted events while the task is still active — the only path the spec permits (§4.3 rejects terminal subscribes, covered by test #13).
 
 5. **Cancellation token reaches running executor**
    Executor loops checking `ctx.cancellation.is_cancelled()`, with an explicit tick every 50ms. `:cancel` is called on the task. Assert: executor observes cancellation within 200ms, calls `sink.cancelled(Some("user cancelled"))`, and the task's terminal event is `CANCELED` with that reason in the message.
@@ -332,10 +376,10 @@ These tests gate ADR-010 acceptance and phase-2 completion. All must be green on
 10. **Failed executor emits FAILED terminal**
     Executor returns `Err(A2aError::Internal { … })` without touching sink. Framework writes terminal `FAILED` with the error message. Assert: terminal event is `FAILED` and wire response to blocking send contains the task in FAILED state.
 
-11. **Blocking timeout trips cancellation, then hard-aborts if needed**
-    Two sub-cases:
-    - **Cooperative**: executor loops checking `ctx.cancellation.is_cancelled()` with a 50ms tick. Blocking send configured with soft=500ms, grace=1000ms. Assert: request returns within 700ms, terminal event is `CANCELED` (executor acknowledged), `JoinHandle` has resolved, registry entry is gone.
-    - **Abort fallback**: executor ignores cancellation and sleeps forever. Same timeout config. Assert: request returns within soft+grace+200ms (≤1700ms), terminal event is `FAILED` with reason mentioning timeout, `JoinHandle::abort()` was invoked, supervisor fires completion oneshot after unwind, registry entry is gone. Critically: after the test returns, poll tokio for the executor task existence — must be absent.
+11. **Blocking timeout: cancellation-first with race-aware abort fallback** — three sub-cases:
+    - **(a) Cooperative**: executor loops checking `ctx.cancellation.is_cancelled()` with a 50ms tick. Blocking send configured with soft=500ms, grace=1000ms. Assert: request returns within 700ms with task in CANCELED state (executor acknowledged via `sink.cancelled(…)`), `yielded` fired once (not twice), registry entry eventually cleaned up when `JoinHandle` resolves.
+    - **(b) Abort fallback (framework wins)**: executor ignores cancellation and `tokio::time::sleep`s forever past the hard deadline. Same timeout config. Assert: request returns within soft+grace+200ms (≤1700ms) with task in FAILED state, terminal reason mentions timeout, `JoinHandle::abort()` was invoked by the supervisor, registry entry is gone after abort unwinds. After the test completes, verify the executor task is no longer live (e.g. via tokio runtime task list or drop-guard counter).
+    - **(c) Abort-vs-cooperative race (executor wins at the last moment)**: executor ignores cancellation for `soft + grace − 50ms`, then synchronously calls `sink.cancelled(Some("last-ditch"))` before the hard deadline fires. Gated via test-only channel to make the race deterministic. Assert: persisted terminal is CANCELED (not FAILED), framework's hard-deadline `update_task_status_with_events(FAILED)` attempt received `TerminalStateAlreadySet { current_state: "TASK_STATE_CANCELED" }`, framework read the actual state via `get_task` and fired `yielded` with the CANCELED snapshot. Blocking send returns CANCELED. Single terminal event in the durable store — no FAILED ever persisted. This test validates the §4.1 race-aware loser handling.
 
 12. **Single-terminal-writer parity across backends**
     For each of in-memory, SQLite, PostgreSQL, DynamoDB: spawn 10 concurrent callers each attempting a different terminal write (`COMPLETED`, `FAILED`, `CANCELED`, `REJECTED`) on the same `(tenant, task_id)` that starts in WORKING. Assert: exactly one returns `Ok`, the other 9 return `A2aStorageError::TerminalStateAlreadySet` (not a generic error, not `InvalidStateTransition`). The event store contains exactly one terminal event. The persisted task state matches the winning caller's write.
