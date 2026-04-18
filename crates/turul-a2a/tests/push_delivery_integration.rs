@@ -77,6 +77,7 @@ fn fast_worker(
 fn sentinel_target(base_url: &str) -> PushTarget {
     PushTarget {
         tenant: "tenant-1".into(),
+        owner: "anonymous".into(),
         task_id: format!("task-{}", uuid::Uuid::now_v7()),
         event_sequence: 1,
         config_id: "cfg-A".into(),
@@ -408,6 +409,7 @@ async fn reqwest_connects_to_validated_ip_not_system_dns() {
 
     let target = PushTarget {
         tenant: "tenant-1".into(),
+        owner: "anonymous".into(),
         task_id: format!("task-{}", uuid::Uuid::now_v7()),
         event_sequence: 1,
         config_id: "cfg-A".into(),
@@ -514,11 +516,19 @@ impl A2aPushDeliveryStore for FailingTerminalStore {
         event_sequence: u64,
         config_id: &str,
         claimant: &str,
+        owner: &str,
         claim_expiry: Duration,
     ) -> Result<DeliveryClaim, A2aStorageError> {
         self.inner
-            .claim_delivery(tenant, task_id, event_sequence, config_id, claimant, claim_expiry)
+            .claim_delivery(tenant, task_id, event_sequence, config_id, claimant, owner, claim_expiry)
             .await
+    }
+
+    async fn list_reclaimable_claims(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<turul_a2a::push::claim::ReclaimableClaim>, A2aStorageError> {
+        self.inner.list_reclaimable_claims(limit).await
     }
 
     async fn record_attempt_started(
@@ -654,6 +664,174 @@ async fn terminal_persist_failure_becomes_transient_not_succeeded() {
     drop(server);
 }
 
+// ---------------------------------------------------------------------------
+// Reclaim-and-redispatch recovery (ADR-011 §10.5).
+//
+// Truly persistent terminal-write failures — failures that outlast
+// the worker's bounded persist retry — must not leave the claim row
+// stuck forever. The server's reclaim loop calls
+// `list_reclaimable_claims` and hands each row to
+// `PushDispatcher::redispatch_one`, which re-invokes `deliver()`.
+// Because the stored row is expired and non-terminal,
+// `claim_delivery` increments the generation and the worker proceeds
+// as if it were a fresh delivery. The wiremock therefore sees two
+// POSTs for the same event — the receiver is responsible for
+// deduplication per the at-least-once contract.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reclaim_sweep_redispatches_after_persistent_terminal_failure() {
+    use turul_a2a::push::dispatcher::PushDispatcher;
+    use turul_a2a::push::A2aPushDeliveryStore as _;
+
+    let server = MockServer::start().await;
+    // Two POSTs arrive: one for the initial (stuck) delivery,
+    // one for the redispatch after the claim expires and the sweep
+    // picks it up.
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let inner = Arc::new(InMemoryA2aStorage::new());
+    // Fail the first three terminal writes → first deliver exhausts
+    // persist_terminal's bounded retry (3 attempts) and returns
+    // Transient. Subsequent terminal writes succeed.
+    let failing = Arc::new(FailingTerminalStore::new(
+        inner.clone(),
+        A2aStorageError::DatabaseError("simulated persistent store outage".into()),
+        3,
+    ));
+    let delivery_store: Arc<dyn A2aPushDeliveryStore> = failing.clone();
+
+    // Worker config: short claim_expiry so the row becomes
+    // reclaimable quickly, short backoffs to keep the test fast.
+    // `max_attempts=2` leaves the redispatched deliver enough retry
+    // budget to issue the second POST — the budget is cluster-wide
+    // (ADR-011 §10 — `delivery_attempt_count` is NOT reset on
+    // re-claim, so count=1 after the first deliver's POST and the
+    // redispatch can do exactly one more).
+    let mut cfg = PushDeliveryConfig::default();
+    cfg.max_attempts = 2;
+    cfg.backoff_base = Duration::from_millis(1);
+    cfg.backoff_cap = Duration::from_millis(1);
+    cfg.backoff_jitter = 0.0;
+    cfg.request_timeout = Duration::from_secs(1);
+    cfg.connect_timeout = Duration::from_millis(500);
+    cfg.read_timeout = Duration::from_secs(1);
+    cfg.claim_expiry = Duration::from_millis(100);
+    cfg.max_payload_bytes = 64 * 1024;
+    cfg.allow_insecure_urls = true;
+    let worker = Arc::new(
+        PushDeliveryWorker::new(delivery_store.clone(), cfg, None, "instance-A".into())
+            .expect("worker build"),
+    );
+
+    let push_storage: Arc<dyn turul_a2a::storage::A2aPushNotificationStorage> = inner.clone();
+    let task_storage: Arc<dyn turul_a2a::storage::A2aTaskStorage> = inner.clone();
+    let dispatcher = PushDispatcher::new(worker.clone(), push_storage.clone(), task_storage.clone());
+
+    // Seed a task in storage so the redispatch path's get_task
+    // succeeds. Use the owner-scoped atomic store since that's what
+    // the server would do.
+    let tenant = "tenant-reclaim";
+    let task_id = format!("task-{}", uuid::Uuid::now_v7());
+    let owner = "anonymous";
+    let task = turul_a2a_types::Task::new(
+        &task_id,
+        turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Working),
+    )
+    .with_context_id("ctx-reclaim");
+    let submitted = turul_a2a::streaming::StreamEvent::StatusUpdate {
+        status_update: turul_a2a::streaming::StatusUpdatePayload {
+            task_id: task_id.clone(),
+            context_id: "ctx-reclaim".into(),
+            status: serde_json::to_value(&turul_a2a_types::TaskStatus::new(
+                turul_a2a_types::TaskState::Submitted,
+            ))
+            .unwrap(),
+        },
+    };
+    use turul_a2a::storage::A2aAtomicStore;
+    inner
+        .create_task_with_events(tenant, owner, task, vec![submitted])
+        .await
+        .expect("seed task");
+
+    // Create a push config so redispatch_one's get_config returns.
+    let cfg_proto = turul_a2a_proto::TaskPushNotificationConfig {
+        tenant: tenant.into(),
+        id: "cfg-reclaim".into(),
+        task_id: task_id.clone(),
+        url: format!("{}/webhook", server.uri()),
+        token: String::new(),
+        authentication: Some(turul_a2a_proto::AuthenticationInfo {
+            scheme: "Bearer".into(),
+            credentials: "cred".into(),
+        }),
+    };
+    push_storage
+        .create_config(tenant, cfg_proto.clone())
+        .await
+        .expect("create_config");
+
+    // --- Step 1: first deliver exhausts persist_terminal retries.
+    let target = turul_a2a::push::delivery::PushTarget::from_config(
+        tenant, owner, &task_id, 1, &cfg_proto,
+    )
+    .expect("valid target");
+    let payload = b"{}".to_vec();
+    let first = worker.deliver(&target, &payload).await;
+    assert_eq!(
+        first,
+        DeliveryReport::TransientStoreError,
+        "first delivery must return Transient after persist retry budget"
+    );
+    // Persist retry burned all three attempts against the terminal write.
+    assert_eq!(*failing.terminal_writes_seen.lock().unwrap(), 3);
+
+    // --- Step 2: wait for the claim to expire, then verify the
+    // reclaim enumeration surfaces the row. Using delivery_store
+    // directly; the wrapper delegates list_reclaimable_claims to
+    // the inner store.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let reclaimable = delivery_store
+        .list_reclaimable_claims(16)
+        .await
+        .expect("list_reclaimable_claims");
+    assert_eq!(
+        reclaimable.len(),
+        1,
+        "exactly one reclaimable row expected, got {reclaimable:?}"
+    );
+    assert_eq!(reclaimable[0].owner, owner);
+    assert_eq!(reclaimable[0].task_id, task_id);
+    assert_eq!(reclaimable[0].config_id, "cfg-reclaim");
+
+    // --- Step 3: redispatch. The wrapper's fail counter is now
+    // exhausted, so the terminal write succeeds on attempt 1 of the
+    // second deliver's persist_terminal invocation.
+    let row = reclaimable.into_iter().next().unwrap();
+    dispatcher.redispatch_one(row).await;
+
+    // --- Step 4: the row should now be terminal — no longer
+    // reclaimable. Wiremock asserts on drop that exactly 2 POSTs
+    // arrived: one from the original (stuck) attempt and one from
+    // the redispatch.
+    let reclaimable_after = delivery_store
+        .list_reclaimable_claims(16)
+        .await
+        .expect("list_reclaimable_claims");
+    assert!(
+        reclaimable_after.is_empty(),
+        "redispatch should have driven the row terminal; still reclaimable: {reclaimable_after:?}"
+    );
+
+    drop(server);
+}
+
 #[tokio::test]
 async fn terminal_persist_recovers_after_transient_blip() {
     // Two initial failures, third attempt succeeds: the bounded
@@ -786,6 +964,7 @@ async fn unauthenticated_config_sends_no_authorization_header() {
     // `authentication = None` and `token = ""`.
     let target = PushTarget {
         tenant: "t".into(),
+        owner: "anonymous".into(),
         task_id: format!("task-{}", uuid::Uuid::now_v7()),
         event_sequence: 1,
         config_id: "cfg-noauth".into(),

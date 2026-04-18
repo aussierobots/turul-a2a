@@ -120,6 +120,7 @@ impl PostgresA2aStorage {
                 event_sequence BIGINT NOT NULL,
                 config_id TEXT NOT NULL,
                 claimant TEXT NOT NULL,
+                owner TEXT NOT NULL DEFAULT '',
                 generation BIGINT NOT NULL,
                 claimed_at_micros BIGINT NOT NULL,
                 expires_at_micros BIGINT NOT NULL,
@@ -1244,6 +1245,7 @@ impl A2aPushDeliveryStore for PostgresA2aStorage {
         event_sequence: u64,
         config_id: &str,
         claimant: &str,
+        owner: &str,
         claim_expiry: std::time::Duration,
     ) -> Result<DeliveryClaim, A2aStorageError> {
         let now = std::time::SystemTime::now();
@@ -1254,8 +1256,8 @@ impl A2aPushDeliveryStore for PostgresA2aStorage {
             .begin()
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
-        let existing: Option<(i64, i64, i64, String)> = sqlx::query_as(
-            "SELECT generation, expires_at_micros, delivery_attempt_count, status \
+        let existing: Option<(String, i64, i64, i64, String)> = sqlx::query_as(
+            "SELECT owner, generation, expires_at_micros, delivery_attempt_count, status \
              FROM a2a_push_deliveries \
              WHERE tenant = $1 AND task_id = $2 AND event_sequence = $3 AND config_id = $4 \
              FOR UPDATE",
@@ -1268,7 +1270,7 @@ impl A2aPushDeliveryStore for PostgresA2aStorage {
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        if let Some((prev_gen, prev_expires, prev_count, prev_status_s)) = existing {
+        if let Some((prev_owner, prev_gen, prev_expires, prev_count, prev_status_s)) = existing {
             let prev_status = pg_claim_status_from_str(&prev_status_s)?;
             let is_terminal = matches!(
                 prev_status,
@@ -1284,8 +1286,9 @@ impl A2aPushDeliveryStore for PostgresA2aStorage {
                 });
             }
             // Re-claim conditional on current state — see the
-            // SQLite impl for rationale. Guards against a stale read
-            // followed by a concurrent terminal commit.
+            // SQLite impl for rationale. Owner is preserved from the
+            // original claim (it is a property of the push
+            // registration, not the claimant).
             let new_gen = prev_gen + 1;
             let update_result = sqlx::query(
                 "UPDATE a2a_push_deliveries SET \
@@ -1322,6 +1325,7 @@ impl A2aPushDeliveryStore for PostgresA2aStorage {
                 .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
             return Ok(DeliveryClaim {
                 claimant: claimant.to_string(),
+                owner: prev_owner,
                 generation: new_gen as u64,
                 claimed_at: now,
                 delivery_attempt_count: prev_count as u32,
@@ -1332,9 +1336,9 @@ impl A2aPushDeliveryStore for PostgresA2aStorage {
         // ON CONFLICT DO NOTHING collapses concurrent fresh inserts.
         let result = sqlx::query(
             "INSERT INTO a2a_push_deliveries \
-                (tenant, task_id, event_sequence, config_id, claimant, generation, \
+                (tenant, task_id, event_sequence, config_id, claimant, owner, generation, \
                  claimed_at_micros, expires_at_micros, delivery_attempt_count, status) \
-             VALUES ($1, $2, $3, $4, $5, 1, $6, $7, 0, 'Pending') \
+             VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, 0, 'Pending') \
              ON CONFLICT (tenant, task_id, event_sequence, config_id) DO NOTHING",
         )
         .bind(tenant)
@@ -1342,6 +1346,7 @@ impl A2aPushDeliveryStore for PostgresA2aStorage {
         .bind(event_sequence as i64)
         .bind(config_id)
         .bind(claimant)
+        .bind(owner)
         .bind(now_micros)
         .bind(expires_micros)
         .execute(&mut *tx)
@@ -1360,6 +1365,7 @@ impl A2aPushDeliveryStore for PostgresA2aStorage {
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         Ok(DeliveryClaim {
             claimant: claimant.to_string(),
+            owner: owner.to_string(),
             generation: 1,
             claimed_at: now,
             delivery_attempt_count: 0,
@@ -1582,6 +1588,36 @@ impl A2aPushDeliveryStore for PostgresA2aStorage {
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         Ok(row.0.max(0) as u64)
+    }
+
+    async fn list_reclaimable_claims(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::push::claim::ReclaimableClaim>, A2aStorageError> {
+        let now_micros = pg_systime_to_micros(std::time::SystemTime::now());
+        let rows: Vec<(String, String, String, i64, String)> = sqlx::query_as(
+            "SELECT tenant, owner, task_id, event_sequence, config_id \
+             FROM a2a_push_deliveries \
+             WHERE expires_at_micros < $1 AND status IN ('Pending', 'Attempting') \
+             LIMIT $2",
+        )
+        .bind(now_micros)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|(tenant, owner, task_id, event_sequence, config_id)| {
+                crate::push::claim::ReclaimableClaim {
+                    tenant,
+                    owner,
+                    task_id,
+                    event_sequence: event_sequence.max(0) as u64,
+                    config_id,
+                }
+            })
+            .collect())
     }
 
     async fn list_failed_deliveries(
@@ -1973,6 +2009,12 @@ mod tests {
     async fn test_push_sweep_counts_expired_nonterminal_and_preserves_status() {
         let s = storage().await;
         parity_tests::test_push_sweep_counts_expired_nonterminal_and_preserves_status(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_list_reclaimable_filters_and_returns_identity() {
+        let s = storage().await;
+        parity_tests::test_push_list_reclaimable_filters_and_returns_identity(&s).await;
     }
 
     #[tokio::test]

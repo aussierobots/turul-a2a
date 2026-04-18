@@ -93,6 +93,7 @@ impl Default for PushDeliveryConfig {
 #[derive(Clone)]
 pub struct PushTarget {
     pub tenant: String,
+    pub owner: String,
     pub task_id: String,
     pub event_sequence: u64,
     pub config_id: String,
@@ -482,6 +483,27 @@ impl PushDeliveryWorker {
         DeliveryReport::TransientStoreError
     }
 
+    /// Claim a stuck (expired, non-terminal) row purely to record
+    /// an [`DeliveryOutcome::Abandoned`]. Used by the reclaim sweeper
+    /// when the task or config underlying a stuck claim has been
+    /// deleted — we can't POST, but we also don't want the row to
+    /// keep appearing in every `list_reclaimable_claims` tick. Moving
+    /// it to a terminal `Abandoned` state is the only way to stop
+    /// that churn without dropping the audit trail.
+    pub async fn abandon_reclaimed(
+        &self,
+        target: &PushTarget,
+        reason: AbandonedReason,
+    ) -> DeliveryReport {
+        let claim = match self.claim(target).await {
+            Ok(c) => c,
+            Err(ClaimFailure::AlreadyHeld) => return DeliveryReport::ClaimLostOrFinal,
+            Err(ClaimFailure::Other(_)) => return DeliveryReport::UnclaimedSkip,
+        };
+        self.persist_terminal(target, &claim, DeliveryOutcome::Abandoned { reason })
+            .await
+    }
+
     async fn claim(&self, target: &PushTarget) -> Result<DeliveryClaim, ClaimFailure> {
         match self
             .push_delivery_store
@@ -491,6 +513,7 @@ impl PushDeliveryWorker {
                 target.event_sequence,
                 &target.config_id,
                 &self.instance_id,
+                &target.owner,
                 self.config.claim_expiry,
             )
             .await
@@ -671,6 +694,7 @@ mod tests {
     fn target(url: &str) -> PushTarget {
         PushTarget {
             tenant: "t".into(),
+            owner: "anonymous".into(),
             task_id: format!("task-{}", uuid::Uuid::now_v7()),
             event_sequence: 1,
             config_id: "cfg-A".into(),

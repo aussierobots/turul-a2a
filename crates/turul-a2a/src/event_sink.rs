@@ -348,6 +348,7 @@ impl EventSinkInner {
                     };
                     dispatcher.dispatch(
                         self.tenant.clone(),
+                        self.owner.clone(),
                         task.clone(),
                         vec![(seq, ev)],
                     );

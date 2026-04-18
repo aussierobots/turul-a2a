@@ -1517,6 +1517,7 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
         event_sequence: u64,
         config_id: &str,
         claimant: &str,
+        owner: &str,
         claim_expiry: std::time::Duration,
     ) -> Result<DeliveryClaim, A2aStorageError> {
         let now = std::time::SystemTime::now();
@@ -1566,6 +1567,10 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
                 .get("deliveryAttemptCount")
                 .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None })
                 .unwrap_or(0);
+            let prev_owner = item
+                .get("owner")
+                .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                .unwrap_or_default();
             let new_gen = prev_gen + 1;
 
             // Re-claim UpdateItem fenced on generation match AND
@@ -1618,6 +1623,7 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
                 Ok(_) => {
                     return Ok(DeliveryClaim {
                         claimant: claimant.to_string(),
+                        owner: prev_owner,
                         generation: new_gen as u64,
                         claimed_at: now,
                         delivery_attempt_count: prev_count as u32,
@@ -1651,6 +1657,7 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
             .item("eventSequence", AttributeValue::N(event_sequence.to_string()))
             .item("configId", AttributeValue::S(config_id.to_string()))
             .item("claimant", AttributeValue::S(claimant.to_string()))
+            .item("owner", AttributeValue::S(owner.to_string()))
             .item("generation", AttributeValue::N("1".into()))
             .item("claimedAtMicros", AttributeValue::N(now_micros.to_string()))
             .item("expiresAtMicros", AttributeValue::N(expires_micros.to_string()))
@@ -1663,6 +1670,7 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
         match put.send().await {
             Ok(_) => Ok(DeliveryClaim {
                 claimant: claimant.to_string(),
+                owner: owner.to_string(),
                 generation: 1,
                 claimed_at: now,
                 delivery_attempt_count: 0,
@@ -1980,6 +1988,78 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
             }
         }
         Ok(count)
+    }
+
+    async fn list_reclaimable_claims(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::push::claim::ReclaimableClaim>, A2aStorageError> {
+        // Same coarse scan as `sweep_expired_claims`, but carrying
+        // enough identity on each row to drive a redispatch. The
+        // sweep loop bounds load by passing a `limit` and iterating
+        // tick by tick.
+        let now_micros = ddb_systime_to_micros(std::time::SystemTime::now());
+        let mut out: Vec<crate::push::claim::ReclaimableClaim> = Vec::new();
+        let mut last_key = None;
+        while out.len() < limit {
+            let mut scan = self
+                .client
+                .scan()
+                .table_name(&self.config.push_deliveries_table)
+                .filter_expression(
+                    "expiresAtMicros < :now AND (#status = :pending OR #status = :attempting)",
+                )
+                .expression_attribute_names("#status", "status")
+                .expression_attribute_values(":now", AttributeValue::N(now_micros.to_string()))
+                .expression_attribute_values(":pending", AttributeValue::S("Pending".into()))
+                .expression_attribute_values(":attempting", AttributeValue::S("Attempting".into()));
+            if let Some(k) = last_key.take() {
+                scan = scan.set_exclusive_start_key(Some(k));
+            }
+            let page = scan
+                .send()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            if let Some(items) = page.items {
+                for item in items {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    let tenant = item
+                        .get("tenant")
+                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .unwrap_or_default();
+                    let owner = item
+                        .get("owner")
+                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .unwrap_or_default();
+                    let task_id = item
+                        .get("taskId")
+                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .unwrap_or_default();
+                    let event_sequence = item
+                        .get("eventSequence")
+                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<u64>().ok() } else { None })
+                        .unwrap_or(0);
+                    let config_id = item
+                        .get("configId")
+                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .unwrap_or_default();
+                    out.push(crate::push::claim::ReclaimableClaim {
+                        tenant,
+                        owner,
+                        task_id,
+                        event_sequence,
+                        config_id,
+                    });
+                }
+            }
+            last_key = page.last_evaluated_key;
+            if last_key.is_none() {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     async fn list_failed_deliveries(
@@ -2532,10 +2612,11 @@ mod tests {
             event_sequence: u64,
             config_id: &str,
             claimant: &str,
+            owner: &str,
             claim_expiry: std::time::Duration,
         ) -> Result<DeliveryClaim, A2aStorageError> {
             self.inner
-                .claim_delivery(&self.scoped_tenant(tenant), task_id, event_sequence, config_id, claimant, claim_expiry)
+                .claim_delivery(&self.scoped_tenant(tenant), task_id, event_sequence, config_id, claimant, owner, claim_expiry)
                 .await
         }
 
@@ -2570,6 +2651,13 @@ mod tests {
 
         async fn sweep_expired_claims(&self) -> Result<u64, A2aStorageError> {
             self.inner.sweep_expired_claims().await
+        }
+
+        async fn list_reclaimable_claims(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<crate::push::claim::ReclaimableClaim>, A2aStorageError> {
+            self.inner.list_reclaimable_claims(limit).await
         }
 
         async fn list_failed_deliveries(
@@ -3098,6 +3186,12 @@ mod tests {
     async fn test_push_sweep_counts_expired_nonterminal_and_preserves_status() {
         skip_unless_dynamodb_env!(s);
         parity_tests::test_push_sweep_counts_expired_nonterminal_and_preserves_status(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_list_reclaimable_filters_and_returns_identity() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_list_reclaimable_filters_and_returns_identity(&s).await;
     }
 
     #[tokio::test]

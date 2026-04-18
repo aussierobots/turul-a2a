@@ -124,6 +124,7 @@ impl SqliteA2aStorage {
                 event_sequence INTEGER NOT NULL,
                 config_id TEXT NOT NULL,
                 claimant TEXT NOT NULL,
+                owner TEXT NOT NULL DEFAULT '',
                 generation INTEGER NOT NULL,
                 claimed_at_micros INTEGER NOT NULL,
                 expires_at_micros INTEGER NOT NULL,
@@ -1274,6 +1275,7 @@ impl A2aPushDeliveryStore for SqliteA2aStorage {
         event_sequence: u64,
         config_id: &str,
         claimant: &str,
+        owner: &str,
         claim_expiry: std::time::Duration,
     ) -> Result<DeliveryClaim, A2aStorageError> {
         let now = std::time::SystemTime::now();
@@ -1284,9 +1286,9 @@ impl A2aPushDeliveryStore for SqliteA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        let existing: Option<(String, i64, i64, i64, i64, String, Option<i64>, Option<i64>, Option<i64>, Option<String>)> =
+        let existing: Option<(String, String, i64, i64, i64, i64, String, Option<i64>, Option<i64>, Option<i64>, Option<String>)> =
             sqlx::query_as(
-                "SELECT claimant, generation, claimed_at_micros, expires_at_micros, \
+                "SELECT claimant, owner, generation, claimed_at_micros, expires_at_micros, \
                     delivery_attempt_count, status, first_attempted_at_micros, \
                     last_attempted_at_micros, last_http_status, last_error_class \
                  FROM a2a_push_deliveries \
@@ -1303,7 +1305,7 @@ impl A2aPushDeliveryStore for SqliteA2aStorage {
         let now_micros = systime_to_micros(now);
         let expires_micros = systime_to_micros(expires_at);
 
-        if let Some((_prev_claimant, prev_gen, _prev_claimed, prev_expires, prev_count, prev_status_s, prev_first, prev_last, prev_http, prev_err)) = existing {
+        if let Some((_prev_claimant, prev_owner, prev_gen, _prev_claimed, prev_expires, prev_count, prev_status_s, prev_first, prev_last, prev_http, prev_err)) = existing {
             let prev_status = claim_status_from_str(&prev_status_s)?;
             let is_terminal = matches!(
                 prev_status,
@@ -1323,6 +1325,8 @@ impl A2aPushDeliveryStore for SqliteA2aStorage {
             // generation we just read. Without these guards, a
             // stale read followed by a concurrent terminal commit
             // would let the re-claim UPDATE clobber the terminal.
+            // Owner is preserved from the original claim — a re-claim
+            // is a recovery hand-off, not a new registration.
             let new_gen = prev_gen + 1;
             let update_result = sqlx::query(
                 "UPDATE a2a_push_deliveries SET \
@@ -1363,6 +1367,7 @@ impl A2aPushDeliveryStore for SqliteA2aStorage {
             let _ = (prev_count, prev_first, prev_last, prev_http, prev_err);
             return Ok(DeliveryClaim {
                 claimant: claimant.to_string(),
+                owner: prev_owner,
                 generation: new_gen as u64,
                 claimed_at: now,
                 delivery_attempt_count: prev_count as u32,
@@ -1376,9 +1381,9 @@ impl A2aPushDeliveryStore for SqliteA2aStorage {
         // rather than surfacing a UNIQUE constraint violation.
         let result = sqlx::query(
             "INSERT INTO a2a_push_deliveries \
-                (tenant, task_id, event_sequence, config_id, claimant, generation, \
+                (tenant, task_id, event_sequence, config_id, claimant, owner, generation, \
                  claimed_at_micros, expires_at_micros, delivery_attempt_count, status) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 0, 'Pending') \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, 0, 'Pending') \
              ON CONFLICT (tenant, task_id, event_sequence, config_id) DO NOTHING",
         )
         .bind(tenant)
@@ -1386,6 +1391,7 @@ impl A2aPushDeliveryStore for SqliteA2aStorage {
         .bind(event_sequence as i64)
         .bind(config_id)
         .bind(claimant)
+        .bind(owner)
         .bind(now_micros)
         .bind(expires_micros)
         .execute(&mut *tx)
@@ -1405,6 +1411,7 @@ impl A2aPushDeliveryStore for SqliteA2aStorage {
 
         Ok(DeliveryClaim {
             claimant: claimant.to_string(),
+            owner: owner.to_string(),
             generation: 1,
             claimed_at: now,
             delivery_attempt_count: 0,
@@ -1642,6 +1649,38 @@ impl A2aPushDeliveryStore for SqliteA2aStorage {
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         Ok(row.0.max(0) as u64)
+    }
+
+    async fn list_reclaimable_claims(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::push::claim::ReclaimableClaim>, A2aStorageError> {
+        let now_micros = systime_to_micros(std::time::SystemTime::now());
+        let rows: Vec<(String, String, String, i64, String)> = sqlx::query_as(
+            "SELECT tenant, owner, task_id, event_sequence, config_id \
+             FROM a2a_push_deliveries \
+             WHERE expires_at_micros < ?1 AND status IN ('Pending', 'Attempting') \
+             LIMIT ?2",
+        )
+        .bind(now_micros)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(tenant, owner, task_id, event_sequence, config_id)| {
+                    crate::push::claim::ReclaimableClaim {
+                        tenant,
+                        owner,
+                        task_id,
+                        event_sequence: event_sequence.max(0) as u64,
+                        config_id,
+                    }
+                },
+            )
+            .collect())
     }
 
     async fn list_failed_deliveries(
@@ -2020,6 +2059,12 @@ mod tests {
     async fn test_push_sweep_counts_expired_nonterminal_and_preserves_status() {
         let s = storage().await;
         parity_tests::test_push_sweep_counts_expired_nonterminal_and_preserves_status(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_list_reclaimable_filters_and_returns_identity() {
+        let s = storage().await;
+        parity_tests::test_push_list_reclaimable_filters_and_returns_identity(&s).await;
     }
 
     #[tokio::test]

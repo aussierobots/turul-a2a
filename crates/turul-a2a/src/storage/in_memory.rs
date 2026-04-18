@@ -51,6 +51,9 @@ type PushDeliveryKey = (String, String, u64, String); // (tenant, task_id, event
 #[derive(Debug, Clone)]
 struct StoredDeliveryClaim {
     claimant: String,
+    /// Owner recorded on the first claim so the reclaim sweeper can
+    /// call owner-scoped `get_task`. Not changed on re-claim.
+    owner: String,
     generation: u64,
     claimed_at: std::time::SystemTime,
     expires_at: std::time::SystemTime,
@@ -71,6 +74,7 @@ impl StoredDeliveryClaim {
     fn as_claim(&self) -> DeliveryClaim {
         DeliveryClaim {
             claimant: self.claimant.clone(),
+            owner: self.owner.clone(),
             generation: self.generation,
             claimed_at: self.claimed_at,
             delivery_attempt_count: self.delivery_attempt_count,
@@ -950,6 +954,7 @@ impl A2aPushDeliveryStore for InMemoryA2aStorage {
         event_sequence: u64,
         config_id: &str,
         claimant: &str,
+        owner: &str,
         claim_expiry: std::time::Duration,
     ) -> Result<DeliveryClaim, A2aStorageError> {
         let key: PushDeliveryKey = (
@@ -977,10 +982,13 @@ impl A2aPushDeliveryStore for InMemoryA2aStorage {
                 });
             }
             // Re-claim after expiry: advance generation; preserve
-            // delivery_attempt_count; reset status to Pending;
-            // refresh claimed_at and expires_at; replace claimant.
+            // delivery_attempt_count AND owner (owner is a property of
+            // the underlying push config, not the claimant); reset
+            // status to Pending; refresh claimed_at and expires_at;
+            // replace claimant.
             let new_claim = StoredDeliveryClaim {
                 claimant: claimant.to_string(),
+                owner: existing.owner.clone(),
                 generation: existing.generation + 1,
                 claimed_at: now,
                 expires_at,
@@ -1001,6 +1009,7 @@ impl A2aPushDeliveryStore for InMemoryA2aStorage {
 
         let fresh = StoredDeliveryClaim {
             claimant: claimant.to_string(),
+            owner: owner.to_string(),
             generation: 1,
             claimed_at: now,
             expires_at,
@@ -1190,6 +1199,34 @@ impl A2aPushDeliveryStore for InMemoryA2aStorage {
             }
         }
         Ok(count)
+    }
+
+    async fn list_reclaimable_claims(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::push::claim::ReclaimableClaim>, A2aStorageError> {
+        let now = std::time::SystemTime::now();
+        let claims = self.push_delivery_claims.read().await;
+        let mut out: Vec<crate::push::claim::ReclaimableClaim> = claims
+            .iter()
+            .filter_map(|((tenant, task_id, event_sequence, config_id), row)| {
+                if !matches!(row.status, ClaimStatus::Pending | ClaimStatus::Attempting) {
+                    return None;
+                }
+                if row.expires_at >= now {
+                    return None;
+                }
+                Some(crate::push::claim::ReclaimableClaim {
+                    tenant: tenant.clone(),
+                    owner: row.owner.clone(),
+                    task_id: task_id.clone(),
+                    event_sequence: *event_sequence,
+                    config_id: config_id.clone(),
+                })
+            })
+            .collect();
+        out.truncate(limit);
+        Ok(out)
     }
 
     async fn list_failed_deliveries(
@@ -1542,6 +1579,12 @@ mod tests {
     async fn test_push_sweep_counts_expired_nonterminal_and_preserves_status() {
         let s = storage();
         parity_tests::test_push_sweep_counts_expired_nonterminal_and_preserves_status(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_list_reclaimable_filters_and_returns_identity() {
+        let s = storage();
+        parity_tests::test_push_list_reclaimable_filters_and_returns_identity(&s).await;
     }
 
     #[tokio::test]

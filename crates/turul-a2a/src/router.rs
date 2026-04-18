@@ -1023,6 +1023,7 @@ async fn await_yielded_with_two_deadlines(
                 let seq = seqs.first().copied().unwrap_or(0);
                 dispatcher.dispatch(
                     tenant.to_string(),
+                    owner.to_string(),
                     task.clone(),
                     vec![(seq, failed_event_for_dispatch)],
                 );
@@ -1267,6 +1268,7 @@ pub async fn core_cancel_task(
                 let seq = seqs.first().copied().unwrap_or(0);
                 dispatcher.dispatch(
                     tenant.to_string(),
+                    owner.to_string(),
                     task.clone(),
                     vec![(seq, cancel_event_for_dispatch)],
                 );

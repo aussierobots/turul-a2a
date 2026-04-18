@@ -1794,7 +1794,7 @@ pub async fn test_push_claim_is_exclusive(store: &dyn A2aPushDeliveryStore) {
     let expiry = Duration::from_secs(60);
 
     let claim = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", expiry)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", "owner-x", expiry)
         .await
         .expect("first claim must succeed");
     assert_eq!(claim.claimant, "A");
@@ -1803,7 +1803,7 @@ pub async fn test_push_claim_is_exclusive(store: &dyn A2aPushDeliveryStore) {
     assert_eq!(claim.status, ClaimStatus::Pending);
 
     let result = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", expiry)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", "owner-x", expiry)
         .await;
     match result {
         Err(A2aStorageError::ClaimAlreadyHeld {
@@ -1845,7 +1845,7 @@ pub async fn test_push_claim_expired_is_reclaimable(store: &dyn A2aPushDeliveryS
     let long = Duration::from_secs(60);
 
     let claim_a = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", short)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", "owner-x", short)
         .await
         .expect("A's first claim");
     assert_eq!(claim_a.generation, 1);
@@ -1855,7 +1855,7 @@ pub async fn test_push_claim_expired_is_reclaimable(store: &dyn A2aPushDeliveryS
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     let claim_b = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", "owner-x", long)
         .await
         .expect("B re-claims after A's expiry");
     assert_eq!(claim_b.claimant, "B");
@@ -1888,12 +1888,12 @@ pub async fn test_push_outcome_fenced_to_current_claim(store: &dyn A2aPushDelive
     let long = Duration::from_secs(60);
 
     let claim_a = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", short)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", "owner-x", short)
         .await
         .expect("A claims");
     tokio::time::sleep(Duration::from_millis(80)).await;
     let claim_b = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", "owner-x", long)
         .await
         .expect("B re-claims");
     assert_eq!(claim_b.generation, 2);
@@ -1937,7 +1937,7 @@ pub async fn test_push_outcome_fenced_to_current_claim(store: &dyn A2aPushDelive
         .expect("B's outcome with current identity must succeed");
 
     let reclaim = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "C", long)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "C", "owner-x", long)
         .await;
     assert!(
         matches!(reclaim, Err(A2aStorageError::ClaimAlreadyHeld { .. })),
@@ -1956,7 +1956,7 @@ pub async fn test_push_claim_terminal_succeeded_blocks_reclaim(store: &dyn A2aPu
     let long = Duration::from_secs(60);
 
     let claim = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", short)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", "owner-x", short)
         .await
         .expect("claim");
     store
@@ -1978,7 +1978,7 @@ pub async fn test_push_claim_terminal_succeeded_blocks_reclaim(store: &dyn A2aPu
 
     tokio::time::sleep(Duration::from_millis(80)).await;
     let err = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", "owner-x", long)
         .await;
     assert!(
         matches!(err, Err(A2aStorageError::ClaimAlreadyHeld { .. })),
@@ -1996,7 +1996,7 @@ pub async fn test_push_claim_terminal_gaveup_blocks_reclaim(store: &dyn A2aPushD
     let long = Duration::from_secs(60);
 
     let claim = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", short)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", "owner-x", short)
         .await
         .expect("claim");
     store
@@ -2022,7 +2022,7 @@ pub async fn test_push_claim_terminal_gaveup_blocks_reclaim(store: &dyn A2aPushD
 
     tokio::time::sleep(Duration::from_millis(80)).await;
     let err = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", "owner-x", long)
         .await;
     assert!(
         matches!(err, Err(A2aStorageError::ClaimAlreadyHeld { .. })),
@@ -2052,7 +2052,7 @@ pub async fn test_push_claim_terminal_abandoned_blocks_reclaim_and_not_listed(
     let long = Duration::from_secs(60);
 
     let claim = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", short)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", "owner-x", short)
         .await
         .expect("claim");
     store
@@ -2072,7 +2072,7 @@ pub async fn test_push_claim_terminal_abandoned_blocks_reclaim_and_not_listed(
 
     tokio::time::sleep(Duration::from_millis(80)).await;
     let err = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", "owner-x", long)
         .await;
     assert!(
         matches!(err, Err(A2aStorageError::ClaimAlreadyHeld { .. })),
@@ -2103,7 +2103,7 @@ pub async fn test_push_attempt_started_advances_count_and_status(
     let long = Duration::from_secs(60);
 
     let claim = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", long)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", "owner-x", long)
         .await
         .expect("claim");
     assert_eq!(claim.delivery_attempt_count, 0);
@@ -2124,7 +2124,7 @@ pub async fn test_push_attempt_started_advances_count_and_status(
     // Re-claim window long enough — claim still held by A. Probe via
     // claim_delivery with a different claimant: ClaimAlreadyHeld.
     let err = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", "owner-x", long)
         .await;
     assert!(matches!(err, Err(A2aStorageError::ClaimAlreadyHeld { .. })));
 }
@@ -2143,12 +2143,12 @@ pub async fn test_push_attempt_started_is_fenced(store: &dyn A2aPushDeliveryStor
     let long = Duration::from_secs(60);
 
     let claim_a = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", short)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", "owner-x", short)
         .await
         .expect("A claim");
     tokio::time::sleep(Duration::from_millis(80)).await;
     let claim_b = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", "owner-x", long)
         .await
         .expect("B re-claim");
     assert_eq!(claim_b.generation, claim_a.generation + 1);
@@ -2189,7 +2189,7 @@ pub async fn test_push_retry_outcome_keeps_claim_open(store: &dyn A2aPushDeliver
     let long = Duration::from_secs(60);
 
     let claim = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", long)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", "owner-x", long)
         .await
         .expect("claim");
     let count_1 = store
@@ -2218,7 +2218,7 @@ pub async fn test_push_retry_outcome_keeps_claim_open(store: &dyn A2aPushDeliver
 
     // Re-claim by another claimant must still fail (claim open).
     let err = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", "owner-x", long)
         .await;
     assert!(matches!(err, Err(A2aStorageError::ClaimAlreadyHeld { .. })));
 
@@ -2241,7 +2241,7 @@ pub async fn test_push_outcome_idempotent_on_terminal(store: &dyn A2aPushDeliver
     let long = Duration::from_secs(60);
 
     let claim = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", long)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", "owner-x", long)
         .await
         .expect("claim");
     store
@@ -2277,7 +2277,7 @@ pub async fn test_push_outcome_idempotent_on_terminal(store: &dyn A2aPushDeliver
 
     // Row state unchanged: re-claim still blocked.
     let err = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", "owner-x", long)
         .await;
     assert!(matches!(err, Err(A2aStorageError::ClaimAlreadyHeld { .. })));
 }
@@ -2302,19 +2302,19 @@ pub async fn test_push_sweep_counts_expired_nonterminal_and_preserves_status(
 
     // A: fresh Pending (not eligible).
     let _ = store
-        .claim_delivery(&tenant_a, &task_a, seq_a, &config_a, "w", long)
+        .claim_delivery(&tenant_a, &task_a, seq_a, &config_a, "w", "owner-x", long)
         .await
         .expect("A claim");
 
     // B: expired Pending (eligible).
     let _ = store
-        .claim_delivery(&tenant_b, &task_b, seq_b, &config_b, "w", short)
+        .claim_delivery(&tenant_b, &task_b, seq_b, &config_b, "w", "owner-x", short)
         .await
         .expect("B claim");
 
     // C: terminal (never eligible even after expiry).
     let claim_c = store
-        .claim_delivery(&tenant_c, &task_c, seq_c, &config_c, "w", short)
+        .claim_delivery(&tenant_c, &task_c, seq_c, &config_c, "w", "owner-x", short)
         .await
         .expect("C claim");
     store
@@ -2347,21 +2347,103 @@ pub async fn test_push_sweep_counts_expired_nonterminal_and_preserves_status(
     // rewritten to something sweep-invented.
     assert!(matches!(
         store
-            .claim_delivery(&tenant_a, &task_a, seq_a, &config_a, "probe", long)
+            .claim_delivery(&tenant_a, &task_a, seq_a, &config_a, "probe", "owner-x", long)
             .await,
         Err(A2aStorageError::ClaimAlreadyHeld { .. })
     ));
     let re_b = store
-        .claim_delivery(&tenant_b, &task_b, seq_b, &config_b, "w2", long)
+        .claim_delivery(&tenant_b, &task_b, seq_b, &config_b, "w2", "owner-x", long)
         .await
         .expect("B is re-claimable after expiry (status stayed non-terminal)");
     assert_eq!(re_b.generation, 2);
     assert!(matches!(
         store
-            .claim_delivery(&tenant_c, &task_c, seq_c, &config_c, "probe", long)
+            .claim_delivery(&tenant_c, &task_c, seq_c, &config_c, "probe", "owner-x", long)
             .await,
         Err(A2aStorageError::ClaimAlreadyHeld { .. })
     ));
+}
+
+/// PD-RECLAIM-001: `list_reclaimable_claims(limit)` returns
+/// expired-but-non-terminal rows with tenant/owner/task/sequence/
+/// config identifiers, and excludes fresh rows, terminal rows
+/// (`Succeeded` / `GaveUp` / `Abandoned`), and rows that have been
+/// re-claimed back to a live generation. This is the enumeration
+/// the server's reclaim-and-redispatch loop consumes.
+pub async fn test_push_list_reclaimable_filters_and_returns_identity(
+    store: &dyn A2aPushDeliveryStore,
+) {
+    let (tenant_a, task_a, seq_a, config_a) = push_tuple("rcl-fresh");
+    let (tenant_b, task_b, seq_b, config_b) = push_tuple("rcl-expired");
+    let (tenant_c, task_c, seq_c, config_c) = push_tuple("rcl-succeeded");
+    let short = Duration::from_millis(30);
+    let long = Duration::from_secs(60);
+
+    // A: fresh, non-expired — must NOT appear.
+    let _ = store
+        .claim_delivery(&tenant_a, &task_a, seq_a, &config_a, "w", "owner-rcl", long)
+        .await
+        .expect("A claim");
+
+    // B: expired + Pending — MUST appear with owner = "owner-rcl".
+    let _ = store
+        .claim_delivery(&tenant_b, &task_b, seq_b, &config_b, "w", "owner-rcl", short)
+        .await
+        .expect("B claim");
+
+    // C: expired but terminal Succeeded — must NOT appear (terminal
+    // rows never reclaim regardless of age).
+    let claim_c = store
+        .claim_delivery(&tenant_c, &task_c, seq_c, &config_c, "w", "owner-rcl", short)
+        .await
+        .expect("C claim");
+    store
+        .record_attempt_started(&tenant_c, &task_c, seq_c, &config_c, "w", claim_c.generation)
+        .await
+        .expect("C start");
+    store
+        .record_delivery_outcome(
+            &tenant_c,
+            &task_c,
+            seq_c,
+            &config_c,
+            "w",
+            claim_c.generation,
+            DeliveryOutcome::Succeeded { http_status: 200 },
+        )
+        .await
+        .expect("C Succeeded");
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let rows = store
+        .list_reclaimable_claims(16)
+        .await
+        .expect("list_reclaimable_claims");
+
+    // B must be in the result; A and C must not.
+    let has_a = rows.iter().any(|r| {
+        r.tenant == tenant_a && r.task_id == task_a && r.config_id == config_a
+    });
+    let has_b = rows.iter().any(|r| {
+        r.tenant == tenant_b && r.task_id == task_b && r.config_id == config_b
+    });
+    let has_c = rows.iter().any(|r| {
+        r.tenant == tenant_c && r.task_id == task_c && r.config_id == config_c
+    });
+    assert!(!has_a, "fresh non-expired row must not be reclaimable");
+    assert!(has_b, "expired non-terminal row must be reclaimable");
+    assert!(!has_c, "terminal row must not be reclaimable");
+
+    // Owner + sequence round-trip for B: the reclaim sweeper uses
+    // these to call `A2aTaskStorage::get_task`, so they must match
+    // what was passed to `claim_delivery`.
+    let row_b = rows
+        .into_iter()
+        .find(|r| r.task_id == task_b && r.config_id == config_b)
+        .expect("B row");
+    assert_eq!(row_b.owner, "owner-rcl");
+    assert_eq!(row_b.event_sequence, seq_b);
 }
 
 /// PD-LIST-001: `list_failed_deliveries(tenant, since, limit)`
@@ -2385,7 +2467,7 @@ pub async fn test_push_list_failed_filters_and_orders(store: &dyn A2aPushDeliver
         let config = format!("cfg-gu-{suffix}");
         let seq = 1u64;
         let claim = store
-            .claim_delivery(tenant, &task, seq, &config, "w", expiry)
+            .claim_delivery(tenant, &task, seq, &config, "w", "owner-x", expiry)
             .await
             .expect("claim");
         store
@@ -2420,7 +2502,7 @@ pub async fn test_push_list_failed_filters_and_orders(store: &dyn A2aPushDeliver
         let task = "task-ok".to_string();
         let config = "cfg-ok".to_string();
         let claim = store
-            .claim_delivery(&tenant, &task, 1, &config, "w", long)
+            .claim_delivery(&tenant, &task, 1, &config, "w", "owner-x", long)
             .await
             .expect("claim ok");
         store
@@ -2445,7 +2527,7 @@ pub async fn test_push_list_failed_filters_and_orders(store: &dyn A2aPushDeliver
         let task = "task-ab".to_string();
         let config = "cfg-ab".to_string();
         let claim = store
-            .claim_delivery(&tenant, &task, 1, &config, "w", long)
+            .claim_delivery(&tenant, &task, 1, &config, "w", "owner-x", long)
             .await
             .expect("claim ab");
         store
@@ -2513,7 +2595,7 @@ pub async fn test_push_list_failed_is_tenant_scoped(store: &dyn A2aPushDeliveryS
         let task = format!("task-{cfg_tag}");
         let config = format!("cfg-{cfg_tag}");
         let claim = store
-            .claim_delivery(tenant, &task, 1, &config, "w", long)
+            .claim_delivery(tenant, &task, 1, &config, "w", "owner-x", long)
             .await
             .expect("claim");
         store
@@ -2566,7 +2648,7 @@ pub async fn test_push_failed_delivery_diagnostics_roundtrip(store: &dyn A2aPush
     let long = Duration::from_secs(60);
 
     let claim = store
-        .claim_delivery(&tenant, &task_id, seq, &config_id, "w", long)
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "w", "owner-x", long)
         .await
         .expect("claim");
     let before = SystemTime::now();
@@ -2636,7 +2718,7 @@ pub async fn test_push_attempt_started_rejected_after_terminal(
     ) -> (String, String, u64, String, String, u64, u32) {
         let (tenant, task_id, seq, config_id) = push_tuple(suffix);
         let claim = store
-            .claim_delivery(&tenant, &task_id, seq, &config_id, "w", Duration::from_secs(60))
+            .claim_delivery(&tenant, &task_id, seq, &config_id, "w", "owner-x", Duration::from_secs(60))
             .await
             .expect("claim");
         // At least one attempt start (so count > 0 for checking).
@@ -2690,7 +2772,7 @@ pub async fn test_push_attempt_started_rejected_after_terminal(
     // we verify the claim stays terminal by attempting another
     // claim:
     let reclaim = store
-        .claim_delivery(&t, &tid, seq, &cid, "other", long)
+        .claim_delivery(&t, &tid, seq, &cid, "other", "owner-x", long)
         .await;
     assert!(matches!(reclaim, Err(A2aStorageError::ClaimAlreadyHeld { .. })));
     let _ = count_at_terminal;
@@ -2762,7 +2844,7 @@ pub async fn test_push_outcome_does_not_overwrite_terminal(
     ) -> (String, String, u64, String, u64) {
         let (tenant, task_id, seq, config_id) = push_tuple(suffix);
         let claim = store
-            .claim_delivery(&tenant, &task_id, seq, &config_id, "w", Duration::from_secs(60))
+            .claim_delivery(&tenant, &task_id, seq, &config_id, "w", "owner-x", Duration::from_secs(60))
             .await
             .expect("claim");
         store
@@ -2807,7 +2889,7 @@ pub async fn test_push_outcome_does_not_overwrite_terminal(
         )
         .await
         .expect("Succeeded->Retry must be Ok no-op");
-    let rc = store.claim_delivery(&t, &tid, seq, &cid, "x", long).await;
+    let rc = store.claim_delivery(&t, &tid, seq, &cid, "x", "owner-x", long).await;
     assert!(
         matches!(rc, Err(A2aStorageError::ClaimAlreadyHeld { .. })),
         "row must still be Succeeded; got {rc:?}"
@@ -2904,7 +2986,7 @@ pub async fn test_push_outcome_does_not_overwrite_terminal(
         )
         .await
         .expect("Abandoned->Succeeded must be Ok no-op");
-    let rc = store.claim_delivery(&t, &tid, seq, &cid, "x", long).await;
+    let rc = store.claim_delivery(&t, &tid, seq, &cid, "x", "owner-x", long).await;
     assert!(
         matches!(rc, Err(A2aStorageError::ClaimAlreadyHeld { .. })),
         "row must remain Abandoned (non-re-claimable)"
@@ -2942,7 +3024,7 @@ where
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
             store
-                .claim_delivery(&tenant, &task_id, seq, &config_id, claimant, long)
+                .claim_delivery(&tenant, &task_id, seq, &config_id, claimant, "owner-x", long)
                 .await
         }));
     }

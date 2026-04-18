@@ -55,6 +55,21 @@ pub struct RuntimeConfig {
     pub push_failed_delivery_retention: Duration,
     pub push_max_payload_bytes: usize,
     pub allow_insecure_push_urls: bool,
+
+    /// Interval between reclaim-and-redispatch sweeps (ADR-011 §10.5).
+    /// The server background task enumerates expired-but-non-terminal
+    /// claim rows via
+    /// [`crate::push::A2aPushDeliveryStore::list_reclaimable_claims`]
+    /// and drives each through
+    /// [`crate::push::PushDispatcher::redispatch_one`]. Shorter
+    /// cadence recovers stuck rows faster but increases steady-state
+    /// load; default 60s balances recovery latency against scan cost.
+    pub push_reclaim_sweep_interval: Duration,
+
+    /// Max reclaimable rows to pull per sweep tick. The sweeper
+    /// paginates: each tick fetches up to this many rows, redispatches
+    /// them, and returns. The next tick picks up any remainder.
+    pub push_reclaim_sweep_batch: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -77,6 +92,8 @@ impl Default for RuntimeConfig {
             push_failed_delivery_retention: Duration::from_secs(7 * 24 * 60 * 60),
             push_max_payload_bytes: 1024 * 1024,
             allow_insecure_push_urls: false,
+            push_reclaim_sweep_interval: Duration::from_secs(60),
+            push_reclaim_sweep_batch: 64,
         }
     }
 }
@@ -228,9 +245,21 @@ impl A2aServerBuilder {
 
     /// Dev-only escape hatch: permit `http://` webhook URLs AND bypass the
     /// private-IP blocklist. Required for localhost wiremock testing.
-    /// Default false. 
+    /// Default false.
     pub fn allow_insecure_push_urls(mut self, allow: bool) -> Self {
         self.runtime_config.allow_insecure_push_urls = allow;
+        self
+    }
+
+    /// Interval between reclaim-and-redispatch sweeps. Default 60s.
+    pub fn push_reclaim_sweep_interval(mut self, d: Duration) -> Self {
+        self.runtime_config.push_reclaim_sweep_interval = d;
+        self
+    }
+
+    /// Max rows pulled per reclaim sweep tick. Default 64.
+    pub fn push_reclaim_sweep_batch(mut self, n: usize) -> Self {
+        self.runtime_config.push_reclaim_sweep_batch = n;
         self
     }
 
@@ -430,6 +459,7 @@ impl A2aServerBuilder {
                 Some(Arc::new(crate::push::PushDispatcher::new(
                     Arc::new(worker),
                     push_storage.clone(),
+                    task_storage.clone(),
                 )))
             } else {
                 None
@@ -643,6 +673,11 @@ impl A2aServer {
         let poller_supervisor = std::sync::Arc::clone(&self.state.cancellation_supervisor);
         let poller_interval = self.state.runtime_config.cross_instance_cancel_poll_interval;
         let push_delivery_store_for_sweep = self.state.push_delivery_store.clone();
+        let self_push_dispatcher_for_sweep = self.state.push_dispatcher.clone();
+        let sweep_interval_for_task =
+            self.state.runtime_config.push_reclaim_sweep_interval;
+        let sweep_batch_for_task =
+            self.state.runtime_config.push_reclaim_sweep_batch;
 
         let app = self.into_router();
         let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -664,51 +699,59 @@ impl A2aServer {
             poller_shutdown,
         ));
 
-        // Push-claim sweep loop (ADR-011 §10.5). Emits an observability
-        // gauge on expired-but-non-terminal rows so operators can alert
-        // on stuck claim accumulation. Backends may piggy-back retention
-        // cleanup of terminal claims here; the return value is the
-        // eligibility count.
-        let sweep_handle = push_delivery_store_for_sweep.as_ref().map(|store| {
-            let store = store.clone();
-            let shutdown = shutdown.clone();
-            // Interval tuned to keep the gauge fresh without
-            // hammering storage. One minute is a reasonable default
-            // for a count-only query; adopters that want a tighter
-            // cadence can swap in their own background task.
-            let interval = Duration::from_secs(60);
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(interval);
-                ticker.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Delay,
-                );
-                loop {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => break,
-                        _ = ticker.tick() => {
-                            match store.sweep_expired_claims().await {
-                                Ok(count) if count > 0 => {
-                                    tracing::warn!(
-                                        target: "turul_a2a::push_claims_expired",
-                                        count,
-                                        "expired non-terminal push claim rows \
-                                         observed; investigate storage or stuck deliveries"
-                                    );
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    tracing::error!(
-                                        target: "turul_a2a::push_sweep_error",
-                                        error = %e,
-                                        "push claim sweep failed"
-                                    );
+        // Push-claim reclaim-and-redispatch loop (ADR-011 §10.5).
+        // Every `push_reclaim_sweep_interval` we pull up to
+        // `push_reclaim_sweep_batch` expired-but-non-terminal rows
+        // and hand each to the dispatcher. A row returned here means
+        // some earlier delivery attempt could not finalise (terminal
+        // store write exhausted its bounded retry) — the sweeper's
+        // job is to drive those back to terminal by re-POSTing,
+        // rather than just counting them for observability.
+        let sweep_handle = match (
+            push_delivery_store_for_sweep,
+            self_push_dispatcher_for_sweep,
+        ) {
+            (Some(store), Some(dispatcher)) => {
+                let shutdown = shutdown.clone();
+                let interval = sweep_interval_for_task;
+                let batch = sweep_batch_for_task;
+                Some(tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(interval);
+                    ticker.set_missed_tick_behavior(
+                        tokio::time::MissedTickBehavior::Delay,
+                    );
+                    loop {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            _ = ticker.tick() => {
+                                match store.list_reclaimable_claims(batch).await {
+                                    Ok(rows) if !rows.is_empty() => {
+                                        tracing::warn!(
+                                            target: "turul_a2a::push_claims_reclaimed",
+                                            count = rows.len(),
+                                            "reclaim sweep found expired non-terminal \
+                                             push claims; redispatching"
+                                        );
+                                        for row in rows {
+                                            dispatcher.redispatch_one(row).await;
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        tracing::error!(
+                                            target: "turul_a2a::push_sweep_error",
+                                            error = %e,
+                                            "push claim sweep failed"
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            })
-        });
+                }))
+            }
+            _ => None,
+        };
 
         let serve_result = axum::serve(listener, app).await;
 

@@ -25,25 +25,29 @@
 //! # Transient-store-error handling
 //!
 //! If the worker reports [`DeliveryReport::TransientStoreError`]
-//! after its own bounded retries, the POST succeeded but the terminal
-//! row is still non-terminal. The dispatcher logs a warning and
-//! returns — the claim row remains open until it expires, at which
-//! point `claim_delivery` will re-claim on its next call for the same
-//! tuple. Today re-claim only happens on a new task event. A
-//! dedicated reclaim-and-redispatch sweeper that walks expired
-//! non-terminal claim rows and re-invokes `deliver()` without a new
-//! event is a planned addition; until then, operators should watch
-//! the `sweep_expired_claims` gauge and the tracing warnings emitted
-//! here for stuck rows.
+//! after its own bounded retries, the POST succeeded but the
+//! terminal row is still non-terminal. The dispatcher logs a warning
+//! and returns; the row stays expired and non-terminal on storage.
+//! The server's reclaim-and-redispatch sweep loop (see
+//! [`crate::server::A2aServer::run`]) enumerates such rows via
+//! [`crate::push::A2aPushDeliveryStore::list_reclaimable_claims`]
+//! and drives each through [`PushDispatcher::redispatch_one`]. Each
+//! redispatch re-claims atomically (the stored row is expired and
+//! non-terminal, so `claim_delivery` increments the generation) and
+//! invokes the worker, which at-least-once semantics allow to
+//! re-POST. Rows whose task or push config has since been deleted
+//! are moved to `Abandoned` by the sweeper so they stop being
+//! reclaimable.
 
 use std::sync::Arc;
 
 use turul_a2a_types::Task;
 use url::Url;
 
+use crate::push::claim::ReclaimableClaim;
 use crate::push::delivery::{DeliveryReport, PushDeliveryWorker, PushTarget};
 use crate::push::secret::Secret;
-use crate::storage::A2aPushNotificationStorage;
+use crate::storage::{A2aPushNotificationStorage, A2aTaskStorage};
 use crate::streaming::StreamEvent;
 
 /// Dispatcher of push notifications from durable commit events.
@@ -58,14 +62,20 @@ use crate::streaming::StreamEvent;
 pub struct PushDispatcher {
     worker: Arc<PushDeliveryWorker>,
     push_storage: Arc<dyn A2aPushNotificationStorage>,
+    task_storage: Arc<dyn A2aTaskStorage>,
 }
 
 impl PushDispatcher {
     pub fn new(
         worker: Arc<PushDeliveryWorker>,
         push_storage: Arc<dyn A2aPushNotificationStorage>,
+        task_storage: Arc<dyn A2aTaskStorage>,
     ) -> Self {
-        Self { worker, push_storage }
+        Self {
+            worker,
+            push_storage,
+            task_storage,
+        }
     }
 
     /// Dispatch deliveries for a batch of events just committed for a task.
@@ -77,10 +87,20 @@ impl PushDispatcher {
     /// (event, config) pair so a slow receiver for one config cannot
     /// hold up deliveries to other configs on the same task.
     ///
+    /// `owner` is recorded on the claim row so the reclaim sweeper can
+    /// re-load the task via the owner-scoped `A2aTaskStorage::get_task`
+    /// without opening a new unscoped read path.
+    ///
     /// This call never awaits; it returns after spawning. Failures
     /// inside deliveries land in the push-delivery store's
     /// failed-delivery ledger; callers do not see per-delivery errors.
-    pub fn dispatch(&self, tenant: String, task: Task, events: Vec<(u64, StreamEvent)>) {
+    pub fn dispatch(
+        &self,
+        tenant: String,
+        owner: String,
+        task: Task,
+        events: Vec<(u64, StreamEvent)>,
+    ) {
         // Early-filter terminal events so we skip the list_configs
         // round-trip on tasks that aren't actually terminating.
         let terminal_seqs: Vec<u64> = events
@@ -135,7 +155,8 @@ impl PushDispatcher {
 
             for seq in &terminal_seqs {
                 for cfg in &configs {
-                    let Some(target) = PushTarget::from_config(&tenant, &task_id, *seq, cfg)
+                    let Some(target) =
+                        PushTarget::from_config(&tenant, &owner, &task_id, *seq, cfg)
                     else {
                         continue;
                     };
@@ -170,6 +191,126 @@ impl PushDispatcher {
             }
         });
     }
+
+    /// Redispatch one previously-stuck claim row.
+    ///
+    /// Called by the server's reclaim-and-redispatch loop on rows
+    /// returned by [`crate::push::A2aPushDeliveryStore::list_reclaimable_claims`].
+    /// The sweeper does not hold any claim itself — it only enumerates
+    /// rows. This method assembles the target the same way the
+    /// dispatch-on-event path does, then invokes
+    /// [`PushDeliveryWorker::deliver`], which re-claims the row
+    /// atomically (the stored row is expired and non-terminal, so
+    /// `claim_delivery` increments the generation and resets status
+    /// to `Pending` before proceeding).
+    ///
+    /// Missing task or missing config causes the redispatch to still
+    /// claim the row and record a terminal `Abandoned` outcome so
+    /// the row stops being reclaimable. The worker's existing
+    /// `persist_terminal` path performs that commit atomically; if
+    /// the write fails with `TransientStoreError` we log and leave
+    /// the row for the next sweep tick.
+    pub async fn redispatch_one(&self, claim: ReclaimableClaim) {
+        use crate::push::claim::AbandonedReason;
+
+        let ReclaimableClaim {
+            tenant,
+            owner,
+            task_id,
+            event_sequence,
+            config_id,
+        } = claim;
+
+        let config = self
+            .push_storage
+            .get_config(&tenant, &task_id, &config_id)
+            .await
+            .ok()
+            .flatten();
+
+        let task = self
+            .task_storage
+            .get_task(&tenant, &task_id, &owner, None)
+            .await
+            .ok()
+            .flatten();
+
+        match (task, config) {
+            (Some(task), Some(cfg)) => {
+                let Some(target) =
+                    PushTarget::from_config(&tenant, &owner, &task_id, event_sequence, &cfg)
+                else {
+                    // Same rationale as the dispatch path — skip
+                    // malformed-URL configs. The create-time URL
+                    // check makes this effectively unreachable; a
+                    // future abandon-by-URL API would also live
+                    // behind this branch.
+                    return;
+                };
+                let payload = match serde_json::to_vec(&task) {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let log_tenant = target.tenant.clone();
+                let log_task = target.task_id.clone();
+                let log_cfg = target.config_id.clone();
+                let log_seq = target.event_sequence;
+                let report = self.worker.deliver(&target, &payload).await;
+                if matches!(report, DeliveryReport::TransientStoreError) {
+                    tracing::warn!(
+                        target: "turul_a2a::push_redispatch_stuck",
+                        tenant = %log_tenant,
+                        task_id = %log_task,
+                        config_id = %log_cfg,
+                        event_sequence = log_seq,
+                        "reclaim redispatch POST succeeded but terminal \
+                         claim write still did not persist"
+                    );
+                }
+            }
+            (task, cfg) => {
+                // Either the task or the config was deleted between
+                // the original dispatch and this reclaim sweep. The
+                // row should be Abandoned so it stops showing up as
+                // reclaimable. Build a synthetic target just to
+                // route through the worker's claim + record-terminal
+                // path; payload is unused because we skip the POST.
+                let abandon_reason = if task.is_none() {
+                    AbandonedReason::TaskDeleted
+                } else {
+                    AbandonedReason::ConfigDeleted
+                };
+                let url = cfg
+                    .as_ref()
+                    .and_then(|c| Url::parse(&c.url).ok())
+                    // Placeholder URL if config is gone — only used
+                    // for PushTarget construction; the worker never
+                    // POSTs because we short-circuit to Abandoned.
+                    .unwrap_or_else(|| {
+                        Url::parse("https://invalid.abandoned.push/").expect("static")
+                    });
+                let target = PushTarget {
+                    tenant: tenant.clone(),
+                    owner: owner.clone(),
+                    task_id: task_id.clone(),
+                    event_sequence,
+                    config_id: config_id.clone(),
+                    url,
+                    auth_scheme: String::new(),
+                    auth_credentials: Secret::new(String::new()),
+                    token: None,
+                };
+                // Claim via the worker's helper, then record
+                // Abandoned under our fencing token. Ignore errors:
+                // at-least-once is about receiver semantics; here
+                // we're just trying to mark the row dead.
+                let _ = self
+                    .worker
+                    .abandon_reclaimed(&target, abandon_reason)
+                    .await;
+            }
+        }
+    }
 }
 
 /// Deliver only on terminal status events (ADR-011 §2 + §13.11).
@@ -186,6 +327,7 @@ impl PushTarget {
     /// here so the whole dispatch run isn't poisoned by one bad config.
     pub fn from_config(
         tenant: &str,
+        owner: &str,
         task_id: &str,
         event_sequence: u64,
         cfg: &turul_a2a_proto::TaskPushNotificationConfig,
@@ -202,6 +344,7 @@ impl PushTarget {
         };
         Some(PushTarget {
             tenant: tenant.to_string(),
+            owner: owner.to_string(),
             task_id: task_id.to_string(),
             event_sequence,
             config_id: cfg.id.clone(),
@@ -277,7 +420,7 @@ mod tests {
                 credentials: "CRED-Y".into(),
             }),
         };
-        let t = PushTarget::from_config("t", "task-1", 42, &cfg).expect("valid target");
+        let t = PushTarget::from_config("t", "anonymous", "task-1", 42, &cfg).expect("valid target");
         assert_eq!(t.config_id, "cfg-A");
         assert_eq!(t.event_sequence, 42);
         assert_eq!(t.auth_scheme, "Bearer");
@@ -296,6 +439,6 @@ mod tests {
             token: String::new(),
             authentication: None,
         };
-        assert!(PushTarget::from_config("t", "task-1", 1, &cfg).is_none());
+        assert!(PushTarget::from_config("t", "anonymous", "task-1", 1, &cfg).is_none());
     }
 }

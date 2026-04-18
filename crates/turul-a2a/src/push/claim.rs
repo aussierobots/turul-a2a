@@ -144,6 +144,7 @@ pub trait A2aPushDeliveryStore: Send + Sync {
         event_sequence: u64,
         config_id: &str,
         claimant: &str,
+        owner: &str,
         claim_expiry: Duration,
     ) -> Result<DeliveryClaim, A2aStorageError>;
 
@@ -289,6 +290,34 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     /// counted regardless of age.
     async fn sweep_expired_claims(&self) -> Result<u64, A2aStorageError>;
 
+    /// Enumerate expired-but-non-terminal claim rows so the server's
+    /// reclaim-and-redispatch loop can retry stuck deliveries.
+    ///
+    /// A row is returned when, at query time:
+    /// - `claimed_at + claim_expiry < now` (expired relative to the
+    ///   `claim_expiry` that was in effect for the most recent
+    ///   claim), AND
+    /// - `status ∈ {Pending, Attempting}` (non-terminal).
+    ///
+    /// `Succeeded` / `GaveUp` / `Abandoned` rows are never returned.
+    ///
+    /// Results are returned in any order; the framework sweeper
+    /// bounds the workload by passing a `limit` and iterating tick
+    /// by tick until the load catches up. Backends MAY return fewer
+    /// than `limit` rows even when more are available (e.g., a
+    /// DynamoDB scan page boundary) — callers treat any row count
+    /// below `limit` as the normal stopping signal for this tick.
+    ///
+    /// The returned [`ReclaimableClaim`] carries exactly the key
+    /// identifiers plus `owner` so the sweeper can call
+    /// `A2aTaskStorage::get_task` and `A2aPushNotificationStorage::get_config`
+    /// to reassemble the delivery target without opening an
+    /// unscoped read path on the task store.
+    async fn list_reclaimable_claims(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ReclaimableClaim>, A2aStorageError>;
+
     /// Operator inspection: list failed deliveries for a tenant.
     ///
     /// Returns rows with status `GaveUp` whose `gave_up_at >= since`,
@@ -324,6 +353,13 @@ pub struct DeliveryClaim {
     /// back on `record_delivery_outcome` as one half of the fencing
     /// identity.
     pub claimant: String,
+
+    /// Owner string recorded on the claim row. Kept here (rather than
+    /// looked up via the push-config row) so the reclaim sweep path
+    /// can call `A2aTaskStorage::get_task` without introducing a new
+    /// unscoped read method. Persisted from the first
+    /// `claim_delivery` call and not changed on re-claim.
+    pub owner: String,
 
     /// Monotonic per-tuple fencing token. Starts at `1` on the first
     /// successful claim; increments by `1` on each re-claim after
@@ -535,4 +571,22 @@ pub struct FailedDelivery {
     pub delivery_attempt_count: u32,
     pub last_http_status: Option<u16>,
     pub last_error_class: DeliveryErrorClass,
+}
+
+/// Row returned by
+/// [`A2aPushDeliveryStore::list_reclaimable_claims`]. Carries just
+/// enough identity for the sweeper to reassemble the target:
+/// `(tenant, owner, task_id, event_sequence, config_id)`. Owner is
+/// persisted on the claim row by `claim_delivery` so the reclaim
+/// path can call the owner-scoped
+/// [`crate::storage::A2aTaskStorage::get_task`] without a separate
+/// unscoped read method.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ReclaimableClaim {
+    pub tenant: String,
+    pub owner: String,
+    pub task_id: String,
+    pub event_sequence: u64,
+    pub config_id: String,
 }
