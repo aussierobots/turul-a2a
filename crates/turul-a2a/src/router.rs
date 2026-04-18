@@ -53,6 +53,13 @@ pub struct AppState {
     /// reads. Use `set_cancel_requested` on `task_storage` for marker
     /// writes (owner-scoped, handler-safe).
     pub cancellation_supervisor: Arc<dyn crate::storage::A2aCancellationSupervisor>,
+
+    /// Push-delivery coordination store (ADR-011 §10). `None` on
+    /// deployments that do not wire a `PushDeliveryWorker`; the
+    /// push config CRUD paths continue to work without it —
+    /// configs are stored, just not delivered. Set via
+    /// [`crate::server::A2aServerBuilder::push_delivery_store`].
+    pub push_delivery_store: Option<Arc<dyn crate::push::A2aPushDeliveryStore>>,
 }
 
 /// Build the axum router with all proto-defined routes.

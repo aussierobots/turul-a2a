@@ -522,7 +522,9 @@ impl PushDeliveryWorker {
 
 enum ClaimFailure {
     AlreadyHeld,
-    Other(String),
+    // String is retained for future log/trace plumbing; silence the
+    // unused-field lint until the worker wires per-failure tracing.
+    Other(#[allow(dead_code)] String),
 }
 
 /// What `deliver` returns; used by the dispatcher to log / update

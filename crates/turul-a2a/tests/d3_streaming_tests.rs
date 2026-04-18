@@ -67,6 +67,7 @@ fn single_instance_state() -> AppState {
         runtime_config: turul_a2a::server::RuntimeConfig::default(),
         in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
+        push_delivery_store: None,
     }
 }
 
@@ -84,6 +85,7 @@ fn two_instances() -> (AppState, AppState) {
         runtime_config: turul_a2a::server::RuntimeConfig::default(),
         in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
+        push_delivery_store: None,
     };
     (make(&s), make(&s))
 }
@@ -382,6 +384,7 @@ async fn d3_no_broker_correctness_dependency() {
         runtime_config: turul_a2a::server::RuntimeConfig::default(),
         in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
+        push_delivery_store: None,
     };
 
     // Create non-terminal task with events — NO broker.notify()

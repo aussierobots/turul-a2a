@@ -54,6 +54,7 @@ fn make_state(executor: Arc<dyn AgentExecutor>) -> AppState {
         runtime_config: RuntimeConfig::default(),
         in_flight: Arc::new(InFlightRegistry::new()),
         cancellation_supervisor: storage,
+        push_delivery_store: None,
     }
 }
 

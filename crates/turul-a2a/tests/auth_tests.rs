@@ -140,6 +140,7 @@ fn state_no_auth() -> AppState {
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         event_store: Arc::new(s.clone()),
         atomic_store: Arc::new(s),
+        push_delivery_store: None,
     }
 }
 
@@ -158,6 +159,7 @@ fn state_with_auth() -> AppState {
         runtime_config: turul_a2a::server::RuntimeConfig::default(),
         in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
+        push_delivery_store: None,
     }
 }
 

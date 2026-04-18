@@ -229,6 +229,7 @@ impl LambdaA2aServerBuilder {
             runtime_config: turul_a2a::server::RuntimeConfig::default(),
             in_flight: Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
             cancellation_supervisor,
+            push_delivery_store: None,
         };
 
         let router = build_router(state);

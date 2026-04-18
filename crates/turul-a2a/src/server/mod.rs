@@ -89,6 +89,7 @@ pub struct A2aServerBuilder {
     event_store: Option<Arc<dyn crate::storage::A2aEventStore>>,
     atomic_store: Option<Arc<dyn A2aAtomicStore>>,
     cancellation_supervisor: Option<Arc<dyn crate::storage::A2aCancellationSupervisor>>,
+    push_delivery_store: Option<Arc<dyn crate::push::A2aPushDeliveryStore>>,
     bind_addr: SocketAddr,
     middleware: Vec<Arc<dyn A2aMiddleware>>,
     runtime_config: RuntimeConfig,
@@ -103,6 +104,7 @@ impl A2aServerBuilder {
             event_store: None,
             atomic_store: None,
             cancellation_supervisor: None,
+            push_delivery_store: None,
             bind_addr: ([0, 0, 0, 0], 3000).into(),
             middleware: vec![],
             runtime_config: RuntimeConfig::default(),
@@ -250,6 +252,7 @@ impl A2aServerBuilder {
             + crate::storage::A2aEventStore
             + A2aAtomicStore
             + crate::storage::A2aCancellationSupervisor
+            + crate::push::A2aPushDeliveryStore
             + Clone
             + 'static,
     {
@@ -257,7 +260,8 @@ impl A2aServerBuilder {
         self.push_storage = Some(Arc::new(storage.clone()));
         self.event_store = Some(Arc::new(storage.clone()));
         self.atomic_store = Some(Arc::new(storage.clone()));
-        self.cancellation_supervisor = Some(Arc::new(storage));
+        self.cancellation_supervisor = Some(Arc::new(storage.clone()));
+        self.push_delivery_store = Some(Arc::new(storage));
         self
     }
 
@@ -296,6 +300,21 @@ impl A2aServerBuilder {
         self
     }
 
+    /// Set the push delivery claim store individually (ADR-011 §10).
+    ///
+    /// Required when push-notification delivery is enabled in the
+    /// deployment. `.storage()` wires this automatically from a unified
+    /// backend; use this setter only for mixed-backend tests or when
+    /// running against an external push-coordination service. Prefer
+    /// `.storage()` for ADR-009 same-backend compliance.
+    pub fn push_delivery_store(
+        mut self,
+        store: impl crate::push::A2aPushDeliveryStore + 'static,
+    ) -> Self {
+        self.push_delivery_store = Some(Arc::new(store));
+        self
+    }
+
     pub fn bind(mut self, addr: impl Into<SocketAddr>) -> Self {
         self.bind_addr = addr.into();
         self
@@ -328,7 +347,9 @@ impl A2aServerBuilder {
             .unwrap_or_else(|| Arc::new(default_storage.clone()));
         let cancellation_supervisor: Arc<dyn crate::storage::A2aCancellationSupervisor> = self
             .cancellation_supervisor
-            .unwrap_or_else(|| Arc::new(default_storage));
+            .unwrap_or_else(|| Arc::new(default_storage.clone()));
+        let push_delivery_store: Option<Arc<dyn crate::push::A2aPushDeliveryStore>> =
+            self.push_delivery_store;
 
         // Same-backend enforcement (ADR-009): all storage traits must share the same backend.
         let task_backend = task_storage.backend_name();
@@ -347,6 +368,37 @@ impl A2aServerBuilder {
                  cancellation_supervisor={supervisor_backend}. \
                  ADR-009 requires all storage traits to share the same backend."
             )));
+        }
+        if let Some(push_delivery) = push_delivery_store.as_ref() {
+            let push_delivery_backend = push_delivery.backend_name();
+            if task_backend != push_delivery_backend {
+                return Err(A2aError::Internal(format!(
+                    "Storage backend mismatch: task={task_backend}, \
+                     push_delivery={push_delivery_backend}. \
+                     ADR-009 requires all storage traits to share the same backend."
+                )));
+            }
+
+            // ADR-011 §10.3: claim expiry must exceed the worst-case retry
+            // horizon so a claim held by a healthy worker is never mis-
+            // classified as stale mid-retry. Upper bound for the horizon
+            // is `max_attempts * backoff_cap` (every attempt waits the cap),
+            // which is conservative and independent of jitter.
+            let retry_horizon = self
+                .runtime_config
+                .push_backoff_cap
+                .saturating_mul(self.runtime_config.push_max_attempts as u32);
+            if self.runtime_config.push_claim_expiry <= retry_horizon {
+                return Err(A2aError::Internal(format!(
+                    "push_claim_expiry ({:?}) must be greater than retry horizon \
+                     (push_max_attempts={} * push_backoff_cap={:?} = {:?}). \
+                     Raise push_claim_expiry or lower push_max_attempts/push_backoff_cap.",
+                    self.runtime_config.push_claim_expiry,
+                    self.runtime_config.push_max_attempts,
+                    self.runtime_config.push_backoff_cap,
+                    retry_horizon
+                )));
+            }
         }
 
         // Collect and merge security contributions
@@ -369,6 +421,7 @@ impl A2aServerBuilder {
                 runtime_config: self.runtime_config,
                 in_flight: Arc::new(crate::server::in_flight::InFlightRegistry::new()),
                 cancellation_supervisor,
+                push_delivery_store,
             },
             merged_security: merged,
             bind_addr: self.bind_addr,
@@ -530,6 +583,7 @@ impl A2aServer {
             runtime_config: self.state.runtime_config,
             in_flight: self.state.in_flight,
             cancellation_supervisor: self.state.cancellation_supervisor,
+            push_delivery_store: None,
         };
 
         build_router(augmented_state)
@@ -826,5 +880,92 @@ mod tests {
         assert_eq!(cfg.blocking_task_timeout, defaults.blocking_task_timeout);
         assert_eq!(cfg.push_max_attempts, defaults.push_max_attempts);
         assert_eq!(cfg.allow_insecure_push_urls, defaults.allow_insecure_push_urls);
+    }
+
+    // -----------------------------------------------------------------
+    // Push delivery store wiring (ADR-011 E.5)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn unified_storage_wires_push_delivery_store() {
+        // `.storage()` must populate AppState.push_delivery_store so that
+        // a PushDeliveryWorker spawned from the built state has
+        // somewhere to claim against.
+        let server = A2aServer::builder()
+            .executor(DummyExecutor)
+            .storage(InMemoryA2aStorage::new())
+            .build()
+            .expect("build must succeed");
+        assert!(
+            server.state.push_delivery_store.is_some(),
+            "storage() must wire push_delivery_store"
+        );
+    }
+
+    #[test]
+    fn default_storage_leaves_push_delivery_store_unset() {
+        // When no storage is passed at all, push delivery is opt-in —
+        // push-config CRUD must still work but no worker gets spawned.
+        let server = A2aServer::builder()
+            .executor(DummyExecutor)
+            .build()
+            .expect("build must succeed");
+        assert!(
+            server.state.push_delivery_store.is_none(),
+            "default build must leave push_delivery_store unset"
+        );
+    }
+
+    #[test]
+    fn explicit_push_delivery_store_setter() {
+        // The individual setter exists for mixed-backend tests. It should
+        // also satisfy the same-backend check when paired with matching
+        // storage.
+        let storage = InMemoryA2aStorage::new();
+        let server = A2aServer::builder()
+            .executor(DummyExecutor)
+            .storage(storage.clone())
+            .push_delivery_store(storage)
+            .build()
+            .expect("build must succeed");
+        assert!(server.state.push_delivery_store.is_some());
+    }
+
+    #[test]
+    fn retry_horizon_violation_rejected() {
+        // push_claim_expiry <= max_attempts * backoff_cap must fail fast
+        // (ADR-011 §10.3). The in-memory delivery store is required to
+        // trigger the check.
+        let res = A2aServer::builder()
+            .executor(DummyExecutor)
+            .storage(InMemoryA2aStorage::new())
+            .push_max_attempts(10)
+            .push_backoff_cap(Duration::from_secs(60))
+            // 10 * 60s = 600s — equal to claim expiry, which is <=, so rejected.
+            .push_claim_expiry(Duration::from_secs(600))
+            .build();
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("retry horizon violation must be rejected"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("retry horizon") || msg.contains("push_claim_expiry"),
+            "error should mention retry horizon: {msg}"
+        );
+    }
+
+    #[test]
+    fn retry_horizon_satisfied_accepted() {
+        // push_claim_expiry > max_attempts * backoff_cap succeeds.
+        let server = A2aServer::builder()
+            .executor(DummyExecutor)
+            .storage(InMemoryA2aStorage::new())
+            .push_max_attempts(5)
+            .push_backoff_cap(Duration::from_secs(60))
+            .push_claim_expiry(Duration::from_secs(5 * 60 + 1))
+            .build()
+            .expect("horizon-satisfying config must build");
+        assert!(server.state.push_delivery_store.is_some());
     }
 }
