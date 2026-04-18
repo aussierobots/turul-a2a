@@ -121,7 +121,7 @@ fn parse_sse_event(text: &str) -> Option<SseEvent> {
 }
 
 // =========================================================
-// Typed streaming events (Phase 3)
+// Typed streaming events
 // =========================================================
 
 /// A typed streaming event from the server.

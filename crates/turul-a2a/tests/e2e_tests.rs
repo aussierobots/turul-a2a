@@ -1,4 +1,4 @@
-//! Phase 4: End-to-end protocol compliance tests.
+//! End-to-end protocol compliance tests.
 //!
 //! Full lifecycle scenarios exercising HTTP + JSON-RPC + SSE together.
 //! Assertions are wire-level and spec-level, not implementation-shaped.

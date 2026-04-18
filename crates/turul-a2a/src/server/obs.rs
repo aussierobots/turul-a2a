@@ -1,9 +1,10 @@
 //! Structured-event target declarations for framework observability.
 //!
-//! 0.1.x ships structured `tracing` events rather than a committed metrics
-//! backend. The targets below are the stable contract adopters subscribe to
-//! when wiring their own telemetry. Future phases add events at additional
-//! targets; the naming scheme is `turul_a2a::<component>_<event>`.
+//! The framework ships structured `tracing` events rather than a committed
+//! metrics backend. The targets below are the stable contract adopters
+//! subscribe to when wiring their own telemetry. Additional framework
+//! events should add targets here; the naming scheme is
+//! `turul_a2a::<component>_<event>`.
 //!
 //! Event-emission guidelines:
 //! - Every framework-internal event uses a target from this module.

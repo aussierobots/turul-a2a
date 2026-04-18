@@ -474,8 +474,9 @@ fn merge_stacked_contributions(
 /// scope maps (HashMap) have non-deterministic iteration order. PartialEq
 /// on HashMap compares by content (not order), so this is correct for
 /// HashMap but would need explicit normalization if proto ever uses
-/// BTreeMap or sorted structures. This is sufficient for v0.2 supported
-/// scheme types (API Key + HTTP Bearer).
+/// BTreeMap or sorted structures. Sufficient for the scheme types
+/// this workspace supports (API Key + HTTP Bearer); revisit if new
+/// scheme types introduce ordering-sensitive fields.
 fn schemes_equivalent(
     a: &turul_a2a_proto::SecurityScheme,
     b: &turul_a2a_proto::SecurityScheme,

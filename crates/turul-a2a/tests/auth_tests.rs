@@ -1,6 +1,6 @@
-//! Phase 3: Router auth integration tests.
+//! Router auth integration tests.
 //!
-//! Proves auth middleware runs at transport level before handlers/JSON-RPC dispatch.
+//! Proves auth middleware runs at transport level before handlers / JSON-RPC dispatch.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -227,8 +227,9 @@ async fn no_middleware_jsonrpc_works() {
 }
 
 // =========================================================
-// TODO: Tests below require Tower auth layer wired into router.
-// They will fail until Phase 3 implementation is done.
+// TODO: Tests below require the Tower auth layer wired into the
+// router before they can execute. They document the expected
+// contract and fail until that wiring lands.
 // =========================================================
 
 // Placeholder tests that document the contract.

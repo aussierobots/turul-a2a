@@ -8,7 +8,7 @@
 //! at `turul_a2a::supervisor_panic`. Tests capture events via a thread-safe
 //! `tracing_subscriber::Layer` so assertions run against event occurrence +
 //! field values, not counter increments. This is the canonical capture
-//! pattern for later phases.
+//! pattern for framework observability tests.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -278,7 +278,8 @@ async fn supervisor_sentinel_drops_on_panic_still_cleans_up() {
 /// isolation is achieved by filtering captured events by a unique `task_id`
 /// prefix per test.
 ///
-/// This is the canonical pattern for subsequent phases' observability tests.
+/// This is the canonical pattern for framework observability tests
+/// that assert tracing-event occurrence plus field values.
 #[tokio::test]
 async fn supervisor_panic_emits_structured_event() {
     let capture = global_capture();
@@ -424,8 +425,9 @@ async fn yielded_oneshot_fires_once_under_concurrent_triggers() {
 }
 
 /// Test 6 (secret handling): `secrecy::SecretBox<String>` redacts in Debug
-/// and Display. Validates the invariant that future phases (push delivery,
-/// etc.) can rely on: formatting a secret never leaks the underlying value.
+/// and Display. Validates the invariant that any framework code
+/// (push delivery and other integrations) can rely on: formatting a
+/// secret never leaks the underlying value.
 #[tokio::test]
 async fn secrecy_newtype_never_leaks_in_debug_or_display() {
     let sentinel_value = "SECRET-VALUE-DO-NOT-LEAK-48a9f7b3";

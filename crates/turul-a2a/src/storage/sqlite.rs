@@ -803,7 +803,7 @@ impl A2aEventStore for SqliteA2aStorage {
     }
 
     async fn cleanup_expired(&self) -> Result<u64, A2aStorageError> {
-        // SQLite: no TTL tracking in v0.1. No-op.
+        // SQLite has no TTL tracking; cleanup is a no-op.
         Ok(0)
     }
 }
