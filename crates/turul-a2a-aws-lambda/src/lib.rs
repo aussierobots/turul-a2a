@@ -6,7 +6,12 @@
 //! - Streaming supported via durable event store (D3)
 //! - SSE responses are buffered: task executes, events are collected, returned as one response
 //! - `POST /message:stream` executes the task within the Lambda invocation and returns all events
-//! - `GET /tasks/{id}:subscribe` replays stored events (works best for terminal tasks)
+//! - `GET /tasks/{id}:subscribe` is for tasks that are **not** in a terminal
+//!   state. Within one invocation it emits the initial `Task` snapshot,
+//!   replays stored events via `Last-Event-ID`, and closes when the task
+//!   reaches a terminal state. Subscribing to an already-terminal task
+//!   returns `UnsupportedOperationError` per A2A v1.0 §3.1.6 / ADR-010
+//!   §4.3. For retrieving a terminal task's final state use `GetTask`.
 //!
 //! Lambda streaming is request-scoped (not persistent SSE connections). The durable
 //! event store ensures events survive across invocations. Clients reconnect with

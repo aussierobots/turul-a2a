@@ -346,8 +346,20 @@ fn build_rejects_cancellation_supervisor_backend_mismatch() {
 }
 
 /// Positive test: individual setters including `.cancellation_supervisor()`
-/// on the same backend succeed. Proves the supervisor Arc lands in the
-/// built handler's AppState.
+/// on the same backend accept the combination and produce a handler
+/// without error.
+///
+/// Scope: this test proves only what `build()` returns — i.e., that the
+/// same-backend check accepts the matching supervisor and that the
+/// required-field validation is satisfied. It does NOT inspect
+/// `AppState` directly (the `LambdaA2aHandler` wraps the router with no
+/// test-only accessor). The corresponding AppState-wiring coverage lives
+/// in `crates/turul-a2a/src/server/mod.rs::tests::runtime_config_setters_survive_build`
+/// for the main server builder, and in the Phase C cancellation
+/// integration tests which exercise the supervisor via the full cancel
+/// flow. Together those give end-to-end proof that the Arc reaches the
+/// router's handler state; this test is the compile-time + build-time
+/// slice for the Lambda builder's setter surface.
 #[test]
 fn build_succeeds_with_explicit_cancellation_supervisor_same_backend() {
     let storage = InMemoryA2aStorage::new();
