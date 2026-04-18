@@ -121,26 +121,76 @@ impl PushDispatcher {
 
         tokio::spawn(async move {
             // Load every config for this task by walking the full
-            // pagination chain. Hitting only the first page —
-            // whatever backend-chosen default size that is — would
-            // silently skip deliveries to configs on later pages.
-            // The storage trait contract says `next_page_token ==
-            // ""` marks the end of iteration.
+            // pagination chain. Each page read gets a bounded retry
+            // with exponential backoff: a transient config-store
+            // blip at terminal-event commit would otherwise silently
+            // drop the whole notification (the reclaim sweeper has
+            // no claim row to walk because none has been created
+            // yet). Three attempts balances recovery against
+            // dispatch latency; persistent outages surface as an
+            // ERROR trace and the event is lost — an operator-
+            // actionable incident, not silent data loss.
+            //
+            // `next_page_token == ""` marks the end of iteration per
+            // the storage trait contract.
+            const LIST_MAX_ATTEMPTS: u32 = 3;
+            let backoffs = [
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(150),
+                std::time::Duration::from_millis(500),
+            ];
+
             let mut configs: Vec<turul_a2a_proto::TaskPushNotificationConfig> = Vec::new();
             let mut page_token: Option<String> = None;
-            loop {
-                let page = match push_storage
-                    .list_configs(&tenant, &task_id, page_token.as_deref(), None)
-                    .await
-                {
-                    Ok(p) => p,
-                    Err(_) => return,
+            let page_fetch_outcome: Result<(), crate::storage::A2aStorageError> = loop {
+                let mut last_err: Option<crate::storage::A2aStorageError> = None;
+                let page = 'retry: loop {
+                    for attempt in 0..LIST_MAX_ATTEMPTS {
+                        if attempt > 0 {
+                            tokio::time::sleep(
+                                backoffs[(attempt as usize).min(backoffs.len() - 1)],
+                            )
+                            .await;
+                        }
+                        match push_storage
+                            .list_configs(&tenant, &task_id, page_token.as_deref(), None)
+                            .await
+                        {
+                            Ok(p) => break 'retry Some(p),
+                            Err(e) => last_err = Some(e),
+                        }
+                    }
+                    break 'retry None;
                 };
-                configs.extend(page.configs);
-                if page.next_page_token.is_empty() {
-                    break;
+                match page {
+                    Some(p) => {
+                        configs.extend(p.configs);
+                        if p.next_page_token.is_empty() {
+                            break Ok(());
+                        }
+                        page_token = Some(p.next_page_token);
+                    }
+                    None => {
+                        break Err(last_err.unwrap_or_else(|| {
+                            crate::storage::A2aStorageError::DatabaseError(
+                                "list_configs exhausted retry budget without recording an error"
+                                    .into(),
+                            )
+                        }));
+                    }
                 }
-                page_token = Some(page.next_page_token);
+            };
+
+            if let Err(e) = page_fetch_outcome {
+                tracing::error!(
+                    target: "turul_a2a::push_dispatch_config_list_failed",
+                    tenant = %tenant,
+                    task_id = %task_id,
+                    error = %e,
+                    "push dispatch aborted: list_configs failed after bounded retry; \
+                     terminal event was not delivered to any push config"
+                );
+                return;
             }
             if configs.is_empty() {
                 return;
@@ -221,30 +271,60 @@ impl PushDispatcher {
             config_id,
         } = claim;
 
-        let config = self
+        // Three-way branching on each storage read: only `Ok(None)`
+        // is "deleted". `Err(_)` is a transient outage and MUST
+        // leave the row non-terminal so the next sweep tick picks
+        // it up — otherwise a short blip on the push-config or task
+        // store would terminalise perfectly-valid reclaimable rows.
+        let config_result = self
             .push_storage
             .get_config(&tenant, &task_id, &config_id)
-            .await
-            .ok()
-            .flatten();
-
-        let task = self
+            .await;
+        let task_result = self
             .task_storage
             .get_task(&tenant, &task_id, &owner, None)
-            .await
-            .ok()
-            .flatten();
+            .await;
+
+        if let Err(e) = &config_result {
+            tracing::warn!(
+                target: "turul_a2a::push_redispatch_read_error",
+                tenant = %tenant,
+                task_id = %task_id,
+                config_id = %config_id,
+                event_sequence,
+                error = %e,
+                "reclaim redispatch skipped: push-config store read failed; will retry next sweep"
+            );
+            return;
+        }
+        if let Err(e) = &task_result {
+            tracing::warn!(
+                target: "turul_a2a::push_redispatch_read_error",
+                tenant = %tenant,
+                task_id = %task_id,
+                config_id = %config_id,
+                event_sequence,
+                error = %e,
+                "reclaim redispatch skipped: task store read failed; will retry next sweep"
+            );
+            return;
+        }
+
+        let config = config_result.expect("Err handled above");
+        let task = task_result.expect("Err handled above");
 
         match (task, config) {
             (Some(task), Some(cfg)) => {
                 let Some(target) =
                     PushTarget::from_config(&tenant, &owner, &task_id, event_sequence, &cfg)
                 else {
-                    // Same rationale as the dispatch path — skip
-                    // malformed-URL configs. The create-time URL
-                    // check makes this effectively unreachable; a
-                    // future abandon-by-URL API would also live
-                    // behind this branch.
+                    // Malformed URL; create-time validation rejects
+                    // these so this is effectively unreachable. We
+                    // can't POST and can't classify under any
+                    // existing AbandonedReason, so we leave the row
+                    // for the next sweep — a future URL-validation
+                    // follow-up can promote this to a terminal
+                    // outcome.
                     return;
                 };
                 let payload = match serde_json::to_vec(&task) {
@@ -269,12 +349,9 @@ impl PushDispatcher {
                 }
             }
             (task, cfg) => {
-                // Either the task or the config was deleted between
-                // the original dispatch and this reclaim sweep. The
-                // row should be Abandoned so it stops showing up as
-                // reclaimable. Build a synthetic target just to
-                // route through the worker's claim + record-terminal
-                // path; payload is unused because we skip the POST.
+                // `Ok(None)` on either side = genuine deletion. Mark
+                // the row Abandoned so it stops being reclaimable;
+                // the sweep loop would otherwise walk it forever.
                 let abandon_reason = if task.is_none() {
                     AbandonedReason::TaskDeleted
                 } else {
@@ -283,9 +360,9 @@ impl PushDispatcher {
                 let url = cfg
                     .as_ref()
                     .and_then(|c| Url::parse(&c.url).ok())
-                    // Placeholder URL if config is gone — only used
-                    // for PushTarget construction; the worker never
-                    // POSTs because we short-circuit to Abandoned.
+                    // Placeholder URL when the config is gone — the
+                    // worker's abandon path never POSTs, so the URL
+                    // is never dialled.
                     .unwrap_or_else(|| {
                         Url::parse("https://invalid.abandoned.push/").expect("static")
                     });
@@ -300,10 +377,6 @@ impl PushDispatcher {
                     auth_credentials: Secret::new(String::new()),
                     token: None,
                 };
-                // Claim via the worker's helper, then record
-                // Abandoned under our fencing token. Ignore errors:
-                // at-least-once is about receiver semantics; here
-                // we're just trying to mark the row dead.
                 let _ = self
                     .worker
                     .abandon_reclaimed(&target, abandon_reason)

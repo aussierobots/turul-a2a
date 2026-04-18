@@ -2,28 +2,53 @@
 //!
 //! This suite exercises every core RPC defined in the A2A v1.0
 //! specification (normative proto source at
-//! `crates/turul-a2a-proto/proto/a2a.proto`) across both transport
+//! `crates/turul-a2a-proto/proto/a2a.proto`) on both transport
 //! bindings the spec requires servers to expose:
 //!
 //! - **HTTP + JSON** — per-RPC `google.api.http` bindings.
 //! - **JSON-RPC 2.0** — `POST /jsonrpc` with PascalCase method names.
 //!
+//! Per-RPC coverage matrix:
+//!
+//! | RPC                               | HTTP | JSON-RPC |
+//! |-----------------------------------|------|----------|
+//! | AgentCard (`/.well-known/...`)    |  ✅  |  n/a     |
+//! | GetExtendedAgentCard              |  ✅  |  ✅      |
+//! | SendMessage                       |  ✅  |  ✅      |
+//! | SendStreamingMessage              |  ✅  |  see SSE suite |
+//! | GetTask                           |  ✅  |  ✅      |
+//! | ListTasks                         |  ✅  |  ✅      |
+//! | CancelTask                        |  ✅  |  ✅      |
+//! | SubscribeToTask (terminal-400)    |  ✅  |  see SSE suite |
+//! | CreateTaskPushNotificationConfig  |  ✅  |  ✅      |
+//! | GetTaskPushNotificationConfig     |  ✅  |  ✅      |
+//! | ListTaskPushNotificationConfigs   |  ✅  |  ✅      |
+//! | DeleteTaskPushNotificationConfig  |  ✅  |  ✅      |
+//!
+//! AgentCard discovery is HTTP-only by spec — there is no JSON-RPC
+//! equivalent for the `.well-known` URL. Live-subscription sequencing
+//! for `SendStreamingMessage` + `SubscribeToTask` is exercised in the
+//! dedicated streaming suites (`sse_tests.rs`, `d3_streaming_tests.rs`);
+//! this file asserts only the "terminal-task subscribe returns
+//! UnsupportedOperationError" contract (§3.1.6).
+//!
 //! For each operation we assert:
 //! - the wire path + verb match the proto's `google.api.http` option,
-//! - the response envelope matches the spec (pbjson camelCase, required
-//!   fields present, JSON-RPC responses preserve the request `id`),
+//! - the response envelope matches the spec (pbjson camelCase,
+//!   required fields present, JSON-RPC responses preserve the
+//!   request `id`),
 //! - error paths carry the spec-mandated HTTP status and JSON-RPC
 //!   code, plus a `google.rpc.ErrorInfo` under `error.details`
-//!   (spec §5.4 / ADR-004).
+//!   (HTTP, AIP-193) or `error.data` (JSON-RPC 2.0) — spec §5.4 /
+//!   ADR-004.
 //!
 //! The tests stand up a single `A2aServer` router via `into_router()`
 //! so the compliance harness is hermetic — no external ports, no
-//! wiremock. Push-notification delivery is out of scope here and is
-//! covered by `push_dispatcher_server_tests.rs`; this file exercises
-//! the push *CRUD* surface for spec compliance.
+//! wiremock. Push-notification *delivery* wire mechanics are out of
+//! scope here and are covered by `push_dispatcher_server_tests.rs`;
+//! this file exercises the push *CRUD* surface.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -496,6 +521,155 @@ async fn cancel_nonexistent_task_returns_404_not_cancel_error() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn push_config_crud_roundtrip_over_jsonrpc() {
+    let router = compliance_router();
+    let (_, _, send_resp) = http_call(
+        router.clone(),
+        Method::POST,
+        "/message:send",
+        Some(http_send_body("m-compliance-jrpc-push", "x")),
+    )
+    .await;
+    let task_id = send_resp
+        .get("task")
+        .and_then(|t| t.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+    // Create via JSON-RPC.
+    let created = jsonrpc_call(
+        router.clone(),
+        "CreateTaskPushNotificationConfig",
+        serde_json::json!({
+            "id": "cfg-jrpc",
+            "taskId": task_id,
+            "url": "https://example.com/hook",
+            "token": "tok",
+            "authentication": {"scheme": "Bearer", "credentials": "c"},
+        }),
+        101,
+    )
+    .await;
+    assert_eq!(
+        created
+            .get("result")
+            .and_then(|r| r.get("id"))
+            .and_then(|v| v.as_str()),
+        Some("cfg-jrpc"),
+        "JSON-RPC create must return the registered config"
+    );
+
+    // Get via JSON-RPC.
+    let got = jsonrpc_call(
+        router.clone(),
+        "GetTaskPushNotificationConfig",
+        serde_json::json!({"taskId": task_id, "id": "cfg-jrpc"}),
+        102,
+    )
+    .await;
+    assert_eq!(
+        got.get("result")
+            .and_then(|r| r.get("url"))
+            .and_then(|v| v.as_str()),
+        Some("https://example.com/hook")
+    );
+
+    // List via JSON-RPC.
+    let listed = jsonrpc_call(
+        router.clone(),
+        "ListTaskPushNotificationConfigs",
+        serde_json::json!({"taskId": task_id}),
+        103,
+    )
+    .await;
+    let configs = listed
+        .get("result")
+        .and_then(|r| r.get("configs"))
+        .and_then(|v| v.as_array())
+        .expect("configs array");
+    assert_eq!(configs.len(), 1);
+
+    // Delete via JSON-RPC.
+    let deleted = jsonrpc_call(
+        router.clone(),
+        "DeleteTaskPushNotificationConfig",
+        serde_json::json!({"taskId": task_id, "id": "cfg-jrpc"}),
+        104,
+    )
+    .await;
+    assert!(
+        deleted.get("result").is_some(),
+        "JSON-RPC delete must return a result envelope"
+    );
+
+    // Confirm via JSON-RPC List that the config is gone.
+    let after_delete = jsonrpc_call(
+        router,
+        "ListTaskPushNotificationConfigs",
+        serde_json::json!({"taskId": task_id}),
+        105,
+    )
+    .await;
+    let configs = after_delete
+        .get("result")
+        .and_then(|r| r.get("configs"))
+        .and_then(|v| v.as_array())
+        .unwrap();
+    assert!(configs.is_empty());
+}
+
+#[tokio::test]
+async fn extended_agent_card_available_over_jsonrpc() {
+    let router = compliance_router();
+    let resp = jsonrpc_call(router, "GetExtendedAgentCard", serde_json::json!({}), 77).await;
+    // The compliance agent returns an extended card with the
+    // distinguishing description string.
+    assert_eq!(
+        resp.get("result")
+            .and_then(|r| r.get("description"))
+            .and_then(|v| v.as_str()),
+        Some("turul-a2a compliance reference (extended)"),
+        "JSON-RPC GetExtendedAgentCard must return the executor-supplied extended card"
+    );
+}
+
+#[tokio::test]
+async fn subscribe_to_task_terminal_returns_unsupported_operation() {
+    // Per A2A spec §3.1.6 (and ADR on subscribe): subscribing to an
+    // already-terminal task MUST return UnsupportedOperationError.
+    // `ComplianceAgent` completes synchronously, so the task we
+    // create via send is immediately terminal.
+    let router = compliance_router();
+    let (_, _, send_resp) = http_call(
+        router.clone(),
+        Method::POST,
+        "/message:send",
+        Some(http_send_body("m-compliance-sub", "x")),
+    )
+    .await;
+    let task_id = send_resp
+        .get("task")
+        .and_then(|t| t.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+    let (status, _, err) = http_call(
+        router,
+        Method::GET,
+        &format!("/tasks/{task_id}:subscribe"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "UnsupportedOperationError HTTP status per ADR-004"
+    );
+    assert_has_error_info(&err, "UNSUPPORTED_OPERATION");
+}
+
+#[tokio::test]
 async fn push_config_crud_roundtrip_over_http() {
     let router = compliance_router();
     let (_, _, send_resp) = http_call(
@@ -586,12 +760,20 @@ async fn push_config_crud_roundtrip_over_http() {
 
 // ---------------------------------------------------------------------------
 // A2A-Version header contract (ADR-004)
+//
+// Two explicit tests, each pinning one behaviour so a regression
+// flips exactly one assertion:
+//
+// - Default build (no `compat-v03`): missing header MUST return
+//   400 VERSION_NOT_SUPPORTED.
+// - `compat-v03` feature build: missing header MUST be accepted so
+//   a2a-sdk 0.3.x clients keep working.
 // ---------------------------------------------------------------------------
 
+#[cfg(not(feature = "compat-v03"))]
 #[tokio::test]
-async fn a2a_version_header_required_on_mutating_rpcs() {
+async fn a2a_version_missing_rejected_with_400_strict() {
     let router = compliance_router();
-    // Send without A2A-Version — rejected.
     let req = Request::builder()
         .method(Method::POST)
         .uri("/message:send")
@@ -599,15 +781,54 @@ async fn a2a_version_header_required_on_mutating_rpcs() {
         .body(Body::from(http_send_body("m-no-version", "x")))
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
-    // Either 400 VERSION_NOT_SUPPORTED (strict) or a 2xx under
-    // compat mode — the contract is that the header is accepted
-    // when present. This test pins the "missing header" behaviour
-    // matches what the framework's transport layer declares.
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "default (strict) build MUST reject missing A2A-Version with 400"
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_has_error_info(&body, "VERSION_NOT_SUPPORTED");
+}
+
+#[cfg(feature = "compat-v03")]
+#[tokio::test]
+async fn a2a_version_missing_accepted_under_compat_v03() {
+    let router = compliance_router();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/message:send")
+        .header("content-type", "application/json")
+        .body(Body::from(http_send_body("m-no-version", "x")))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
     assert!(
-        resp.status().as_u16() == 400 || resp.status().is_success(),
-        "A2A-Version missing: must be explicit 400 or compat-accepted, got {}",
+        resp.status().is_success(),
+        "compat-v03 build MUST accept missing A2A-Version (a2a-sdk 0.3.x compatibility), got {}",
         resp.status()
     );
+}
+
+#[tokio::test]
+async fn a2a_version_unsupported_value_always_rejected() {
+    let router = compliance_router();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/message:send")
+        .header("content-type", "application/json")
+        .header("A2A-Version", "9.9")
+        .body(Body::from(http_send_body("m-bad-version", "x")))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "unsupported A2A-Version must always be rejected with 400 \
+         regardless of compat feature"
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_has_error_info(&body, "VERSION_NOT_SUPPORTED");
 }
 
 // ---------------------------------------------------------------------------
