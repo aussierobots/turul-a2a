@@ -247,6 +247,244 @@ async fn framework_cancel_triggers_push_delivery_with_canceled_state() {
     drop(mock);
 }
 
+// ---------------------------------------------------------------------------
+// Dispatcher paginates through push configs.
+//
+// The storage trait exposes pagination on `list_configs`; the
+// dispatcher must walk the whole chain, not just the backend default
+// page size. Proved here with a `TinyPageStorage` that forces
+// page_size=1 regardless of the requested size, so the pagination
+// path is exercised deterministically without standing up N>50
+// configs.
+// ---------------------------------------------------------------------------
+
+/// Storage wrapper that intercepts `list_configs` to force
+/// page_size=1 pagination. Delegates every other trait method to the
+/// inner in-memory store.
+struct TinyPageStorage {
+    inner: Arc<InMemoryA2aStorage>,
+}
+
+#[async_trait]
+impl turul_a2a::storage::A2aPushNotificationStorage for TinyPageStorage {
+    fn backend_name(&self) -> &'static str {
+        turul_a2a::storage::A2aPushNotificationStorage::backend_name(&*self.inner)
+    }
+    async fn create_config(
+        &self,
+        tenant: &str,
+        config: turul_a2a_proto::TaskPushNotificationConfig,
+    ) -> Result<turul_a2a_proto::TaskPushNotificationConfig, turul_a2a::storage::A2aStorageError>
+    {
+        self.inner.create_config(tenant, config).await
+    }
+    async fn get_config(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        config_id: &str,
+    ) -> Result<Option<turul_a2a_proto::TaskPushNotificationConfig>, turul_a2a::storage::A2aStorageError>
+    {
+        self.inner.get_config(tenant, task_id, config_id).await
+    }
+    async fn list_configs(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        page_token: Option<&str>,
+        _page_size: Option<i32>,
+    ) -> Result<turul_a2a::storage::PushConfigListPage, turul_a2a::storage::A2aStorageError> {
+        // Force page_size=1 so the dispatcher must traverse the full
+        // chain to see every config.
+        self.inner.list_configs(tenant, task_id, page_token, Some(1)).await
+    }
+    async fn delete_config(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        config_id: &str,
+    ) -> Result<(), turul_a2a::storage::A2aStorageError> {
+        self.inner.delete_config(tenant, task_id, config_id).await
+    }
+}
+
+#[tokio::test]
+async fn dispatcher_paginates_through_all_push_configs() {
+    // Exactly 3 configs, each pointing at the same wiremock. With the
+    // fix the dispatcher walks all three pages and issues three POSTs;
+    // before the fix it would stop after page 1 (one POST) and the
+    // `.expect(3)` assertion on drop would fail.
+    const EXPECTED_CONFIGS: usize = 3;
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(EXPECTED_CONFIGS as u64)
+        .mount(&mock)
+        .await;
+
+    let inner = Arc::new(InMemoryA2aStorage::new());
+    let tiny_push: Arc<dyn turul_a2a::storage::A2aPushNotificationStorage> =
+        Arc::new(TinyPageStorage {
+            inner: inner.clone(),
+        });
+
+    // Manually wire an AppState via the builder's `.storage()` for
+    // task/event/atomic/supervisor, but override `.push_storage()`
+    // with the paginating wrapper. Same-backend requirement still
+    // holds — the wrapper's `backend_name()` forwards to inner.
+    let server = A2aServer::builder()
+        .executor(DummyExecutor)
+        .task_storage((*inner).clone())
+        .event_store((*inner).clone())
+        .atomic_store((*inner).clone())
+        .cancellation_supervisor((*inner).clone())
+        .push_delivery_store((*inner).clone())
+        .push_storage(TinyPageStorage {
+            inner: inner.clone(),
+        })
+        .allow_insecure_push_urls(true)
+        .cancel_handler_grace(Duration::from_millis(50))
+        .cancel_handler_poll_interval(Duration::from_millis(10))
+        .push_max_attempts(1)
+        .push_backoff_cap(Duration::from_millis(10))
+        .push_claim_expiry(Duration::from_secs(5))
+        .build()
+        .expect("server build");
+    let router = server.into_router();
+
+    // Seed a WORKING task directly so the :cancel path takes the
+    // grace-expiry → force-commit branch.
+    let task_id = "task-pagination";
+    seed_working_task(&inner, task_id).await;
+
+    // Register EXPECTED_CONFIGS configs through the router so they
+    // pass CRUD validation (URL parse, task ownership). Different
+    // config_ids ensure the dispatcher produces distinct claims.
+    let webhook = format!("{}/hook", mock.uri());
+    for i in 0..EXPECTED_CONFIGS {
+        let body = serde_json::json!({
+            "id": format!("cfg-{i}"),
+            "taskId": task_id,
+            "url": webhook,
+            "authentication": {"scheme": "Bearer", "credentials": "c"},
+        });
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/tasks/{task_id}/pushNotificationConfigs"))
+                    .header("content-type", "application/json")
+                    .header("A2A-Version", "1.0")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "cfg-{i} create");
+    }
+
+    // Drive framework-committed CANCELED through :cancel → dispatcher
+    // fans out to all configs. Confirmed unused — keeping for
+    // rustc-ignorable no-op side-effect purposes.
+    let _cancel_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/tasks/{task_id}:cancel"))
+                .header("A2A-Version", "1.0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Wait for ALL expected POSTs to arrive (spawned per-config tasks).
+    let reqs = await_n_requests(&mock, EXPECTED_CONFIGS, Duration::from_secs(3)).await;
+    assert!(reqs.len() >= EXPECTED_CONFIGS);
+
+    drop(mock);
+    // Suppress "used here" lint on the forced trait object.
+    let _ = &tiny_push;
+}
+
+// ---------------------------------------------------------------------------
+// push-config create rejects unparseable URL (ADR-011 §R1).
+//
+// The create-time URL-parse check gives operators an immediate 400
+// when the webhook URL is malformed. Without it the dispatcher would
+// silently skip bad configs at delivery time with no failed-delivery
+// row — a config typo stays invisible until someone notices
+// notifications aren't arriving.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn push_config_create_rejects_unparseable_url() {
+    let storage = InMemoryA2aStorage::new();
+    let server = A2aServer::builder()
+        .executor(DummyExecutor)
+        .storage(storage.clone())
+        .allow_insecure_push_urls(true)
+        .build()
+        .expect("server build");
+    let router = server.into_router();
+
+    let task_id = "task-bad-url";
+    seed_working_task(&storage, task_id).await;
+
+    // Malformed URL string — neither scheme nor host.
+    let bad_body = serde_json::json!({
+        "id": "cfg-bad-url",
+        "taskId": task_id,
+        "url": "not a url at all",
+        "authentication": {"scheme": "Bearer", "credentials": "c"},
+    });
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/tasks/{task_id}/pushNotificationConfigs"))
+                .header("content-type", "application/json")
+                .header("A2A-Version", "1.0")
+                .body(Body::from(bad_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "unparseable URL must be rejected at create, not deferred to dispatch"
+    );
+
+    // Empty URL also rejected.
+    let empty_body = serde_json::json!({
+        "id": "cfg-empty-url",
+        "taskId": task_id,
+        "url": "",
+        "authentication": {"scheme": "Bearer", "credentials": "c"},
+    });
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/tasks/{task_id}/pushNotificationConfigs"))
+                .header("content-type", "application/json")
+                .header("A2A-Version", "1.0")
+                .body(Body::from(empty_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 /// Executor that blocks on a notify, then completes via the sink.
 /// This mirrors the real-world "long-running task" shape: the HTTP
 /// caller doesn't block, the test registers a push config while the

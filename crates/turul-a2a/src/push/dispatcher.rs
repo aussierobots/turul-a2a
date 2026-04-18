@@ -86,17 +86,28 @@ impl PushDispatcher {
         };
 
         tokio::spawn(async move {
-            // Load all configs for this task (single page is fine —
-            // ADR-011 scope; a task with >1 page of configs is a
-            // deployment anti-pattern that the push-config CRUD can
-            // address separately).
-            let configs = match push_storage
-                .list_configs(&tenant, &task_id, None, None)
-                .await
-            {
-                Ok(page) => page.configs,
-                Err(_) => return,
-            };
+            // Load every config for this task by walking the full
+            // pagination chain. Hitting only the first page —
+            // whatever backend-chosen default size that is — would
+            // silently skip deliveries to configs on later pages.
+            // The storage trait contract says `next_page_token ==
+            // ""` marks the end of iteration.
+            let mut configs: Vec<turul_a2a_proto::TaskPushNotificationConfig> = Vec::new();
+            let mut page_token: Option<String> = None;
+            loop {
+                let page = match push_storage
+                    .list_configs(&tenant, &task_id, page_token.as_deref(), None)
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                configs.extend(page.configs);
+                if page.next_page_token.is_empty() {
+                    break;
+                }
+                page_token = Some(page.next_page_token);
+            }
             if configs.is_empty() {
                 return;
             }

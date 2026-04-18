@@ -25,14 +25,17 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use async_trait::async_trait;
 use futures::future::BoxFuture;
-use turul_a2a::push::claim::A2aPushDeliveryStore;
+use turul_a2a::push::claim::{
+    A2aPushDeliveryStore, DeliveryClaim, DeliveryOutcome, FailedDelivery,
+};
 use turul_a2a::push::delivery::{
     DeliveryReport, PushDeliveryConfig, PushDeliveryWorker, PushDnsResolver, PushTarget,
 };
 use turul_a2a::push::secret::Secret;
 use turul_a2a::push::{DeliveryErrorClass, GaveUpReason};
-use turul_a2a::storage::InMemoryA2aStorage;
+use turul_a2a::storage::{A2aStorageError, InMemoryA2aStorage};
 use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -429,6 +432,277 @@ async fn reqwest_connects_to_validated_ip_not_system_dns() {
     );
 
     // Wiremock `.expect(1)` asserts on drop.
+    drop(server);
+}
+
+// ---------------------------------------------------------------------------
+// Terminal-outcome persistence.
+//
+// If the POST succeeds but the terminal `record_delivery_outcome`
+// write fails, the worker must NOT return
+// `DeliveryReport::Succeeded`: the claim row is still non-terminal,
+// and a sweeper would legitimately re-claim and issue a duplicate
+// POST while the dispatcher treats the event as resolved. Instead
+// the worker reports `TransientStoreError` (caller/sweeper retries)
+// or `ClaimLostOrFinal` on `StaleDeliveryClaim` (another writer
+// already finalised the row — receiver may observe one extra POST,
+// which at-least-once semantics already allow per ADR-011 §5a).
+// ---------------------------------------------------------------------------
+
+/// Wrapper that delegates every call to the inner in-memory store
+/// EXCEPT terminal `record_delivery_outcome` writes, which return a
+/// configurable error. Retry (non-terminal) writes still pass through
+/// so the rest of the worker's bookkeeping is unchanged.
+struct FailingTerminalStore {
+    inner: Arc<InMemoryA2aStorage>,
+    /// Error returned on terminal outcomes. Reset per test.
+    terminal_error: Mutex<Option<A2aStorageError>>,
+}
+
+impl FailingTerminalStore {
+    fn new(inner: Arc<InMemoryA2aStorage>, err: A2aStorageError) -> Self {
+        Self {
+            inner,
+            terminal_error: Mutex::new(Some(err)),
+        }
+    }
+}
+
+#[async_trait]
+impl A2aPushDeliveryStore for FailingTerminalStore {
+    fn backend_name(&self) -> &'static str {
+        self.inner.backend_name()
+    }
+
+    async fn claim_delivery(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        config_id: &str,
+        claimant: &str,
+        claim_expiry: Duration,
+    ) -> Result<DeliveryClaim, A2aStorageError> {
+        self.inner
+            .claim_delivery(tenant, task_id, event_sequence, config_id, claimant, claim_expiry)
+            .await
+    }
+
+    async fn record_attempt_started(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        config_id: &str,
+        claimant: &str,
+        claim_generation: u64,
+    ) -> Result<u32, A2aStorageError> {
+        self.inner
+            .record_attempt_started(
+                tenant,
+                task_id,
+                event_sequence,
+                config_id,
+                claimant,
+                claim_generation,
+            )
+            .await
+    }
+
+    async fn record_delivery_outcome(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        config_id: &str,
+        claimant: &str,
+        claim_generation: u64,
+        outcome: DeliveryOutcome,
+    ) -> Result<(), A2aStorageError> {
+        let is_terminal = matches!(
+            outcome,
+            DeliveryOutcome::Succeeded { .. }
+                | DeliveryOutcome::GaveUp { .. }
+                | DeliveryOutcome::Abandoned { .. }
+        );
+        if is_terminal {
+            if let Some(err) = self.terminal_error.lock().unwrap().take() {
+                return Err(err);
+            }
+        }
+        self.inner
+            .record_delivery_outcome(
+                tenant,
+                task_id,
+                event_sequence,
+                config_id,
+                claimant,
+                claim_generation,
+                outcome,
+            )
+            .await
+    }
+
+    async fn sweep_expired_claims(&self) -> Result<u64, A2aStorageError> {
+        self.inner.sweep_expired_claims().await
+    }
+
+    async fn list_failed_deliveries(
+        &self,
+        tenant: &str,
+        since: SystemTime,
+        limit: usize,
+    ) -> Result<Vec<FailedDelivery>, A2aStorageError> {
+        self.inner.list_failed_deliveries(tenant, since, limit).await
+    }
+}
+
+#[tokio::test]
+async fn terminal_persist_failure_becomes_transient_not_succeeded() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let inner = Arc::new(InMemoryA2aStorage::new());
+    let store: Arc<dyn A2aPushDeliveryStore> = Arc::new(FailingTerminalStore::new(
+        inner.clone(),
+        A2aStorageError::DatabaseError("simulated storage outage".into()),
+    ));
+
+    // Build the worker directly so we can inject the wrapper store.
+    let mut cfg = PushDeliveryConfig::default();
+    cfg.max_attempts = 1;
+    cfg.backoff_base = Duration::from_millis(1);
+    cfg.backoff_cap = Duration::from_millis(1);
+    cfg.backoff_jitter = 0.0;
+    cfg.request_timeout = Duration::from_secs(1);
+    cfg.connect_timeout = Duration::from_millis(500);
+    cfg.read_timeout = Duration::from_secs(1);
+    cfg.claim_expiry = Duration::from_secs(60);
+    cfg.max_payload_bytes = 64 * 1024;
+    cfg.allow_insecure_urls = true;
+    let worker = PushDeliveryWorker::new(store, cfg, None, "instance-fail".into())
+        .expect("worker build");
+
+    let target = sentinel_target(&server.uri());
+
+    let report = worker.deliver(&target, b"{}").await;
+    assert_eq!(
+        report,
+        DeliveryReport::TransientStoreError,
+        "worker must NOT report Succeeded when the terminal write fails"
+    );
+
+    // Wiremock still saw the POST — the receiver received the push,
+    // which is the at-least-once contract. What matters is that the
+    // worker does not mislead the dispatcher into thinking the claim
+    // row is final.
+    drop(server);
+}
+
+#[tokio::test]
+async fn stale_claim_on_terminal_write_becomes_claim_lost() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let inner = Arc::new(InMemoryA2aStorage::new());
+    let store: Arc<dyn A2aPushDeliveryStore> = Arc::new(FailingTerminalStore::new(
+        inner.clone(),
+        A2aStorageError::StaleDeliveryClaim {
+            tenant: "tenant-1".into(),
+            task_id: "task-stale".into(),
+            event_sequence: 1,
+            config_id: "cfg-A".into(),
+        },
+    ));
+
+    let mut cfg = PushDeliveryConfig::default();
+    cfg.max_attempts = 1;
+    cfg.backoff_base = Duration::from_millis(1);
+    cfg.backoff_cap = Duration::from_millis(1);
+    cfg.backoff_jitter = 0.0;
+    cfg.request_timeout = Duration::from_secs(1);
+    cfg.connect_timeout = Duration::from_millis(500);
+    cfg.read_timeout = Duration::from_secs(1);
+    cfg.claim_expiry = Duration::from_secs(60);
+    cfg.max_payload_bytes = 64 * 1024;
+    cfg.allow_insecure_urls = true;
+    let worker = PushDeliveryWorker::new(store, cfg, None, "instance-stale".into())
+        .expect("worker build");
+    let target = sentinel_target(&server.uri());
+
+    let report = worker.deliver(&target, b"{}").await;
+    assert_eq!(
+        report,
+        DeliveryReport::ClaimLostOrFinal,
+        "StaleDeliveryClaim on terminal write means another writer finalised \
+         the row; worker reports ClaimLostOrFinal, not Succeeded"
+    );
+    drop(server);
+}
+
+// ---------------------------------------------------------------------------
+// Unauthenticated config: no Authorization header (ADR-011 §4).
+//
+// Configs with no `authentication` carry empty auth_scheme + empty
+// credentials. Emitting `Authorization: "{scheme} {credentials}"`
+// with both parts empty produces a malformed header that hardened
+// receivers reject and muddies the "this config is unauthenticated"
+// semantics. The worker omits the header entirely when scheme is
+// empty.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn unauthenticated_config_sends_no_authorization_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(InMemoryA2aStorage::new());
+    let worker = fast_worker(store, 1);
+
+    // Empty auth_scheme + empty credentials + no token — the shape a
+    // `PushTarget::from_config` produces for a config with
+    // `authentication = None` and `token = ""`.
+    let target = PushTarget {
+        tenant: "t".into(),
+        task_id: format!("task-{}", uuid::Uuid::now_v7()),
+        event_sequence: 1,
+        config_id: "cfg-noauth".into(),
+        url: Url::parse(&format!("{}/webhook", server.uri())).unwrap(),
+        auth_scheme: String::new(),
+        auth_credentials: Secret::new(String::new()),
+        token: None,
+    };
+
+    let report = worker.deliver(&target, b"{}").await;
+    assert_eq!(report, DeliveryReport::Succeeded(200));
+
+    // The recorded request must not carry an Authorization header.
+    let reqs = server
+        .received_requests()
+        .await
+        .expect("wiremock recording enabled");
+    assert_eq!(reqs.len(), 1);
+    assert!(
+        !reqs[0].headers.contains_key("authorization"),
+        "unauthenticated config must NOT set Authorization header; got headers: {:?}",
+        reqs[0].headers.keys().collect::<Vec<_>>()
+    );
+
     drop(server);
 }
 

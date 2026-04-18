@@ -194,15 +194,10 @@ impl PushDeliveryWorker {
                 Ok(c) => c,
                 Err(_e) => return DeliveryReport::UnclaimedSkip,
             };
-            let _ = self
-                .push_delivery_store
-                .record_delivery_outcome(
-                    &target.tenant,
-                    &target.task_id,
-                    target.event_sequence,
-                    &target.config_id,
-                    &claim.claimant,
-                    claim.generation,
+            return self
+                .persist_terminal(
+                    target,
+                    &claim,
                     DeliveryOutcome::GaveUp {
                         reason: GaveUpReason::PayloadTooLarge,
                         last_error_class: DeliveryErrorClass::PayloadTooLarge,
@@ -210,7 +205,6 @@ impl PushDeliveryWorker {
                     },
                 )
                 .await;
-            return DeliveryReport::GaveUp(GaveUpReason::PayloadTooLarge);
         }
 
         let claim = match self.claim(target).await {
@@ -226,15 +220,10 @@ impl PushDeliveryWorker {
             // when the pre-start count has already reached the
             // ceiling.
             if current_count >= self.config.max_attempts {
-                let _ = self
-                    .push_delivery_store
-                    .record_delivery_outcome(
-                        &target.tenant,
-                        &target.task_id,
-                        target.event_sequence,
-                        &target.config_id,
-                        &claim.claimant,
-                        claim.generation,
+                return self
+                    .persist_terminal(
+                        target,
+                        &claim,
                         DeliveryOutcome::GaveUp {
                             reason: GaveUpReason::MaxAttemptsExhausted,
                             last_error_class: DeliveryErrorClass::Timeout,
@@ -242,7 +231,6 @@ impl PushDeliveryWorker {
                         },
                     )
                     .await;
-                return DeliveryReport::GaveUp(GaveUpReason::MaxAttemptsExhausted);
             }
 
             // SSRF / scheme pre-flight.
@@ -260,15 +248,10 @@ impl PushDeliveryWorker {
                 SsrfDecision::Allow { resolved_ip } => resolved_ip,
                 SsrfDecision::Block(reason) => {
                     let (gu, ec) = ssrf_block_to_diagnostics(reason);
-                    let _ = self
-                        .push_delivery_store
-                        .record_delivery_outcome(
-                            &target.tenant,
-                            &target.task_id,
-                            target.event_sequence,
-                            &target.config_id,
-                            &claim.claimant,
-                            claim.generation,
+                    return self
+                        .persist_terminal(
+                            target,
+                            &claim,
                             DeliveryOutcome::GaveUp {
                                 reason: gu,
                                 last_error_class: ec,
@@ -276,7 +259,6 @@ impl PushDeliveryWorker {
                             },
                         )
                         .await;
-                    return DeliveryReport::GaveUp(gu);
                 }
             };
 
@@ -348,75 +330,122 @@ impl PushDeliveryWorker {
                 },
             };
 
-            let is_terminal_outcome = matches!(
-                outcome,
+            match outcome {
                 DeliveryOutcome::Succeeded { .. }
-                    | DeliveryOutcome::GaveUp { .. }
-                    | DeliveryOutcome::Abandoned { .. }
-            );
-
-            let _ = self
-                .push_delivery_store
-                .record_delivery_outcome(
-                    &target.tenant,
-                    &target.task_id,
-                    target.event_sequence,
-                    &target.config_id,
-                    &claim.claimant,
-                    claim.generation,
-                    outcome.clone(),
-                )
-                .await;
-
-            match &outcome {
-                DeliveryOutcome::Succeeded { http_status } => {
-                    return DeliveryReport::Succeeded(*http_status)
-                }
-                DeliveryOutcome::GaveUp { reason, .. } => {
-                    return DeliveryReport::GaveUp(*reason)
-                }
-                DeliveryOutcome::Abandoned { reason } => {
-                    return DeliveryReport::Abandoned(*reason)
+                | DeliveryOutcome::GaveUp { .. }
+                | DeliveryOutcome::Abandoned { .. } => {
+                    // Terminal outcome. Persist it and report based on
+                    // the durable result: if the store write fails the
+                    // worker must NOT claim success, because the claim
+                    // row is still non-terminal and a sweeper would
+                    // legitimately re-claim and POST again. See
+                    // `persist_terminal` for error-class mapping.
+                    return self.persist_terminal(target, &claim, outcome).await;
                 }
                 DeliveryOutcome::Retry {
                     http_status,
                     error_class,
                     ..
                 } => {
+                    // Non-terminal: record-and-continue. Failure to
+                    // persist this Retry row is non-fatal for
+                    // correctness — the next attempt's fenced
+                    // `record_attempt_started` reconciles via the
+                    // claim's (claimant, generation) token.
+                    let _ = self
+                        .push_delivery_store
+                        .record_delivery_outcome(
+                            &target.tenant,
+                            &target.task_id,
+                            target.event_sequence,
+                            &target.config_id,
+                            &claim.claimant,
+                            claim.generation,
+                            DeliveryOutcome::Retry {
+                                next_attempt_at: SystemTime::now()
+                                    + self.backoff_for(new_count),
+                                http_status,
+                                error_class,
+                            },
+                        )
+                        .await;
                     if current_count >= self.config.max_attempts {
-                        // Retry budget exhausted. The final attempt's
-                        // diagnostics are already live on the row via
-                        // the Retry we just recorded — but operators
-                        // read terminal state off `FailedDelivery`
-                        // (populated from GaveUp). Carry the Retry's
-                        // http_status + error_class into the GaveUp so
-                        // the failed-delivery row reflects the actual
-                        // last-seen failure (e.g., `HttpError5xx { 500 }`)
-                        // rather than a generic NetworkError sentinel.
-                        let _ = self
-                            .push_delivery_store
-                            .record_delivery_outcome(
-                                &target.tenant,
-                                &target.task_id,
-                                target.event_sequence,
-                                &target.config_id,
-                                &claim.claimant,
-                                claim.generation,
+                        // Retry budget exhausted. Commit the terminal
+                        // GaveUp with the final attempt's classified
+                        // error preserved — operators read
+                        // `FailedDelivery` rows off the terminal row,
+                        // not the intermediate Retry.
+                        return self
+                            .persist_terminal(
+                                target,
+                                &claim,
                                 DeliveryOutcome::GaveUp {
                                     reason: GaveUpReason::MaxAttemptsExhausted,
-                                    last_error_class: *error_class,
-                                    last_http_status: *http_status,
+                                    last_error_class: error_class,
+                                    last_http_status: http_status,
                                 },
                             )
                             .await;
-                        return DeliveryReport::GaveUp(GaveUpReason::MaxAttemptsExhausted);
                     }
                     tokio::time::sleep(self.backoff_for(new_count)).await;
-                    // Loop back to the next attempt.
-                    let _ = is_terminal_outcome;
                     continue;
                 }
             }
+        }
+    }
+
+    /// Commit a terminal outcome and return the matching
+    /// [`DeliveryReport`], classifying any store error so the caller
+    /// never reports success for a row that remained non-terminal.
+    ///
+    /// Mapping:
+    /// - `Ok(())` → the report matching the outcome variant.
+    /// - `Err(StaleDeliveryClaim)` → `ClaimLostOrFinal`. Another
+    ///   writer finalised the row under our fencing token, so the
+    ///   terminal state IS durable cluster-wide — just not from our
+    ///   perspective. Receivers may observe one extra POST in this
+    ///   race, which at-least-once semantics already allow
+    ///   (ADR-011 §5a).
+    /// - `Err(_)` → `TransientStoreError`. The POST happened but the
+    ///   row is still non-terminal; the sweeper will re-claim and
+    ///   (likely) re-POST. At-least-once again. The worker MUST NOT
+    ///   return `Succeeded` here, because the dispatcher would then
+    ///   treat the event as permanently resolved and lose the ability
+    ///   to retry the commit.
+    async fn persist_terminal(
+        &self,
+        target: &PushTarget,
+        claim: &DeliveryClaim,
+        outcome: DeliveryOutcome,
+    ) -> DeliveryReport {
+        let success_report = match &outcome {
+            DeliveryOutcome::Succeeded { http_status } => {
+                DeliveryReport::Succeeded(*http_status)
+            }
+            DeliveryOutcome::GaveUp { reason, .. } => DeliveryReport::GaveUp(*reason),
+            DeliveryOutcome::Abandoned { reason } => DeliveryReport::Abandoned(*reason),
+            // Should not happen — caller is responsible for filtering
+            // Retry before calling this helper — but if it does we
+            // cannot safely claim terminal delivery.
+            DeliveryOutcome::Retry { .. } => return DeliveryReport::TransientStoreError,
+        };
+
+        match self
+            .push_delivery_store
+            .record_delivery_outcome(
+                &target.tenant,
+                &target.task_id,
+                target.event_sequence,
+                &target.config_id,
+                &claim.claimant,
+                claim.generation,
+                outcome,
+            )
+            .await
+        {
+            Ok(()) => success_report,
+            Err(A2aStorageError::StaleDeliveryClaim { .. }) => DeliveryReport::ClaimLostOrFinal,
+            Err(_) => DeliveryReport::TransientStoreError,
         }
     }
 
@@ -482,10 +511,6 @@ impl PushDeliveryWorker {
 
         let mut req = client
             .post(target.url.clone())
-            .header(
-                "Authorization",
-                format!("{} {}", target.auth_scheme, target.auth_credentials.expose()),
-            )
             .header("Content-Type", "application/json")
             .header(
                 "User-Agent",
@@ -495,6 +520,18 @@ impl PushDeliveryWorker {
                 "X-Turul-Event-Sequence",
                 target.event_sequence.to_string(),
             );
+        // ADR-011 §4: omit the `Authorization` header entirely when
+        // the config has no authentication. Emitting an empty
+        // `"{scheme} {creds}"` value — as the earlier implementation
+        // did — can be rejected by hardened receivers that refuse
+        // malformed auth headers, and it muddies the semantics of
+        // "this config is unauthenticated".
+        if !target.auth_scheme.is_empty() {
+            req = req.header(
+                "Authorization",
+                format!("{} {}", target.auth_scheme, target.auth_credentials.expose()),
+            );
+        }
         if let Some(tok) = &target.token {
             req = req.header("X-Turul-Push-Token", tok.expose());
         }

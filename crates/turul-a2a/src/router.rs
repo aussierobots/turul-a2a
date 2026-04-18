@@ -1330,6 +1330,23 @@ pub(crate) async fn core_create_push_config(
         })?;
     config.task_id = task_id.to_string();
 
+    // ADR-011 §R1: URL must parse at CRUD time. The dispatcher used
+    // to silently skip unparseable URLs with no failed-delivery row,
+    // so an operator who mistyped the webhook had no feedback loop.
+    // Scheme (http/https) and SSRF checks still happen at delivery
+    // time — those depend on runtime flags (`allow_insecure_push_urls`)
+    // the CRUD call does not see.
+    if config.url.is_empty() {
+        return Err(A2aError::InvalidRequest {
+            message: "push config url is required".into(),
+        });
+    }
+    if let Err(e) = url::Url::parse(&config.url) {
+        return Err(A2aError::InvalidRequest {
+            message: format!("push config url is not a valid URL: {e}"),
+        });
+    }
+
     let created = state.push_storage.create_config(tenant, config).await.map_err(A2aError::from)?;
     Ok(Json(serde_json::to_value(&created).unwrap_or_default()))
 }
