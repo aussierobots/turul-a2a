@@ -1476,6 +1476,117 @@ pub async fn test_terminal_cas_rejects_sequential_second_terminal(
     );
 }
 
+// =========================================================
+// ADR-012 cancel-marker parity (phase C)
+// =========================================================
+
+/// CS-001: `set_cancel_requested` + `supervisor_get_cancel_requested`
+/// round-trip. After set, the marker is observable via the supervisor
+/// read path.
+pub async fn test_cancel_marker_roundtrip(
+    tasks: &dyn A2aTaskStorage,
+    supervisor: &dyn crate::storage::A2aCancellationSupervisor,
+) {
+    let task = make_task("cm-rt-1", "ctx");
+    tasks.create_task("default", "owner-cm", task).await.unwrap();
+    // Advance to Working so the marker write is eligible.
+    tasks
+        .update_task_status("default", "cm-rt-1", "owner-cm", TaskStatus::new(TaskState::Working))
+        .await
+        .unwrap();
+
+    // Before: marker is false.
+    assert!(!supervisor
+        .supervisor_get_cancel_requested("default", "cm-rt-1")
+        .await
+        .unwrap());
+
+    // Set the marker (owner-scoped).
+    tasks
+        .set_cancel_requested("default", "cm-rt-1", "owner-cm")
+        .await
+        .unwrap();
+
+    // After: marker is true.
+    assert!(supervisor
+        .supervisor_get_cancel_requested("default", "cm-rt-1")
+        .await
+        .unwrap());
+
+    // Idempotent: setting again is a successful no-op.
+    tasks
+        .set_cancel_requested("default", "cm-rt-1", "owner-cm")
+        .await
+        .unwrap();
+    assert!(supervisor
+        .supervisor_get_cancel_requested("default", "cm-rt-1")
+        .await
+        .unwrap());
+}
+
+/// CS-002: `supervisor_list_cancel_requested` returns only the marked
+/// subset and excludes terminal tasks. Tests the batch API parity.
+pub async fn test_supervisor_list_cancel_requested_parity(
+    tasks: &dyn A2aTaskStorage,
+    atomic: &dyn A2aAtomicStore,
+    supervisor: &dyn crate::storage::A2aCancellationSupervisor,
+) {
+    // Create 4 tasks: t1 marked+Working, t2 unmarked+Working,
+    // t3 marked+Completed (terminal → excluded), t4 nonexistent.
+    for id in ["cm-list-1", "cm-list-2", "cm-list-3"] {
+        let task = make_task(id, "ctx-list");
+        tasks.create_task("default", "owner-list", task).await.unwrap();
+        // Advance each into Working so we can mark and set terminal later.
+        atomic
+            .update_task_status_with_events(
+                "default",
+                id,
+                "owner-list",
+                TaskStatus::new(TaskState::Working),
+                vec![],
+            )
+            .await
+            .unwrap();
+    }
+
+    // Mark t1 and t3.
+    tasks
+        .set_cancel_requested("default", "cm-list-1", "owner-list")
+        .await
+        .unwrap();
+    tasks
+        .set_cancel_requested("default", "cm-list-3", "owner-list")
+        .await
+        .unwrap();
+    // Transition t3 to COMPLETED.
+    atomic
+        .update_task_status_with_events(
+            "default",
+            "cm-list-3",
+            "owner-list",
+            TaskStatus::new(TaskState::Completed),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    let result = supervisor
+        .supervisor_list_cancel_requested(
+            "default",
+            &[
+                "cm-list-1".to_string(),
+                "cm-list-2".to_string(),
+                "cm-list-3".to_string(),
+                "cm-list-4".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Only t1 is marked AND non-terminal. t2 unmarked, t3 terminal, t4 absent.
+    assert_eq!(result, vec!["cm-list-1".to_string()]);
+}
+
 /// AT-CAS-003: distinct error variants — `InvalidTransition` is NOT
 /// conflated with `TerminalStateAlreadySet`. Callers (e.g. phase D's
 /// `EventSink::closed` translation) rely on this distinction.

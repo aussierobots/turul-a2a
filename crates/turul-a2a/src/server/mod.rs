@@ -85,6 +85,7 @@ pub struct A2aServerBuilder {
     push_storage: Option<Arc<dyn A2aPushNotificationStorage>>,
     event_store: Option<Arc<dyn crate::storage::A2aEventStore>>,
     atomic_store: Option<Arc<dyn A2aAtomicStore>>,
+    cancellation_supervisor: Option<Arc<dyn crate::storage::A2aCancellationSupervisor>>,
     bind_addr: SocketAddr,
     middleware: Vec<Arc<dyn A2aMiddleware>>,
     runtime_config: RuntimeConfig,
@@ -98,6 +99,7 @@ impl A2aServerBuilder {
             push_storage: None,
             event_store: None,
             atomic_store: None,
+            cancellation_supervisor: None,
             bind_addr: ([0, 0, 0, 0], 3000).into(),
             middleware: vec![],
             runtime_config: RuntimeConfig::default(),
@@ -251,13 +253,26 @@ impl A2aServerBuilder {
             + A2aPushNotificationStorage
             + crate::storage::A2aEventStore
             + A2aAtomicStore
+            + crate::storage::A2aCancellationSupervisor
             + Clone
             + 'static,
     {
         self.task_storage = Some(Arc::new(storage.clone()));
         self.push_storage = Some(Arc::new(storage.clone()));
         self.event_store = Some(Arc::new(storage.clone()));
-        self.atomic_store = Some(Arc::new(storage));
+        self.atomic_store = Some(Arc::new(storage.clone()));
+        self.cancellation_supervisor = Some(Arc::new(storage));
+        self
+    }
+
+    /// Set the cancellation supervisor individually. Prefer `.storage()`
+    /// for ADR-009 same-backend compliance. Consumed by `:cancel`
+    /// handler (phase C) for cross-instance marker reads.
+    pub fn cancellation_supervisor(
+        mut self,
+        supervisor: impl crate::storage::A2aCancellationSupervisor + 'static,
+    ) -> Self {
+        self.cancellation_supervisor = Some(Arc::new(supervisor));
         self
     }
 
@@ -314,6 +329,9 @@ impl A2aServerBuilder {
             .unwrap_or_else(|| Arc::new(default_storage.clone()));
         let atomic_store: Arc<dyn A2aAtomicStore> = self
             .atomic_store
+            .unwrap_or_else(|| Arc::new(default_storage.clone()));
+        let cancellation_supervisor: Arc<dyn crate::storage::A2aCancellationSupervisor> = self
+            .cancellation_supervisor
             .unwrap_or_else(|| Arc::new(default_storage));
 
         // Same-backend enforcement (ADR-009): all storage traits must share the same backend.
@@ -321,13 +339,16 @@ impl A2aServerBuilder {
         let push_backend = push_storage.backend_name();
         let event_backend = event_store.backend_name();
         let atomic_backend = atomic_store.backend_name();
+        let supervisor_backend = cancellation_supervisor.backend_name();
         if task_backend != push_backend
             || task_backend != event_backend
             || task_backend != atomic_backend
+            || task_backend != supervisor_backend
         {
             return Err(A2aError::Internal(format!(
                 "Storage backend mismatch: task={task_backend}, push={push_backend}, \
-                 event={event_backend}, atomic={atomic_backend}. \
+                 event={event_backend}, atomic={atomic_backend}, \
+                 cancellation_supervisor={supervisor_backend}. \
                  ADR-009 requires all storage traits to share the same backend."
             )));
         }
@@ -350,6 +371,8 @@ impl A2aServerBuilder {
                 event_broker: TaskEventBroker::new(),
                 middleware_stack: Arc::new(MiddlewareStack::new(self.middleware)),
                 runtime_config: self.runtime_config,
+                in_flight: Arc::new(crate::server::in_flight::InFlightRegistry::new()),
+                cancellation_supervisor,
             },
             merged_security: merged,
             bind_addr: self.bind_addr,
@@ -508,6 +531,8 @@ impl A2aServer {
             event_broker: self.state.event_broker,
             middleware_stack: self.state.middleware_stack,
             runtime_config: self.state.runtime_config,
+            in_flight: self.state.in_flight,
+            cancellation_supervisor: self.state.cancellation_supervisor,
         };
 
         build_router(augmented_state)
@@ -516,13 +541,42 @@ impl A2aServer {
     /// Run the server.
     pub async fn run(self) -> Result<(), A2aError> {
         let bind_addr = self.bind_addr;
+        // Capture substrate refs for the cross-instance cancel poller
+        // before `into_router` consumes `self`. The poller uses the same
+        // Arcs for `in_flight` and `cancellation_supervisor` as the
+        // router's AppState, so a marker write from any instance is
+        // observed here within one `cross_instance_cancel_poll_interval`.
+        let poller_registry = std::sync::Arc::clone(&self.state.in_flight);
+        let poller_supervisor = std::sync::Arc::clone(&self.state.cancellation_supervisor);
+        let poller_interval = self.state.runtime_config.cross_instance_cancel_poll_interval;
+
         let app = self.into_router();
         let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
             .map_err(|e| A2aError::Internal(format!("Failed to bind: {e}")))?;
         tracing::info!("A2A server listening on {}", bind_addr);
-        axum::serve(listener, app)
-            .await
+
+        // Spawn the supervisor poll loop. A shutdown token lets us stop
+        // the poller when the server exits; for now axum::serve runs to
+        // completion so the token is never tripped (server shutdown is
+        // driven by process exit). Later: wire the token to a graceful
+        // shutdown signal.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let poller_shutdown = shutdown.clone();
+        let poller_handle = tokio::spawn(crate::server::in_flight::run_cross_instance_cancel_poller(
+            poller_registry,
+            poller_supervisor,
+            poller_interval,
+            poller_shutdown,
+        ));
+
+        let serve_result = axum::serve(listener, app).await;
+
+        // Gracefully stop the poller — relevant if axum::serve ever returns.
+        shutdown.cancel();
+        let _ = poller_handle.await;
+
+        serve_result
             .map_err(|e| A2aError::Internal(format!("Server error: {e}")))?;
         Ok(())
     }

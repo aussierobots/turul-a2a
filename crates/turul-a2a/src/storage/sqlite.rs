@@ -55,6 +55,7 @@ impl SqliteA2aStorage {
                 task_json TEXT NOT NULL,
                 context_id TEXT NOT NULL DEFAULT '',
                 status_state TEXT NOT NULL DEFAULT '',
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (tenant, task_id)
@@ -63,6 +64,23 @@ impl SqliteA2aStorage {
         .execute(&self.pool)
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+        // Additive migration for pre-0.1.4 deployments: add the ADR-012
+        // cancel_requested column if the table already exists without it.
+        // SQLite has no conditional ADD COLUMN, so we attempt the ALTER
+        // and ignore the duplicate-column error. This is the standard
+        // idempotent migration pattern for SQLite.
+        let alter_result =
+            sqlx::query("ALTER TABLE a2a_tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
+                .execute(&self.pool)
+                .await;
+        match alter_result {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {
+                // Column already present — expected on fresh installs.
+            }
+            Err(e) => return Err(A2aStorageError::DatabaseError(e.to_string())),
+        }
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS a2a_push_configs (
@@ -437,6 +455,125 @@ impl A2aTaskStorage for SqliteA2aStorage {
 
     async fn maintenance(&self) -> Result<(), A2aStorageError> {
         Ok(())
+    }
+
+    async fn set_cancel_requested(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        owner: &str,
+    ) -> Result<(), A2aStorageError> {
+        // Single SQL round-trip: only update if the row exists with this
+        // owner AND is non-terminal. rows_affected == 0 requires a second
+        // SELECT to classify (not-found/wrong-owner vs terminal).
+        let result = sqlx::query(
+            "UPDATE a2a_tasks SET cancel_requested = 1
+             WHERE tenant = ? AND task_id = ? AND owner = ?
+               AND status_state NOT IN ('Completed', 'Failed', 'Canceled', 'Rejected')",
+        )
+        .bind(tenant)
+        .bind(task_id)
+        .bind(owner)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+        if result.rows_affected() > 0 {
+            return Ok(());
+        }
+
+        // Classify the zero-rows case: read the row (ignoring owner) to
+        // decide between TaskNotFound and TerminalState.
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT owner, status_state FROM a2a_tasks
+             WHERE tenant = ? AND task_id = ?",
+        )
+        .bind(tenant)
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+        match row {
+            None => Err(A2aStorageError::TaskNotFound(task_id.to_string())),
+            Some((row_owner, _)) if row_owner != owner => {
+                // Anti-enumeration: wrong owner surfaces as TaskNotFound.
+                Err(A2aStorageError::TaskNotFound(task_id.to_string()))
+            }
+            Some((_, state_str)) => {
+                // Owner matched but state was terminal.
+                let state = match state_str.as_str() {
+                    "Completed" => turul_a2a_types::TaskState::Completed,
+                    "Failed" => turul_a2a_types::TaskState::Failed,
+                    "Canceled" => turul_a2a_types::TaskState::Canceled,
+                    "Rejected" => turul_a2a_types::TaskState::Rejected,
+                    // Idempotent no-op on a non-terminal row (this arm
+                    // is reachable if the UPDATE affected 0 rows because
+                    // cancel_requested was already set AND... no actually
+                    // the UPDATE sets = 1 regardless of prior value, so
+                    // rows_affected is 1 as long as WHERE matches. Falling
+                    // here implies something odd; return generic error.
+                    other => return Err(A2aStorageError::DatabaseError(format!(
+                        "unexpected status_state on set_cancel_requested classify: {other}"
+                    ))),
+                };
+                Err(A2aStorageError::TerminalState(state))
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl crate::storage::A2aCancellationSupervisor for SqliteA2aStorage {
+    fn backend_name(&self) -> &'static str {
+        "sqlite"
+    }
+
+    async fn supervisor_get_cancel_requested(
+        &self,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<bool, A2aStorageError> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT cancel_requested FROM a2a_tasks
+             WHERE tenant = ? AND task_id = ?
+               AND status_state NOT IN ('Completed', 'Failed', 'Canceled', 'Rejected')",
+        )
+        .bind(tenant)
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        Ok(row.map(|(v,)| v != 0).unwrap_or(false))
+    }
+
+    async fn supervisor_list_cancel_requested(
+        &self,
+        tenant: &str,
+        task_ids: &[String],
+    ) -> Result<Vec<String>, A2aStorageError> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Build an `IN (?,?,?...)` clause of the right width. sqlx does
+        // not support Vec binding directly for SQLite; explicit parameter
+        // expansion is the supported pattern.
+        let placeholders = task_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT task_id FROM a2a_tasks
+             WHERE tenant = ? AND task_id IN ({placeholders})
+               AND cancel_requested = 1
+               AND status_state NOT IN ('Completed', 'Failed', 'Canceled', 'Rejected')"
+        );
+        let mut query = sqlx::query_as::<_, (String,)>(&sql).bind(tenant);
+        for id in task_ids {
+            query = query.bind(id);
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 }
 
@@ -1156,6 +1293,20 @@ mod tests {
     async fn test_invalid_transition_distinct_from_terminal_already_set() {
         let s = storage().await;
         parity_tests::test_invalid_transition_distinct_from_terminal_already_set(&s, &s).await;
+    }
+
+    // Cancel-marker parity (ADR-012 / phase C).
+
+    #[tokio::test]
+    async fn test_cancel_marker_roundtrip() {
+        let s = storage().await;
+        parity_tests::test_cancel_marker_roundtrip(&s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_list_cancel_requested_parity() {
+        let s = storage().await;
+        parity_tests::test_supervisor_list_cancel_requested_parity(&s, &s, &s).await;
     }
 
     #[tokio::test]

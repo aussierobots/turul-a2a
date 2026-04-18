@@ -20,6 +20,8 @@ struct StoredTask {
     task: Task,
     /// Last update timestamp (spec §3.1.4: ListTasks sorted by last update time DESC).
     updated_at: String,
+    /// ADR-012 cancel-requested marker. Storage-internal; never on wire.
+    cancel_requested: bool,
 }
 
 /// Current UTC timestamp as ISO 8601 string.
@@ -119,6 +121,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
             owner: owner.to_string(),
             task: task.clone(),
             updated_at: now_iso(),
+            cancel_requested: false,
         };
         let mut tasks = self.tasks.write().await;
         tasks.insert(key, stored);
@@ -152,6 +155,9 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         let mut tasks = self.tasks.write().await;
         match tasks.get(&key) {
             Some(stored) if stored.owner == owner => {
+                // Preserve cancel_requested marker (monotonic; never
+                // cleared by a full-task replacement).
+                let cancel_requested = stored.cancel_requested;
                 tasks.insert(
                     key,
                     StoredTask {
@@ -159,6 +165,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
                         owner: owner.to_string(),
                         task,
                         updated_at: now_iso(),
+                        cancel_requested,
                     },
                 );
                 Ok(())
@@ -333,6 +340,8 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         let updated_task =
             Task::try_from(proto).map_err(|e| A2aStorageError::TypeError(e))?;
 
+        // Preserve cancel_requested (monotonic).
+        let cancel_requested = stored.cancel_requested;
         tasks.insert(
             key,
             StoredTask {
@@ -340,6 +349,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
                 owner: owner.to_string(),
                 task: updated_task.clone(),
                 updated_at: now_iso(),
+                cancel_requested,
             },
         );
 
@@ -414,6 +424,90 @@ impl A2aTaskStorage for InMemoryA2aStorage {
 
     async fn maintenance(&self) -> Result<(), A2aStorageError> {
         Ok(())
+    }
+
+    async fn set_cancel_requested(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        owner: &str,
+    ) -> Result<(), A2aStorageError> {
+        let key = (tenant.to_string(), task_id.to_string());
+        let mut tasks = self.tasks.write().await;
+        let stored = tasks
+            .get_mut(&key)
+            .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?;
+        // Owner mismatch → anti-enumeration: return TaskNotFound.
+        if stored.owner != owner {
+            return Err(A2aStorageError::TaskNotFound(task_id.to_string()));
+        }
+        // Terminal → reject per ADR-012 contract. Uses TerminalState
+        // (the state-machine-style signal); router maps to 409 at wire.
+        let state = stored
+            .task
+            .status()
+            .and_then(|s| s.state().ok())
+            .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?;
+        if turul_a2a_types::state_machine::is_terminal(state) {
+            return Err(A2aStorageError::TerminalState(state));
+        }
+        // Idempotent: already true → no-op success.
+        stored.cancel_requested = true;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::storage::A2aCancellationSupervisor for InMemoryA2aStorage {
+    fn backend_name(&self) -> &'static str {
+        "in-memory"
+    }
+
+    async fn supervisor_get_cancel_requested(
+        &self,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<bool, A2aStorageError> {
+        let key = (tenant.to_string(), task_id.to_string());
+        let tasks = self.tasks.read().await;
+        let Some(stored) = tasks.get(&key) else {
+            return Ok(false);
+        };
+        // Ignore the marker if the task is already terminal — supervisor
+        // treats "already terminal" and "no cancel needed" identically.
+        let state = stored
+            .task
+            .status()
+            .and_then(|s| s.state().ok());
+        let terminal = state
+            .map(turul_a2a_types::state_machine::is_terminal)
+            .unwrap_or(false);
+        Ok(stored.cancel_requested && !terminal)
+    }
+
+    async fn supervisor_list_cancel_requested(
+        &self,
+        tenant: &str,
+        task_ids: &[String],
+    ) -> Result<Vec<String>, A2aStorageError> {
+        let tasks = self.tasks.read().await;
+        let mut out = Vec::new();
+        for task_id in task_ids {
+            let key = (tenant.to_string(), task_id.clone());
+            if let Some(stored) = tasks.get(&key) {
+                let state = stored
+                    .task
+                    .status()
+                    .and_then(|s| s.state().ok());
+                let terminal = state
+                    .map(turul_a2a_types::state_machine::is_terminal)
+                    .unwrap_or(false);
+                if stored.cancel_requested && !terminal {
+                    out.push(task_id.clone());
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -610,6 +704,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
                 owner: owner.to_string(),
                 task: task.clone(),
                 updated_at: now_iso(),
+                cancel_requested: false,
             },
         );
 
@@ -692,6 +787,8 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         proto.status = Some(new_status.into_proto());
         let updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
 
+        // Preserve cancel_requested (monotonic).
+        let cancel_requested = stored.cancel_requested;
         tasks.insert(
             task_key,
             StoredTask {
@@ -699,6 +796,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
                 owner: owner.to_string(),
                 task: updated_task.clone(),
                 updated_at: now_iso(),
+                cancel_requested,
             },
         );
 
@@ -745,7 +843,12 @@ impl A2aAtomicStore for InMemoryA2aStorage {
             }
         }
 
-        // Replace task
+        // Replace task, preserving cancel_requested marker (monotonic;
+        // full-task replacement must not wipe it).
+        let cancel_requested = tasks
+            .get(&task_key)
+            .map(|s| s.cancel_requested)
+            .unwrap_or(false);
         tasks.insert(
             task_key,
             StoredTask {
@@ -753,6 +856,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
                 owner: owner.to_string(),
                 task,
                 updated_at: now_iso(),
+                cancel_requested,
             },
         );
 
@@ -963,6 +1067,20 @@ mod tests {
     async fn test_invalid_transition_distinct_from_terminal_already_set() {
         let s = storage();
         parity_tests::test_invalid_transition_distinct_from_terminal_already_set(&s, &s).await;
+    }
+
+    // Cancel-marker parity (ADR-012 / phase C).
+
+    #[tokio::test]
+    async fn test_cancel_marker_roundtrip() {
+        let s = storage();
+        parity_tests::test_cancel_marker_roundtrip(&s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_list_cancel_requested_parity() {
+        let s = storage();
+        parity_tests::test_supervisor_list_cancel_requested_parity(&s, &s, &s).await;
     }
 
     #[tokio::test]

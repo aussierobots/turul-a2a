@@ -146,6 +146,15 @@ impl LambdaA2aServerBuilder {
             )));
         }
 
+        // Lambda adapter uses the same-backend InMemoryA2aStorage as the
+        // cancellation supervisor default (matches the framework default).
+        // Real Lambda deployments pass a shared-storage backend via the
+        // full `.storage()` path below, which would cover the supervisor
+        // too once the API is extended. For 0.1.4 phase C, just match
+        // the builder's fallback pattern.
+        let cancellation_supervisor: Arc<dyn turul_a2a::storage::A2aCancellationSupervisor> =
+            Arc::new(turul_a2a::storage::InMemoryA2aStorage::new());
+
         let state = AppState {
             executor,
             task_storage,
@@ -154,9 +163,9 @@ impl LambdaA2aServerBuilder {
             atomic_store,
             event_broker: TaskEventBroker::new(),
             middleware_stack: Arc::new(MiddlewareStack::new(self.middleware)),
-            // Lambda adapter uses framework defaults for runtime config;
-            // future phases may expose adapter-level overrides.
             runtime_config: turul_a2a::server::RuntimeConfig::default(),
+            in_flight: Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
+            cancellation_supervisor,
         };
 
         let router = build_router(state);

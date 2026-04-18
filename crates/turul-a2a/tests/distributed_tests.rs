@@ -55,6 +55,8 @@ fn two_instances() -> (axum::Router, axum::Router) {
         event_broker: TaskEventBroker::new(), // instance A's local broker
         middleware_stack: Arc::new(MiddlewareStack::new(vec![])),
         runtime_config: turul_a2a::server::RuntimeConfig::default(),
+        in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
+        cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
     };
 
     let state_b = AppState {
@@ -66,6 +68,8 @@ fn two_instances() -> (axum::Router, axum::Router) {
         event_broker: TaskEventBroker::new(), // instance B's separate broker
         middleware_stack: Arc::new(MiddlewareStack::new(vec![])),
         runtime_config: turul_a2a::server::RuntimeConfig::default(),
+        in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
+        cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
     };
 
     (build_router(state_a), build_router(state_b))

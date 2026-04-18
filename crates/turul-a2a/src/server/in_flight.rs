@@ -252,6 +252,28 @@ impl InFlightRegistry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Snapshot of in-flight `(tenant → [task_id, ...])` groups for the
+    /// supervisor's cross-instance cancel-marker poll. Copies the keys
+    /// out of the lock so the poll body runs without holding the lock.
+    pub(crate) fn snapshot_by_tenant(&self) -> std::collections::HashMap<String, Vec<String>> {
+        let map = self
+            .map
+            .read()
+            .expect("InFlightRegistry RwLock poisoned");
+        let mut out: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (tenant, task_id) in map.keys() {
+            out.entry(tenant.clone()).or_default().push(task_id.clone());
+        }
+        out
+    }
+
+    /// Get a handle by key. Test-friendly alias for `get` to make the
+    /// cross-instance-cancel poll body explicit about the lookup intent.
+    pub(crate) fn get_handle(&self, key: &InFlightKey) -> Option<Arc<InFlightHandle>> {
+        self.get(key)
+    }
 }
 
 /// Error returned by [`InFlightRegistry::try_insert`] when the key is
@@ -370,6 +392,96 @@ impl Drop for SupervisorSentinel {
                 task_id = %task_id,
                 "supervisor task panicked; cleanup ran via SupervisorSentinel Drop"
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-instance cancel poller (ADR-012 §3/§4)
+// ---------------------------------------------------------------------------
+
+/// Run a cross-instance cancel-marker poll loop until `shutdown` is cancelled.
+///
+/// Tick interval is `interval`. On each tick:
+/// 1. Snapshot the current in-flight registry into `(tenant → [task_id…])`.
+/// 2. For each tenant, call
+///    [`crate::storage::A2aCancellationSupervisor::supervisor_list_cancel_requested`]
+///    to get the subset with the marker set.
+/// 3. Trip `cancellation` on each matching handle.
+///
+/// This bridges the cross-instance case: a `:cancel` handler on another
+/// instance writes the marker via
+/// [`crate::storage::A2aTaskStorage::set_cancel_requested`]; this poller
+/// on the executor's instance observes it and tokens the executor on
+/// this side.
+///
+/// Storage-layer errors are logged at WARN and the loop continues on
+/// the next tick — a transient storage failure must not kill
+/// cancellation propagation entirely.
+///
+/// Intended to be spawned by the server runtime at startup and shut
+/// down via the `shutdown` token when the server exits.
+pub async fn run_cross_instance_cancel_poller(
+    registry: std::sync::Arc<InFlightRegistry>,
+    supervisor: std::sync::Arc<dyn crate::storage::A2aCancellationSupervisor>,
+    interval: std::time::Duration,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.cancelled() => {
+                tracing::debug!(
+                    target: "turul_a2a::cross_instance_cancel_poll",
+                    "cross-instance cancel poller shutting down"
+                );
+                return;
+            }
+        }
+        poll_once(&registry, supervisor.as_ref()).await;
+    }
+}
+
+/// Single poll pass. Public so integration tests can drive one tick
+/// deterministically without waiting on a wall-clock interval. Not part
+/// of the stable public surface — may change without a semver bump.
+///
+/// This re-export retains the doc for discoverability; the internal
+/// name stays `poll_once` for brevity.
+pub async fn poll_once_for_tests(
+    registry: &InFlightRegistry,
+    supervisor: &dyn crate::storage::A2aCancellationSupervisor,
+) {
+    poll_once(registry, supervisor).await
+}
+
+/// Internal single-poll pass (not exposed; tests use `poll_once_for_tests`).
+async fn poll_once(
+    registry: &InFlightRegistry,
+    supervisor: &dyn crate::storage::A2aCancellationSupervisor,
+) {
+    let groups = registry.snapshot_by_tenant();
+    for (tenant, task_ids) in groups {
+        match supervisor
+            .supervisor_list_cancel_requested(&tenant, &task_ids)
+            .await
+        {
+            Ok(marked) => {
+                for task_id in marked {
+                    let key = (tenant.clone(), task_id);
+                    if let Some(handle) = registry.get_handle(&key) {
+                        handle.cancellation.cancel();
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "turul_a2a::cross_instance_cancel_poll_error",
+                    tenant = %tenant,
+                    error = %e,
+                    "cross-instance cancel poll failed; will retry next tick"
+                );
+            }
         }
     }
 }

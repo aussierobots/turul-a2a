@@ -254,11 +254,10 @@ Executor can emit progress, interrupted, and terminal events via `ctx.events`. T
   - `crates/turul-a2a/src/router.rs` — rewrite `message:send` (blocking and `return_immediately = true` paths), `message:stream`, using the in-flight registry and spawn-and-supervise pattern
   - `crates/turul-a2a/src/streaming/mod.rs` — stream events from durable store include executor-emitted sink events (via existing ADR-009 infrastructure; no new channel)
   - `crates/turul-a2a/src/server/builder.rs` — activate `blocking_task_timeout`, `timeout_abort_grace` knobs
-  - Legacy-executor-detection rule (ADR-010 §7.2) in the router: if `execute()` returns with task state terminal AND sink was never used, synthesize the corresponding event
-  - **Terminal fallback MUST route through `A2aAtomicStore::update_task_status_with_events`** (the CAS-guarded path from phase B), NOT through `update_task_with_events` (the full-replacement path). Concern from phase B review: `update_task_with_events` replaces the entire task without the terminal-CAS docstring contract, so a legacy executor's synthesized terminal could bypass the single-terminal-writer invariant and overwrite a terminal already committed by another path (e.g., `:cancel` force-commit). Two acceptable solutions, pick one in phase D:
-    - **(a)** Always convert the legacy terminal fallback into a `new_status` + synthesized event pair and call `update_task_status_with_events`. Preferred — reuses the existing CAS path.
-    - **(b)** Extend the terminal-CAS contract to `update_task_with_events` when the replacement task's status is terminal. Requires a second parity test matrix for the replacement-path CAS.
-  - A phase D guard test MUST cover the race: framework commits CANCELED via `:cancel` at T=0, legacy executor's sync `execute()` returns with `task.state = Completed` at T=1ms, framework's legacy fallback runs. Expected: persisted terminal is CANCELED (first commit), executor's synthesized terminal surfaces as `TerminalStateAlreadySet` (rejected by the CAS), and no COMPLETED event lands in the store.
+  - **Direct task-mutation executor compatibility** (ADR-010 §7.2). The existing `AgentExecutor::execute(&mut Task, ...)` signature where executors mutate the task in place and return continues to work through phase D's send-mode rewrite. This is the **pre-EventSink direct task-mutation path** — not "legacy" (we have no installed base yet; this is active dev). Phase D defines how that path coexists with `EventSink`-driven executors.
+  - **Terminal state from every path MUST go through the same CAS boundary** (non-negotiable architectural invariant, not a compatibility carveout). Phase D enforces this by detecting when `execute()` returns with the task in a terminal or interrupted state AND the executor did not use `ctx.events`, and routing the resulting event through `A2aAtomicStore::update_task_status_with_events` (CAS-guarded). **Do NOT use `update_task_with_events`** for terminal persistence; full-task replacement bypasses the single-terminal-writer invariant.
+    - Preferred phase D implementation: detect the status transition produced by the direct-mutation path and synthesize the `new_status` + corresponding event, then call `update_task_status_with_events`. Reserves `update_task_with_events` for non-status mutations (history appends, artifact metadata) that cannot affect terminal ownership.
+  - **Phase D guard test** (required): race framework `CANCELED` (committed by `:cancel` at T=0) vs an executor-produced `COMPLETED` via the direct task-mutation path (returning `task.state = Completed` at T=1ms). Assert: exactly one terminal persists, the losing side surfaces `TerminalStateAlreadySet` (or the phase D sink-equivalent), only the winner's terminal event lands in the store.
 
 ### Tests (maps 1:1 to ADR-010 §9)
 
@@ -270,7 +269,7 @@ Executor can emit progress, interrupted, and terminal events via `ctx.events`. T
 6. `cancel_vs_complete_race_deterministic` — uses phase B CAS.
 7. `multiple_subscribers_receive_identical_ordered_events`
 8. `cross_instance_executor_progress`
-9. `framework_default_fallback_for_legacy_executors` — echo-agent and existing tests continue to pass unchanged.
+9. `direct_task_mutation_executor_still_works` — echo-agent and other pre-EventSink executors that mutate `&mut task` continue to pass unchanged under the new router. Validates the §7.2 detection rule.
 10. `failed_executor_emits_failed_terminal`
 11. `blocking_timeout_cancellation_and_abort` (three sub-cases: 11a cooperative, 11b abort-fallback, 11c race-aware-loser).
 12. `single_terminal_writer_parity_via_eventsink` — verifies phase B's CAS works through the sink path.
@@ -293,11 +292,11 @@ Executor can emit progress, interrupted, and terminal events via `ctx.events`. T
 
 Landing sequence (same transitional-flag policy as phase C):
 
-1. **Development commits**: `ExecutionContext.events` field, new `message:send` / `message:stream` handlers, and `EventSink` API all live behind `#[cfg(feature = "event-sink")]`. Flag defaults **off**. Legacy synchronous executor path is default. Phase D tests run with `--features event-sink`.
-2. **Flip commit**: flag defaults **on**. Legacy path still available for rollback.
-3. **Cleanup commit** (before phase G): remove `#[cfg]` gates, delete legacy handler paths that bypassed `InFlightRegistry`, remove `event-sink` feature from `Cargo.toml`.
+1. **Development commits**: `ExecutionContext.events` field, new `message:send` / `message:stream` handlers, and `EventSink` API all live behind `#[cfg(feature = "event-sink")]`. Flag defaults **off**. Pre-EventSink direct task-mutation path is default. Phase D tests run with `--features event-sink`.
+2. **Flip commit**: flag defaults **on**. Pre-EventSink path remains reachable as the fall-through for executors that don't use `ctx.events` (detected per ADR-010 §7.2).
+3. **Cleanup commit** (before phase G): remove `#[cfg]` gates, delete any handler paths that bypassed `InFlightRegistry` during development, remove `event-sink` feature from `Cargo.toml`. The direct task-mutation path itself is NOT removed — it's a supported executor authoring style, not a compatibility shim.
 
-**Flip-to-default-on criterion**: all 15 tests green on default features; echo-agent example still works unchanged (legacy fallback per ADR-010 §7.2); at least one manual smoke run of `cargo run -p echo-agent` confirms the binary.
+**Flip-to-default-on criterion**: all 15 tests green on default features; direct task-mutation executors (echo-agent, existing test executors) still work unchanged; at least one manual smoke run of `cargo run -p echo-agent` confirms the binary.
 
 **C/D integration**: this phase and phase C share the combined C+D integration gate: merged branch must pass all ADR-010 §9 + ADR-012 §11 race tests together, on three consecutive CI runs.
 
@@ -404,7 +403,7 @@ The reference agent implements a single `AgentExecutor` with routing-by-first-me
 - `cooperative-cancel` — loops checking `ctx.cancellation`; on trip, emits `sink.cancelled(reason)`.
 - `reject` — emits `sink.reject("policy: not permitted")`.
 - `fail` — emits `sink.fail(A2aError::Internal { message: "simulated failure" })`.
-- `instant-complete` — legacy-style: mutates `&mut task` and returns; no sink use. Validates §7.2 detection rule.
+- `instant-complete` — direct task-mutation path: mutates `&mut task` and returns; no sink use. Validates the §7.2 detection rule.
 
 ### Tests
 

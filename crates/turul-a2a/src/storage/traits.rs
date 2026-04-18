@@ -87,6 +87,94 @@ pub trait A2aTaskStorage: Send + Sync {
 
     /// Periodic maintenance (cleanup, compaction).
     async fn maintenance(&self) -> Result<(), A2aStorageError>;
+
+    /// Set the `cancel_requested` marker on a non-terminal task.
+    ///
+    /// Owner-scoped (unlike the supervisor-only reads on
+    /// [`A2aCancellationSupervisor`]): wrong owner or missing task returns
+    /// `TaskNotFound` (anti-enumeration, same pattern as other
+    /// owner-scoped methods). A terminal task returns `TerminalState` —
+    /// callers map to HTTP 409 `TaskNotCancelable` at the wire layer.
+    ///
+    /// The marker is idempotent: setting it on a task where it is already
+    /// `true` is a successful no-op. Storage-internal only; the marker
+    /// never appears on the wire (ADR-012 §1).
+    ///
+    /// Consumers: `core_cancel_task` handler (phase C) and direct cancel
+    /// paths in cross-instance deployments. Once set, the in-flight
+    /// supervisor on the instance running the executor discovers the
+    /// marker via
+    /// [`A2aCancellationSupervisor::supervisor_list_cancel_requested`]
+    /// and trips the executor's cancellation token.
+    async fn set_cancel_requested(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        owner: &str,
+    ) -> Result<(), A2aStorageError>;
+}
+
+/// Supervisor-only cancel-marker reads.
+///
+/// **NOT for request handlers.** Methods on this trait deliberately omit
+/// the `owner` parameter. Authorization invariant: callers MUST operate
+/// only on `task_id`s already present in their own
+/// [`crate::server::in_flight::InFlightRegistry`], whose entries were
+/// owner-validated at spawn time. Re-checking owner on every poll tick
+/// would force the supervisor to carry per-task owner strings through its
+/// registry without producing any security benefit — the upstream
+/// validation already covered it.
+///
+/// External backend implementers implement this trait alongside
+/// [`A2aTaskStorage`], [`super::A2aEventStore`], and
+/// [`super::A2aAtomicStore`]. `AppState` carries
+/// `Arc<dyn A2aCancellationSupervisor>` on a dedicated field so handler
+/// code paths cannot reach the unscoped reads by construction.
+///
+/// # Structural trait-split invariant (compile-time enforced)
+///
+/// Supervisor-only reads MUST NOT be reachable via `Arc<dyn A2aTaskStorage>`.
+/// The following attempts such a call and fails to compile:
+///
+/// ```compile_fail
+/// # use std::sync::Arc;
+/// # use turul_a2a::storage::A2aTaskStorage;
+/// async fn leak(ts: Arc<dyn A2aTaskStorage>) {
+///     let _ = ts.supervisor_get_cancel_requested("tenant", "task").await;
+/// }
+/// ```
+///
+/// Handler code holds `Arc<dyn A2aTaskStorage>` and can call the
+/// owner-scoped [`A2aTaskStorage::set_cancel_requested`], but the type
+/// system prevents it from calling the unscoped reads.
+#[async_trait]
+pub trait A2aCancellationSupervisor: Send + Sync {
+    fn backend_name(&self) -> &'static str;
+
+    /// Read the cancel-requested marker for a single task.
+    ///
+    /// Returns `false` if the marker is unset OR the task is already
+    /// terminal (supervisor treats these identically — no token trip
+    /// needed in either case). Owner is intentionally not checked; see
+    /// trait-level docs for the authorization invariant.
+    async fn supervisor_get_cancel_requested(
+        &self,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<bool, A2aStorageError>;
+
+    /// Batch-read: return the subset of `task_ids` in `tenant` that have
+    /// the cancel-requested marker set AND are not terminal.
+    ///
+    /// One database round-trip per supervisor poll tick, bounded by the
+    /// in-flight registry size. Task IDs absent from storage are silently
+    /// skipped — they aren't returned, and the caller should clean up
+    /// its registry independently.
+    async fn supervisor_list_cancel_requested(
+        &self,
+        tenant: &str,
+        task_ids: &[String],
+    ) -> Result<Vec<String>, A2aStorageError>;
 }
 
 /// Storage trait for push notification configurations.

@@ -39,6 +39,21 @@ pub struct AppState {
     /// AWS Lambda adapter that bypasses the builder), use
     /// `crate::server::RuntimeConfig::default()`.
     pub runtime_config: crate::server::RuntimeConfig,
+
+    /// In-flight task registry (ADR-010 §4.4). Holds one
+    /// [`crate::server::in_flight::InFlightHandle`] per spawned executor
+    /// — keyed by `(tenant, task_id)`. Populated by the executor spawn
+    /// path in phase D; used by the `:cancel` handler in phase C to trip
+    /// the local cancellation token if the executor runs on this
+    /// instance. Empty during phase C when no executor has been spawned
+    /// through the registry yet.
+    pub in_flight: Arc<crate::server::in_flight::InFlightRegistry>,
+
+    /// Supervisor-only cancel-marker reads (ADR-012 §3 / §10). Separate
+    /// from `task_storage` so handler code cannot reach the unscoped
+    /// reads. Use `set_cancel_requested` on `task_storage` for marker
+    /// writes (owner-scoped, handler-safe).
+    pub cancellation_supervisor: Arc<dyn crate::storage::A2aCancellationSupervisor>,
 }
 
 /// Build the axum router with all proto-defined routes.
@@ -904,35 +919,139 @@ pub(crate) async fn core_get_task(
     Ok(Json(serde_json::to_value(&task).unwrap_or_default()))
 }
 
-pub(crate) async fn core_cancel_task(
+/// ADR-012 `CancelTask` handler.
+///
+/// Sequence:
+/// 1. Validate existence + ownership (via owner-scoped `get_task`).
+/// 2. Reject with 409 if task is already terminal.
+/// 3. Write the cancel marker (owner-scoped, idempotent).
+/// 4. Trip the local in-flight cancellation token if present.
+/// 5. Wait up to `cancel_handler_grace`, polling task state every
+///    `cancel_handler_poll_interval`. On observed terminal, return that
+///    persisted task snapshot (cooperative cancel won the race).
+/// 6. On grace expiry, force-commit `CANCELED` via the atomic store
+///    (CAS-guarded by phase B). On success, return CANCELED. On
+///    `TerminalStateAlreadySet`, re-read and return the actual persisted
+///    terminal (another path won at the CAS layer).
+///
+/// Framework-committed terminals carry `message = None` (ADR-012 §8) —
+/// the plain `TaskStatus::new(TaskState::Canceled)` constructor produces
+/// exactly that.
+#[doc(hidden)]
+pub async fn core_cancel_task(
     state: AppState,
     tenant: &str,
     owner: &str,
     task_id: &str,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    // Get context_id for the cancel event
-    let task = state
+    // Step 1: validate existence + ownership. `get_task` is owner-scoped —
+    // wrong owner returns None (TaskNotFound) as anti-enumeration.
+    let initial_task = state
         .task_storage
         .get_task(tenant, task_id, owner, Some(0))
         .await
         .map_err(A2aError::from)?
         .ok_or_else(|| A2aError::TaskNotFound { task_id: task_id.to_string() })?;
 
-    let context_id = task.context_id().to_string();
+    // Step 2: reject terminal tasks up-front with 409.
+    if let Some(status) = initial_task.status() {
+        if let Ok(s) = status.state() {
+            if turul_a2a_types::state_machine::is_terminal(s) {
+                return Err(A2aError::TaskNotCancelable { task_id: task_id.to_string() });
+            }
+        }
+    }
 
-    // Atomic: cancel status + CANCELED event
+    let context_id = initial_task.context_id().to_string();
+
+    // Step 3: write the cancel-requested marker. Idempotent; errors map
+    // to the usual wire responses.
+    match state
+        .task_storage
+        .set_cancel_requested(tenant, task_id, owner)
+        .await
+    {
+        Ok(()) => {}
+        Err(A2aStorageError::TaskNotFound(_)) => {
+            return Err(A2aError::TaskNotFound { task_id: task_id.to_string() });
+        }
+        Err(A2aStorageError::TerminalState(_))
+        | Err(A2aStorageError::InvalidTransition { .. })
+        | Err(A2aStorageError::TerminalStateAlreadySet { .. }) => {
+            return Err(A2aError::TaskNotCancelable { task_id: task_id.to_string() });
+        }
+        Err(other) => return Err(A2aError::from(other)),
+    }
+
+    // Step 4: fast-path token trip if this instance owns the in-flight
+    // executor for this task. Cross-instance cases rely on the supervisor
+    // poll loop (see `server::in_flight::run_cross_instance_cancel_poller`).
+    let in_flight_key = (tenant.to_string(), task_id.to_string());
+    if let Some(handle) = state.in_flight.get(&in_flight_key) {
+        handle.cancellation.cancel();
+    }
+
+    // Step 5: grace-wait with poll. Return early if the task reaches
+    // a terminal state via the executor's cooperative response.
+    let deadline =
+        tokio::time::Instant::now() + state.runtime_config.cancel_handler_grace;
+    let poll_interval = state.runtime_config.cancel_handler_poll_interval;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+
+        match state
+            .task_storage
+            .get_task(tenant, task_id, owner, Some(0))
+            .await
+            .map_err(A2aError::from)?
+        {
+            Some(current) => {
+                if let Some(status) = current.status() {
+                    if let Ok(s) = status.state() {
+                        if turul_a2a_types::state_machine::is_terminal(s) {
+                            // Cooperative terminal (or another path) resolved
+                            // the cancel during grace. Return persisted state.
+                            state.event_broker.notify(task_id).await;
+                            return Ok(Json(serde_json::to_value(&current).unwrap_or_default()));
+                        }
+                    }
+                }
+            }
+            None => {
+                return Err(A2aError::TaskNotFound { task_id: task_id.to_string() });
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let sleep_for = std::cmp::min(poll_interval, remaining);
+        tokio::time::sleep(sleep_for).await;
+    }
+
+    // Step 6: grace expired. Force-commit CANCELED via atomic store.
+    // Per ADR-012 §8, framework-committed terminals use `message = None`
+    // so history / SSE consumers can distinguish from executor-authored
+    // cancels without conflating framework telemetry with agent output.
     let cancel_event = StreamEvent::StatusUpdate {
         status_update: crate::streaming::StatusUpdatePayload {
             task_id: task_id.to_string(),
             context_id,
-            status: serde_json::to_value(&TaskStatus::new(TaskState::Canceled)).unwrap_or_default(),
+            status: serde_json::to_value(&TaskStatus::new(TaskState::Canceled))
+                .unwrap_or_default(),
         },
     };
 
     let result = state
         .atomic_store
         .update_task_status_with_events(
-            tenant, task_id, owner,
+            tenant,
+            task_id,
+            owner,
             TaskStatus::new(TaskState::Canceled),
             vec![cancel_event],
         )
@@ -940,21 +1059,25 @@ pub(crate) async fn core_cancel_task(
 
     match result {
         Ok((task, _seqs)) => {
-            // Notify subscribers of the cancellation
             state.event_broker.notify(task_id).await;
             Ok(Json(serde_json::to_value(&task).unwrap_or_default()))
         }
+        Err(A2aStorageError::TerminalStateAlreadySet { .. }) => {
+            // Race resolved at the atomic-store CAS: another writer
+            // (executor emitting its own terminal, or a concurrent
+            // CancelTask from another instance) committed first. Re-read
+            // and return the actual persisted terminal.
+            let persisted = state
+                .task_storage
+                .get_task(tenant, task_id, owner, None)
+                .await
+                .map_err(A2aError::from)?
+                .ok_or_else(|| A2aError::TaskNotFound { task_id: task_id.to_string() })?;
+            state.event_broker.notify(task_id).await;
+            Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
+        }
         Err(A2aStorageError::TaskNotFound(id)) => Err(A2aError::TaskNotFound { task_id: id }),
-        // All three terminal-write rejection variants surface as the same
-        // wire error (HTTP 409 TaskNotCancelable). Explicitly listed to
-        // make the audit of ADR-010 §7.1 CAS callers exhaustive:
-        // - TerminalState: state-machine-side signal (non-CAS paths).
-        // - TerminalStateAlreadySet: atomic-store CAS loser (phase B).
-        // - InvalidTransition: non-terminal illegal transition (e.g., a
-        //   task already in INPUT_REQUIRED being asked to re-cancel from
-        //   a state where the transition is not defined).
         Err(A2aStorageError::TerminalState(_))
-        | Err(A2aStorageError::TerminalStateAlreadySet { .. })
         | Err(A2aStorageError::InvalidTransition { .. }) => {
             Err(A2aError::TaskNotCancelable { task_id: task_id.to_string() })
         }

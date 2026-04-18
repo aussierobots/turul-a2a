@@ -136,6 +136,8 @@ fn state_no_auth() -> AppState {
         event_broker: TaskEventBroker::new(),
         middleware_stack: Arc::new(MiddlewareStack::new(vec![])),
         runtime_config: turul_a2a::server::RuntimeConfig::default(),
+        in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
+        cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         event_store: Arc::new(s.clone()),
         atomic_store: Arc::new(s),
     }
@@ -154,6 +156,8 @@ fn state_with_auth() -> AppState {
             Arc::new(TestAuthMiddleware),
         ])),
         runtime_config: turul_a2a::server::RuntimeConfig::default(),
+        in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
+        cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
     }
 }
 

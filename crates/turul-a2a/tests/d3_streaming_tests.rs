@@ -65,6 +65,8 @@ fn single_instance_state() -> AppState {
         event_broker: TaskEventBroker::new(),
         middleware_stack: Arc::new(MiddlewareStack::new(vec![])),
         runtime_config: turul_a2a::server::RuntimeConfig::default(),
+        in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
+        cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
     }
 }
 
@@ -80,6 +82,8 @@ fn two_instances() -> (AppState, AppState) {
         event_broker: TaskEventBroker::new(),
         middleware_stack: Arc::new(MiddlewareStack::new(vec![])),
         runtime_config: turul_a2a::server::RuntimeConfig::default(),
+        in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
+        cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
     };
     (make(&s), make(&s))
 }
@@ -376,6 +380,8 @@ async fn d3_no_broker_correctness_dependency() {
         event_broker: TaskEventBroker::new(),
         middleware_stack: Arc::new(MiddlewareStack::new(vec![])),
         runtime_config: turul_a2a::server::RuntimeConfig::default(),
+        in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
+        cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
     };
 
     // Create non-terminal task with events — NO broker.notify()

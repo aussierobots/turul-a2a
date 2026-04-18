@@ -24,7 +24,7 @@ pub use atomic::A2aAtomicStore;
 pub use error::A2aStorageError;
 pub use event_store::A2aEventStore;
 pub use filter::{PushConfigListPage, TaskFilter, TaskListPage};
-pub use traits::{A2aPushNotificationStorage, A2aTaskStorage};
+pub use traits::{A2aCancellationSupervisor, A2aPushNotificationStorage, A2aTaskStorage};
 
 #[cfg(feature = "in-memory")]
 pub use in_memory::InMemoryA2aStorage;

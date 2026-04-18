@@ -55,6 +55,7 @@ impl PostgresA2aStorage {
                 task_json JSONB NOT NULL,
                 context_id TEXT NOT NULL DEFAULT '',
                 status_state TEXT NOT NULL DEFAULT '',
+                cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (tenant, task_id)
@@ -67,6 +68,13 @@ impl PostgresA2aStorage {
         // Migration: add updated_at column if not present (for existing tables)
         let _ = sqlx::query(
             "ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+        )
+        .execute(&self.pool)
+        .await;
+
+        // Migration: add cancel_requested column if not present (ADR-012).
+        let _ = sqlx::query(
+            "ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT FALSE",
         )
         .execute(&self.pool)
         .await;
@@ -443,6 +451,110 @@ impl A2aTaskStorage for PostgresA2aStorage {
 
     async fn maintenance(&self) -> Result<(), A2aStorageError> {
         Ok(())
+    }
+
+    async fn set_cancel_requested(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        owner: &str,
+    ) -> Result<(), A2aStorageError> {
+        let result = sqlx::query(
+            "UPDATE a2a_tasks SET cancel_requested = TRUE
+             WHERE tenant = $1 AND task_id = $2 AND owner = $3
+               AND status_state NOT IN ('Completed', 'Failed', 'Canceled', 'Rejected')",
+        )
+        .bind(tenant)
+        .bind(task_id)
+        .bind(owner)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+        if result.rows_affected() > 0 {
+            return Ok(());
+        }
+
+        // Classify zero-rows: not-found / wrong-owner vs terminal.
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT owner, status_state FROM a2a_tasks
+             WHERE tenant = $1 AND task_id = $2",
+        )
+        .bind(tenant)
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+        match row {
+            None => Err(A2aStorageError::TaskNotFound(task_id.to_string())),
+            Some((row_owner, _)) if row_owner != owner => {
+                Err(A2aStorageError::TaskNotFound(task_id.to_string()))
+            }
+            Some((_, state_str)) => {
+                let state = match state_str.as_str() {
+                    "Completed" => turul_a2a_types::TaskState::Completed,
+                    "Failed" => turul_a2a_types::TaskState::Failed,
+                    "Canceled" => turul_a2a_types::TaskState::Canceled,
+                    "Rejected" => turul_a2a_types::TaskState::Rejected,
+                    other => {
+                        return Err(A2aStorageError::DatabaseError(format!(
+                            "unexpected status_state on set_cancel_requested classify: {other}"
+                        )));
+                    }
+                };
+                Err(A2aStorageError::TerminalState(state))
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl crate::storage::A2aCancellationSupervisor for PostgresA2aStorage {
+    fn backend_name(&self) -> &'static str {
+        "postgres"
+    }
+
+    async fn supervisor_get_cancel_requested(
+        &self,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<bool, A2aStorageError> {
+        let row: Option<(bool,)> = sqlx::query_as(
+            "SELECT cancel_requested FROM a2a_tasks
+             WHERE tenant = $1 AND task_id = $2
+               AND status_state NOT IN ('Completed', 'Failed', 'Canceled', 'Rejected')",
+        )
+        .bind(tenant)
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        Ok(row.map(|(v,)| v).unwrap_or(false))
+    }
+
+    async fn supervisor_list_cancel_requested(
+        &self,
+        tenant: &str,
+        task_ids: &[String],
+    ) -> Result<Vec<String>, A2aStorageError> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // PostgreSQL supports `= ANY($N)` with array binding — cleaner
+        // than dynamic IN-clause expansion.
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT task_id FROM a2a_tasks
+             WHERE tenant = $1 AND task_id = ANY($2)
+               AND cancel_requested = TRUE
+               AND status_state NOT IN ('Completed', 'Failed', 'Canceled', 'Rejected')",
+        )
+        .bind(tenant)
+        .bind(task_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 }
 
@@ -1171,6 +1283,20 @@ mod tests {
     async fn test_invalid_transition_distinct_from_terminal_already_set() {
         let s = storage().await;
         parity_tests::test_invalid_transition_distinct_from_terminal_already_set(&s, &s).await;
+    }
+
+    // Cancel-marker parity (ADR-012 / phase C).
+
+    #[tokio::test]
+    async fn test_cancel_marker_roundtrip() {
+        let s = storage().await;
+        parity_tests::test_cancel_marker_roundtrip(&s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_list_cancel_requested_parity() {
+        let s = storage().await;
+        parity_tests::test_supervisor_list_cancel_requested_parity(&s, &s, &s).await;
     }
 
     #[tokio::test]

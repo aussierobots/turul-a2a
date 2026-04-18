@@ -483,6 +483,184 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
     async fn maintenance(&self) -> Result<(), A2aStorageError> {
         Ok(())
     }
+
+    async fn set_cancel_requested(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        owner: &str,
+    ) -> Result<(), A2aStorageError> {
+        let pk = Self::task_key(tenant, task_id);
+        // Conditional update: item must exist with this owner AND be
+        // non-terminal. DynamoDB's ConditionExpression is atomic at the
+        // item level.
+        let result = self
+            .client
+            .update_item()
+            .table_name(&self.config.tasks_table)
+            .key("pk", AttributeValue::S(pk.clone()))
+            .update_expression("SET cancelRequested = :true")
+            .condition_expression(
+                "attribute_exists(pk) AND #owner = :owner \
+                 AND (attribute_not_exists(statusState) \
+                      OR NOT statusState IN (:completed, :failed, :canceled, :rejected))",
+            )
+            .expression_attribute_names("#owner", "owner")
+            .expression_attribute_values(":true", AttributeValue::Bool(true))
+            .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()))
+            .expression_attribute_values(":completed", AttributeValue::S("Completed".to_string()))
+            .expression_attribute_values(":failed", AttributeValue::S("Failed".to_string()))
+            .expression_attribute_values(":canceled", AttributeValue::S("Canceled".to_string()))
+            .expression_attribute_values(":rejected", AttributeValue::S("Rejected".to_string()))
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                let err_dbg = format!("{err:?}");
+                if err_dbg.contains("ConditionalCheckFailed") {
+                    // Probe to classify: missing, wrong owner, or terminal.
+                    match self.get_task(tenant, task_id, owner, Some(0)).await {
+                        Ok(Some(t)) => {
+                            let state = t
+                                .status()
+                                .and_then(|s| s.state().ok());
+                            if let Some(s) = state {
+                                if turul_a2a_types::state_machine::is_terminal(s) {
+                                    return Err(A2aStorageError::TerminalState(s));
+                                }
+                            }
+                            // get_task succeeded but state is non-terminal —
+                            // means owner check must have been the failing
+                            // condition, but get_task (also owner-scoped)
+                            // returned Some, which means... odd. Treat as
+                            // not-found for safety.
+                            Err(A2aStorageError::TaskNotFound(task_id.to_string()))
+                        }
+                        Ok(None) => Err(A2aStorageError::TaskNotFound(task_id.to_string())),
+                        Err(_) => Err(A2aStorageError::DatabaseError(err_dbg)),
+                    }
+                } else {
+                    Err(A2aStorageError::DatabaseError(err_dbg))
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl crate::storage::A2aCancellationSupervisor for DynamoDbA2aStorage {
+    fn backend_name(&self) -> &'static str {
+        "dynamodb"
+    }
+
+    async fn supervisor_get_cancel_requested(
+        &self,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<bool, A2aStorageError> {
+        let pk = Self::task_key(tenant, task_id);
+        let result = self
+            .client
+            .get_item()
+            .table_name(&self.config.tasks_table)
+            .key("pk", AttributeValue::S(pk))
+            .projection_expression("cancelRequested, statusState")
+            .send()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+        let Some(item) = result.item else {
+            return Ok(false);
+        };
+        let state_str = item
+            .get("statusState")
+            .and_then(|v| v.as_s().ok())
+            .map(String::as_str);
+        let is_terminal = matches!(
+            state_str,
+            Some("Completed") | Some("Failed") | Some("Canceled") | Some("Rejected")
+        );
+        if is_terminal {
+            return Ok(false);
+        }
+        let marker = item
+            .get("cancelRequested")
+            .and_then(|v| v.as_bool().ok().copied())
+            .unwrap_or(false);
+        Ok(marker)
+    }
+
+    async fn supervisor_list_cancel_requested(
+        &self,
+        tenant: &str,
+        task_ids: &[String],
+    ) -> Result<Vec<String>, A2aStorageError> {
+        // DynamoDB BatchGetItem is the efficient path but has a 100-item
+        // cap per call. Chunk the request and filter locally by marker +
+        // non-terminal.
+        let mut hits = Vec::new();
+        for chunk in task_ids.chunks(100) {
+            let keys: Vec<_> = chunk
+                .iter()
+                .map(|tid| {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert(
+                        "pk".to_string(),
+                        AttributeValue::S(Self::task_key(tenant, tid)),
+                    );
+                    m
+                })
+                .collect();
+            let keys_and_attrs = aws_sdk_dynamodb::types::KeysAndAttributes::builder()
+                .set_keys(Some(keys))
+                .projection_expression("pk, cancelRequested, statusState")
+                .build()
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            let resp = self
+                .client
+                .batch_get_item()
+                .request_items(self.config.tasks_table.clone(), keys_and_attrs)
+                .send()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            if let Some(responses) = resp.responses {
+                if let Some(items) = responses.get(&self.config.tasks_table) {
+                    for item in items {
+                        let pk = item
+                            .get("pk")
+                            .and_then(|v| v.as_s().ok())
+                            .cloned()
+                            .unwrap_or_default();
+                        let state_str = item
+                            .get("statusState")
+                            .and_then(|v| v.as_s().ok())
+                            .map(String::as_str);
+                        let is_terminal = matches!(
+                            state_str,
+                            Some("Completed") | Some("Failed") | Some("Canceled") | Some("Rejected")
+                        );
+                        if is_terminal {
+                            continue;
+                        }
+                        let marker = item
+                            .get("cancelRequested")
+                            .and_then(|v| v.as_bool().ok().copied())
+                            .unwrap_or(false);
+                        if !marker {
+                            continue;
+                        }
+                        // pk = "{tenant}#{task_id}" per task_key; extract
+                        // the task_id by splitting on the first '#'.
+                        if let Some(task_id) = pk.split_once('#').map(|(_, t)| t.to_string()) {
+                            hits.push(task_id);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(hits)
+    }
 }
 
 #[async_trait]
@@ -1299,6 +1477,30 @@ mod tests {
         async fn maintenance(&self) -> Result<(), A2aStorageError> {
             self.inner.maintenance().await
         }
+
+        async fn set_cancel_requested(&self, tenant: &str, task_id: &str, owner: &str)
+            -> Result<(), A2aStorageError> {
+            self.inner.set_cancel_requested(&self.scoped_tenant(tenant), task_id, owner).await
+        }
+    }
+
+    #[async_trait]
+    impl crate::storage::A2aCancellationSupervisor for TestStorage {
+        fn backend_name(&self) -> &'static str { "dynamodb-test" }
+
+        async fn supervisor_get_cancel_requested(&self, tenant: &str, task_id: &str)
+            -> Result<bool, A2aStorageError> {
+            <DynamoDbA2aStorage as crate::storage::A2aCancellationSupervisor>::supervisor_get_cancel_requested(
+                &self.inner, &self.scoped_tenant(tenant), task_id,
+            ).await
+        }
+
+        async fn supervisor_list_cancel_requested(&self, tenant: &str, task_ids: &[String])
+            -> Result<Vec<String>, A2aStorageError> {
+            <DynamoDbA2aStorage as crate::storage::A2aCancellationSupervisor>::supervisor_list_cancel_requested(
+                &self.inner, &self.scoped_tenant(tenant), task_ids,
+            ).await
+        }
     }
 
     #[async_trait]
@@ -1552,6 +1754,20 @@ mod tests {
     async fn test_invalid_transition_distinct_from_terminal_already_set() {
         let s = storage().await;
         parity_tests::test_invalid_transition_distinct_from_terminal_already_set(&s, &s).await;
+    }
+
+    // Cancel-marker parity (ADR-012 / phase C).
+
+    #[tokio::test]
+    async fn test_cancel_marker_roundtrip() {
+        let s = storage().await;
+        parity_tests::test_cancel_marker_roundtrip(&s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_list_cancel_requested_parity() {
+        let s = storage().await;
+        parity_tests::test_supervisor_list_cancel_requested_parity(&s, &s, &s).await;
     }
 
     #[tokio::test]
