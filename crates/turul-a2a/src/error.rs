@@ -166,6 +166,13 @@ impl From<crate::storage::A2aStorageError> for A2aError {
             A2aStorageError::TerminalState(_) => A2aError::TaskNotCancelable {
                 task_id: String::new(),
             },
+            // CAS loser from atomic-store terminal-CAS (ADR-010 §7.1):
+            // maps to the same wire error as TerminalState — HTTP 409 /
+            // JSON-RPC -32002. Carry the task_id through for better
+            // diagnostics at the wire layer.
+            A2aStorageError::TerminalStateAlreadySet { task_id, .. } => {
+                A2aError::TaskNotCancelable { task_id }
+            }
             A2aStorageError::InvalidTransition { .. } => A2aError::TaskNotCancelable {
                 task_id: String::new(),
             },

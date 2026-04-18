@@ -15,6 +15,25 @@ pub enum A2aStorageError {
     #[error("Task is in terminal state: {0:?}")]
     TerminalState(TaskState),
 
+    /// The atomic store's single-terminal-writer invariant rejected a
+    /// terminal write because the task was already in a terminal state
+    /// at the time of the CAS. Distinct from [`Self::TerminalState`]
+    /// which is the raw state-machine signal: `TerminalStateAlreadySet`
+    /// is specifically the "you lost the race" signal emitted by
+    /// [`crate::storage::A2aAtomicStore::update_task_status_with_events`].
+    /// Callers typically translate this to HTTP 409 `TaskNotCancelable` /
+    /// JSON-RPC `-32002` on the wire, and to `EventSink::closed` semantics
+    /// when the caller is an executor sink.
+    ///
+    /// The `current_state` field carries the wire enum name (e.g.
+    /// `"TASK_STATE_COMPLETED"`) so log/telemetry consumers can see
+    /// exactly which terminal won the race.
+    #[error("task {task_id} already in terminal state {current_state} (CAS loser)")]
+    TerminalStateAlreadySet {
+        task_id: String,
+        current_state: String,
+    },
+
     #[error("Owner mismatch for task: {task_id}")]
     OwnerMismatch { task_id: String },
 

@@ -845,7 +845,13 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 turul_a2a_types::A2aTypeError::InvalidTransition { current, requested } => {
                     A2aStorageError::InvalidTransition { current, requested }
                 }
-                turul_a2a_types::A2aTypeError::TerminalState(s) => A2aStorageError::TerminalState(s),
+                turul_a2a_types::A2aTypeError::TerminalState(s) => {
+                    A2aStorageError::TerminalStateAlreadySet {
+                        task_id: task_id.to_string(),
+                        current_state: crate::storage::terminal_cas::task_state_wire_name(s)
+                            .to_string(),
+                    }
+                }
                 other => A2aStorageError::TypeError(other),
             },
         )?;
@@ -861,7 +867,15 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         // Get current max sequence for event numbering
         let max_seq = query_max_sequence(&self.client, &self.config.events_table, &pk).await?;
 
-        // Build TransactWriteItems: task update + event puts
+        // Build TransactWriteItems: task update + event puts.
+        //
+        // Terminal-write CAS (ADR-010 §7.1): the task Put's
+        // ConditionExpression now ALSO asserts that the existing
+        // statusState is NOT any of the four terminal values. Between the
+        // get_task read above and this transact_write_items call, another
+        // instance may have committed a terminal for this pk — the
+        // condition-expression rejects our write atomically at the
+        // backend, preserving the single-terminal-writer invariant.
         let mut items = vec![
             aws_sdk_dynamodb::types::TransactWriteItem::builder()
                 .put(
@@ -873,9 +887,16 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                         .item("contextId", AttributeValue::S(updated_task.context_id().to_string()))
                         .item("statusState", AttributeValue::S(state_str))
                         .item("updatedAt", AttributeValue::S(Self::now_iso()))
-                        .condition_expression("#owner = :owner")
+                        .condition_expression(
+                            "#owner = :owner AND (attribute_not_exists(statusState) \
+                             OR NOT statusState IN (:completed, :failed, :canceled, :rejected))",
+                        )
                         .expression_attribute_names("#owner", "owner")
                         .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()))
+                        .expression_attribute_values(":completed", AttributeValue::S("Completed".to_string()))
+                        .expression_attribute_values(":failed", AttributeValue::S("Failed".to_string()))
+                        .expression_attribute_values(":canceled", AttributeValue::S("Canceled".to_string()))
+                        .expression_attribute_values(":rejected", AttributeValue::S("Rejected".to_string()))
                         .build()
                         .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
                 )
@@ -905,14 +926,57 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             );
         }
 
-        self.client
+        let send_result = self
+            .client
             .transact_write_items()
             .set_transact_items(Some(items))
             .send()
-            .await
-            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            .await;
 
-        Ok((updated_task, sequences))
+        match send_result {
+            Ok(_) => Ok((updated_task, sequences)),
+            Err(err) => {
+                // Detect the task-item condition failure — either the owner
+                // check or the non-terminal CAS failed. Re-fetch the task to
+                // figure out which: if the current state is terminal, this is
+                // a CAS loser; otherwise fall back to the generic DB error.
+                //
+                // Detection is via the service error string; the Rust SDK
+                // surfaces `TransactionCanceledException` here.
+                let err_dbg = format!("{err:?}");
+                if err_dbg.contains("TransactionCanceledException")
+                    || err_dbg.contains("ConditionalCheckFailed")
+                {
+                    // Probe current state to classify.
+                    match self.get_task(tenant, task_id, owner, Some(0)).await {
+                        Ok(Some(current_task)) => {
+                            let probe_state = current_task
+                                .status()
+                                .and_then(|s| s.state().ok());
+                            if let Some(s) = probe_state {
+                                if turul_a2a_types::state_machine::is_terminal(s) {
+                                    return Err(A2aStorageError::TerminalStateAlreadySet {
+                                        task_id: task_id.to_string(),
+                                        current_state:
+                                            crate::storage::terminal_cas::task_state_wire_name(s)
+                                                .to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // Task disappeared between reads — unusual but surface
+                            // as TaskNotFound.
+                            return Err(A2aStorageError::TaskNotFound(task_id.to_string()));
+                        }
+                        Err(_) => {
+                            // Fall through to generic error.
+                        }
+                    }
+                }
+                Err(A2aStorageError::DatabaseError(err_dbg))
+            }
+        }
     }
 
     async fn update_task_with_events(
@@ -1146,6 +1210,7 @@ mod tests {
                 tasks_table: TEST_TASKS_TABLE.into(),
                 push_configs_table: TEST_PUSH_TABLE.into(),
                 events_table: TEST_EVENTS_TABLE.into(),
+                ..DynamoDbConfig::default()
             },
         );
 
@@ -1451,6 +1516,31 @@ mod tests {
     async fn test_atomic_update_task_with_events() {
         let s = storage().await;
         parity_tests::test_atomic_update_task_with_events(&s, &s, &s).await;
+    }
+
+    // Terminal-write CAS (ADR-010 §7.1) — phase B parity.
+
+    #[tokio::test]
+    async fn test_terminal_cas_single_winner_on_concurrent_terminals() {
+        let s = std::sync::Arc::new(storage().await);
+        parity_tests::test_terminal_cas_single_winner_on_concurrent_terminals(
+            s.clone(),
+            s.clone(),
+            s,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_terminal_cas_rejects_sequential_second_terminal() {
+        let s = storage().await;
+        parity_tests::test_terminal_cas_rejects_sequential_second_terminal(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_invalid_transition_distinct_from_terminal_already_set() {
+        let s = storage().await;
+        parity_tests::test_invalid_transition_distinct_from_terminal_already_set(&s, &s).await;
     }
 
     #[tokio::test]

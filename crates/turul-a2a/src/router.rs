@@ -945,7 +945,17 @@ pub(crate) async fn core_cancel_task(
             Ok(Json(serde_json::to_value(&task).unwrap_or_default()))
         }
         Err(A2aStorageError::TaskNotFound(id)) => Err(A2aError::TaskNotFound { task_id: id }),
-        Err(A2aStorageError::TerminalState(_)) | Err(A2aStorageError::InvalidTransition { .. }) => {
+        // All three terminal-write rejection variants surface as the same
+        // wire error (HTTP 409 TaskNotCancelable). Explicitly listed to
+        // make the audit of ADR-010 §7.1 CAS callers exhaustive:
+        // - TerminalState: state-machine-side signal (non-CAS paths).
+        // - TerminalStateAlreadySet: atomic-store CAS loser (phase B).
+        // - InvalidTransition: non-terminal illegal transition (e.g., a
+        //   task already in INPUT_REQUIRED being asked to re-cancel from
+        //   a state where the transition is not defined).
+        Err(A2aStorageError::TerminalState(_))
+        | Err(A2aStorageError::TerminalStateAlreadySet { .. })
+        | Err(A2aStorageError::InvalidTransition { .. }) => {
             Err(A2aError::TaskNotCancelable { task_id: task_id.to_string() })
         }
         Err(other) => Err(A2aError::from(other)),

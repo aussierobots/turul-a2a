@@ -665,13 +665,23 @@ impl A2aAtomicStore for InMemoryA2aStorage {
 
         let new_state = new_status.state().map_err(A2aStorageError::TypeError)?;
 
+        // Terminal-write CAS contract (ADR-010 §7.1): the state machine
+        // emits `TerminalState` when `current_state` is terminal, which we
+        // translate to `TerminalStateAlreadySet` — the CAS "you lost the
+        // race" signal. Non-terminal illegal transitions remain
+        // `InvalidTransition`. Because this whole method holds the tasks
+        // write lock for the entire read-check-write, the CAS is
+        // guaranteed atomic in-process.
         turul_a2a_types::state_machine::validate_transition(current_state, new_state).map_err(
             |e| match e {
                 turul_a2a_types::A2aTypeError::InvalidTransition { current, requested } => {
                     A2aStorageError::InvalidTransition { current, requested }
                 }
                 turul_a2a_types::A2aTypeError::TerminalState(s) => {
-                    A2aStorageError::TerminalState(s)
+                    A2aStorageError::TerminalStateAlreadySet {
+                        task_id: task_id.to_string(),
+                        current_state: crate::storage::terminal_cas::task_state_wire_name(s).to_string(),
+                    }
                 }
                 other => A2aStorageError::TypeError(other),
             },
@@ -917,6 +927,31 @@ mod tests {
     async fn test_atomic_update_task_with_events() {
         let s = storage();
         parity_tests::test_atomic_update_task_with_events(&s, &s, &s).await;
+    }
+
+    // Terminal-write CAS (ADR-010 §7.1) — phase B parity.
+
+    #[tokio::test]
+    async fn test_terminal_cas_single_winner_on_concurrent_terminals() {
+        let s = std::sync::Arc::new(storage());
+        parity_tests::test_terminal_cas_single_winner_on_concurrent_terminals(
+            s.clone(),
+            s.clone(),
+            s,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_terminal_cas_rejects_sequential_second_terminal() {
+        let s = storage();
+        parity_tests::test_terminal_cas_rejects_sequential_second_terminal(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_invalid_transition_distinct_from_terminal_already_set() {
+        let s = storage();
+        parity_tests::test_invalid_transition_distinct_from_terminal_already_set(&s, &s).await;
     }
 
     #[tokio::test]

@@ -783,7 +783,13 @@ impl A2aAtomicStore for PostgresA2aStorage {
                 turul_a2a_types::A2aTypeError::InvalidTransition { current, requested } => {
                     A2aStorageError::InvalidTransition { current, requested }
                 }
-                turul_a2a_types::A2aTypeError::TerminalState(s) => A2aStorageError::TerminalState(s),
+                turul_a2a_types::A2aTypeError::TerminalState(s) => {
+                    A2aStorageError::TerminalStateAlreadySet {
+                        task_id: task_id.to_string(),
+                        current_state: crate::storage::terminal_cas::task_state_wire_name(s)
+                            .to_string(),
+                    }
+                }
                 other => A2aStorageError::TypeError(other),
             },
         )?;
@@ -795,9 +801,20 @@ impl A2aAtomicStore for PostgresA2aStorage {
         let task_json = Self::task_to_json(&updated_task)?;
         let state_str = Self::status_state_str(&updated_task);
 
-        sqlx::query(
-            "UPDATE a2a_tasks SET task_json = $1, status_state = $2, context_id = $3, updated_at = NOW()
-             WHERE tenant = $4 AND task_id = $5 AND owner = $6",
+        // Terminal-write CAS (ADR-010 §7.1). Under PostgreSQL default
+        // isolation (READ COMMITTED), two transactions can both read a
+        // non-terminal state from the SELECT above, both pass the state
+        // machine check, and both reach the UPDATE. The WHERE clause
+        // below rejects a row whose status_state is already terminal at
+        // UPDATE time, guaranteeing exactly-one-winner semantics. Row
+        // count == 0 after the UPDATE ⇒ another writer committed a
+        // terminal first; no events persist (the rollback at end-of-scope
+        // discards event inserts below too).
+        let result = sqlx::query(
+            "UPDATE a2a_tasks
+               SET task_json = $1, status_state = $2, context_id = $3, updated_at = NOW()
+             WHERE tenant = $4 AND task_id = $5 AND owner = $6
+               AND status_state NOT IN ('Completed', 'Failed', 'Canceled', 'Rejected')",
         )
         .bind(&task_json)
         .bind(&state_str)
@@ -808,6 +825,26 @@ impl A2aAtomicStore for PostgresA2aStorage {
         .execute(&mut *tx)
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            // Concurrent terminal write won the race. Re-read the
+            // now-terminal state for the error; transaction aborts.
+            let current: Option<(String,)> = sqlx::query_as(
+                "SELECT status_state FROM a2a_tasks WHERE tenant = $1 AND task_id = $2",
+            )
+            .bind(tenant)
+            .bind(task_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            let current_state_str = current
+                .map(|(s,)| crate::storage::terminal_cas::debug_state_to_wire_name(&s))
+                .unwrap_or_else(|| "TASK_STATE_UNKNOWN".to_string());
+            return Err(A2aStorageError::TerminalStateAlreadySet {
+                task_id: task_id.to_string(),
+                current_state: current_state_str,
+            });
+        }
 
         let mut sequences = Vec::with_capacity(events.len());
         for event in &events {
@@ -1098,6 +1135,31 @@ mod tests {
     async fn test_atomic_update_task_with_events() {
         let s = storage().await;
         parity_tests::test_atomic_update_task_with_events(&s, &s, &s).await;
+    }
+
+    // Terminal-write CAS (ADR-010 §7.1) — phase B parity.
+
+    #[tokio::test]
+    async fn test_terminal_cas_single_winner_on_concurrent_terminals() {
+        let s = std::sync::Arc::new(storage().await);
+        parity_tests::test_terminal_cas_single_winner_on_concurrent_terminals(
+            s.clone(),
+            s.clone(),
+            s,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_terminal_cas_rejects_sequential_second_terminal() {
+        let s = storage().await;
+        parity_tests::test_terminal_cas_rejects_sequential_second_terminal(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_invalid_transition_distinct_from_terminal_already_set() {
+        let s = storage().await;
+        parity_tests::test_invalid_transition_distinct_from_terminal_already_set(&s, &s).await;
     }
 
     #[tokio::test]

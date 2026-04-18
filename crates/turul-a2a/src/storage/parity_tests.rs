@@ -1095,3 +1095,295 @@ where
         );
     }
 }
+
+// =========================================================
+// Terminal-write CAS (ADR-010 §7.1): single-terminal-writer parity
+// =========================================================
+//
+// For each backend, `A2aAtomicStore::update_task_status_with_events` MUST:
+// - accept exactly one terminal write per task,
+// - return `A2aStorageError::TerminalStateAlreadySet` to all other
+//   concurrent terminal-write attempts,
+// - NOT append events from losing calls to the event store,
+// - keep the task's persisted state equal to the winner's write.
+//
+// `InvalidTransition` MUST remain a distinct variant (non-terminal
+// illegal transitions), not be conflated with `TerminalStateAlreadySet`.
+
+use std::sync::Arc;
+
+/// Need an Arc-friendly view of the backend so spawned tasks can share
+/// it without cloning the underlying struct. Each backend's test entry
+/// point wraps its storage in `Arc` before calling these helpers.
+pub async fn test_terminal_cas_single_winner_on_concurrent_terminals(
+    atomic: Arc<dyn A2aAtomicStore>,
+    tasks: Arc<dyn A2aTaskStorage>,
+    events: Arc<dyn A2aEventStore>,
+) {
+    // Setup: create task in Submitted state, advance to Working.
+    let task = make_task("cas-1", "ctx-cas");
+    tasks
+        .create_task("default", "owner-cas", task)
+        .await
+        .unwrap();
+    let prep_events = vec![make_status_event_for(
+        "cas-1",
+        "ctx-cas",
+        "TASK_STATE_WORKING",
+    )];
+    atomic
+        .update_task_status_with_events(
+            "default",
+            "cas-1",
+            "owner-cas",
+            TaskStatus::new(TaskState::Working),
+            prep_events,
+        )
+        .await
+        .unwrap();
+
+    // Event sequence at race start
+    let pre_race_events = events
+        .get_events_after("default", "cas-1", 0)
+        .await
+        .unwrap();
+    let pre_race_count = pre_race_events.len();
+
+    // Race three concurrent terminal writers: Completed, Failed, Canceled.
+    // Per the A2A v1.0 state machine, Working → { Completed, Failed,
+    // Canceled, InputRequired, AuthRequired } are the permitted exits;
+    // REJECTED is only reachable from Submitted (refuse-at-intake). With
+    // all three candidates being spec-valid Working-exits, the winner is
+    // decided solely by the atomic store's CAS.
+    let terminals = [
+        TaskState::Completed,
+        TaskState::Failed,
+        TaskState::Canceled,
+    ];
+    let mut handles = Vec::with_capacity(terminals.len());
+    let barrier = Arc::new(tokio::sync::Barrier::new(terminals.len() + 1));
+    for (i, terminal) in terminals.into_iter().enumerate() {
+        let atomic = Arc::clone(&atomic);
+        let barrier = Arc::clone(&barrier);
+        let evt = make_status_event_for(
+            "cas-1",
+            "ctx-cas",
+            crate::storage::terminal_cas::task_state_wire_name(terminal),
+        );
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let result = atomic
+                .update_task_status_with_events(
+                    "default",
+                    "cas-1",
+                    "owner-cas",
+                    TaskStatus::new(terminal),
+                    vec![evt],
+                )
+                .await;
+            (i, terminal, result)
+        }));
+    }
+    // Release all racers simultaneously.
+    barrier.wait().await;
+
+    let mut winners = Vec::new();
+    let mut losers = Vec::new();
+    for handle in handles {
+        let (_i, terminal, result) = handle.await.unwrap();
+        match result {
+            Ok((task, seqs)) => winners.push((terminal, task, seqs)),
+            Err(crate::storage::A2aStorageError::TerminalStateAlreadySet {
+                task_id,
+                current_state,
+            }) => {
+                losers.push((terminal, task_id, current_state));
+            }
+            Err(other) => panic!(
+                "unexpected error from terminal-CAS attempt ({terminal:?}): {other:?}"
+            ),
+        }
+    }
+
+    // Exactly one winner, rest lose with TerminalStateAlreadySet.
+    assert_eq!(winners.len(), 1, "exactly one terminal write must win");
+    assert_eq!(
+        losers.len(),
+        terminals.len() - 1,
+        "all non-winners must surface TerminalStateAlreadySet"
+    );
+
+    let (winning_terminal, _winning_task, winning_seqs) = &winners[0];
+    assert_eq!(winning_seqs.len(), 1, "winner appended exactly one event");
+
+    // Losers' `current_state` points at the winning terminal's wire name.
+    // Under READ-COMMITTED-ish timing, the loser may have read a stale
+    // state before the winner committed; but the CAS detection path always
+    // re-reads after the failed UPDATE to classify the failure. Either way,
+    // losers must report A TERMINAL state.
+    let terminal_wire_names = [
+        "TASK_STATE_COMPLETED",
+        "TASK_STATE_FAILED",
+        "TASK_STATE_CANCELED",
+    ];
+    for (_t, task_id, current_state) in &losers {
+        assert_eq!(task_id, "cas-1", "loser should carry the task_id");
+        assert!(
+            terminal_wire_names.contains(&current_state.as_str()),
+            "loser's current_state must be a terminal wire name: got {current_state}"
+        );
+    }
+
+    // Persisted state matches the winner.
+    let fetched = tasks
+        .get_task("default", "cas-1", "owner-cas", None)
+        .await
+        .unwrap()
+        .expect("task still exists");
+    let persisted_state = fetched.status().unwrap().state().unwrap();
+    assert_eq!(
+        persisted_state, *winning_terminal,
+        "persisted state must equal winner's write"
+    );
+
+    // Event store holds exactly one additional event (the winner's).
+    let post_race_events = events
+        .get_events_after("default", "cas-1", 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        post_race_events.len(),
+        pre_race_count + 1,
+        "exactly one terminal event appended; losers must NOT persist events"
+    );
+}
+
+/// AT-CAS-002: terminal-already-set rejects a follow-up terminal write
+/// sequentially, not just under race. Sanity check that the CAS contract
+/// is not only about concurrency — a later write to a terminal row also
+/// fails with TerminalStateAlreadySet.
+pub async fn test_terminal_cas_rejects_sequential_second_terminal(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+) {
+    let task = make_task("cas-seq-1", "ctx-cas-seq");
+    tasks
+        .create_task("default", "owner-seq", task)
+        .await
+        .unwrap();
+    atomic
+        .update_task_status_with_events(
+            "default",
+            "cas-seq-1",
+            "owner-seq",
+            TaskStatus::new(TaskState::Working),
+            vec![make_status_event_for(
+                "cas-seq-1",
+                "ctx-cas-seq",
+                "TASK_STATE_WORKING",
+            )],
+        )
+        .await
+        .unwrap();
+    atomic
+        .update_task_status_with_events(
+            "default",
+            "cas-seq-1",
+            "owner-seq",
+            TaskStatus::new(TaskState::Completed),
+            vec![make_status_event_for(
+                "cas-seq-1",
+                "ctx-cas-seq",
+                "TASK_STATE_COMPLETED",
+            )],
+        )
+        .await
+        .unwrap();
+
+    let event_count_after_first_terminal =
+        events.get_events_after("default", "cas-seq-1", 0).await.unwrap().len();
+
+    // Second terminal — must fail.
+    let second = atomic
+        .update_task_status_with_events(
+            "default",
+            "cas-seq-1",
+            "owner-seq",
+            TaskStatus::new(TaskState::Canceled),
+            vec![make_status_event_for(
+                "cas-seq-1",
+                "ctx-cas-seq",
+                "TASK_STATE_CANCELED",
+            )],
+        )
+        .await;
+    match second {
+        Err(crate::storage::A2aStorageError::TerminalStateAlreadySet {
+            task_id,
+            current_state,
+        }) => {
+            assert_eq!(task_id, "cas-seq-1");
+            assert_eq!(current_state, "TASK_STATE_COMPLETED");
+        }
+        other => panic!(
+            "expected TerminalStateAlreadySet on second terminal write, got {other:?}"
+        ),
+    }
+
+    // No new event appended.
+    let final_events = events
+        .get_events_after("default", "cas-seq-1", 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        final_events.len(),
+        event_count_after_first_terminal,
+        "second-terminal loser must not persist events"
+    );
+}
+
+/// AT-CAS-003: distinct error variants — `InvalidTransition` is NOT
+/// conflated with `TerminalStateAlreadySet`. Callers (e.g. phase D's
+/// `EventSink::closed` translation) rely on this distinction.
+pub async fn test_invalid_transition_distinct_from_terminal_already_set(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+) {
+    // Create task in Submitted. Then try to jump SUBMITTED → INPUT_REQUIRED,
+    // which is NOT a valid state-machine transition (Submitted → Working is
+    // the only non-terminal forward path). Expected: InvalidTransition,
+    // NOT TerminalStateAlreadySet.
+    let task = make_task("cas-dist-1", "ctx-dist");
+    tasks
+        .create_task("default", "owner-dist", task)
+        .await
+        .unwrap();
+
+    let result = atomic
+        .update_task_status_with_events(
+            "default",
+            "cas-dist-1",
+            "owner-dist",
+            TaskStatus::new(TaskState::InputRequired),
+            vec![make_status_event_for(
+                "cas-dist-1",
+                "ctx-dist",
+                "TASK_STATE_INPUT_REQUIRED",
+            )],
+        )
+        .await;
+
+    match result {
+        Err(crate::storage::A2aStorageError::InvalidTransition { current, requested }) => {
+            assert_eq!(current, TaskState::Submitted);
+            assert_eq!(requested, TaskState::InputRequired);
+        }
+        Err(crate::storage::A2aStorageError::TerminalStateAlreadySet { .. }) => {
+            panic!("illegal non-terminal transition must surface InvalidTransition, \
+                    not TerminalStateAlreadySet");
+        }
+        Err(other) => panic!("unexpected error: {other:?}"),
+        Ok(_) => panic!("illegal transition must fail"),
+    }
+}

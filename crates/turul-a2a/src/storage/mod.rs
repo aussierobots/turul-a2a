@@ -2,6 +2,7 @@ pub mod atomic;
 pub mod error;
 pub mod event_store;
 pub mod filter;
+pub mod terminal_cas;
 pub mod traits;
 
 #[cfg(feature = "in-memory")]
