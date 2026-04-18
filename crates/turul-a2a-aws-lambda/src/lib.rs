@@ -17,32 +17,30 @@
 //! event store ensures events survive across invocations. Clients reconnect with
 //! `Last-Event-ID` for continuation.
 //!
-//! # Cross-instance cancellation (0.1.4 phase C scope)
+//! # Cross-instance cancellation
 //!
-//! The Lambda adapter **does NOT run the cross-instance cancel poller**
-//! that `A2aServer::run()` spawns. Lambda invocations are stateless and
-//! short-lived; there is no persistent background task to drive
-//! `cross_instance_cancel_poll_interval` between requests. Consequences
-//! for ADR-012 cancellation:
+//! Lambda invocations are stateless and short-lived, so the Lambda
+//! adapter does **not** run the persistent cross-instance cancel
+//! poller that `A2aServer::run()` spawns. Cancellation behaviour on
+//! the Lambda adapter:
 //!
-//! - **Marker writes** — `CancelTask` on a Lambda invocation writes the
-//!   marker to the shared backend (DynamoDB/Postgres). This part works.
+//! - **Marker writes** — `CancelTask` on a Lambda invocation writes
+//!   the cancel marker to the shared backend (DynamoDB / PostgreSQL).
+//!   This works.
 //! - **Propagation to a live executor on the SAME Lambda invocation** —
 //!   works via the same-instance token-trip path in `core_cancel_task`.
 //! - **Propagation to a live executor on a DIFFERENT Lambda invocation
-//!   (warm container)** — **not supported in 0.1.4 phase C**. There is
-//!   no poller to observe markers written by other invocations. A
-//!   subsequent request whose handler reads the marker directly may act
-//!   on it (phase D's per-invocation check), but that is out of scope
-//!   for phase C.
+//!   (warm container)** — **not currently supported**. There is no
+//!   persistent poller to observe markers written by other
+//!   invocations. A subsequent invocation whose handler reads the
+//!   marker directly may act on it, but that is not a substitute for
+//!   the server runtime's live propagation.
 //!
-//! The `LambdaA2aServerBuilder` still **requires** a proper
-//! `A2aCancellationSupervisor` implementation on the same backend so
-//! that (a) marker writes reach the correct backend and (b) the
-//! infrastructure is in place for phase D / a future polling-adapter
-//! variant to consume it. This is non-negotiable: if a Lambda
-//! deployment passes a non-matching supervisor, `build()` rejects
-//! the configuration.
+//! The builder still **requires** an `A2aCancellationSupervisor`
+//! implementation on the same backend so that marker writes reach
+//! the correct backend and a future polling-adapter variant can
+//! consume them. If a deployment passes a non-matching supervisor,
+//! `build()` rejects the configuration.
 
 mod adapter;
 mod auth;

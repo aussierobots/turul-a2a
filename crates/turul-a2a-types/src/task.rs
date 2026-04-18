@@ -201,6 +201,40 @@ impl Task {
         self.inner.artifacts.push(artifact.into_proto());
     }
 
+    /// Merge an artifact using A2A streaming append semantics.
+    ///
+    /// - `append = true`: if an artifact with the same `artifactId` is
+    ///   already on the task, extend its `parts` with the incoming parts
+    ///   (same as a streaming-chunk continuation). Otherwise, append as
+    ///   a new entry.
+    /// - `append = false`: append unconditionally (new entry or caller
+    ///   tolerates duplicate ids).
+    ///
+    /// The `last_chunk` flag is transport-only metadata (ADR-006 / ADR-009)
+    /// — it is not persisted on the task. It is accepted here so callers
+    /// can keep the signature symmetric with the streaming wire event
+    /// payload and not drop the parameter separately.
+    ///
+    /// This mirrors the server storage append-artifact semantics so that
+    /// in-memory task mutations and the storage layer converge on the
+    /// same view. The storage trait lives in the server crate; this
+    /// helper is the dependency-free equivalent for wrapper callers.
+    pub fn merge_artifact(&mut self, artifact: Artifact, append: bool, _last_chunk: bool) {
+        if append {
+            let target_id = artifact.as_proto().artifact_id.clone();
+            if let Some(existing) = self
+                .inner
+                .artifacts
+                .iter_mut()
+                .find(|a| a.artifact_id == target_id)
+            {
+                existing.parts.extend(artifact.into_proto().parts);
+                return;
+            }
+        }
+        self.append_artifact(artifact);
+    }
+
     /// Set the task's status. This is the low-level escape hatch —
     /// prefer `complete()`, `fail()`, etc. for common transitions.
     pub fn set_status(&mut self, status: TaskStatus) {
@@ -399,6 +433,53 @@ mod tests {
         task.append_artifact(crate::Artifact::new("a-1", vec![Part::text("result")]));
         assert_eq!(task.history().len(), 1);
         assert_eq!(task.artifacts().len(), 1);
+    }
+
+    #[test]
+    fn task_merge_artifact_append_true_extends_existing_by_id() {
+        let mut task = Task::new("t-merge-1", TaskStatus::new(TaskState::Working));
+        task.append_artifact(crate::Artifact::new("a-1", vec![Part::text("chunk-1")]));
+
+        task.merge_artifact(
+            crate::Artifact::new("a-1", vec![Part::text("chunk-2")]),
+            true,
+            false,
+        );
+
+        assert_eq!(task.artifacts().len(), 1, "same-id append must not duplicate");
+        assert_eq!(task.artifacts()[0].parts.len(), 2);
+    }
+
+    #[test]
+    fn task_merge_artifact_append_true_no_match_adds_new() {
+        let mut task = Task::new("t-merge-2", TaskStatus::new(TaskState::Working));
+        task.append_artifact(crate::Artifact::new("a-1", vec![Part::text("x")]));
+
+        task.merge_artifact(
+            crate::Artifact::new("a-2", vec![Part::text("y")]),
+            true,
+            false,
+        );
+
+        assert_eq!(task.artifacts().len(), 2);
+    }
+
+    #[test]
+    fn task_merge_artifact_append_false_always_appends() {
+        let mut task = Task::new("t-merge-3", TaskStatus::new(TaskState::Working));
+        task.append_artifact(crate::Artifact::new("a-1", vec![Part::text("x")]));
+
+        task.merge_artifact(
+            crate::Artifact::new("a-1", vec![Part::text("y")]),
+            false,
+            true,
+        );
+
+        assert_eq!(
+            task.artifacts().len(),
+            2,
+            "append=false does not merge by id"
+        );
     }
 
     #[test]

@@ -2,10 +2,14 @@
 
 ## Current State
 
-- 9 crates in workspace, 328+ tests, 8 ADRs, 3 example agents.
-- **Strong for**: single-instance/server deployment, request/response Lambda, 4 parity-tested storage backends (in-memory, SQLite, PostgreSQL, DynamoDB), auth middleware (Bearer JWT + API Key), client library.
-- **Not yet complete for**: distributed multi-instance deployment claims, cross-instance streaming/subscription, full Lambda streaming parity.
-- Do not present the project as production-complete for horizontally scaled deployments until distributed verification and durable event coordination (D3) are done.
+- 9 crates in workspace, 3 example agents, 10 ADRs.
+- **Strong for** (server deployment):
+  - Durable event coordination: atomic task+event writes with terminal-preservation CAS on all four storage backends (in-memory, SQLite, PostgreSQL, DynamoDB).
+  - Multi-instance request/response correctness and cross-instance streaming subscription via shared backend. Verified by `tests/distributed_tests.rs` and `tests/d3_streaming_tests.rs`.
+  - Executor `EventSink` with spawn-and-track, two-deadline blocking timeout, and cross-instance cancellation propagation via the in-process cancel-marker poller (ADR-010, ADR-012).
+  - Auth middleware (Bearer JWT + API Key), client library.
+- **Lambda adapter** supports request/response and buffered-streaming SSE against the shared event store. Same-invocation cancellation works. The Lambda adapter does **not** run the persistent cross-instance cancel-marker poller that the server runtime uses, so cross-instance cancellation propagation to a live executor on a different warm Lambda invocation is not currently supported; see `crates/turul-a2a-aws-lambda/src/lib.rs` module docs for the exact scope.
+- Compliance and maturity claims still require a fresh upstream-spec diff per the Version Hygiene and Compliance Audit Gate sections before new public claims land.
 
 ## Source of Truth
 
@@ -253,6 +257,8 @@ cargo fmt --all -- --check
 - Keep `CLAUDE.md` concise and operational.
 - If both files exist and conflict, `AGENTS.md` wins.
 - Do not document speculative endpoints or field names as if implemented.
+- Code comments and rustdoc must describe the stable behavior, invariant, or public contract of the code as it exists. Do not mention internal implementation phases, task numbers, review cycles, temporary branch state, or agent workflow labels in code comments or doc strings.
+- If a behavior is temporary while a feature is being built, keep that explanation in planning docs, ADR amendments, issues, or commit messages. In source comments, state the current contract plainly and add a TODO only when it names the concrete missing behavior, not the internal phase that will deliver it.
 - Architectural decisions made during planning or implementation should be captured later as ADRs under `docs/adr/`.
 - For meaningful architecture changes, require the ADR to be written and accepted before implementation proceeds.
 

@@ -1031,10 +1031,16 @@ impl A2aAtomicStore for SqliteA2aStorage {
         let mut tx = self.pool.begin().await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        // Verify task exists and owner matches
+        // Terminal-preservation CAS (ADR-010 §7.1 extension): the UPDATE's
+        // WHERE clause excludes terminal status_state values. If the
+        // persisted row is terminal the update matches zero rows;
+        // a follow-up SELECT disambiguates "task missing" vs "already
+        // terminal" so the caller gets the right error.
         let result = sqlx::query(
-            "UPDATE a2a_tasks SET task_json = ?, status_state = ?, context_id = ?, updated_at = datetime('now')
-             WHERE tenant = ? AND task_id = ? AND owner = ?",
+            "UPDATE a2a_tasks
+               SET task_json = ?, status_state = ?, context_id = ?, updated_at = datetime('now')
+             WHERE tenant = ? AND task_id = ? AND owner = ?
+               AND status_state NOT IN ('Completed', 'Failed', 'Canceled', 'Rejected')",
         )
         .bind(&task_json)
         .bind(&state_str)
@@ -1047,7 +1053,25 @@ impl A2aAtomicStore for SqliteA2aStorage {
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         if result.rows_affected() == 0 {
-            return Err(A2aStorageError::TaskNotFound(task.id().to_string()));
+            // Disambiguate: not-found vs terminal-already-set.
+            let current: Option<(String,)> = sqlx::query_as(
+                "SELECT status_state FROM a2a_tasks WHERE tenant = ? AND task_id = ? AND owner = ?",
+            )
+            .bind(tenant)
+            .bind(task.id())
+            .bind(owner)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+            return match current {
+                Some((state,)) => Err(A2aStorageError::TerminalStateAlreadySet {
+                    task_id: task.id().to_string(),
+                    current_state:
+                        crate::storage::terminal_cas::debug_state_to_wire_name(&state),
+                }),
+                None => Err(A2aStorageError::TaskNotFound(task.id().to_string())),
+            };
         }
 
         // Append events
@@ -1287,6 +1311,12 @@ mod tests {
     async fn test_terminal_cas_rejects_sequential_second_terminal() {
         let s = storage().await;
         parity_tests::test_terminal_cas_rejects_sequential_second_terminal(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_task_with_events_rejects_terminal_already_set() {
+        let s = storage().await;
+        parity_tests::test_update_task_with_events_rejects_terminal_already_set(&s, &s, &s).await;
     }
 
     #[tokio::test]

@@ -1253,7 +1253,11 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         // Get current max sequence
         let max_seq = query_max_sequence(&self.client, &self.config.events_table, &pk).await?;
 
-        // Build TransactWriteItems: task put (with owner check) + event puts
+        // Build TransactWriteItems: task put (with owner check + terminal
+        // CAS) + event puts. ADR-010 §7.1 extension: the ConditionExpression
+        // rejects writes against a task whose persisted statusState is
+        // already terminal, protecting against full-task replacement
+        // clobbering a concurrent terminal commit.
         let mut task_put = aws_sdk_dynamodb::types::Put::builder()
             .table_name(&self.config.tasks_table)
             .item("pk", AttributeValue::S(pk.clone()))
@@ -1264,9 +1268,16 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             .item("contextId", AttributeValue::S(task.context_id().to_string()))
             .item("statusState", AttributeValue::S(state_str))
             .item("updatedAt", AttributeValue::S(Self::now_iso()))
-            .condition_expression("#owner = :owner")
+            .condition_expression(
+                "#owner = :owner AND (attribute_not_exists(statusState) \
+                 OR NOT statusState IN (:completed, :failed, :canceled, :rejected))",
+            )
             .expression_attribute_names("#owner", "owner")
-            .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()));
+            .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()))
+            .expression_attribute_values(":completed", AttributeValue::S("Completed".to_string()))
+            .expression_attribute_values(":failed", AttributeValue::S("Failed".to_string()))
+            .expression_attribute_values(":canceled", AttributeValue::S("Canceled".to_string()))
+            .expression_attribute_values(":rejected", AttributeValue::S("Rejected".to_string()));
         if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
             task_put = task_put.item("ttl", ttl);
         }
@@ -1308,14 +1319,51 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             );
         }
 
-        self.client
+        let task_id = task.id().to_string();
+        let tx_result = self.client
             .transact_write_items()
             .set_transact_items(Some(items))
             .send()
-            .await
-            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            .await;
 
-        Ok(sequences)
+        match tx_result {
+            Ok(_) => Ok(sequences),
+            Err(err) => {
+                // Classify via the service error string: if the tx was
+                // cancelled because the task-item's condition failed AND
+                // the persisted state is terminal, return
+                // TerminalStateAlreadySet. Owner-mismatch falls through to
+                // a generic DB error since the existing contract path
+                // never mapped update_task_with_events to OwnerMismatch.
+                let err_dbg = format!("{err:?}");
+                if err_dbg.contains("TransactionCanceledException")
+                    || err_dbg.contains("ConditionalCheckFailed")
+                {
+                    match self.get_task(tenant, &task_id, owner, Some(0)).await {
+                        Ok(Some(current_task)) => {
+                            let probe_state = current_task
+                                .status()
+                                .and_then(|s| s.state().ok());
+                            if let Some(s) = probe_state {
+                                if turul_a2a_types::state_machine::is_terminal(s) {
+                                    return Err(A2aStorageError::TerminalStateAlreadySet {
+                                        task_id,
+                                        current_state:
+                                            crate::storage::terminal_cas::task_state_wire_name(s)
+                                                .to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            return Err(A2aStorageError::TaskNotFound(task_id));
+                        }
+                        Err(_) => {}
+                    }
+                }
+                Err(A2aStorageError::DatabaseError(err_dbg))
+            }
+        }
     }
 }
 
@@ -1906,6 +1954,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_task_with_events_rejects_terminal_already_set() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_update_task_with_events_rejects_terminal_already_set(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
     async fn test_invalid_transition_distinct_from_terminal_already_set() {
         skip_unless_dynamodb_env!(s);
         parity_tests::test_invalid_transition_distinct_from_terminal_already_set(&s, &s).await;
@@ -2024,10 +2078,12 @@ mod tests {
         expected_seq: u64,
         expected_data: &str,
     ) {
+        // pk — partition key
         match item.get("pk") {
             Some(AttributeValue::S(v)) => assert_eq!(v, expected_pk),
             other => panic!("missing/wrong pk attribute: {other:?}"),
         }
+        // sk — range key, must be zero-padded 20-digit decimal of seq
         match item.get("sk") {
             Some(AttributeValue::S(v)) => {
                 assert_eq!(v, &format!("{expected_seq:020}"));
@@ -2035,12 +2091,14 @@ mod tests {
             }
             other => panic!("missing/wrong sk attribute: {other:?}"),
         }
+        // eventSequence — numeric attribute carrying the logical seq
         match item.get("eventSequence") {
             Some(AttributeValue::N(v)) => {
                 assert_eq!(v, &expected_seq.to_string());
             }
             other => panic!("missing/wrong eventSequence attribute: {other:?}"),
         }
+        // eventData — serialized StreamEvent JSON
         match item.get("eventData") {
             Some(AttributeValue::S(v)) => assert_eq!(v, expected_data),
             other => panic!("missing/wrong eventData attribute: {other:?}"),
@@ -2049,6 +2107,8 @@ mod tests {
 
     #[test]
     fn build_event_item_has_required_attributes_for_append_event_path() {
+        // `append_event` writes one event row with seq = max + 1,
+        // no TTL when unconfigured.
         let item = DynamoDbA2aStorage::build_event_item(
             "tenant-a#task-1",
             7,
@@ -2064,6 +2124,7 @@ mod tests {
 
     #[test]
     fn build_event_item_has_required_attributes_for_create_task_path() {
+        // `create_task_with_events` writes events starting at seq = 1.
         let item = DynamoDbA2aStorage::build_event_item(
             "tenant-b#task-2",
             1,
@@ -2080,8 +2141,10 @@ mod tests {
 
     #[test]
     fn build_event_item_has_required_attributes_for_update_status_path() {
-        // Numeric values near u32::MAX confirm the encoding stays
-        // stable at high sequences.
+        // `update_task_status_with_events` writes events at seq =
+        // max_seq + 1; the terminal-preservation CAS still includes
+        // these rows. Numeric values near u32::MAX confirm the
+        // encoding stays stable at high sequences.
         let big_seq = 4_000_000_000u64;
         let item = DynamoDbA2aStorage::build_event_item(
             "tenant-c#task-3",
@@ -2099,6 +2162,8 @@ mod tests {
 
     #[test]
     fn build_event_item_has_required_attributes_for_update_task_path() {
+        // `update_task_with_events` writes artifact-update events;
+        // sequence advancement follows the same contract.
         let item = DynamoDbA2aStorage::build_event_item(
             "tenant-d#task-4",
             42,

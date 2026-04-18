@@ -24,7 +24,6 @@ use turul_a2a_types::wire::jsonrpc as methods;
 use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
 
 use crate::error::A2aError;
-use crate::executor::ExecutionContext;
 use crate::router::AppState;
 use crate::storage::A2aEventStore;
 use crate::streaming::{self, StreamEvent, replay};
@@ -268,72 +267,48 @@ async fn dispatch_send_streaming_message(
         .create_task_with_events(tenant, owner, task, vec![submitted_event])
         .await
         .map_err(A2aError::from)?;
-
     state.event_broker.notify(&task_id).await;
 
-    // Spawn executor in background
-    let exec_state = state.clone();
-    let exec_tenant = tenant.to_string();
-    let exec_owner = owner.to_string();
-    let exec_task_id = task_id.clone();
-    let exec_context_id = context_id.clone();
-    let exec_message = message.clone();
-    tokio::spawn(async move {
-        let working_event = StreamEvent::StatusUpdate {
-            status_update: streaming::StatusUpdatePayload {
-                task_id: exec_task_id.clone(),
-                context_id: exec_context_id.clone(),
-                status: serde_json::to_value(&TaskStatus::new(TaskState::Working)).unwrap_or_default(),
-            },
-        };
+    // SUBMITTED → WORKING via CAS so subscribers see WORKING before
+    // the executor begins emitting.
+    let working_event = StreamEvent::StatusUpdate {
+        status_update: streaming::StatusUpdatePayload {
+            task_id: task_id.clone(),
+            context_id: context_id.clone(),
+            status: serde_json::to_value(&TaskStatus::new(TaskState::Working))
+                .unwrap_or_default(),
+        },
+    };
+    state
+        .atomic_store
+        .update_task_status_with_events(
+            tenant,
+            &task_id,
+            owner,
+            TaskStatus::new(TaskState::Working),
+            vec![working_event],
+        )
+        .await
+        .map_err(A2aError::from)?;
+    state.event_broker.notify(&task_id).await;
 
-        let result = exec_state
-            .atomic_store
-            .update_task_status_with_events(
-                &exec_tenant, &exec_task_id, &exec_owner,
-                TaskStatus::new(TaskState::Working),
-                vec![working_event],
-            )
-            .await;
-
-        if let Ok((_, _)) = result {
-            exec_state.event_broker.notify(&exec_task_id).await;
-
-            let mut task = exec_state
-                .task_storage
-                .get_task(&exec_tenant, &exec_task_id, &exec_owner, None)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| Task::new(&exec_task_id, TaskStatus::new(TaskState::Working)));
-
-            let exec_ctx = ExecutionContext {
-                owner: exec_owner.clone(),
-                tenant: if exec_tenant.is_empty() { None } else { Some(exec_tenant.clone()) },
-                task_id: exec_task_id.clone(),
-                context_id: Some(exec_context_id.clone()),
-                claims: None,
-                cancellation: tokio_util::sync::CancellationToken::new(),
-            };
-            let _ = exec_state.executor.execute(&mut task, &exec_message, &exec_ctx).await;
-
-            let final_status = task.status().unwrap_or_else(|| TaskStatus::new(TaskState::Completed));
-            let final_event = StreamEvent::StatusUpdate {
-                status_update: streaming::StatusUpdatePayload {
-                    task_id: exec_task_id.clone(),
-                    context_id: exec_context_id.clone(),
-                    status: serde_json::to_value(&final_status).unwrap_or_default(),
-                },
-            };
-
-            let _ = exec_state
-                .atomic_store
-                .update_task_with_events(&exec_tenant, &exec_owner, task, vec![final_event])
-                .await;
-
-            exec_state.event_broker.notify(&exec_task_id).await;
-        }
-    });
+    // Spawn the executor on a tracked handle. Streaming transport does
+    // not block on yielded_rx.
+    let spawn_deps = crate::server::spawn::SpawnDeps {
+        executor: state.executor.clone(),
+        task_storage: state.task_storage.clone(),
+        atomic_store: state.atomic_store.clone(),
+        event_broker: state.event_broker.clone(),
+        in_flight: state.in_flight.clone(),
+    };
+    let scope = crate::server::spawn::SpawnScope {
+        tenant: tenant.to_string(),
+        owner: owner.to_string(),
+        task_id: task_id.clone(),
+        context_id: context_id.clone(),
+        message: message.clone(),
+    };
+    let _spawn = crate::server::spawn::spawn_tracked_executor(spawn_deps, scope)?;
 
     Ok(make_jsonrpc_sse_response(
         request_id,

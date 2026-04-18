@@ -15,7 +15,7 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::A2aError;
-use crate::executor::{AgentExecutor, ExecutionContext};
+use crate::executor::AgentExecutor;
 use crate::storage::{A2aAtomicStore, A2aEventStore, A2aPushNotificationStorage, A2aStorageError, A2aTaskStorage, TaskFilter, TaskListPage};
 use crate::streaming::{StreamEvent, replay};
 use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
@@ -30,23 +30,22 @@ pub struct AppState {
     pub atomic_store: Arc<dyn A2aAtomicStore>,
     pub event_broker: crate::streaming::TaskEventBroker,
     pub middleware_stack: Arc<crate::middleware::MiddlewareStack>,
-    /// Runtime configuration preserved from `A2aServerBuilder`. Consumed
-    /// in phases C (cancellation), D (EventSink / long-running), and E
-    /// (push delivery). Phase A threads it through so setter values
-    /// survive `.build()` — future phases read via `state.runtime_config`.
-    ///
-    /// When constructing `AppState` directly (e.g., in tests or an
-    /// AWS Lambda adapter that bypasses the builder), use
-    /// `crate::server::RuntimeConfig::default()`.
+    /// Runtime configuration carried from [`crate::server::A2aServerBuilder`].
+    /// Consumers read fields via `state.runtime_config` — cancellation
+    /// handler grace / poll interval, cross-instance cancel poll
+    /// interval, blocking-send two-deadline timeouts, and push delivery
+    /// tuning. Construct via
+    /// [`crate::server::RuntimeConfig::default()`] when building
+    /// `AppState` directly (tests, Lambda adapter) rather than through
+    /// the server builder.
     pub runtime_config: crate::server::RuntimeConfig,
 
     /// In-flight task registry (ADR-010 §4.4). Holds one
     /// [`crate::server::in_flight::InFlightHandle`] per spawned executor
     /// — keyed by `(tenant, task_id)`. Populated by the executor spawn
-    /// path in phase D; used by the `:cancel` handler in phase C to trip
-    /// the local cancellation token if the executor runs on this
-    /// instance. Empty during phase C when no executor has been spawned
-    /// through the registry yet.
+    /// path; consumed by the `:cancel` handler to trip the local
+    /// cancellation token if the executor runs on this instance. May be
+    /// empty when no executor has been spawned through the registry yet.
     pub in_flight: Arc<crate::server::in_flight::InFlightRegistry>,
 
     /// Supervisor-only cancel-marker reads (ADR-012 §3 / §10). Separate
@@ -398,10 +397,10 @@ pub(crate) async fn core_send_streaming_message(
         message.as_proto().context_id.clone()
     };
 
-    // Subscribe to wake-ups BEFORE creating the task so we don't miss notifications
+    // Subscribe to wake-ups BEFORE creating the task so we don't miss notifications.
     let wake_rx = state.event_broker.subscribe(&task_id).await;
 
-    // Atomic: create task + SUBMITTED event
+    // Atomic: create task (SUBMITTED) + SUBMITTED event.
     let mut task = Task::new(&task_id, TaskStatus::new(TaskState::Submitted))
         .with_context_id(&context_id);
     task.append_message(message.clone());
@@ -410,7 +409,8 @@ pub(crate) async fn core_send_streaming_message(
         status_update: crate::streaming::StatusUpdatePayload {
             task_id: task_id.clone(),
             context_id: context_id.clone(),
-            status: serde_json::to_value(&TaskStatus::new(TaskState::Submitted)).unwrap_or_default(),
+            status: serde_json::to_value(&TaskStatus::new(TaskState::Submitted))
+                .unwrap_or_default(),
         },
     };
 
@@ -420,86 +420,61 @@ pub(crate) async fn core_send_streaming_message(
         .await
         .map_err(A2aError::from)?;
 
-    // Wake up any subscribers
     state.event_broker.notify(&task_id).await;
 
-    // Spawn executor in background — all writes through atomic store
-    let exec_state = state.clone();
-    let exec_tenant = tenant.to_string();
-    let exec_owner = owner.to_string();
-    let exec_task_id = task_id.clone();
-    let exec_context_id = context_id.clone();
-    let exec_message = message.clone();
-    tokio::spawn(async move {
-        // Atomic: move to Working + WORKING event
-        let working_event = StreamEvent::StatusUpdate {
-            status_update: crate::streaming::StatusUpdatePayload {
-                task_id: exec_task_id.clone(),
-                context_id: exec_context_id.clone(),
-                status: serde_json::to_value(&TaskStatus::new(TaskState::Working)).unwrap_or_default(),
-            },
-        };
+    // Advance SUBMITTED → WORKING via the CAS-guarded atomic store so
+    // streaming subscribers see the WORKING event before the executor
+    // emits its own events.
+    let working_event = StreamEvent::StatusUpdate {
+        status_update: crate::streaming::StatusUpdatePayload {
+            task_id: task_id.clone(),
+            context_id: context_id.clone(),
+            status: serde_json::to_value(&TaskStatus::new(TaskState::Working))
+                .unwrap_or_default(),
+        },
+    };
+    state
+        .atomic_store
+        .update_task_status_with_events(
+            tenant,
+            &task_id,
+            owner,
+            TaskStatus::new(TaskState::Working),
+            vec![working_event],
+        )
+        .await
+        .map_err(A2aError::from)?;
+    state.event_broker.notify(&task_id).await;
 
-        let result = exec_state
-            .atomic_store
-            .update_task_status_with_events(
-                &exec_tenant, &exec_task_id, &exec_owner,
-                TaskStatus::new(TaskState::Working),
-                vec![working_event],
-            )
-            .await;
+    // Spawn the executor on a tracked handle. We drop the yielded
+    // receiver — streaming transport does not block on it; subscribers
+    // observe terminal events through the durable store instead.
+    let spawn_deps = crate::server::spawn::SpawnDeps {
+        executor: state.executor.clone(),
+        task_storage: state.task_storage.clone(),
+        atomic_store: state.atomic_store.clone(),
+        event_broker: state.event_broker.clone(),
+        in_flight: state.in_flight.clone(),
+    };
+    let scope = crate::server::spawn::SpawnScope {
+        tenant: tenant.to_string(),
+        owner: owner.to_string(),
+        task_id: task_id.clone(),
+        context_id: context_id.clone(),
+        message: message.clone(),
+    };
+    let _spawn = crate::server::spawn::spawn_tracked_executor(spawn_deps, scope)?;
 
-        if let Ok((_, _)) = result {
-            exec_state.event_broker.notify(&exec_task_id).await;
-
-            // Execute agent logic
-            let mut task = exec_state
-                .task_storage
-                .get_task(&exec_tenant, &exec_task_id, &exec_owner, None)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| Task::new(&exec_task_id, TaskStatus::new(TaskState::Working)));
-
-            let exec_ctx = ExecutionContext {
-                owner: exec_owner.clone(),
-                tenant: if exec_tenant.is_empty() { None } else { Some(exec_tenant.clone()) },
-                task_id: exec_task_id.clone(),
-                context_id: Some(exec_context_id.clone()),
-                claims: None, // TODO: thread claims from RequestContext when needed
-                cancellation: tokio_util::sync::CancellationToken::new(),
-            };
-            let _ = exec_state.executor.execute(&mut task, &exec_message, &exec_ctx).await;
-
-            // Atomic: persist final state + terminal event
-            let final_status = task.status().unwrap_or_else(|| TaskStatus::new(TaskState::Completed));
-            let final_event = StreamEvent::StatusUpdate {
-                status_update: crate::streaming::StatusUpdatePayload {
-                    task_id: exec_task_id.clone(),
-                    context_id: exec_context_id.clone(),
-                    status: serde_json::to_value(&final_status).unwrap_or_default(),
-                },
-            };
-
-            let _ = exec_state
-                .atomic_store
-                .update_task_with_events(&exec_tenant, &exec_owner, task, vec![final_event])
-                .await;
-
-            exec_state.event_broker.notify(&exec_task_id).await;
-        }
-    });
-
-    // Return SSE stream reading from durable store
-    // No initial Task snapshot for streaming send — the task was just created,
-    // the SUBMITTED event is the first thing the client sees.
+    // SSE stream reads from the durable store. No initial Task
+    // snapshot: SUBMITTED + WORKING are already in the event store and
+    // will replay on subscription.
     Ok(make_store_sse_response(
         state.event_store,
         tenant.to_string(),
         task_id,
-        0, // start from beginning
+        0,
         wake_rx,
-        None, // no initial task snapshot for streaming send
+        None,
     ))
 }
 
@@ -710,7 +685,8 @@ fn parse_task_state(s: &str) -> Option<TaskState> {
     }
 }
 
-pub(crate) async fn core_send_message(
+#[doc(hidden)]
+pub async fn core_send_message(
     state: AppState,
     tenant: &str,
     owner: &str,
@@ -729,11 +705,16 @@ pub(crate) async fn core_send_message(
         message: format!("Invalid message: {e}"),
     })?;
 
+    let return_immediately = request
+        .configuration
+        .as_ref()
+        .map(|c| c.return_immediately)
+        .unwrap_or(false);
+
     let msg_task_id = message.as_proto().task_id.clone();
 
-    // If message has a task_id, continue the existing task; otherwise create new
-    let (task_id, is_continuation) = if !msg_task_id.is_empty() {
-        // Verify the task exists and is accessible
+    // If message has a task_id, continue the existing task; otherwise create new.
+    let (task_id, context_id, is_continuation) = if !msg_task_id.is_empty() {
         let existing = state
             .task_storage
             .get_task(tenant, &msg_task_id, owner, None)
@@ -743,7 +724,7 @@ pub(crate) async fn core_send_message(
                 task_id: msg_task_id.clone(),
             })?;
 
-        // Reject contextId/taskId mismatch (spec §3.4.3 MUST)
+        // Reject contextId/taskId mismatch (spec §3.4.3 MUST).
         let msg_context_id = &message.as_proto().context_id;
         if !msg_context_id.is_empty() && msg_context_id != existing.context_id() {
             return Err(A2aError::InvalidRequest {
@@ -754,7 +735,7 @@ pub(crate) async fn core_send_message(
             });
         }
 
-        // Only allow continuation for interrupted states (INPUT_REQUIRED, AUTH_REQUIRED)
+        // Continuation is only valid from interrupted states.
         if let Some(status) = existing.status() {
             if let Ok(s) = status.state() {
                 match s {
@@ -770,91 +751,278 @@ pub(crate) async fn core_send_message(
             }
         }
 
-        (msg_task_id, true)
+        (
+            msg_task_id,
+            existing.context_id().to_string(),
+            true,
+        )
     } else {
-        (uuid::Uuid::now_v7().to_string(), false)
+        let context_id = if message.as_proto().context_id.is_empty() {
+            uuid::Uuid::now_v7().to_string()
+        } else {
+            message.as_proto().context_id.clone()
+        };
+        (uuid::Uuid::now_v7().to_string(), context_id, false)
     };
 
+    // Set up task storage in WORKING atomically, emitting SUBMITTED
+    // + WORKING events through the CAS-guarded atomic store so that
+    // subscribers / push delivery observe the lifecycle even on the
+    // blocking-send path. For continuations, append the incoming
+    // message and transition INPUT_REQUIRED/AUTH_REQUIRED → WORKING.
     if is_continuation {
-        // Append message to existing task
         state
             .task_storage
             .append_message(tenant, &task_id, owner, message.clone())
             .await
             .map_err(A2aError::from)?;
 
-        // Move to Working if in interrupted state
-        let task = state
-            .task_storage
-            .update_task_status(tenant, &task_id, owner, TaskStatus::new(TaskState::Working))
-            .await
-            .map_err(A2aError::from)?;
-
-        let mut task = task;
-        let ctx = ExecutionContext {
-            owner: owner.to_string(),
-            tenant: if tenant.is_empty() { None } else { Some(tenant.to_string()) },
-            task_id: task_id.clone(),
-            context_id: Some(task.context_id().to_string()),
-            claims: None,
-            cancellation: tokio_util::sync::CancellationToken::new(),
+        let working_event = StreamEvent::StatusUpdate {
+            status_update: crate::streaming::StatusUpdatePayload {
+                task_id: task_id.clone(),
+                context_id: context_id.clone(),
+                status: serde_json::to_value(&TaskStatus::new(TaskState::Working))
+                    .unwrap_or_default(),
+            },
         };
-        state.executor.execute(&mut task, &message, &ctx).await?;
-
         state
-            .task_storage
-            .update_task(tenant, owner, task.clone())
+            .atomic_store
+            .update_task_status_with_events(
+                tenant,
+                &task_id,
+                owner,
+                TaskStatus::new(TaskState::Working),
+                vec![working_event],
+            )
             .await
             .map_err(A2aError::from)?;
-
-        Ok(Json(serde_json::json!({
-            "task": serde_json::to_value(&task).unwrap_or_default()
-        })))
+        state.event_broker.notify(&task_id).await;
     } else {
-        // Create new task
-        let context_id = if message.as_proto().context_id.is_empty() {
-            uuid::Uuid::now_v7().to_string()
-        } else {
-            message.as_proto().context_id.clone()
-        };
-
         let mut task = Task::new(&task_id, TaskStatus::new(TaskState::Submitted))
             .with_context_id(&context_id);
         task.append_message(message.clone());
 
-        state
-            .task_storage
-            .create_task(tenant, owner, task)
-            .await
-            .map_err(A2aError::from)?;
-
-        let task = state
-            .task_storage
-            .update_task_status(tenant, &task_id, owner, TaskStatus::new(TaskState::Working))
-            .await
-            .map_err(A2aError::from)?;
-
-        let mut task = task;
-        let ctx = ExecutionContext {
-            owner: owner.to_string(),
-            tenant: if tenant.is_empty() { None } else { Some(tenant.to_string()) },
-            task_id: task_id.clone(),
-            context_id: Some(context_id.clone()),
-            claims: None,
-            cancellation: tokio_util::sync::CancellationToken::new(),
+        let submitted_event = StreamEvent::StatusUpdate {
+            status_update: crate::streaming::StatusUpdatePayload {
+                task_id: task_id.clone(),
+                context_id: context_id.clone(),
+                status: serde_json::to_value(&TaskStatus::new(TaskState::Submitted))
+                    .unwrap_or_default(),
+            },
         };
-        state.executor.execute(&mut task, &message, &ctx).await?;
-
         state
-            .task_storage
-            .update_task(tenant, owner, task.clone())
+            .atomic_store
+            .create_task_with_events(tenant, owner, task, vec![submitted_event])
             .await
             .map_err(A2aError::from)?;
+        state.event_broker.notify(&task_id).await;
 
-        Ok(Json(serde_json::json!({
-            "task": serde_json::to_value(&task).unwrap_or_default()
-        })))
+        let working_event = StreamEvent::StatusUpdate {
+            status_update: crate::streaming::StatusUpdatePayload {
+                task_id: task_id.clone(),
+                context_id: context_id.clone(),
+                status: serde_json::to_value(&TaskStatus::new(TaskState::Working))
+                    .unwrap_or_default(),
+            },
+        };
+        state
+            .atomic_store
+            .update_task_status_with_events(
+                tenant,
+                &task_id,
+                owner,
+                TaskStatus::new(TaskState::Working),
+                vec![working_event],
+            )
+            .await
+            .map_err(A2aError::from)?;
+        state.event_broker.notify(&task_id).await;
     }
+
+    // Spawn the executor on a tracked handle with a live EventSink.
+    let spawn_deps = crate::server::spawn::SpawnDeps {
+        executor: state.executor.clone(),
+        task_storage: state.task_storage.clone(),
+        atomic_store: state.atomic_store.clone(),
+        event_broker: state.event_broker.clone(),
+        in_flight: state.in_flight.clone(),
+    };
+    let scope = crate::server::spawn::SpawnScope {
+        tenant: tenant.to_string(),
+        owner: owner.to_string(),
+        task_id: task_id.clone(),
+        context_id: context_id.clone(),
+        message: message.clone(),
+    };
+    let spawn = crate::server::spawn::spawn_tracked_executor(spawn_deps, scope)?;
+
+    if return_immediately {
+        // Non-blocking send (A2A spec §3.2.2, proto
+        // SendMessageConfiguration.return_immediately=true): return the
+        // task in its current state immediately. Drop yielded_rx — the
+        // background executor keeps running; the caller polls / streams
+        // to observe completion.
+        drop(spawn.yielded_rx);
+        let current = state
+            .task_storage
+            .get_task(tenant, &task_id, owner, None)
+            .await
+            .map_err(A2aError::from)?
+            .ok_or_else(|| A2aError::TaskNotFound {
+                task_id: task_id.clone(),
+            })?;
+        return Ok(Json(serde_json::json!({
+            "task": serde_json::to_value(&current).unwrap_or_default()
+        })));
+    }
+
+    // Blocking send: await yielded_rx with the two-deadline timeout.
+    let task = await_yielded_with_two_deadlines(
+        spawn.yielded_rx,
+        spawn.cancellation,
+        spawn.handle,
+        &state,
+        tenant,
+        owner,
+        &task_id,
+        &context_id,
+    )
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "task": serde_json::to_value(&task).unwrap_or_default()
+    })))
+}
+
+/// Two-deadline blocking-send timeout (ADR-010 §4.1).
+///
+/// 1. **Soft deadline** (`blocking_task_timeout`): wait for the
+///    executor to emit a terminal or interrupted event. If the deadline
+///    fires first, trip `cancellation` and enter the cooperative window.
+/// 2. **Cooperative window** (through `timeout_abort_grace`): the
+///    cancellation token is already set; a well-behaved executor
+///    observes it and emits `sink.cancelled(...)` (or another terminal).
+/// 3. **Hard deadline** (`soft + grace`): force-commit `FAILED` via
+///    `update_task_status_with_events` — CAS-guarded. On
+///    `TerminalStateAlreadySet` the executor won the race at the last
+///    moment; re-read and return the persisted terminal. On success,
+///    abort the spawned JoinHandle as best-effort cleanup.
+///
+/// Returns the Task the caller should hand back to the client.
+async fn await_yielded_with_two_deadlines(
+    mut yielded_rx: tokio::sync::oneshot::Receiver<Task>,
+    cancellation: tokio_util::sync::CancellationToken,
+    handle: Arc<crate::server::in_flight::InFlightHandle>,
+    state: &AppState,
+    tenant: &str,
+    owner: &str,
+    task_id: &str,
+    context_id: &str,
+) -> Result<Task, A2aError> {
+    let soft = tokio::time::Instant::now() + state.runtime_config.blocking_task_timeout;
+    let hard = soft + state.runtime_config.timeout_abort_grace;
+
+    // Soft wait: wait for yielded OR the soft deadline.
+    let soft_outcome = tokio::select! {
+        result = &mut yielded_rx => YieldedOutcome::Yielded(result.ok()),
+        _ = tokio::time::sleep_until(soft) => YieldedOutcome::SoftTimeout,
+    };
+
+    if let YieldedOutcome::Yielded(Some(task)) = soft_outcome {
+        return Ok(task);
+    }
+    if let YieldedOutcome::Yielded(None) = soft_outcome {
+        // The yielded sender was dropped without firing — the
+        // supervisor sentinel ran its cleanup before any terminal
+        // landed. Surface this as Internal so the client sees a clear
+        // failure rather than hanging.
+        return Err(A2aError::Internal(
+            "executor exited without emitting a terminal or interrupted event".into(),
+        ));
+    }
+
+    // Cooperative wait: soft deadline expired. Trip the cancellation
+    // token so the executor observes cancellation, and wait for the
+    // cooperative window to expire (or for yielded to fire from the
+    // executor's own terminal emit).
+    cancellation.cancel();
+
+    let cooperative_outcome = tokio::select! {
+        result = &mut yielded_rx => YieldedOutcome::Yielded(result.ok()),
+        _ = tokio::time::sleep_until(hard) => YieldedOutcome::HardTimeout,
+    };
+
+    if let YieldedOutcome::Yielded(Some(task)) = cooperative_outcome {
+        return Ok(task);
+    }
+    // Yielded-None during the cooperative wait also falls through to the
+    // hard timeout.
+
+    // Hard timeout: force-commit FAILED via CAS.
+    let reason_msg = Message::new(
+        uuid::Uuid::now_v7().to_string(),
+        turul_a2a_types::Role::Agent,
+        vec![turul_a2a_types::Part::text(
+            "task timed out: hard deadline exceeded without terminal emission",
+        )],
+    );
+    let failed_status = TaskStatus::new(TaskState::Failed).with_message(reason_msg);
+    let failed_event = StreamEvent::StatusUpdate {
+        status_update: crate::streaming::StatusUpdatePayload {
+            task_id: task_id.to_string(),
+            context_id: context_id.to_string(),
+            status: serde_json::to_value(&failed_status).unwrap_or_default(),
+        },
+    };
+
+    let result = state
+        .atomic_store
+        .update_task_status_with_events(
+            tenant,
+            task_id,
+            owner,
+            failed_status,
+            vec![failed_event],
+        )
+        .await;
+
+    match result {
+        Ok((task, _)) => {
+            // Abort the spawned executor. The cloneable AbortHandle
+            // is independent of the supervisor's JoinHandle
+            // ownership, so this works whether or not the supervisor
+            // has already taken the JoinHandle to `.await` it. The
+            // supervisor continues to track the task for registry
+            // cleanup — its `.await` returns `JoinError::Cancelled`
+            // once the abort propagates at the next executor yield
+            // point.
+            handle.abort();
+            state.event_broker.notify(task_id).await;
+            Ok(task)
+        }
+        Err(crate::storage::A2aStorageError::TerminalStateAlreadySet { .. }) => {
+            // Executor emitted its own terminal while we were
+            // racing the hard deadline. Return the actually-persisted
+            // terminal.
+            state.event_broker.notify(task_id).await;
+            let persisted = state
+                .task_storage
+                .get_task(tenant, task_id, owner, None)
+                .await
+                .map_err(A2aError::from)?
+                .ok_or_else(|| A2aError::TaskNotFound {
+                    task_id: task_id.to_string(),
+                })?;
+            Ok(persisted)
+        }
+        Err(e) => Err(A2aError::from(e)),
+    }
+}
+
+enum YieldedOutcome {
+    Yielded(Option<Task>),
+    SoftTimeout,
+    HardTimeout,
 }
 
 pub(crate) async fn core_list_tasks(
@@ -930,7 +1098,8 @@ pub(crate) async fn core_get_task(
 ///    `cancel_handler_poll_interval`. On observed terminal, return that
 ///    persisted task snapshot (cooperative cancel won the race).
 /// 6. On grace expiry, force-commit `CANCELED` via the atomic store
-///    (CAS-guarded by phase B). On success, return CANCELED. On
+///    (CAS-guarded via the atomic store's terminal-preservation
+///    contract). On success, return CANCELED. On
 ///    `TerminalStateAlreadySet`, re-read and return the actual persisted
 ///    terminal (another path won at the CAS layer).
 ///

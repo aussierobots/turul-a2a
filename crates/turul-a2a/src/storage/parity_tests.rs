@@ -1476,6 +1476,126 @@ pub async fn test_terminal_cas_rejects_sequential_second_terminal(
     );
 }
 
+/// Terminal-preservation CAS on `update_task_with_events` (ADR-010 §7.1
+/// extension): once the persisted task is terminal, any subsequent
+/// full-task replacement MUST be rejected with
+/// `TerminalStateAlreadySet` and MUST NOT append any events.
+///
+/// This protects [`crate::event_sink::EventSink::emit_artifact`]'s
+/// read-mutate-write path from silently overwriting a concurrently
+/// committed terminal. Without this CAS, an artifact emit that read the
+/// task while it was WORKING and wrote back after a terminal commit
+/// would roll back the terminal.
+pub async fn test_update_task_with_events_rejects_terminal_already_set(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+) {
+    // Arrange: create task, move to WORKING, then commit a terminal.
+    let task = make_task("upd-tpc-1", "ctx-upd-tpc");
+    tasks
+        .create_task("default", "owner-upd", task)
+        .await
+        .unwrap();
+    atomic
+        .update_task_status_with_events(
+            "default",
+            "upd-tpc-1",
+            "owner-upd",
+            TaskStatus::new(TaskState::Working),
+            vec![make_status_event_for(
+                "upd-tpc-1",
+                "ctx-upd-tpc",
+                "TASK_STATE_WORKING",
+            )],
+        )
+        .await
+        .unwrap();
+    atomic
+        .update_task_status_with_events(
+            "default",
+            "upd-tpc-1",
+            "owner-upd",
+            TaskStatus::new(TaskState::Completed),
+            vec![make_status_event_for(
+                "upd-tpc-1",
+                "ctx-upd-tpc",
+                "TASK_STATE_COMPLETED",
+            )],
+        )
+        .await
+        .unwrap();
+
+    let event_count_before = events
+        .get_events_after("default", "upd-tpc-1", 0)
+        .await
+        .unwrap()
+        .len();
+
+    // Act: attempt a full-task replacement that pretends the task is still
+    // WORKING — the exact shape of the EventSink::emit_artifact
+    // read-mutate-write race. The argument task carries WORKING;
+    // the persisted task is COMPLETED.
+    let stale = Task::new("upd-tpc-1", TaskStatus::new(TaskState::Working))
+        .with_context_id("ctx-upd-tpc");
+    let result = atomic
+        .update_task_with_events(
+            "default",
+            "owner-upd",
+            stale,
+            vec![make_status_event_for(
+                "upd-tpc-1",
+                "ctx-upd-tpc",
+                "TASK_STATE_WORKING",
+            )],
+        )
+        .await;
+
+    // Assert: rejected with TerminalStateAlreadySet and the persisted
+    // state reported in proto wire form.
+    match result {
+        Err(crate::storage::A2aStorageError::TerminalStateAlreadySet {
+            task_id,
+            current_state,
+        }) => {
+            assert_eq!(task_id, "upd-tpc-1");
+            assert_eq!(current_state, "TASK_STATE_COMPLETED");
+        }
+        Ok(_) => panic!(
+            "update_task_with_events must reject writes to a task whose \
+             persisted state is terminal"
+        ),
+        Err(other) => panic!("expected TerminalStateAlreadySet, got {other:?}"),
+    }
+
+    // Assert: no events committed by the rejected write.
+    let event_count_after = events
+        .get_events_after("default", "upd-tpc-1", 0)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(
+        event_count_after, event_count_before,
+        "rejected update_task_with_events must not append events"
+    );
+
+    // Assert: persisted task state is unchanged.
+    let persisted = tasks
+        .get_task("default", "upd-tpc-1", "owner-upd", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        persisted
+            .status()
+            .unwrap()
+            .state()
+            .unwrap(),
+        TaskState::Completed,
+        "rejected update_task_with_events must not mutate task state"
+    );
+}
+
 // =========================================================
 // ADR-012 cancel-marker parity (phase C)
 // =========================================================
@@ -1588,8 +1708,9 @@ pub async fn test_supervisor_list_cancel_requested_parity(
 }
 
 /// AT-CAS-003: distinct error variants — `InvalidTransition` is NOT
-/// conflated with `TerminalStateAlreadySet`. Callers (e.g. phase D's
-/// `EventSink::closed` translation) rely on this distinction.
+/// conflated with `TerminalStateAlreadySet`. Callers that translate
+/// atomic-store errors into executor-facing outcomes (for example,
+/// `EventSink`'s sink-closed translation) rely on this distinction.
 pub async fn test_invalid_transition_distinct_from_terminal_already_set(
     atomic: &dyn A2aAtomicStore,
     tasks: &dyn A2aTaskStorage,

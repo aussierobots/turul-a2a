@@ -1,9 +1,10 @@
 //! In-flight task tracking and supervisor-panic cleanup.
 //!
-//! This module is the **shared runtime substrate** for ADR-010 (long-running
-//! tasks + EventSink), ADR-012 (cancellation propagation), and ADR-011 (push
-//! delivery). Phase A introduces the types and invariants; later phases wire
-//! up the executor, router, and delivery code against them.
+//! Shared runtime substrate for ADR-010 (long-running tasks + EventSink),
+//! ADR-012 (cancellation propagation), and ADR-011 (push delivery). The
+//! types in this module own the invariants around spawned executors —
+//! cancellation signalling, blocking-send return, abort capability,
+//! cleanup on every exit path.
 //!
 //! # Types
 //!
@@ -46,7 +47,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use turul_a2a_types::Task;
@@ -66,15 +67,16 @@ pub type InFlightKey = (String, String);
 /// [`SupervisorSentinel::drop`] when the executor exits (normally, in error,
 /// or via panic unwind).
 pub struct InFlightHandle {
-    /// Cancellation signal. Tripped by the `:cancel` handler (phase C) or by
-    /// the blocking-send timeout path (phase D). The clone passed to the
+    /// Cancellation signal. Tripped by the `:cancel` handler or by
+    /// the blocking-send soft-timeout path. The clone passed to the
     /// executor lives on `ExecutionContext::cancellation`.
     pub cancellation: CancellationToken,
 
     /// Yielded oneshot. Fires on the **first** commit of a terminal or
-    /// interrupted task event. Consumer: blocking `SendMessage` handler
-    /// (phase D). Independent of `spawned` — fires as soon as the commit
-    /// succeeds, not when the executor task exits.
+    /// interrupted task event. Consumed by the blocking `SendMessage`
+    /// handler waiting to return the task to the client. Independent
+    /// of `spawned` — fires as soon as the commit succeeds, not when
+    /// the executor task exits.
     ///
     /// The sender is wrapped in a Mutex<Option<_>> so it can be atomically
     /// taken at fire time. The CAS on `yielded_fired` serializes calls so
@@ -85,12 +87,25 @@ pub struct InFlightHandle {
     /// The AcqRel CAS ensures concurrent triggers see exactly one winner.
     yielded_fired: AtomicBool,
 
-    /// Executor's tokio task handle. Used by the supervisor for cleanup and,
-    /// in later phases, for blocking-send hard-timeout abort.
+    /// Executor's tokio task handle. Held in an `Option` so the
+    /// supervisor task can `take()` it out and `.await` ownership.
     ///
-    /// `Mutex<Option<_>>` so the supervisor can `take()` for awaiting while
-    /// the sentinel still has a shot at aborting on panic.
+    /// Abort capability is carried on [`Self::abort_handle`]
+    /// separately — after the supervisor takes the `JoinHandle`, this
+    /// field is `None` but abort is still reachable from any caller
+    /// that holds the registry handle.
     spawned: Mutex<Option<JoinHandle<()>>>,
+
+    /// Cloneable abort capability for the spawned executor task.
+    ///
+    /// Decoupled from [`Self::spawned`] so the blocking-send hard
+    /// timeout and the `SupervisorSentinel` drop path can abort the
+    /// executor without owning the `JoinHandle` — the supervisor
+    /// typically already took it to await ownership. Kept in a
+    /// `Mutex` so it can be replaced when
+    /// [`InFlightHandle::set_spawned`] installs a real handle over an
+    /// initial placeholder.
+    abort_handle: Mutex<AbortHandle>,
 }
 
 impl InFlightHandle {
@@ -100,12 +115,30 @@ impl InFlightHandle {
         yielded_tx: oneshot::Sender<Task>,
         spawned: JoinHandle<()>,
     ) -> Self {
+        let abort_handle = spawned.abort_handle();
         Self {
             cancellation,
             yielded_tx: Mutex::new(Some(yielded_tx)),
             yielded_fired: AtomicBool::new(false),
             spawned: Mutex::new(Some(spawned)),
+            abort_handle: Mutex::new(abort_handle),
         }
+    }
+
+    /// Abort the spawned executor task.
+    ///
+    /// Idempotent; safe to call when the task has already finished,
+    /// already been aborted, or is still running. Used by the
+    /// blocking-send hard-timeout path to stop an executor that is
+    /// ignoring cancellation. Returns immediately — the actual task
+    /// teardown (future drop, resource release) happens on the tokio
+    /// runtime at the next yield point in the executor body. Callers
+    /// that need to observe the teardown should await the
+    /// `JoinHandle` separately (typically done by the supervisor
+    /// task).
+    pub fn abort(&self) {
+        let guard = self.abort_handle.lock().expect("abort_handle Mutex poisoned");
+        guard.abort();
     }
 
     /// Fire the `yielded` signal with the given task snapshot.
@@ -115,7 +148,7 @@ impl InFlightHandle {
     /// flag — a loser's `task` argument is dropped without reaching the
     /// receiver.
     ///
-    /// Used by the commit hook in phase D when a terminal or interrupted
+    /// Used by the sink's commit hook when a terminal or interrupted
     /// state lands in the atomic store.
     pub fn fire_yielded(&self, task: Task) -> bool {
         // AcqRel on the CAS: Acq of the prior Release makes the sender's
@@ -145,10 +178,27 @@ impl InFlightHandle {
 
     /// Query whether `yielded` has fired.
     ///
-    /// Used by phase D's blocking-send timeout path to decide between waiting
-    /// and forcing a framework terminal.
+    /// Used by the blocking-send timeout path to decide between
+    /// continuing to wait and force-committing a framework terminal.
     pub fn yielded_fired(&self) -> bool {
         self.yielded_fired.load(Ordering::Acquire)
+    }
+
+    /// Install the spawned JoinHandle after-the-fact.
+    ///
+    /// The send-path spawns the executor *after* the handle is built
+    /// (because the executor body needs a [`crate::event_sink::EventSink`]
+    /// that holds `Arc<InFlightHandle>`, so the handle has to exist
+    /// first). Initial construction uses a placeholder noop
+    /// JoinHandle; this setter swaps in the real one once
+    /// `tokio::spawn(executor_body)` returns. Updates both the
+    /// `JoinHandle` slot and the cloneable abort handle atomically so
+    /// a subsequent [`Self::abort`] targets the real task, not the
+    /// placeholder.
+    pub fn set_spawned(&self, spawned: JoinHandle<()>) {
+        let new_abort = spawned.abort_handle();
+        *self.spawned.lock().expect("spawned Mutex poisoned") = Some(spawned);
+        *self.abort_handle.lock().expect("abort_handle Mutex poisoned") = new_abort;
     }
 
     /// Take the spawned JoinHandle out of the handle.
@@ -172,9 +222,9 @@ impl InFlightHandle {
 /// the access pattern is read-heavy (lookups from `:cancel`, push delivery,
 /// etc.) with infrequent writes (insert-on-spawn, remove-on-exit). Lock
 /// contention at typical in-flight counts is negligible; a workspace-wide
-/// `dashmap` dependency is not justified for phase A. If profiling in phase
-/// D or E surfaces contention, this type can be swapped for `DashMap`
-/// without changing any caller's API.
+/// `dashmap` dependency is not justified at current scale. If
+/// profiling later surfaces contention, this type can be swapped for
+/// `DashMap` without changing any caller's API.
 #[derive(Default)]
 pub struct InFlightRegistry {
     map: RwLock<HashMap<InFlightKey, Arc<InFlightHandle>>>,
@@ -333,7 +383,7 @@ impl std::error::Error for InsertCollision {}
 /// panicking context risks delivering a corrupt task snapshot to a blocking
 /// caller. Blocking-send's `yielded` awaiter falls through to its own
 /// `blocking_task_timeout` if the supervisor panics mid-execution — the
-/// timeout path is itself sentinel-guarded in phase D.
+/// timeout path is itself sentinel-guarded.
 pub struct SupervisorSentinel {
     registry: Arc<InFlightRegistry>,
     key: InFlightKey,
@@ -361,17 +411,15 @@ impl Drop for SupervisorSentinel {
         // panic case.
         let panicking = std::thread::panicking();
 
-        // 1. Abort THIS sentinel's spawned task if the supervisor's normal
-        //    path didn't take and await it. Load-bearing panic-safety
-        //    guarantee: a panicked supervisor cannot leave a live executor.
-        //    This runs regardless of whether the registry still owns the
-        //    entry — each sentinel is responsible for cleaning up its own
-        //    JoinHandle.
-        if let Some(handle) = self.handle.take_spawned() {
-            if !handle.is_finished() {
-                handle.abort();
-            }
-        }
+        // 1. Abort this sentinel's executor task. Load-bearing
+        //    panic-safety guarantee: a panicked supervisor cannot
+        //    leave a live executor behind. Using the cloneable
+        //    AbortHandle means we never race the supervisor's
+        //    `take_spawned().await` — the abort call works even when
+        //    the supervisor has already taken ownership of the
+        //    JoinHandle. Abort is idempotent: safe to call on a task
+        //    that has already finished.
+        self.handle.abort();
 
         // 2. Remove the registry entry ONLY if it still contains our
         //    handle. A stale sentinel must not remove a newer handle that

@@ -70,8 +70,10 @@ pub trait A2aTaskStorage: Send + Sync {
 
     /// Append an artifact to a task. Enforces tenant + owner isolation.
     /// `append`: if true and artifact_id matches existing, append parts to it.
-    /// `last_chunk`: transport-level signal for SSE streaming (Phase 3).
-    ///   Storage passes it through but does not model completion state in v0.1.
+    /// `last_chunk`: transport metadata carried in the SSE
+    ///   `ArtifactUpdate` event. Storage does not persist it as task
+    ///   state; the server layer forwards it to streaming
+    ///   subscribers.
     async fn append_artifact(
         &self,
         tenant: &str,
@@ -100,10 +102,9 @@ pub trait A2aTaskStorage: Send + Sync {
     /// `true` is a successful no-op. Storage-internal only; the marker
     /// never appears on the wire (ADR-012 §1).
     ///
-    /// Consumers: `core_cancel_task` handler (phase C) and direct cancel
-    /// paths in cross-instance deployments. Once set, the in-flight
-    /// supervisor on the instance running the executor discovers the
-    /// marker via
+    /// Consumers: the `CancelTask` handler and direct cancel paths in
+    /// cross-instance deployments. Once set, the in-flight supervisor
+    /// on the instance running the executor discovers the marker via
     /// [`A2aCancellationSupervisor::supervisor_list_cancel_requested`]
     /// and trips the executor's cancellation token.
     async fn set_cancel_requested(

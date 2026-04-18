@@ -8,7 +8,7 @@ Turul-a2a is a Rust implementation of the A2A (Agent-to-Agent) Protocol v1.0. Li
 
 **Proto-first architecture**: Types are generated from the normative `proto/a2a.proto` (package `lf.a2a.v1`) using `prost` + `pbjson`, then wrapped in ergonomic Rust types.
 
-**Maturity**: D3 durable event coordination complete across all deployment surfaces (359+ tests, 455 with all backends). Four parity-proven backends (in-memory, SQLite, PostgreSQL, DynamoDB) implement event store + atomic task/event writes. Cross-instance streaming verified: store is truth, broker is wake-up signal, terminal replay works, Last-Event-ID reconnection proven. Lambda streaming verified via cargo-lambda: SSE events with durable IDs, terminal replay, Last-Event-ID reconnection. Same-backend enforcement on both server and Lambda builders.
+**Maturity**: D3 durable event coordination complete across all deployment surfaces (359+ tests, 455 with all backends). Four parity-proven backends (in-memory, SQLite, PostgreSQL, DynamoDB) implement event store + atomic task/event writes. Cross-instance streaming verified: store is truth, broker is wake-up signal; subscribers attached while a task is non-terminal receive replay of earlier events and then live delivery up to and including the terminal event; `Last-Event-ID` reconnection for still-running tasks is proven. Subscribing to an already-terminal task returns `UnsupportedOperationError` per A2A v1.0 §3.1.6 (terminal state is retrieved via `GetTask`). Lambda streaming verified via cargo-lambda: SSE events with durable IDs, `Last-Event-ID` reconnection while non-terminal. Same-backend enforcement on both server and Lambda builders.
 
 ## Build & Development Commands
 
@@ -143,6 +143,10 @@ For non-trivial architecture changes, the ADR should be accepted before implemen
 - **Examples must prefer wrapper/helper APIs over raw proto mutation.** Repeated `as_proto().clone()` + manual proto construction in examples is a design smell — it signals the wrapper layer is missing a helper that should be designed.
 - If a simple example needs generated-proto editing to do normal work (e.g., complete a task, add an artifact), stop and evaluate whether `Task`, `Artifact`, or related types are missing a helper method.
 - Raw proto access (`as_proto()`, `as_proto_mut()`) is an escape hatch, not the primary path for common operations.
+
+### Comment and Docstring Style
+
+Do not reference internal task or phase names (e.g. "phase A", "D.2", task numbers, issue identifiers) in code comments, docstrings, or committed artifacts. Those labels are planning scaffolding — they rot once the phase ships and leak implementation history into the public surface. Write comments that describe the invariant, the contract, or the "why" in timeless terms. References to ADRs and to upstream specs (A2A spec sections, proto line numbers) are fine and encouraged — they are durable external anchors. If a constraint is only meaningful relative to an in-flight refactor, put it in the plan or PR description, not in source.
 
 ### TDD Discipline
 

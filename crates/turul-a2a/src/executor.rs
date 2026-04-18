@@ -5,10 +5,12 @@ use tokio_util::sync::CancellationToken;
 use turul_a2a_types::{Message, Task};
 
 use crate::error::A2aError;
+use crate::event_sink::EventSink;
 
 /// Context available to the executor during message processing.
 ///
-/// Provides auth identity, tenant/task metadata, and cooperative cancellation.
+/// Provides auth identity, tenant/task metadata, cooperative cancellation,
+/// and an [`EventSink`] for durable event emission (ADR-010 §2).
 /// `#[non_exhaustive]` allows adding fields in future versions.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -26,10 +28,30 @@ pub struct ExecutionContext {
     /// Cooperative cancellation token. Check `cancellation.is_cancelled()`
     /// in long-running loops to respect client cancellation.
     pub cancellation: CancellationToken,
+    /// Durable event sink (ADR-010). Executors that want to drive task
+    /// lifecycle themselves — progress artifacts, interrupted states,
+    /// explicit terminal — call the methods on this sink.
+    ///
+    /// Production send paths install a live sink that writes through the
+    /// atomic store and fires the framework's blocking-send awaiter on
+    /// terminal or interrupted commit.
+    /// [`ExecutionContext::anonymous`] returns a detached sink — emits
+    /// return `A2aError::Internal`. Executor unit tests that don't stand
+    /// up a server can use it as-is; they simply cannot drive durable
+    /// lifecycle events without real storage.
+    pub events: EventSink,
 }
 
 impl ExecutionContext {
     /// Create a context for anonymous/unauthenticated execution.
+    ///
+    /// The [`events`] sink is [`EventSink::detached`] — emits return
+    /// `A2aError::Internal`. Use this for executor unit tests that don't
+    /// need durable event persistence. Production code constructs
+    /// `ExecutionContext` with a live sink wired to the framework's
+    /// atomic store.
+    ///
+    /// [`events`]: Self#structfield.events
     pub fn anonymous(task_id: &str) -> Self {
         Self {
             owner: "anonymous".to_string(),
@@ -38,6 +60,7 @@ impl ExecutionContext {
             context_id: None,
             claims: None,
             cancellation: CancellationToken::new(),
+            events: EventSink::detached(),
         }
     }
 }

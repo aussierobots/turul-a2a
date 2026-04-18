@@ -54,6 +54,7 @@ pub mod card_builder;
 #[cfg(feature = "compat-v03")]
 pub mod compat_v03;
 pub mod error;
+pub mod event_sink;
 pub mod executor;
 pub mod jsonrpc;
 pub mod middleware;

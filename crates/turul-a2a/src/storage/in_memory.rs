@@ -843,6 +843,25 @@ impl A2aAtomicStore for InMemoryA2aStorage {
             }
         }
 
+        // Terminal-preservation CAS (ADR-010 §7.1 extension): if the
+        // persisted task is already terminal, refuse the write and
+        // commit nothing — a full-task replacement must not silently
+        // overwrite a terminal committed by a concurrent writer.
+        if let Some(stored) = tasks.get(&task_key) {
+            if let Some(status) = stored.task.status() {
+                if let Ok(state) = status.state() {
+                    if turul_a2a_types::state_machine::is_terminal(state) {
+                        return Err(A2aStorageError::TerminalStateAlreadySet {
+                            task_id: task.id().to_string(),
+                            current_state:
+                                crate::storage::terminal_cas::task_state_wire_name(state)
+                                    .to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
         // Replace task, preserving cancel_requested marker (monotonic;
         // full-task replacement must not wipe it).
         let cancel_requested = tasks
@@ -1061,6 +1080,12 @@ mod tests {
     async fn test_terminal_cas_rejects_sequential_second_terminal() {
         let s = storage();
         parity_tests::test_terminal_cas_rejects_sequential_second_terminal(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_task_with_events_rejects_terminal_already_set() {
+        let s = storage();
+        parity_tests::test_update_task_with_events_rejects_terminal_already_set(&s, &s, &s).await;
     }
 
     #[tokio::test]

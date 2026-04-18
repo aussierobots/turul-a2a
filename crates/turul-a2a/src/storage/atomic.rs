@@ -82,8 +82,9 @@ pub trait A2aAtomicStore: Send + Sync {
     /// [`A2aStorageError::InvalidTransition`]. The latter is the
     /// state-machine's illegal-transition signal (e.g. `SUBMITTED →
     /// INPUT_REQUIRED`); the former is specifically "you lost the race on
-    /// a terminal write." Callers that need to distinguish the two (e.g.
-    /// `EventSink` translation in phase D) match on the variant.
+    /// a terminal write." Callers that need to distinguish the two
+    /// (e.g. the executor-side [`crate::event_sink::EventSink`] error
+    /// translation) match on the variant.
     ///
     /// Concurrent-write parity tests (`parity_tests::terminal_cas_*`) gate
     /// acceptance of each backend implementation.
@@ -98,6 +99,50 @@ pub trait A2aAtomicStore: Send + Sync {
 
     /// Full replacement update of a task and append events atomically.
     /// Returns assigned event sequences.
+    ///
+    /// # Terminal-preservation CAS contract (ADR-010 §7.1 extension — normative)
+    ///
+    /// If the **persisted** task is already in a terminal state
+    /// (`COMPLETED`, `FAILED`, `CANCELED`, `REJECTED`) at the time this
+    /// method commits, the implementation **MUST** return
+    /// [`A2aStorageError::TerminalStateAlreadySet`] and MUST NOT mutate
+    /// the task row nor append any events. This applies regardless of
+    /// the status field on the incoming `task` argument — a full-task
+    /// replacement must not overwrite a concurrently-committed terminal.
+    ///
+    /// Rationale: `EventSink::emit_artifact` reads the current task,
+    /// mutates a local copy, then calls this method to persist. Between
+    /// the read and the write, another writer (the cancel handler's
+    /// force-commit, the executor's own terminal on a different task
+    /// future, or the framework's hard-deadline commit) may have
+    /// committed a terminal. A naive full-replacement would silently
+    /// roll back that terminal and defeat the CAS that
+    /// [`Self::update_task_status_with_events`] so carefully enforces.
+    ///
+    /// Per-backend enforcement:
+    ///
+    /// - **In-memory**: the terminal check runs under the same write
+    ///   lock as the replacement — inspect the stored task's current
+    ///   status before overwriting; if terminal, return the error.
+    /// - **SQLite / PostgreSQL**: the conditional `UPDATE`'s `WHERE`
+    ///   clause excludes terminal `status_state` values (same set as
+    ///   [`crate::storage::terminal_cas::DEBUG_TERMINAL_STATES`]).
+    ///   Affected-rows = 0 on an existing task ⇒ terminal already set;
+    ///   the surrounding transaction rolls back so no events commit.
+    /// - **DynamoDB**: the task-item's `Update` carries a
+    ///   `ConditionExpression` asserting `statusState NOT IN
+    ///   (:completed, :failed, :canceled, :rejected)`. A
+    ///   `TransactionCanceledException` citing the condition-check
+    ///   failure ⇒ terminal already set; the transaction as a whole
+    ///   aborts so no events commit.
+    ///
+    /// This clause is distinct from terminal transition validation —
+    /// [`Self::update_task_status_with_events`] rejects a terminal-to-
+    /// terminal write attempt; this method rejects any write (including
+    /// an innocuous artifact-only update) performed against a task
+    /// whose persisted state is terminal. Together the two clauses
+    /// ensure that once a terminal is persisted, it is immutable from
+    /// every write path in the trait.
     async fn update_task_with_events(
         &self,
         tenant: &str,

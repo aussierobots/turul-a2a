@@ -1,12 +1,17 @@
 /// A2A TaskState transition validation.
 ///
-/// Validates transitions per the A2A v1.0 task lifecycle:
+/// Validates transitions per the A2A v1.0 task lifecycle. `REJECTED`
+/// may be emitted from any non-terminal state, reflecting the proto
+/// spec language that an agent "may be done during initial task
+/// creation or later once an agent has determined it can't or won't
+/// proceed" (a2a.proto TASK_STATE_REJECTED doc comment).
 ///
 /// ```text
-/// Submitted   -> Working | Rejected | Failed | Canceled
-/// Working     -> Completed | Failed | Canceled | InputRequired | AuthRequired
-/// InputRequired -> Working | Completed | Failed | Canceled
-/// AuthRequired  -> Working | Failed | Canceled
+/// Submitted     -> Working | Rejected | Failed | Canceled
+/// Working       -> Completed | Failed | Canceled | Rejected
+///                  | InputRequired | AuthRequired
+/// InputRequired -> Working | Completed | Failed | Canceled | Rejected
+/// AuthRequired  -> Working | Failed | Canceled | Rejected
 /// Completed/Failed/Canceled/Rejected -> ERROR (terminal)
 /// Unspecified -> ERROR (not a valid application state)
 /// ```
@@ -29,6 +34,7 @@ pub fn validate_transition(from: TaskState, to: TaskState) -> Result<(), A2aType
             TaskState::Completed
             | TaskState::Failed
             | TaskState::Canceled
+            | TaskState::Rejected
             | TaskState::InputRequired
             | TaskState::AuthRequired => Ok(()),
             _ => Err(A2aTypeError::InvalidTransition {
@@ -40,14 +46,18 @@ pub fn validate_transition(from: TaskState, to: TaskState) -> Result<(), A2aType
             TaskState::Working
             | TaskState::Completed
             | TaskState::Failed
-            | TaskState::Canceled => Ok(()),
+            | TaskState::Canceled
+            | TaskState::Rejected => Ok(()),
             _ => Err(A2aTypeError::InvalidTransition {
                 current: from,
                 requested: to,
             }),
         },
         TaskState::AuthRequired => match to {
-            TaskState::Working | TaskState::Failed | TaskState::Canceled => Ok(()),
+            TaskState::Working
+            | TaskState::Failed
+            | TaskState::Canceled
+            | TaskState::Rejected => Ok(()),
             _ => Err(A2aTypeError::InvalidTransition {
                 current: from,
                 requested: to,
@@ -94,9 +104,14 @@ mod tests {
 
     #[test]
     fn valid_working_transitions() {
+        // REJECTED is now valid from any non-terminal state per the
+        // proto enum doc: "This may be done during initial task
+        // creation or later once an agent has determined it can't or
+        // won't proceed."
         assert!(validate_transition(TaskState::Working, TaskState::Completed).is_ok());
         assert!(validate_transition(TaskState::Working, TaskState::Failed).is_ok());
         assert!(validate_transition(TaskState::Working, TaskState::Canceled).is_ok());
+        assert!(validate_transition(TaskState::Working, TaskState::Rejected).is_ok());
         assert!(validate_transition(TaskState::Working, TaskState::InputRequired).is_ok());
         assert!(validate_transition(TaskState::Working, TaskState::AuthRequired).is_ok());
     }
@@ -105,7 +120,6 @@ mod tests {
     fn invalid_working_transitions() {
         assert!(validate_transition(TaskState::Working, TaskState::Working).is_err());
         assert!(validate_transition(TaskState::Working, TaskState::Submitted).is_err());
-        assert!(validate_transition(TaskState::Working, TaskState::Rejected).is_err());
     }
 
     #[test]
@@ -114,6 +128,7 @@ mod tests {
         assert!(validate_transition(TaskState::InputRequired, TaskState::Completed).is_ok());
         assert!(validate_transition(TaskState::InputRequired, TaskState::Failed).is_ok());
         assert!(validate_transition(TaskState::InputRequired, TaskState::Canceled).is_ok());
+        assert!(validate_transition(TaskState::InputRequired, TaskState::Rejected).is_ok());
     }
 
     #[test]
@@ -123,7 +138,6 @@ mod tests {
         );
         assert!(validate_transition(TaskState::InputRequired, TaskState::AuthRequired).is_err());
         assert!(validate_transition(TaskState::InputRequired, TaskState::Submitted).is_err());
-        assert!(validate_transition(TaskState::InputRequired, TaskState::Rejected).is_err());
     }
 
     #[test]
@@ -131,6 +145,7 @@ mod tests {
         assert!(validate_transition(TaskState::AuthRequired, TaskState::Working).is_ok());
         assert!(validate_transition(TaskState::AuthRequired, TaskState::Failed).is_ok());
         assert!(validate_transition(TaskState::AuthRequired, TaskState::Canceled).is_ok());
+        assert!(validate_transition(TaskState::AuthRequired, TaskState::Rejected).is_ok());
     }
 
     #[test]
@@ -140,7 +155,6 @@ mod tests {
         assert!(validate_transition(TaskState::AuthRequired, TaskState::AuthRequired).is_err());
         assert!(validate_transition(TaskState::AuthRequired, TaskState::InputRequired).is_err());
         assert!(validate_transition(TaskState::AuthRequired, TaskState::Submitted).is_err());
-        assert!(validate_transition(TaskState::AuthRequired, TaskState::Rejected).is_err());
     }
 
     #[test]
