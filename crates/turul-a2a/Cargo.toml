@@ -61,3 +61,5 @@ turul-a2a-auth = { path = "../turul-a2a-auth" }
 reqwest = { workspace = true }
 # Structured-event capture for observability-contract tests (phase A onward).
 tracing-subscriber = { workspace = true }
+# Mock HTTP server for push-delivery integration tests (ADR-011 §13).
+wiremock = { workspace = true }
