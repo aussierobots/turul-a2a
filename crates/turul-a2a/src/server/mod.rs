@@ -642,6 +642,7 @@ impl A2aServer {
         let poller_registry = std::sync::Arc::clone(&self.state.in_flight);
         let poller_supervisor = std::sync::Arc::clone(&self.state.cancellation_supervisor);
         let poller_interval = self.state.runtime_config.cross_instance_cancel_poll_interval;
+        let push_delivery_store_for_sweep = self.state.push_delivery_store.clone();
 
         let app = self.into_router();
         let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -663,11 +664,60 @@ impl A2aServer {
             poller_shutdown,
         ));
 
+        // Push-claim sweep loop (ADR-011 §10.5). Emits an observability
+        // gauge on expired-but-non-terminal rows so operators can alert
+        // on stuck claim accumulation. Backends may piggy-back retention
+        // cleanup of terminal claims here; the return value is the
+        // eligibility count.
+        let sweep_handle = push_delivery_store_for_sweep.as_ref().map(|store| {
+            let store = store.clone();
+            let shutdown = shutdown.clone();
+            // Interval tuned to keep the gauge fresh without
+            // hammering storage. One minute is a reasonable default
+            // for a count-only query; adopters that want a tighter
+            // cadence can swap in their own background task.
+            let interval = Duration::from_secs(60);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                ticker.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Delay,
+                );
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = ticker.tick() => {
+                            match store.sweep_expired_claims().await {
+                                Ok(count) if count > 0 => {
+                                    tracing::warn!(
+                                        target: "turul_a2a::push_claims_expired",
+                                        count,
+                                        "expired non-terminal push claim rows \
+                                         observed; investigate storage or stuck deliveries"
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::error!(
+                                        target: "turul_a2a::push_sweep_error",
+                                        error = %e,
+                                        "push claim sweep failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        });
+
         let serve_result = axum::serve(listener, app).await;
 
-        // Gracefully stop the poller — relevant if axum::serve ever returns.
+        // Gracefully stop background loops — relevant if axum::serve ever returns.
         shutdown.cancel();
         let _ = poller_handle.await;
+        if let Some(h) = sweep_handle {
+            let _ = h.await;
+        }
 
         serve_result
             .map_err(|e| A2aError::Internal(format!("Server error: {e}")))?;

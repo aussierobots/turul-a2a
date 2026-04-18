@@ -5,9 +5,9 @@
 //!
 //! - Terminal `StatusUpdate` events trigger delivery (one POST per
 //!   registered push config on the task).
-//! - `ArtifactUpdate` events do NOT trigger delivery in 0.1.x
-//!   (ADR-011 §13.11 pins this scope).
-//! - Non-terminal status transitions do not trigger delivery either
+//! - `ArtifactUpdate` events do not trigger delivery (ADR-011
+//!   §13.11).
+//! - Non-terminal status transitions do not trigger delivery
 //!   (ADR-011 §2).
 //!
 //! The dispatcher takes ownership of the work of translating a
@@ -21,13 +21,27 @@
 //! blocking-send hard-timeout FAILED) both route through this
 //! dispatcher so ADR-011 §13.13 — "framework-committed CANCELED
 //! triggers delivery" — is satisfied by construction.
+//!
+//! # Transient-store-error handling
+//!
+//! If the worker reports [`DeliveryReport::TransientStoreError`]
+//! after its own bounded retries, the POST succeeded but the terminal
+//! row is still non-terminal. The dispatcher logs a warning and
+//! returns — the claim row remains open until it expires, at which
+//! point `claim_delivery` will re-claim on its next call for the same
+//! tuple. Today re-claim only happens on a new task event. A
+//! dedicated reclaim-and-redispatch sweeper that walks expired
+//! non-terminal claim rows and re-invokes `deliver()` without a new
+//! event is a planned addition; until then, operators should watch
+//! the `sweep_expired_claims` gauge and the tracing warnings emitted
+//! here for stuck rows.
 
 use std::sync::Arc;
 
 use turul_a2a_types::Task;
 use url::Url;
 
-use crate::push::delivery::{PushDeliveryWorker, PushTarget};
+use crate::push::delivery::{DeliveryReport, PushDeliveryWorker, PushTarget};
 use crate::push::secret::Secret;
 use crate::storage::A2aPushNotificationStorage;
 use crate::streaming::StreamEvent;
@@ -127,8 +141,30 @@ impl PushDispatcher {
                     };
                     let worker = worker.clone();
                     let payload = payload.clone();
+                    let log_tenant = target.tenant.clone();
+                    let log_task = target.task_id.clone();
+                    let log_cfg = target.config_id.clone();
+                    let log_seq = target.event_sequence;
                     tokio::spawn(async move {
-                        let _ = worker.deliver(&target, &payload).await;
+                        let report = worker.deliver(&target, &payload).await;
+                        if matches!(report, DeliveryReport::TransientStoreError) {
+                            // The POST went through but the claim row
+                            // could not be finalised after the worker's
+                            // bounded retry. The row is stuck
+                            // non-terminal until either a new event
+                            // fires for this tuple or a reclaim-sweep
+                            // handles it. Surface loudly so operators
+                            // can correlate with storage alarms.
+                            tracing::warn!(
+                                target: "turul_a2a::push_delivery_stuck",
+                                tenant = %log_tenant,
+                                task_id = %log_task,
+                                config_id = %log_cfg,
+                                event_sequence = log_seq,
+                                "push delivery POST succeeded but terminal claim write \
+                                 did not persist; row remains non-terminal"
+                            );
+                        }
                     });
                 }
             }
@@ -136,8 +172,8 @@ impl PushDispatcher {
     }
 }
 
-/// ADR-011 §2 + §13.11: deliver only on terminal status events.
-/// Artifact events are out of scope for 0.1.x.
+/// Deliver only on terminal status events (ADR-011 §2 + §13.11).
+/// Artifact events are out of scope for push delivery.
 fn dispatch_eligible(ev: &StreamEvent) -> bool {
     matches!(ev, StreamEvent::StatusUpdate { .. }) && ev.is_terminal()
 }

@@ -299,8 +299,8 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     /// Records do NOT carry credentials, tokens, or receiver
     /// response bodies — [`FailedDelivery`] has no fields for those
     /// values. Adopters use this to surface failed-delivery state
-    /// via their own admin APIs; the framework ships no HTTP
-    /// endpoint in 0.1.x.
+    /// via their own admin APIs; the framework does not expose an
+    /// HTTP endpoint for inspection.
     async fn list_failed_deliveries(
         &self,
         tenant: &str,

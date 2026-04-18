@@ -398,7 +398,14 @@ impl PushDeliveryWorker {
     /// [`DeliveryReport`], classifying any store error so the caller
     /// never reports success for a row that remained non-terminal.
     ///
-    /// Mapping:
+    /// The write is retried up to `TERMINAL_PERSIST_MAX_ATTEMPTS`
+    /// times with exponential backoff so that transient storage
+    /// blips — brief connection drops, conflicting writes that clear
+    /// on retry — don't leak up to the dispatcher as
+    /// `TransientStoreError`. A truly persistent failure does surface
+    /// so the dispatcher / sweeper can react.
+    ///
+    /// Mapping on the final attempt:
     /// - `Ok(())` → the report matching the outcome variant.
     /// - `Err(StaleDeliveryClaim)` → `ClaimLostOrFinal`. Another
     ///   writer finalised the row under our fencing token, so the
@@ -407,11 +414,11 @@ impl PushDeliveryWorker {
     ///   race, which at-least-once semantics already allow
     ///   (ADR-011 §5a).
     /// - `Err(_)` → `TransientStoreError`. The POST happened but the
-    ///   row is still non-terminal; the sweeper will re-claim and
-    ///   (likely) re-POST. At-least-once again. The worker MUST NOT
-    ///   return `Succeeded` here, because the dispatcher would then
-    ///   treat the event as permanently resolved and lose the ability
-    ///   to retry the commit.
+    ///   row is still non-terminal; operator intervention (or a
+    ///   future reclaim-and-redispatch sweeper) is required. The
+    ///   worker MUST NOT return `Succeeded` here, because the
+    ///   dispatcher would then treat the event as permanently
+    ///   resolved while the claim row stays stuck.
     async fn persist_terminal(
         &self,
         target: &PushTarget,
@@ -430,23 +437,49 @@ impl PushDeliveryWorker {
             DeliveryOutcome::Retry { .. } => return DeliveryReport::TransientStoreError,
         };
 
-        match self
-            .push_delivery_store
-            .record_delivery_outcome(
-                &target.tenant,
-                &target.task_id,
-                target.event_sequence,
-                &target.config_id,
-                &claim.claimant,
-                claim.generation,
-                outcome,
-            )
-            .await
-        {
-            Ok(()) => success_report,
-            Err(A2aStorageError::StaleDeliveryClaim { .. }) => DeliveryReport::ClaimLostOrFinal,
-            Err(_) => DeliveryReport::TransientStoreError,
+        // Backoff schedule: 50ms, 150ms, 500ms between attempts.
+        // Short enough to stay well inside claim_expiry and to avoid
+        // holding the delivery task open for long; bounded so a
+        // permanently-down store does surface the error.
+        const TERMINAL_PERSIST_MAX_ATTEMPTS: u32 = 3;
+        let backoffs = [
+            Duration::from_millis(50),
+            Duration::from_millis(150),
+            Duration::from_millis(500),
+        ];
+
+        let mut last_error: Option<A2aStorageError> = None;
+        for attempt in 0..TERMINAL_PERSIST_MAX_ATTEMPTS {
+            if attempt > 0 {
+                // Index is safe: loop bound == slice length.
+                tokio::time::sleep(backoffs[(attempt as usize).min(backoffs.len() - 1)]).await;
+            }
+            match self
+                .push_delivery_store
+                .record_delivery_outcome(
+                    &target.tenant,
+                    &target.task_id,
+                    target.event_sequence,
+                    &target.config_id,
+                    &claim.claimant,
+                    claim.generation,
+                    outcome.clone(),
+                )
+                .await
+            {
+                Ok(()) => return success_report,
+                Err(A2aStorageError::StaleDeliveryClaim { .. }) => {
+                    // Fencing loss is terminal for this claim and not
+                    // retryable — another writer holds the row now.
+                    return DeliveryReport::ClaimLostOrFinal;
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                }
+            }
         }
+        let _ = last_error; // Reserved for future tracing plumbing.
+        DeliveryReport::TransientStoreError
     }
 
     async fn claim(&self, target: &PushTarget) -> Result<DeliveryClaim, ClaimFailure> {

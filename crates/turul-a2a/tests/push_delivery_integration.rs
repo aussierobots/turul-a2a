@@ -451,20 +451,53 @@ async fn reqwest_connects_to_validated_ip_not_system_dns() {
 
 /// Wrapper that delegates every call to the inner in-memory store
 /// EXCEPT terminal `record_delivery_outcome` writes, which return a
-/// configurable error. Retry (non-terminal) writes still pass through
-/// so the rest of the worker's bookkeeping is unchanged.
+/// configurable error up to `fail_count` times. Retry (non-terminal)
+/// writes still pass through so the rest of the worker's bookkeeping
+/// is unchanged. After `fail_count` terminal attempts, subsequent
+/// terminal writes go through to the inner store — lets tests probe
+/// the bounded-retry path (0 for "never fail", N for "succeed on
+/// attempt N+1", usize::MAX for "always fail").
 struct FailingTerminalStore {
     inner: Arc<InMemoryA2aStorage>,
-    /// Error returned on terminal outcomes. Reset per test.
-    terminal_error: Mutex<Option<A2aStorageError>>,
+    error_template: A2aStorageError,
+    remaining_failures: Mutex<usize>,
+    /// Observed count of terminal writes (including the ones that
+    /// failed). Tests assert this against the worker's bounded
+    /// retry budget.
+    terminal_writes_seen: Mutex<usize>,
 }
 
 impl FailingTerminalStore {
-    fn new(inner: Arc<InMemoryA2aStorage>, err: A2aStorageError) -> Self {
+    fn new(inner: Arc<InMemoryA2aStorage>, err: A2aStorageError, fail_count: usize) -> Self {
         Self {
             inner,
-            terminal_error: Mutex::new(Some(err)),
+            error_template: err,
+            remaining_failures: Mutex::new(fail_count),
+            terminal_writes_seen: Mutex::new(0),
         }
+    }
+}
+
+/// Cheap `Clone` for the enum variants we actually exercise. The
+/// real `A2aStorageError` is not `Clone` (anyhow-ish payloads), so
+/// we reconstruct each variant explicitly.
+fn clone_storage_error(e: &A2aStorageError) -> A2aStorageError {
+    match e {
+        A2aStorageError::DatabaseError(s) => A2aStorageError::DatabaseError(s.clone()),
+        A2aStorageError::StaleDeliveryClaim {
+            tenant,
+            task_id,
+            event_sequence,
+            config_id,
+        } => A2aStorageError::StaleDeliveryClaim {
+            tenant: tenant.clone(),
+            task_id: task_id.clone(),
+            event_sequence: *event_sequence,
+            config_id: config_id.clone(),
+        },
+        other => A2aStorageError::DatabaseError(format!(
+            "FailingTerminalStore: unsupported error variant {other:?}"
+        )),
     }
 }
 
@@ -526,8 +559,11 @@ impl A2aPushDeliveryStore for FailingTerminalStore {
                 | DeliveryOutcome::Abandoned { .. }
         );
         if is_terminal {
-            if let Some(err) = self.terminal_error.lock().unwrap().take() {
-                return Err(err);
+            *self.terminal_writes_seen.lock().unwrap() += 1;
+            let mut remaining = self.remaining_failures.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(clone_storage_error(&self.error_template));
             }
         }
         self.inner
@@ -568,10 +604,14 @@ async fn terminal_persist_failure_becomes_transient_not_succeeded() {
         .await;
 
     let inner = Arc::new(InMemoryA2aStorage::new());
-    let store: Arc<dyn A2aPushDeliveryStore> = Arc::new(FailingTerminalStore::new(
+    // usize::MAX → every attempt, including the bounded retry
+    // budget inside persist_terminal, hits the error.
+    let failing = Arc::new(FailingTerminalStore::new(
         inner.clone(),
         A2aStorageError::DatabaseError("simulated storage outage".into()),
+        usize::MAX,
     ));
+    let store: Arc<dyn A2aPushDeliveryStore> = failing.clone();
 
     // Build the worker directly so we can inject the wrapper store.
     let mut cfg = PushDeliveryConfig::default();
@@ -597,10 +637,68 @@ async fn terminal_persist_failure_becomes_transient_not_succeeded() {
         "worker must NOT report Succeeded when the terminal write fails"
     );
 
+    // The worker's bounded retry in persist_terminal exercised all
+    // three attempts before surfacing the failure. Observing
+    // `terminal_writes_seen == 3` locks the bound — a regression
+    // that reverts the retry would drop this to 1.
+    assert_eq!(
+        *failing.terminal_writes_seen.lock().unwrap(),
+        3,
+        "persist_terminal must try three times before reporting Transient"
+    );
+
     // Wiremock still saw the POST — the receiver received the push,
     // which is the at-least-once contract. What matters is that the
     // worker does not mislead the dispatcher into thinking the claim
     // row is final.
+    drop(server);
+}
+
+#[tokio::test]
+async fn terminal_persist_recovers_after_transient_blip() {
+    // Two initial failures, third attempt succeeds: the bounded
+    // retry inside persist_terminal must absorb the blip and return
+    // a proper Succeeded report. If the retry ever regresses this
+    // test flips to TransientStoreError.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let inner = Arc::new(InMemoryA2aStorage::new());
+    let failing = Arc::new(FailingTerminalStore::new(
+        inner.clone(),
+        A2aStorageError::DatabaseError("blip".into()),
+        2, // fail twice, let attempt 3 through
+    ));
+    let store: Arc<dyn A2aPushDeliveryStore> = failing.clone();
+
+    let mut cfg = PushDeliveryConfig::default();
+    cfg.max_attempts = 1;
+    cfg.backoff_base = Duration::from_millis(1);
+    cfg.backoff_cap = Duration::from_millis(1);
+    cfg.backoff_jitter = 0.0;
+    cfg.request_timeout = Duration::from_secs(1);
+    cfg.connect_timeout = Duration::from_millis(500);
+    cfg.read_timeout = Duration::from_secs(1);
+    cfg.claim_expiry = Duration::from_secs(60);
+    cfg.max_payload_bytes = 64 * 1024;
+    cfg.allow_insecure_urls = true;
+    let worker = PushDeliveryWorker::new(store, cfg, None, "instance-blip".into())
+        .expect("worker build");
+    let target = sentinel_target(&server.uri());
+
+    let report = worker.deliver(&target, b"{}").await;
+    assert_eq!(report, DeliveryReport::Succeeded(200));
+    assert_eq!(
+        *failing.terminal_writes_seen.lock().unwrap(),
+        3,
+        "all three attempts must be observed (two fail, third succeeds)"
+    );
+
     drop(server);
 }
 
@@ -615,7 +713,7 @@ async fn stale_claim_on_terminal_write_becomes_claim_lost() {
         .await;
 
     let inner = Arc::new(InMemoryA2aStorage::new());
-    let store: Arc<dyn A2aPushDeliveryStore> = Arc::new(FailingTerminalStore::new(
+    let failing = Arc::new(FailingTerminalStore::new(
         inner.clone(),
         A2aStorageError::StaleDeliveryClaim {
             tenant: "tenant-1".into(),
@@ -623,7 +721,9 @@ async fn stale_claim_on_terminal_write_becomes_claim_lost() {
             event_sequence: 1,
             config_id: "cfg-A".into(),
         },
+        usize::MAX,
     ));
+    let store: Arc<dyn A2aPushDeliveryStore> = failing.clone();
 
     let mut cfg = PushDeliveryConfig::default();
     cfg.max_attempts = 1;
@@ -646,6 +746,13 @@ async fn stale_claim_on_terminal_write_becomes_claim_lost() {
         DeliveryReport::ClaimLostOrFinal,
         "StaleDeliveryClaim on terminal write means another writer finalised \
          the row; worker reports ClaimLostOrFinal, not Succeeded"
+    );
+    // Fencing loss is not retryable — persist_terminal returns on
+    // the first StaleDeliveryClaim without consuming the budget.
+    assert_eq!(
+        *failing.terminal_writes_seen.lock().unwrap(),
+        1,
+        "StaleDeliveryClaim must short-circuit on attempt 1"
     );
     drop(server);
 }

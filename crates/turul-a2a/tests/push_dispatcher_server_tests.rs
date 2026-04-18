@@ -7,9 +7,8 @@
 //! transport paths, and assert wiremock receives the dispatched POST
 //! with the correct payload.
 //!
-//! This closes the most important gap in 0.1.x push delivery: the
-//! wiring that takes durable commit events → per-config fan-out →
-//! outbound HTTP POST.
+//! These tests close the wiring contract that takes durable commit
+//! events → per-config fan-out → outbound HTTP POST.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
