@@ -46,6 +46,53 @@ pub enum A2aStorageError {
     #[error("Push notification config not found: {0}")]
     PushConfigNotFound(String),
 
+    /// The push delivery claim for a `(tenant, task_id, event_sequence,
+    /// config_id)` tuple is already held by another instance whose claim
+    /// has not yet expired, OR the tuple has already reached a terminal
+    /// outcome (`Succeeded`, `GaveUp`, `Abandoned`) and cannot be
+    /// re-claimed regardless of expiry.
+    ///
+    /// Returned only by
+    /// [`crate::push::A2aPushDeliveryStore::claim_delivery`]. Callers
+    /// treat this as "skip delivery on this instance" — the event is
+    /// already being (or has already been) handled.
+    #[error(
+        "push delivery claim already held: tenant={tenant} task_id={task_id} \
+         event_sequence={event_sequence} config_id={config_id}"
+    )]
+    ClaimAlreadyHeld {
+        tenant: String,
+        task_id: String,
+        event_sequence: u64,
+        config_id: String,
+    },
+
+    /// The claim identity passed to
+    /// [`crate::push::A2aPushDeliveryStore::record_delivery_outcome`]
+    /// does not match the currently-stored claim for this tuple.
+    /// Two causes: the claim expired and another instance re-claimed
+    /// (generation advanced), or the same instance's prior process
+    /// died and the restarted process holds a different `claimant`
+    /// identifier. Either way, the stale caller's outcome is
+    /// dropped so it cannot overwrite a terminal state committed by
+    /// the current claimant.
+    ///
+    /// Workers that receive this error MUST abort their retry loop
+    /// for the affected tuple — the current claimant (or whoever
+    /// re-claims next) owns the remaining lifecycle.
+    #[error(
+        "stale push delivery claim: tenant={tenant} task_id={task_id} \
+         event_sequence={event_sequence} config_id={config_id} — recorded \
+         outcome dropped because the claim was re-acquired by another \
+         claimant or generation"
+    )]
+    StaleDeliveryClaim {
+        tenant: String,
+        task_id: String,
+        event_sequence: u64,
+        config_id: String,
+    },
+
     #[error("Database error: {0}")]
     DatabaseError(String),
 

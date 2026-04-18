@@ -1752,3 +1752,1214 @@ pub async fn test_invalid_transition_distinct_from_terminal_already_set(
         Ok(_) => panic!("illegal transition must fail"),
     }
 }
+
+// =========================================================
+// A2aPushDeliveryStore parity tests (ADR-011 §10)
+//
+// Executable helpers every backend wires into its own test module.
+// The invariants in each docstring are normative for all backends;
+// identical assertion code across in-memory, SQLite, PostgreSQL,
+// and DynamoDB runs through these functions.
+// =========================================================
+
+use crate::push::{
+    A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryErrorClass, DeliveryOutcome,
+    GaveUpReason,
+};
+use crate::storage::A2aStorageError;
+use std::time::{Duration, SystemTime};
+
+/// Unique tuple per test + test-nameable tenant, so the same
+/// backend instance can host parallel push-parity runs without
+/// cross-test contamination. `who` suffix makes debugging easier
+/// — the tuple in an error message points to the test that wrote it.
+fn push_tuple(who: &str) -> (String, String, u64, String) {
+    (
+        format!("t-pd-{who}"),
+        format!("task-{who}-{}", uuid::Uuid::now_v7()),
+        1,
+        format!("cfg-{who}"),
+    )
+}
+
+/// PD-CLAIM-001: first `claim_delivery` on a tuple succeeds and
+/// returns `DeliveryClaim { generation: 1, delivery_attempt_count:
+/// 0, status: Pending }` with `claimant` and `claimed_at` set from
+/// the arguments. `delivery_attempt_count` starts at `0` because no
+/// POST has been started yet — claim acquisition does not consume
+/// budget. A second `claim_delivery` with the same tuple and a live
+/// expiry returns `ClaimAlreadyHeld` without mutating the stored row.
+pub async fn test_push_claim_is_exclusive(store: &dyn A2aPushDeliveryStore) {
+    let (tenant, task_id, seq, config_id) = push_tuple("cl-001");
+    let expiry = Duration::from_secs(60);
+
+    let claim = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", expiry)
+        .await
+        .expect("first claim must succeed");
+    assert_eq!(claim.claimant, "A");
+    assert_eq!(claim.generation, 1);
+    assert_eq!(claim.delivery_attempt_count, 0, "no POST started yet");
+    assert_eq!(claim.status, ClaimStatus::Pending);
+
+    let result = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", expiry)
+        .await;
+    match result {
+        Err(A2aStorageError::ClaimAlreadyHeld {
+            tenant: et,
+            task_id: ett,
+            event_sequence: es,
+            config_id: ec,
+        }) => {
+            // `ends_with` accommodates test harnesses that prefix
+            // the tenant (e.g., DynamoDB TestStorage) for parallel
+            // isolation; bare backends match exactly.
+            assert!(
+                et.ends_with(&tenant),
+                "tenant echo: got {et:?}, expected suffix {tenant:?}"
+            );
+            assert_eq!(ett, task_id);
+            assert_eq!(es, seq);
+            assert_eq!(ec, config_id);
+        }
+        Ok(other) => panic!("expected ClaimAlreadyHeld, got claim {other:?}"),
+        Err(other) => panic!("expected ClaimAlreadyHeld, got {other:?}"),
+    }
+}
+
+/// PD-CLAIM-002: a claim whose `claimed_at + claim_expiry < now`
+/// and whose status is `Pending` or `Attempting` is re-claimable.
+/// The re-claim returns the new `claimant`, a fresh `claimed_at`,
+/// `generation` incremented by 1, `delivery_attempt_count`
+/// **unchanged** (claim acquisition does not consume budget —
+/// only `record_attempt_started` advances the count), and `status`
+/// reset to `Pending`. The prior claimant's row is replaced, not
+/// duplicated. The budget-preservation part of this invariant
+/// blocks the pathological case where repeated crash-before-POST
+/// cycles exhaust `push_max_attempts` without any real POST
+/// happening.
+pub async fn test_push_claim_expired_is_reclaimable(store: &dyn A2aPushDeliveryStore) {
+    let (tenant, task_id, seq, config_id) = push_tuple("cl-002");
+    let short = Duration::from_millis(30);
+    let long = Duration::from_secs(60);
+
+    let claim_a = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", short)
+        .await
+        .expect("A's first claim");
+    assert_eq!(claim_a.generation, 1);
+    assert_eq!(claim_a.delivery_attempt_count, 0);
+
+    // Wait past A's expiry.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let claim_b = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .await
+        .expect("B re-claims after A's expiry");
+    assert_eq!(claim_b.claimant, "B");
+    assert_eq!(claim_b.generation, 2, "generation advances on re-claim");
+    assert_eq!(
+        claim_b.delivery_attempt_count, 0,
+        "re-claim preserves the prior count (budget-preservation invariant)"
+    );
+    assert_eq!(claim_b.status, ClaimStatus::Pending);
+    assert!(
+        claim_b.claimed_at >= claim_a.claimed_at,
+        "claimed_at refreshed on re-claim"
+    );
+}
+
+/// PD-CLAIM-002b: fencing — `record_delivery_outcome` with a stale
+/// `(claimant, claim_generation)` pair returns
+/// `StaleDeliveryClaim` and MUST NOT mutate the stored row. Setup:
+/// worker A claims (generation=1). Simulate expiry. Worker B
+/// re-claims (generation=2). Worker A — now stale — calls
+/// `record_delivery_outcome(Succeeded { .. })` with A's original
+/// `(claimant, generation=1)`. Expected: `StaleDeliveryClaim`. A
+/// subsequent probe of the stored row via another `claim_delivery`
+/// attempt confirms B's claim is intact and A's write did not
+/// overwrite it. Regression-guards the fencing invariant — stale
+/// claimants cannot overwrite a fresh claimant's terminal state.
+pub async fn test_push_outcome_fenced_to_current_claim(store: &dyn A2aPushDeliveryStore) {
+    let (tenant, task_id, seq, config_id) = push_tuple("cl-002b");
+    let short = Duration::from_millis(30);
+    let long = Duration::from_secs(60);
+
+    let claim_a = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", short)
+        .await
+        .expect("A claims");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let claim_b = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .await
+        .expect("B re-claims");
+    assert_eq!(claim_b.generation, 2);
+
+    // A — now stale — tries to commit Succeeded with generation=1.
+    let err = store
+        .record_delivery_outcome(
+            &tenant,
+            &task_id,
+            seq,
+            &config_id,
+            &claim_a.claimant,
+            claim_a.generation,
+            DeliveryOutcome::Succeeded { http_status: 200 },
+        )
+        .await
+        .expect_err("stale claimant outcome must be rejected");
+    match err {
+        A2aStorageError::StaleDeliveryClaim { .. } => {}
+        other => panic!("expected StaleDeliveryClaim, got {other:?}"),
+    }
+
+    // B can still commit — its identity is current. Probe the row by
+    // calling claim_delivery again with B's live expiry; terminal
+    // status blocks the re-claim. If A's stale outcome had landed as
+    // Succeeded, B's outcome-record below would see a terminal row
+    // and the subsequent probe would still block, but then B's state
+    // wouldn't match what B wrote. So we assert both (a) B can write
+    // Succeeded and (b) the claim is blocked after.
+    store
+        .record_delivery_outcome(
+            &tenant,
+            &task_id,
+            seq,
+            &config_id,
+            &claim_b.claimant,
+            claim_b.generation,
+            DeliveryOutcome::Succeeded { http_status: 204 },
+        )
+        .await
+        .expect("B's outcome with current identity must succeed");
+
+    let reclaim = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "C", long)
+        .await;
+    assert!(
+        matches!(reclaim, Err(A2aStorageError::ClaimAlreadyHeld { .. })),
+        "terminal blocks re-claim; got {reclaim:?}"
+    );
+}
+
+/// PD-CLAIM-003: `record_delivery_outcome(Succeeded { .. })`
+/// transitions the claim to status `Succeeded`. Subsequent
+/// `claim_delivery` on the same tuple returns `ClaimAlreadyHeld`
+/// regardless of how much time has passed beyond the expiry. This
+/// is the at-least-once guarantee: once confirmed, never re-posted.
+pub async fn test_push_claim_terminal_succeeded_blocks_reclaim(store: &dyn A2aPushDeliveryStore) {
+    let (tenant, task_id, seq, config_id) = push_tuple("cl-003");
+    let short = Duration::from_millis(20);
+    let long = Duration::from_secs(60);
+
+    let claim = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", short)
+        .await
+        .expect("claim");
+    store
+        .record_attempt_started(&tenant, &task_id, seq, &config_id, "A", claim.generation)
+        .await
+        .expect("attempt-started");
+    store
+        .record_delivery_outcome(
+            &tenant,
+            &task_id,
+            seq,
+            &config_id,
+            "A",
+            claim.generation,
+            DeliveryOutcome::Succeeded { http_status: 200 },
+        )
+        .await
+        .expect("Succeeded commit");
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let err = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .await;
+    assert!(
+        matches!(err, Err(A2aStorageError::ClaimAlreadyHeld { .. })),
+        "Succeeded claims are never re-claimable regardless of expiry; got {err:?}"
+    );
+}
+
+/// PD-CLAIM-004: `record_delivery_outcome(GaveUp { .. })`
+/// transitions the claim to status `GaveUp` and the tuple is not
+/// re-claimable. The row persists so `list_failed_deliveries` can
+/// surface it within the retention window.
+pub async fn test_push_claim_terminal_gaveup_blocks_reclaim(store: &dyn A2aPushDeliveryStore) {
+    let (tenant, task_id, seq, config_id) = push_tuple("cl-004");
+    let short = Duration::from_millis(20);
+    let long = Duration::from_secs(60);
+
+    let claim = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", short)
+        .await
+        .expect("claim");
+    store
+        .record_attempt_started(&tenant, &task_id, seq, &config_id, "A", claim.generation)
+        .await
+        .expect("attempt-started");
+    store
+        .record_delivery_outcome(
+            &tenant,
+            &task_id,
+            seq,
+            &config_id,
+            "A",
+            claim.generation,
+            DeliveryOutcome::GaveUp {
+                reason: GaveUpReason::MaxAttemptsExhausted,
+                last_error_class: DeliveryErrorClass::HttpError5xx { status: 503 },
+                last_http_status: Some(503),
+            },
+        )
+        .await
+        .expect("GaveUp commit");
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let err = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .await;
+    assert!(
+        matches!(err, Err(A2aStorageError::ClaimAlreadyHeld { .. })),
+        "GaveUp claims are never re-claimable; got {err:?}"
+    );
+
+    // Visible via list_failed_deliveries.
+    let failed = store
+        .list_failed_deliveries(&tenant, SystemTime::UNIX_EPOCH, 100)
+        .await
+        .expect("list");
+    assert_eq!(failed.len(), 1, "GaveUp surfaces in failed list");
+    assert_eq!(failed[0].task_id, task_id);
+    assert_eq!(failed[0].config_id, config_id);
+}
+
+/// PD-CLAIM-005: `record_delivery_outcome(Abandoned { .. })`
+/// transitions the claim to status `Abandoned` and the tuple is not
+/// re-claimable. `list_failed_deliveries` MUST NOT return this row —
+/// nothing failed on the delivery side, the surrounding context
+/// (config or task) went away.
+pub async fn test_push_claim_terminal_abandoned_blocks_reclaim_and_not_listed(
+    store: &dyn A2aPushDeliveryStore,
+) {
+    let (tenant, task_id, seq, config_id) = push_tuple("cl-005");
+    let short = Duration::from_millis(20);
+    let long = Duration::from_secs(60);
+
+    let claim = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", short)
+        .await
+        .expect("claim");
+    store
+        .record_delivery_outcome(
+            &tenant,
+            &task_id,
+            seq,
+            &config_id,
+            "A",
+            claim.generation,
+            DeliveryOutcome::Abandoned {
+                reason: AbandonedReason::ConfigDeleted,
+            },
+        )
+        .await
+        .expect("Abandoned commit");
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let err = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .await;
+    assert!(
+        matches!(err, Err(A2aStorageError::ClaimAlreadyHeld { .. })),
+        "Abandoned claims are never re-claimable; got {err:?}"
+    );
+
+    // Abandoned MUST NOT appear in failed-delivery list.
+    let failed = store
+        .list_failed_deliveries(&tenant, SystemTime::UNIX_EPOCH, 100)
+        .await
+        .expect("list");
+    assert!(
+        failed.iter().all(|f| f.config_id != config_id),
+        "Abandoned must not surface in list_failed_deliveries"
+    );
+}
+
+/// PD-ATTEMPT-001: `record_attempt_started(claimant, generation)`
+/// with the current claim identity advances `delivery_attempt_count`
+/// by 1, transitions `status` to `Attempting`, and returns the new
+/// count. Repeated calls (two pre-flight starts without an
+/// intervening outcome) each advance by 1 — the method is the sole
+/// budget-consumer and every call is billed.
+pub async fn test_push_attempt_started_advances_count_and_status(
+    store: &dyn A2aPushDeliveryStore,
+) {
+    let (tenant, task_id, seq, config_id) = push_tuple("att-001");
+    let long = Duration::from_secs(60);
+
+    let claim = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", long)
+        .await
+        .expect("claim");
+    assert_eq!(claim.delivery_attempt_count, 0);
+    assert_eq!(claim.status, ClaimStatus::Pending);
+
+    let count_1 = store
+        .record_attempt_started(&tenant, &task_id, seq, &config_id, "A", claim.generation)
+        .await
+        .expect("start 1");
+    assert_eq!(count_1, 1, "first start increments count to 1");
+
+    let count_2 = store
+        .record_attempt_started(&tenant, &task_id, seq, &config_id, "A", claim.generation)
+        .await
+        .expect("start 2");
+    assert_eq!(count_2, 2, "second start (pre-retry) increments to 2");
+
+    // Re-claim window long enough — claim still held by A. Probe via
+    // claim_delivery with a different claimant: ClaimAlreadyHeld.
+    let err = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .await;
+    assert!(matches!(err, Err(A2aStorageError::ClaimAlreadyHeld { .. })));
+}
+
+/// PD-ATTEMPT-002: `record_attempt_started` is fenced identically
+/// to `record_delivery_outcome`. A caller whose `(claimant,
+/// claim_generation)` does not match the stored claim receives
+/// `StaleDeliveryClaim` and the row is NOT mutated
+/// (`delivery_attempt_count` stays at its pre-call value). This is
+/// what prevents a stalled worker that wakes after re-claim from
+/// advancing the budget counter a second time for the same logical
+/// attempt.
+pub async fn test_push_attempt_started_is_fenced(store: &dyn A2aPushDeliveryStore) {
+    let (tenant, task_id, seq, config_id) = push_tuple("att-002");
+    let short = Duration::from_millis(30);
+    let long = Duration::from_secs(60);
+
+    let claim_a = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", short)
+        .await
+        .expect("A claim");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let claim_b = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .await
+        .expect("B re-claim");
+    assert_eq!(claim_b.generation, claim_a.generation + 1);
+
+    // A — stale — tries to start an attempt.
+    let err = store
+        .record_attempt_started(&tenant, &task_id, seq, &config_id, "A", claim_a.generation)
+        .await
+        .expect_err("stale record_attempt_started must fail");
+    match err {
+        A2aStorageError::StaleDeliveryClaim { .. } => {}
+        other => panic!("expected StaleDeliveryClaim, got {other:?}"),
+    }
+
+    // B's start advances from the pre-A-stale-call count (which was 0,
+    // and stays 0 because A's call was rejected without mutation).
+    let count = store
+        .record_attempt_started(&tenant, &task_id, seq, &config_id, "B", claim_b.generation)
+        .await
+        .expect("B start");
+    assert_eq!(
+        count, 1,
+        "stale A did not advance the counter; B sees count=1"
+    );
+}
+
+/// PD-CLAIM-006: `record_delivery_outcome(Retry { .. })` with the
+/// current `(claimant, claim_generation)` keeps the claim open
+/// (status stays `Attempting`) and updates `last_http_status` +
+/// `last_error_class` on the row. `delivery_attempt_count`,
+/// `generation`, and `claimant` are unchanged — the attempt was
+/// already accounted for by `record_attempt_started` before the
+/// POST, and the retry is the same claimant's work. A subsequent
+/// `claim_delivery` against the same tuple with the original live
+/// expiry still returns `ClaimAlreadyHeld`.
+pub async fn test_push_retry_outcome_keeps_claim_open(store: &dyn A2aPushDeliveryStore) {
+    let (tenant, task_id, seq, config_id) = push_tuple("cl-006");
+    let long = Duration::from_secs(60);
+
+    let claim = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", long)
+        .await
+        .expect("claim");
+    let count_1 = store
+        .record_attempt_started(&tenant, &task_id, seq, &config_id, "A", claim.generation)
+        .await
+        .expect("start 1");
+    assert_eq!(count_1, 1);
+
+    let next = SystemTime::now() + Duration::from_secs(2);
+    store
+        .record_delivery_outcome(
+            &tenant,
+            &task_id,
+            seq,
+            &config_id,
+            "A",
+            claim.generation,
+            DeliveryOutcome::Retry {
+                next_attempt_at: next,
+                http_status: Some(503),
+                error_class: DeliveryErrorClass::HttpError5xx { status: 503 },
+            },
+        )
+        .await
+        .expect("Retry outcome");
+
+    // Re-claim by another claimant must still fail (claim open).
+    let err = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .await;
+    assert!(matches!(err, Err(A2aStorageError::ClaimAlreadyHeld { .. })));
+
+    // A's next attempt-start advances to 2 (Retry did not touch the counter).
+    let count_2 = store
+        .record_attempt_started(&tenant, &task_id, seq, &config_id, "A", claim.generation)
+        .await
+        .expect("start 2");
+    assert_eq!(count_2, 2, "Retry did not advance the counter");
+}
+
+/// PD-CLAIM-007: `record_delivery_outcome` is idempotent against
+/// its own terminal state. Calling `Succeeded` twice on the same
+/// tuple is a no-op on the second call; the row is unchanged.
+/// Same for `GaveUp` and `Abandoned`. This shields worker
+/// double-dispatch (e.g., a sentinel + normal path both firing) from
+/// corrupting the claim row.
+pub async fn test_push_outcome_idempotent_on_terminal(store: &dyn A2aPushDeliveryStore) {
+    let (tenant, task_id, seq, config_id) = push_tuple("cl-007");
+    let long = Duration::from_secs(60);
+
+    let claim = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "A", long)
+        .await
+        .expect("claim");
+    store
+        .record_attempt_started(&tenant, &task_id, seq, &config_id, "A", claim.generation)
+        .await
+        .expect("start");
+    store
+        .record_delivery_outcome(
+            &tenant,
+            &task_id,
+            seq,
+            &config_id,
+            "A",
+            claim.generation,
+            DeliveryOutcome::Succeeded { http_status: 200 },
+        )
+        .await
+        .expect("first Succeeded");
+
+    // Second identical Succeeded call is a no-op.
+    store
+        .record_delivery_outcome(
+            &tenant,
+            &task_id,
+            seq,
+            &config_id,
+            "A",
+            claim.generation,
+            DeliveryOutcome::Succeeded { http_status: 200 },
+        )
+        .await
+        .expect("second Succeeded must be no-op Ok");
+
+    // Row state unchanged: re-claim still blocked.
+    let err = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "B", long)
+        .await;
+    assert!(matches!(err, Err(A2aStorageError::ClaimAlreadyHeld { .. })));
+}
+
+/// PD-SWEEP-001: `sweep_expired_claims` returns the count of
+/// claim rows currently satisfying the re-claimability derivation
+/// (`claimed_at + claim_expiry < now AND status IN {Pending,
+/// Attempting}`). The sweep MUST NOT transition any claim status —
+/// re-claimability is derived on `claim_delivery`, not stored.
+/// The sweep MUST NOT affect `Succeeded` / `GaveUp` / `Abandoned`
+/// rows (they are never counted regardless of age). Backends MAY
+/// piggy-back terminal-row retention cleanup on the same call; the
+/// test does not assert a specific cleanup policy.
+pub async fn test_push_sweep_counts_expired_nonterminal_and_preserves_status(
+    store: &dyn A2aPushDeliveryStore,
+) {
+    let (tenant_a, task_a, seq_a, config_a) = push_tuple("sw-fresh");
+    let (tenant_b, task_b, seq_b, config_b) = push_tuple("sw-expired-pending");
+    let (tenant_c, task_c, seq_c, config_c) = push_tuple("sw-expired-succeeded");
+    let short = Duration::from_millis(30);
+    let long = Duration::from_secs(60);
+
+    // A: fresh Pending (not eligible).
+    let _ = store
+        .claim_delivery(&tenant_a, &task_a, seq_a, &config_a, "w", long)
+        .await
+        .expect("A claim");
+
+    // B: expired Pending (eligible).
+    let _ = store
+        .claim_delivery(&tenant_b, &task_b, seq_b, &config_b, "w", short)
+        .await
+        .expect("B claim");
+
+    // C: terminal (never eligible even after expiry).
+    let claim_c = store
+        .claim_delivery(&tenant_c, &task_c, seq_c, &config_c, "w", short)
+        .await
+        .expect("C claim");
+    store
+        .record_attempt_started(&tenant_c, &task_c, seq_c, &config_c, "w", claim_c.generation)
+        .await
+        .expect("C start");
+    store
+        .record_delivery_outcome(
+            &tenant_c,
+            &task_c,
+            seq_c,
+            &config_c,
+            "w",
+            claim_c.generation,
+            DeliveryOutcome::Succeeded { http_status: 200 },
+        )
+        .await
+        .expect("C Succeeded");
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let eligible = store.sweep_expired_claims().await.expect("sweep");
+    assert!(
+        eligible >= 1,
+        "at least B's expired Pending row is eligible (got {eligible})"
+    );
+
+    // Status preservation: A still claimable only by probe via
+    // ClaimAlreadyHeld; C still blocks re-claim; B can be re-claimed
+    // after expiry — proving B's status is still non-terminal, not
+    // rewritten to something sweep-invented.
+    assert!(matches!(
+        store
+            .claim_delivery(&tenant_a, &task_a, seq_a, &config_a, "probe", long)
+            .await,
+        Err(A2aStorageError::ClaimAlreadyHeld { .. })
+    ));
+    let re_b = store
+        .claim_delivery(&tenant_b, &task_b, seq_b, &config_b, "w2", long)
+        .await
+        .expect("B is re-claimable after expiry (status stayed non-terminal)");
+    assert_eq!(re_b.generation, 2);
+    assert!(matches!(
+        store
+            .claim_delivery(&tenant_c, &task_c, seq_c, &config_c, "probe", long)
+            .await,
+        Err(A2aStorageError::ClaimAlreadyHeld { .. })
+    ));
+}
+
+/// PD-LIST-001: `list_failed_deliveries(tenant, since, limit)`
+/// returns rows with status `GaveUp` only, ordered newest-first
+/// (`gave_up_at` descending), filtered by `gave_up_at >= since`,
+/// capped at `limit`. Rows with status `Succeeded`, `Abandoned`,
+/// `Pending`, `Attempting` are excluded.
+pub async fn test_push_list_failed_filters_and_orders(store: &dyn A2aPushDeliveryStore) {
+    let tenant = format!("t-pd-list-001-{}", uuid::Uuid::now_v7());
+    let long = Duration::from_secs(60);
+
+    // Three GaveUp rows at distinct times, plus one Succeeded and
+    // one Abandoned to prove they are filtered out.
+    async fn seed_gave_up(
+        store: &dyn A2aPushDeliveryStore,
+        tenant: &str,
+        suffix: &str,
+        expiry: Duration,
+    ) {
+        let task = format!("task-gu-{suffix}");
+        let config = format!("cfg-gu-{suffix}");
+        let seq = 1u64;
+        let claim = store
+            .claim_delivery(tenant, &task, seq, &config, "w", expiry)
+            .await
+            .expect("claim");
+        store
+            .record_attempt_started(tenant, &task, seq, &config, "w", claim.generation)
+            .await
+            .expect("start");
+        store
+            .record_delivery_outcome(
+                tenant,
+                &task,
+                seq,
+                &config,
+                "w",
+                claim.generation,
+                DeliveryOutcome::GaveUp {
+                    reason: GaveUpReason::MaxAttemptsExhausted,
+                    last_error_class: DeliveryErrorClass::HttpError5xx { status: 502 },
+                    last_http_status: Some(502),
+                },
+            )
+            .await
+            .expect("GaveUp");
+    }
+    seed_gave_up(store, &tenant, "alpha", long).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    seed_gave_up(store, &tenant, "bravo", long).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    seed_gave_up(store, &tenant, "charlie", long).await;
+
+    // Succeeded row.
+    {
+        let task = "task-ok".to_string();
+        let config = "cfg-ok".to_string();
+        let claim = store
+            .claim_delivery(&tenant, &task, 1, &config, "w", long)
+            .await
+            .expect("claim ok");
+        store
+            .record_attempt_started(&tenant, &task, 1, &config, "w", claim.generation)
+            .await
+            .expect("start ok");
+        store
+            .record_delivery_outcome(
+                &tenant,
+                &task,
+                1,
+                &config,
+                "w",
+                claim.generation,
+                DeliveryOutcome::Succeeded { http_status: 200 },
+            )
+            .await
+            .expect("ok");
+    }
+    // Abandoned row.
+    {
+        let task = "task-ab".to_string();
+        let config = "cfg-ab".to_string();
+        let claim = store
+            .claim_delivery(&tenant, &task, 1, &config, "w", long)
+            .await
+            .expect("claim ab");
+        store
+            .record_delivery_outcome(
+                &tenant,
+                &task,
+                1,
+                &config,
+                "w",
+                claim.generation,
+                DeliveryOutcome::Abandoned {
+                    reason: AbandonedReason::TaskDeleted,
+                },
+            )
+            .await
+            .expect("ab");
+    }
+
+    let all = store
+        .list_failed_deliveries(&tenant, SystemTime::UNIX_EPOCH, 100)
+        .await
+        .expect("list all");
+    assert_eq!(all.len(), 3, "only GaveUp rows are listed");
+
+    // Newest-first ordering: charlie > bravo > alpha by gave_up_at.
+    assert!(all[0].config_id.ends_with("charlie"));
+    assert!(all[1].config_id.ends_with("bravo"));
+    assert!(all[2].config_id.ends_with("alpha"));
+
+    // Limit capping.
+    let top_two = store
+        .list_failed_deliveries(&tenant, SystemTime::UNIX_EPOCH, 2)
+        .await
+        .expect("list top 2");
+    assert_eq!(top_two.len(), 2);
+    assert!(top_two[0].config_id.ends_with("charlie"));
+    assert!(top_two[1].config_id.ends_with("bravo"));
+
+    // since= filtering: exclude alpha by using a cutoff between
+    // alpha's and bravo's gave_up_at. Conservative pick: alpha's
+    // gave_up_at + 1ms.
+    let cutoff = all[2].gave_up_at + Duration::from_millis(1);
+    let newer = store
+        .list_failed_deliveries(&tenant, cutoff, 100)
+        .await
+        .expect("list newer");
+    assert!(
+        !newer.iter().any(|f| f.config_id.ends_with("alpha")),
+        "alpha should be filtered by since cutoff"
+    );
+    assert!(newer.iter().any(|f| f.config_id.ends_with("bravo")));
+    assert!(newer.iter().any(|f| f.config_id.ends_with("charlie")));
+}
+
+/// PD-LIST-002: `list_failed_deliveries` is tenant-scoped. Rows in
+/// other tenants are not returned even if they satisfy the time +
+/// limit filters. Anti-enumeration invariant: identical to
+/// task-storage tenant scoping.
+pub async fn test_push_list_failed_is_tenant_scoped(store: &dyn A2aPushDeliveryStore) {
+    let tenant_a = format!("t-pd-list-002-A-{}", uuid::Uuid::now_v7());
+    let tenant_b = format!("t-pd-list-002-B-{}", uuid::Uuid::now_v7());
+    let long = Duration::from_secs(60);
+
+    for (tenant, cfg_tag) in [(&tenant_a, "A"), (&tenant_b, "B")] {
+        let task = format!("task-{cfg_tag}");
+        let config = format!("cfg-{cfg_tag}");
+        let claim = store
+            .claim_delivery(tenant, &task, 1, &config, "w", long)
+            .await
+            .expect("claim");
+        store
+            .record_attempt_started(tenant, &task, 1, &config, "w", claim.generation)
+            .await
+            .expect("start");
+        store
+            .record_delivery_outcome(
+                tenant,
+                &task,
+                1,
+                &config,
+                "w",
+                claim.generation,
+                DeliveryOutcome::GaveUp {
+                    reason: GaveUpReason::MaxAttemptsExhausted,
+                    last_error_class: DeliveryErrorClass::Timeout,
+                    last_http_status: None,
+                },
+            )
+            .await
+            .expect("GaveUp");
+    }
+
+    let a_rows = store
+        .list_failed_deliveries(&tenant_a, SystemTime::UNIX_EPOCH, 100)
+        .await
+        .expect("list A");
+    assert_eq!(a_rows.len(), 1);
+    assert_eq!(a_rows[0].config_id, "cfg-A");
+
+    let b_rows = store
+        .list_failed_deliveries(&tenant_b, SystemTime::UNIX_EPOCH, 100)
+        .await
+        .expect("list B");
+    assert_eq!(b_rows.len(), 1);
+    assert_eq!(b_rows[0].config_id, "cfg-B");
+}
+
+/// PD-LIST-003: [`crate::push::FailedDelivery`]'s public fields do
+/// not include credentials, tokens, request bodies, or response
+/// bodies — enforced by the type itself. The parity test asserts
+/// that the diagnostics populated on `GaveUp` round-trip correctly:
+/// `last_error_class`, `last_http_status`, `first_attempted_at`,
+/// `last_attempted_at`, `gave_up_at`, `delivery_attempt_count`.
+/// Regression-guards the §4a invariant that failed-delivery records
+/// are secret-free by construction.
+pub async fn test_push_failed_delivery_diagnostics_roundtrip(store: &dyn A2aPushDeliveryStore) {
+    let (tenant, task_id, seq, config_id) = push_tuple("list-003");
+    let long = Duration::from_secs(60);
+
+    let claim = store
+        .claim_delivery(&tenant, &task_id, seq, &config_id, "w", long)
+        .await
+        .expect("claim");
+    let before = SystemTime::now();
+    store
+        .record_attempt_started(&tenant, &task_id, seq, &config_id, "w", claim.generation)
+        .await
+        .expect("start 1");
+    store
+        .record_attempt_started(&tenant, &task_id, seq, &config_id, "w", claim.generation)
+        .await
+        .expect("start 2");
+    store
+        .record_delivery_outcome(
+            &tenant,
+            &task_id,
+            seq,
+            &config_id,
+            "w",
+            claim.generation,
+            DeliveryOutcome::GaveUp {
+                reason: GaveUpReason::MaxAttemptsExhausted,
+                last_error_class: DeliveryErrorClass::HttpError5xx { status: 503 },
+                last_http_status: Some(503),
+            },
+        )
+        .await
+        .expect("GaveUp");
+    let after = SystemTime::now();
+
+    let rows = store
+        .list_failed_deliveries(&tenant, SystemTime::UNIX_EPOCH, 10)
+        .await
+        .expect("list");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.task_id, task_id);
+    assert_eq!(row.config_id, config_id);
+    assert_eq!(row.event_sequence, seq);
+    assert_eq!(row.delivery_attempt_count, 2, "two starts recorded");
+    assert_eq!(row.last_http_status, Some(503));
+    assert!(matches!(
+        row.last_error_class,
+        DeliveryErrorClass::HttpError5xx { status: 503 }
+    ));
+    assert!(
+        row.first_attempted_at >= before && row.first_attempted_at <= after,
+        "first_attempted_at in window"
+    );
+    assert!(row.last_attempted_at >= row.first_attempted_at);
+    assert!(row.gave_up_at >= row.last_attempted_at);
+    assert!(row.gave_up_at <= after);
+}
+
+/// PD-FROZEN-001: `record_attempt_started` against a terminal row
+/// (same claimant, same generation — the fencing identity still
+/// matches) returns `StaleDeliveryClaim` and does NOT mutate the
+/// row. Exercised for each of the three terminal variants.
+pub async fn test_push_attempt_started_rejected_after_terminal(
+    store: &dyn A2aPushDeliveryStore,
+) {
+    let long = Duration::from_secs(60);
+
+    async fn seed_and_commit_terminal(
+        store: &dyn A2aPushDeliveryStore,
+        suffix: &str,
+        seed_outcome: DeliveryOutcome,
+    ) -> (String, String, u64, String, String, u64, u32) {
+        let (tenant, task_id, seq, config_id) = push_tuple(suffix);
+        let claim = store
+            .claim_delivery(&tenant, &task_id, seq, &config_id, "w", Duration::from_secs(60))
+            .await
+            .expect("claim");
+        // At least one attempt start (so count > 0 for checking).
+        let count_before = store
+            .record_attempt_started(&tenant, &task_id, seq, &config_id, "w", claim.generation)
+            .await
+            .expect("start");
+        store
+            .record_delivery_outcome(
+                &tenant,
+                &task_id,
+                seq,
+                &config_id,
+                "w",
+                claim.generation,
+                seed_outcome,
+            )
+            .await
+            .expect("terminal commit");
+        (
+            tenant,
+            task_id,
+            seq,
+            config_id,
+            "w".to_string(),
+            claim.generation,
+            count_before,
+        )
+    }
+
+    // Succeeded terminal.
+    let (t, tid, seq, cid, claimant, gen_n, count_at_terminal) = seed_and_commit_terminal(
+        store,
+        "frozen-succ",
+        DeliveryOutcome::Succeeded { http_status: 200 },
+    )
+    .await;
+    let err = store
+        .record_attempt_started(&t, &tid, seq, &cid, &claimant, gen_n)
+        .await
+        .expect_err("record_attempt_started on Succeeded row must fail");
+    assert!(
+        matches!(err, A2aStorageError::StaleDeliveryClaim { .. }),
+        "Succeeded-frozen must return StaleDeliveryClaim, got {err:?}"
+    );
+    // Re-claim is blocked (Succeeded is never re-claimable), so the
+    // best we can observe is that the list_failed view remains
+    // empty (Succeeded doesn't show there) — which is stable
+    // regardless of whether the counter moved. What we really want:
+    // re-read the count via the next claim attempt's error. Instead
+    // we verify the claim stays terminal by attempting another
+    // claim:
+    let reclaim = store
+        .claim_delivery(&t, &tid, seq, &cid, "other", long)
+        .await;
+    assert!(matches!(reclaim, Err(A2aStorageError::ClaimAlreadyHeld { .. })));
+    let _ = count_at_terminal;
+
+    // GaveUp terminal.
+    let (t, tid, seq, cid, claimant, gen_n, _) = seed_and_commit_terminal(
+        store,
+        "frozen-gu",
+        DeliveryOutcome::GaveUp {
+            reason: GaveUpReason::MaxAttemptsExhausted,
+            last_error_class: DeliveryErrorClass::HttpError5xx { status: 503 },
+            last_http_status: Some(503),
+        },
+    )
+    .await;
+    let err = store
+        .record_attempt_started(&t, &tid, seq, &cid, &claimant, gen_n)
+        .await
+        .expect_err("record_attempt_started on GaveUp row must fail");
+    assert!(matches!(err, A2aStorageError::StaleDeliveryClaim { .. }));
+    // GaveUp is visible in failed-delivery list; delivery_attempt_count
+    // must reflect only attempts from BEFORE the frozen call — i.e.,
+    // unchanged by the frozen attempt-start.
+    let failed = store
+        .list_failed_deliveries(&t, SystemTime::UNIX_EPOCH, 10)
+        .await
+        .expect("list");
+    let row = failed
+        .iter()
+        .find(|f| f.task_id == tid && f.config_id == cid)
+        .expect("GaveUp row present");
+    assert_eq!(
+        row.delivery_attempt_count, 1,
+        "frozen attempt-start must not advance the counter past its pre-call value"
+    );
+
+    // Abandoned terminal.
+    let (t, tid, seq, cid, claimant, gen_n, _) = seed_and_commit_terminal(
+        store,
+        "frozen-ab",
+        DeliveryOutcome::Abandoned {
+            reason: AbandonedReason::ConfigDeleted,
+        },
+    )
+    .await;
+    let err = store
+        .record_attempt_started(&t, &tid, seq, &cid, &claimant, gen_n)
+        .await
+        .expect_err("record_attempt_started on Abandoned row must fail");
+    assert!(matches!(err, A2aStorageError::StaleDeliveryClaim { .. }));
+}
+
+/// PD-FROZEN-002: `record_delivery_outcome` does NOT mutate a
+/// terminal row, regardless of the incoming outcome. Covers all
+/// four cross-over cases:
+/// - Succeeded -> Retry: row stays Succeeded.
+/// - Succeeded -> GaveUp: row stays Succeeded (NOT listed as failed).
+/// - GaveUp -> Succeeded: row stays GaveUp (listed as failed).
+/// - Abandoned -> Succeeded: row stays Abandoned (NOT listed).
+pub async fn test_push_outcome_does_not_overwrite_terminal(
+    store: &dyn A2aPushDeliveryStore,
+) {
+    let long = Duration::from_secs(60);
+
+    async fn seed_terminal(
+        store: &dyn A2aPushDeliveryStore,
+        suffix: &str,
+        terminal: DeliveryOutcome,
+    ) -> (String, String, u64, String, u64) {
+        let (tenant, task_id, seq, config_id) = push_tuple(suffix);
+        let claim = store
+            .claim_delivery(&tenant, &task_id, seq, &config_id, "w", Duration::from_secs(60))
+            .await
+            .expect("claim");
+        store
+            .record_attempt_started(&tenant, &task_id, seq, &config_id, "w", claim.generation)
+            .await
+            .expect("start");
+        store
+            .record_delivery_outcome(
+                &tenant,
+                &task_id,
+                seq,
+                &config_id,
+                "w",
+                claim.generation,
+                terminal,
+            )
+            .await
+            .expect("terminal commit");
+        (tenant, task_id, seq, config_id, claim.generation)
+    }
+
+    // (1) Succeeded -> Retry: no-op, row still Succeeded (blocks re-claim).
+    let (t, tid, seq, cid, gen_n) = seed_terminal(
+        store,
+        "cross-succ-retry",
+        DeliveryOutcome::Succeeded { http_status: 201 },
+    )
+    .await;
+    store
+        .record_delivery_outcome(
+            &t,
+            &tid,
+            seq,
+            &cid,
+            "w",
+            gen_n,
+            DeliveryOutcome::Retry {
+                next_attempt_at: SystemTime::now() + Duration::from_secs(1),
+                http_status: Some(503),
+                error_class: DeliveryErrorClass::HttpError5xx { status: 503 },
+            },
+        )
+        .await
+        .expect("Succeeded->Retry must be Ok no-op");
+    let rc = store.claim_delivery(&t, &tid, seq, &cid, "x", long).await;
+    assert!(
+        matches!(rc, Err(A2aStorageError::ClaimAlreadyHeld { .. })),
+        "row must still be Succeeded; got {rc:?}"
+    );
+    // Not surfaced as failed.
+    let f = store
+        .list_failed_deliveries(&t, SystemTime::UNIX_EPOCH, 10)
+        .await
+        .expect("list");
+    assert!(!f.iter().any(|row| row.task_id == tid && row.config_id == cid));
+
+    // (2) Succeeded -> GaveUp: no-op, row still Succeeded, NOT in failed list.
+    let (t, tid, seq, cid, gen_n) = seed_terminal(
+        store,
+        "cross-succ-gu",
+        DeliveryOutcome::Succeeded { http_status: 200 },
+    )
+    .await;
+    store
+        .record_delivery_outcome(
+            &t,
+            &tid,
+            seq,
+            &cid,
+            "w",
+            gen_n,
+            DeliveryOutcome::GaveUp {
+                reason: GaveUpReason::MaxAttemptsExhausted,
+                last_error_class: DeliveryErrorClass::Timeout,
+                last_http_status: None,
+            },
+        )
+        .await
+        .expect("Succeeded->GaveUp must be Ok no-op");
+    let f = store
+        .list_failed_deliveries(&t, SystemTime::UNIX_EPOCH, 10)
+        .await
+        .expect("list");
+    assert!(
+        !f.iter().any(|row| row.task_id == tid && row.config_id == cid),
+        "Succeeded row must not appear in failed-delivery list"
+    );
+
+    // (3) GaveUp -> Succeeded: no-op, row still GaveUp, STILL in failed list.
+    let (t, tid, seq, cid, gen_n) = seed_terminal(
+        store,
+        "cross-gu-succ",
+        DeliveryOutcome::GaveUp {
+            reason: GaveUpReason::MaxAttemptsExhausted,
+            last_error_class: DeliveryErrorClass::HttpError5xx { status: 502 },
+            last_http_status: Some(502),
+        },
+    )
+    .await;
+    store
+        .record_delivery_outcome(
+            &t,
+            &tid,
+            seq,
+            &cid,
+            "w",
+            gen_n,
+            DeliveryOutcome::Succeeded { http_status: 200 },
+        )
+        .await
+        .expect("GaveUp->Succeeded must be Ok no-op");
+    let f = store
+        .list_failed_deliveries(&t, SystemTime::UNIX_EPOCH, 10)
+        .await
+        .expect("list");
+    assert!(
+        f.iter().any(|row| row.task_id == tid && row.config_id == cid),
+        "GaveUp row must remain in failed-delivery list after cross-over attempt"
+    );
+
+    // (4) Abandoned -> Succeeded: no-op, row still Abandoned.
+    let (t, tid, seq, cid, gen_n) = seed_terminal(
+        store,
+        "cross-ab-succ",
+        DeliveryOutcome::Abandoned {
+            reason: AbandonedReason::TaskDeleted,
+        },
+    )
+    .await;
+    store
+        .record_delivery_outcome(
+            &t,
+            &tid,
+            seq,
+            &cid,
+            "w",
+            gen_n,
+            DeliveryOutcome::Succeeded { http_status: 200 },
+        )
+        .await
+        .expect("Abandoned->Succeeded must be Ok no-op");
+    let rc = store.claim_delivery(&t, &tid, seq, &cid, "x", long).await;
+    assert!(
+        matches!(rc, Err(A2aStorageError::ClaimAlreadyHeld { .. })),
+        "row must remain Abandoned (non-re-claimable)"
+    );
+    let f = store
+        .list_failed_deliveries(&t, SystemTime::UNIX_EPOCH, 10)
+        .await
+        .expect("list");
+    assert!(
+        !f.iter().any(|row| row.task_id == tid && row.config_id == cid),
+        "Abandoned row must not appear in failed-delivery list"
+    );
+}
+
+/// PD-RACE-001: under concurrent fresh claims from two workers on
+/// the same tuple, exactly one call returns `Ok(DeliveryClaim)` and
+/// the other returns `ClaimAlreadyHeld`. Primary-key race paths in
+/// SQL backends must map to `ClaimAlreadyHeld`, not surface raw
+/// unique-violation errors.
+pub async fn test_push_concurrent_claim_race<S>(store: std::sync::Arc<S>)
+where
+    S: A2aPushDeliveryStore + ?Sized + Send + Sync + 'static,
+{
+    let (tenant, task_id, seq, config_id) = push_tuple("race");
+    let long = Duration::from_secs(60);
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+    let mut handles = Vec::new();
+    for claimant in ["A", "B"] {
+        let store = store.clone();
+        let tenant = tenant.clone();
+        let task_id = task_id.clone();
+        let config_id = config_id.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store
+                .claim_delivery(&tenant, &task_id, seq, &config_id, claimant, long)
+                .await
+        }));
+    }
+
+    let mut results = Vec::new();
+    for h in handles {
+        results.push(h.await.expect("task panic"));
+    }
+
+    let ok_count = results.iter().filter(|r| r.is_ok()).count();
+    let held_count = results
+        .iter()
+        .filter(|r| matches!(r, Err(A2aStorageError::ClaimAlreadyHeld { .. })))
+        .count();
+    assert_eq!(ok_count, 1, "exactly one winner; got {results:?}");
+    assert_eq!(
+        held_count, 1,
+        "loser must see ClaimAlreadyHeld (not a raw DB error); got {results:?}"
+    );
+}

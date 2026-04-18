@@ -5,6 +5,10 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 use turul_a2a_types::{Artifact, Message, Task, TaskStatus};
 
+use crate::push::{
+    A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
+    DeliveryOutcome, FailedDelivery, GaveUpReason,
+};
 use crate::streaming::StreamEvent;
 use super::atomic::A2aAtomicStore;
 use super::error::A2aStorageError;
@@ -39,16 +43,53 @@ fn now_iso() -> String {
 type TaskKey = (String, String); // (tenant, task_id)
 type PushConfigKey = (String, String, String); // (tenant, task_id, config_id)
 type EventKey = (String, String); // (tenant, task_id)
+type PushDeliveryKey = (String, String, u64, String); // (tenant, task_id, event_sequence, config_id)
+
+/// A single push-delivery claim row (ADR-011 §10). Stored values are
+/// exactly those required to satisfy the trait contract — no
+/// credentials, no request bodies, no response bodies.
+#[derive(Debug, Clone)]
+struct StoredDeliveryClaim {
+    claimant: String,
+    generation: u64,
+    claimed_at: std::time::SystemTime,
+    expires_at: std::time::SystemTime,
+    delivery_attempt_count: u32,
+    status: ClaimStatus,
+    first_attempted_at: Option<std::time::SystemTime>,
+    last_attempted_at: Option<std::time::SystemTime>,
+    last_http_status: Option<u16>,
+    last_error_class: Option<DeliveryErrorClass>,
+    gave_up_at: Option<std::time::SystemTime>,
+    #[allow(dead_code)]
+    gave_up_reason: Option<GaveUpReason>,
+    #[allow(dead_code)]
+    abandoned_reason: Option<AbandonedReason>,
+}
+
+impl StoredDeliveryClaim {
+    fn as_claim(&self) -> DeliveryClaim {
+        DeliveryClaim {
+            claimant: self.claimant.clone(),
+            generation: self.generation,
+            claimed_at: self.claimed_at,
+            delivery_attempt_count: self.delivery_attempt_count,
+            status: self.status,
+        }
+    }
+}
 
 /// In-memory A2A storage backend.
-/// Implements A2aTaskStorage, A2aPushNotificationStorage, AND A2aEventStore
-/// on the same struct — enforcing the same-backend requirement from ADR-009.
+/// Implements A2aTaskStorage, A2aPushNotificationStorage, A2aEventStore,
+/// and A2aPushDeliveryStore on the same struct — enforcing the
+/// same-backend requirement from ADR-009.
 #[derive(Clone)]
 pub struct InMemoryA2aStorage {
     tasks: Arc<RwLock<HashMap<TaskKey, StoredTask>>>,
     push_configs: Arc<RwLock<HashMap<PushConfigKey, turul_a2a_proto::TaskPushNotificationConfig>>>,
     events: Arc<RwLock<HashMap<EventKey, Vec<(u64, StreamEvent)>>>>,
     event_counters: Arc<RwLock<HashMap<EventKey, u64>>>,
+    push_delivery_claims: Arc<RwLock<HashMap<PushDeliveryKey, StoredDeliveryClaim>>>,
 }
 
 impl InMemoryA2aStorage {
@@ -58,6 +99,7 @@ impl InMemoryA2aStorage {
             push_configs: Arc::new(RwLock::new(HashMap::new())),
             events: Arc::new(RwLock::new(HashMap::new())),
             event_counters: Arc::new(RwLock::new(HashMap::new())),
+            push_delivery_claims: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -895,6 +937,300 @@ impl A2aAtomicStore for InMemoryA2aStorage {
     }
 }
 
+#[async_trait]
+impl A2aPushDeliveryStore for InMemoryA2aStorage {
+    fn backend_name(&self) -> &'static str {
+        "in-memory"
+    }
+
+    async fn claim_delivery(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        config_id: &str,
+        claimant: &str,
+        claim_expiry: std::time::Duration,
+    ) -> Result<DeliveryClaim, A2aStorageError> {
+        let key: PushDeliveryKey = (
+            tenant.to_string(),
+            task_id.to_string(),
+            event_sequence,
+            config_id.to_string(),
+        );
+        let now = std::time::SystemTime::now();
+        let expires_at = now + claim_expiry;
+        let mut claims = self.push_delivery_claims.write().await;
+
+        if let Some(existing) = claims.get(&key) {
+            let is_terminal = matches!(
+                existing.status,
+                ClaimStatus::Succeeded | ClaimStatus::GaveUp | ClaimStatus::Abandoned
+            );
+            let still_live = existing.expires_at > now;
+            if is_terminal || still_live {
+                return Err(A2aStorageError::ClaimAlreadyHeld {
+                    tenant: tenant.to_string(),
+                    task_id: task_id.to_string(),
+                    event_sequence,
+                    config_id: config_id.to_string(),
+                });
+            }
+            // Re-claim after expiry: advance generation; preserve
+            // delivery_attempt_count; reset status to Pending;
+            // refresh claimed_at and expires_at; replace claimant.
+            let new_claim = StoredDeliveryClaim {
+                claimant: claimant.to_string(),
+                generation: existing.generation + 1,
+                claimed_at: now,
+                expires_at,
+                delivery_attempt_count: existing.delivery_attempt_count,
+                status: ClaimStatus::Pending,
+                first_attempted_at: existing.first_attempted_at,
+                last_attempted_at: existing.last_attempted_at,
+                last_http_status: existing.last_http_status,
+                last_error_class: existing.last_error_class,
+                gave_up_at: None,
+                gave_up_reason: None,
+                abandoned_reason: None,
+            };
+            let out = new_claim.as_claim();
+            claims.insert(key, new_claim);
+            return Ok(out);
+        }
+
+        let fresh = StoredDeliveryClaim {
+            claimant: claimant.to_string(),
+            generation: 1,
+            claimed_at: now,
+            expires_at,
+            delivery_attempt_count: 0,
+            status: ClaimStatus::Pending,
+            first_attempted_at: None,
+            last_attempted_at: None,
+            last_http_status: None,
+            last_error_class: None,
+            gave_up_at: None,
+            gave_up_reason: None,
+            abandoned_reason: None,
+        };
+        let out = fresh.as_claim();
+        claims.insert(key, fresh);
+        Ok(out)
+    }
+
+    async fn record_attempt_started(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        config_id: &str,
+        claimant: &str,
+        claim_generation: u64,
+    ) -> Result<u32, A2aStorageError> {
+        let key: PushDeliveryKey = (
+            tenant.to_string(),
+            task_id.to_string(),
+            event_sequence,
+            config_id.to_string(),
+        );
+        let now = std::time::SystemTime::now();
+        let mut claims = self.push_delivery_claims.write().await;
+        let row = claims
+            .get_mut(&key)
+            .ok_or_else(|| A2aStorageError::StaleDeliveryClaim {
+                tenant: tenant.to_string(),
+                task_id: task_id.to_string(),
+                event_sequence,
+                config_id: config_id.to_string(),
+            })?;
+        if row.claimant != claimant || row.generation != claim_generation {
+            return Err(A2aStorageError::StaleDeliveryClaim {
+                tenant: tenant.to_string(),
+                task_id: task_id.to_string(),
+                event_sequence,
+                config_id: config_id.to_string(),
+            });
+        }
+        // Terminal rows are frozen: a matching (claimant, generation)
+        // that has already committed a terminal cannot restart an
+        // attempt. Same signal as fencing — the retry loop must stop.
+        if matches!(
+            row.status,
+            ClaimStatus::Succeeded | ClaimStatus::GaveUp | ClaimStatus::Abandoned
+        ) {
+            return Err(A2aStorageError::StaleDeliveryClaim {
+                tenant: tenant.to_string(),
+                task_id: task_id.to_string(),
+                event_sequence,
+                config_id: config_id.to_string(),
+            });
+        }
+        row.delivery_attempt_count = row.delivery_attempt_count.saturating_add(1);
+        if matches!(row.status, ClaimStatus::Pending) {
+            row.status = ClaimStatus::Attempting;
+        }
+        if row.first_attempted_at.is_none() {
+            row.first_attempted_at = Some(now);
+        }
+        row.last_attempted_at = Some(now);
+        Ok(row.delivery_attempt_count)
+    }
+
+    async fn record_delivery_outcome(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        config_id: &str,
+        claimant: &str,
+        claim_generation: u64,
+        outcome: DeliveryOutcome,
+    ) -> Result<(), A2aStorageError> {
+        let key: PushDeliveryKey = (
+            tenant.to_string(),
+            task_id.to_string(),
+            event_sequence,
+            config_id.to_string(),
+        );
+        let now = std::time::SystemTime::now();
+        let mut claims = self.push_delivery_claims.write().await;
+        let row = claims
+            .get_mut(&key)
+            .ok_or_else(|| A2aStorageError::StaleDeliveryClaim {
+                tenant: tenant.to_string(),
+                task_id: task_id.to_string(),
+                event_sequence,
+                config_id: config_id.to_string(),
+            })?;
+        if row.claimant != claimant || row.generation != claim_generation {
+            return Err(A2aStorageError::StaleDeliveryClaim {
+                tenant: tenant.to_string(),
+                task_id: task_id.to_string(),
+                event_sequence,
+                config_id: config_id.to_string(),
+            });
+        }
+
+        // Terminal rows are frozen: once Succeeded/GaveUp/Abandoned
+        // has been committed, any subsequent outcome — same terminal
+        // (idempotent) or different (cross-over) — is a no-op. The
+        // stored row is never mutated away from its terminal. This
+        // protects against dispatcher double-dispatch AND against a
+        // worker that confuses its own state.
+        if matches!(
+            row.status,
+            ClaimStatus::Succeeded | ClaimStatus::GaveUp | ClaimStatus::Abandoned
+        ) {
+            return Ok(());
+        }
+
+        match outcome {
+            DeliveryOutcome::Succeeded { http_status } => {
+                row.status = ClaimStatus::Succeeded;
+                row.last_http_status = Some(http_status);
+                // Ensure first/last_attempted_at exist even if the
+                // worker skipped record_attempt_started (e.g.,
+                // immediate success paths in tests).
+                if row.first_attempted_at.is_none() {
+                    row.first_attempted_at = Some(now);
+                }
+                row.last_attempted_at = Some(now);
+            }
+            DeliveryOutcome::Retry {
+                http_status,
+                error_class,
+                next_attempt_at: _,
+            } => {
+                // Retry never changes generation/claimant; keeps the
+                // claim in Attempting and updates diagnostics. Does
+                // NOT increment delivery_attempt_count.
+                row.status = ClaimStatus::Attempting;
+                row.last_http_status = http_status;
+                row.last_error_class = Some(error_class);
+                row.last_attempted_at = Some(now);
+            }
+            DeliveryOutcome::GaveUp {
+                reason,
+                last_error_class,
+                last_http_status,
+            } => {
+                row.status = ClaimStatus::GaveUp;
+                row.gave_up_at = Some(now);
+                row.gave_up_reason = Some(reason);
+                row.last_error_class = Some(last_error_class);
+                row.last_http_status = last_http_status;
+                // Pre-POST giveups (SSRF, payload too large) never
+                // recorded first/last_attempted_at; use claim time
+                // so FailedDelivery has valid timestamps.
+                if row.first_attempted_at.is_none() {
+                    row.first_attempted_at = Some(row.claimed_at);
+                }
+                if row.last_attempted_at.is_none() {
+                    row.last_attempted_at = Some(now);
+                }
+            }
+            DeliveryOutcome::Abandoned { reason } => {
+                row.status = ClaimStatus::Abandoned;
+                row.abandoned_reason = Some(reason);
+            }
+        }
+        Ok(())
+    }
+
+    async fn sweep_expired_claims(&self) -> Result<u64, A2aStorageError> {
+        let now = std::time::SystemTime::now();
+        let claims = self.push_delivery_claims.read().await;
+        let mut count: u64 = 0;
+        for row in claims.values() {
+            if matches!(row.status, ClaimStatus::Pending | ClaimStatus::Attempting)
+                && row.expires_at < now
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn list_failed_deliveries(
+        &self,
+        tenant: &str,
+        since: std::time::SystemTime,
+        limit: usize,
+    ) -> Result<Vec<FailedDelivery>, A2aStorageError> {
+        let claims = self.push_delivery_claims.read().await;
+        let mut out: Vec<FailedDelivery> = claims
+            .iter()
+            .filter_map(|((row_tenant, task_id, event_sequence, config_id), row)| {
+                if row_tenant != tenant || !matches!(row.status, ClaimStatus::GaveUp) {
+                    return None;
+                }
+                let gave_up_at = row.gave_up_at?;
+                if gave_up_at < since {
+                    return None;
+                }
+                Some(FailedDelivery {
+                    task_id: task_id.clone(),
+                    config_id: config_id.clone(),
+                    event_sequence: *event_sequence,
+                    first_attempted_at: row.first_attempted_at.unwrap_or(row.claimed_at),
+                    last_attempted_at: row.last_attempted_at.unwrap_or(gave_up_at),
+                    gave_up_at,
+                    delivery_attempt_count: row.delivery_attempt_count,
+                    last_http_status: row.last_http_status,
+                    last_error_class: row
+                        .last_error_class
+                        .unwrap_or(DeliveryErrorClass::NetworkError),
+                })
+            })
+            .collect();
+        // Newest-first by gave_up_at.
+        out.sort_by(|a, b| b.gave_up_at.cmp(&a.gave_up_at));
+        out.truncate(limit);
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1136,5 +1472,111 @@ mod tests {
     async fn test_atomic_concurrent_sequence_integrity() {
         let s = std::sync::Arc::new(storage());
         parity_tests::test_atomic_concurrent_sequence_integrity(s).await;
+    }
+
+    // =========================================================
+    // A2aPushDeliveryStore parity (ADR-011 §10).
+    // =========================================================
+
+    #[tokio::test]
+    async fn test_push_claim_is_exclusive() {
+        let s = storage();
+        parity_tests::test_push_claim_is_exclusive(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_claim_expired_is_reclaimable() {
+        let s = storage();
+        parity_tests::test_push_claim_expired_is_reclaimable(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_outcome_fenced_to_current_claim() {
+        let s = storage();
+        parity_tests::test_push_outcome_fenced_to_current_claim(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_claim_terminal_succeeded_blocks_reclaim() {
+        let s = storage();
+        parity_tests::test_push_claim_terminal_succeeded_blocks_reclaim(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_claim_terminal_gaveup_blocks_reclaim() {
+        let s = storage();
+        parity_tests::test_push_claim_terminal_gaveup_blocks_reclaim(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_claim_terminal_abandoned_blocks_reclaim_and_not_listed() {
+        let s = storage();
+        parity_tests::test_push_claim_terminal_abandoned_blocks_reclaim_and_not_listed(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_attempt_started_advances_count_and_status() {
+        let s = storage();
+        parity_tests::test_push_attempt_started_advances_count_and_status(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_attempt_started_is_fenced() {
+        let s = storage();
+        parity_tests::test_push_attempt_started_is_fenced(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_retry_outcome_keeps_claim_open() {
+        let s = storage();
+        parity_tests::test_push_retry_outcome_keeps_claim_open(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_outcome_idempotent_on_terminal() {
+        let s = storage();
+        parity_tests::test_push_outcome_idempotent_on_terminal(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_sweep_counts_expired_nonterminal_and_preserves_status() {
+        let s = storage();
+        parity_tests::test_push_sweep_counts_expired_nonterminal_and_preserves_status(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_list_failed_filters_and_orders() {
+        let s = storage();
+        parity_tests::test_push_list_failed_filters_and_orders(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_list_failed_is_tenant_scoped() {
+        let s = storage();
+        parity_tests::test_push_list_failed_is_tenant_scoped(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_failed_delivery_diagnostics_roundtrip() {
+        let s = storage();
+        parity_tests::test_push_failed_delivery_diagnostics_roundtrip(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_attempt_started_rejected_after_terminal() {
+        let s = storage();
+        parity_tests::test_push_attempt_started_rejected_after_terminal(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_outcome_does_not_overwrite_terminal() {
+        let s = storage();
+        parity_tests::test_push_outcome_does_not_overwrite_terminal(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_concurrent_claim_race() {
+        let s = std::sync::Arc::new(storage());
+        parity_tests::test_push_concurrent_claim_race(s).await;
     }
 }

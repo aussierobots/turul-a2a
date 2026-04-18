@@ -4,6 +4,10 @@ use async_trait::async_trait;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use turul_a2a_types::{Artifact, Message, Task, TaskState, TaskStatus};
 
+use crate::push::{
+    A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
+    DeliveryOutcome, FailedDelivery, GaveUpReason,
+};
 use crate::streaming::StreamEvent;
 use super::atomic::A2aAtomicStore;
 use super::error::A2aStorageError;
@@ -100,6 +104,35 @@ impl PostgresA2aStorage {
                 event_data JSONB NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (tenant, task_id, event_sequence)
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+        // Push-delivery claim table (ADR-011 §10). Same shape as
+        // SQLite's backend; BIGINT for epoch micros preserves
+        // ordering without timezone ambiguity.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS a2a_push_deliveries (
+                tenant TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                event_sequence BIGINT NOT NULL,
+                config_id TEXT NOT NULL,
+                claimant TEXT NOT NULL,
+                generation BIGINT NOT NULL,
+                claimed_at_micros BIGINT NOT NULL,
+                expires_at_micros BIGINT NOT NULL,
+                delivery_attempt_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                first_attempted_at_micros BIGINT,
+                last_attempted_at_micros BIGINT,
+                last_http_status INTEGER,
+                last_error_class TEXT,
+                gave_up_at_micros BIGINT,
+                gave_up_reason TEXT,
+                abandoned_reason TEXT,
+                PRIMARY KEY (tenant, task_id, event_sequence, config_id)
             )",
         )
         .execute(&self.pool)
@@ -1088,6 +1121,524 @@ impl A2aAtomicStore for PostgresA2aStorage {
     }
 }
 
+// ===========================================================================
+// A2aPushDeliveryStore (ADR-011 §10)
+//
+// Shape mirrors the SQLite backend. Epoch micros stored as BIGINT so
+// ordering is deterministic and timezone-independent. ClaimStatus,
+// GaveUpReason, AbandonedReason serialise to stable string tokens;
+// DeliveryErrorClass serialises via a local wire enum.
+// ===========================================================================
+
+fn pg_systime_to_micros(t: std::time::SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+fn pg_micros_to_systime(m: i64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_micros(m.max(0) as u64)
+}
+fn pg_claim_status_to_str(s: ClaimStatus) -> &'static str {
+    match s {
+        ClaimStatus::Pending => "Pending",
+        ClaimStatus::Attempting => "Attempting",
+        ClaimStatus::Succeeded => "Succeeded",
+        ClaimStatus::GaveUp => "GaveUp",
+        ClaimStatus::Abandoned => "Abandoned",
+    }
+}
+fn pg_claim_status_from_str(s: &str) -> Result<ClaimStatus, A2aStorageError> {
+    match s {
+        "Pending" => Ok(ClaimStatus::Pending),
+        "Attempting" => Ok(ClaimStatus::Attempting),
+        "Succeeded" => Ok(ClaimStatus::Succeeded),
+        "GaveUp" => Ok(ClaimStatus::GaveUp),
+        "Abandoned" => Ok(ClaimStatus::Abandoned),
+        other => Err(A2aStorageError::DatabaseError(format!(
+            "unknown claim status: {other}"
+        ))),
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "t", content = "s")]
+enum PgErrorClassWire {
+    NetworkError,
+    Timeout,
+    HttpError4xx(u16),
+    HttpError5xx(u16),
+    HttpError429,
+    SSRFBlocked,
+    PayloadTooLarge,
+    ConfigDeleted,
+    TaskDeleted,
+    TlsRejected,
+}
+impl From<DeliveryErrorClass> for PgErrorClassWire {
+    fn from(c: DeliveryErrorClass) -> Self {
+        match c {
+            DeliveryErrorClass::NetworkError => Self::NetworkError,
+            DeliveryErrorClass::Timeout => Self::Timeout,
+            DeliveryErrorClass::HttpError4xx { status } => Self::HttpError4xx(status),
+            DeliveryErrorClass::HttpError5xx { status } => Self::HttpError5xx(status),
+            DeliveryErrorClass::HttpError429 => Self::HttpError429,
+            DeliveryErrorClass::SSRFBlocked => Self::SSRFBlocked,
+            DeliveryErrorClass::PayloadTooLarge => Self::PayloadTooLarge,
+            DeliveryErrorClass::ConfigDeleted => Self::ConfigDeleted,
+            DeliveryErrorClass::TaskDeleted => Self::TaskDeleted,
+            DeliveryErrorClass::TlsRejected => Self::TlsRejected,
+        }
+    }
+}
+impl From<PgErrorClassWire> for DeliveryErrorClass {
+    fn from(w: PgErrorClassWire) -> Self {
+        match w {
+            PgErrorClassWire::NetworkError => DeliveryErrorClass::NetworkError,
+            PgErrorClassWire::Timeout => DeliveryErrorClass::Timeout,
+            PgErrorClassWire::HttpError4xx(s) => DeliveryErrorClass::HttpError4xx { status: s },
+            PgErrorClassWire::HttpError5xx(s) => DeliveryErrorClass::HttpError5xx { status: s },
+            PgErrorClassWire::HttpError429 => DeliveryErrorClass::HttpError429,
+            PgErrorClassWire::SSRFBlocked => DeliveryErrorClass::SSRFBlocked,
+            PgErrorClassWire::PayloadTooLarge => DeliveryErrorClass::PayloadTooLarge,
+            PgErrorClassWire::ConfigDeleted => DeliveryErrorClass::ConfigDeleted,
+            PgErrorClassWire::TaskDeleted => DeliveryErrorClass::TaskDeleted,
+            PgErrorClassWire::TlsRejected => DeliveryErrorClass::TlsRejected,
+        }
+    }
+}
+fn pg_error_class_to_json(c: DeliveryErrorClass) -> String {
+    serde_json::to_string(&PgErrorClassWire::from(c)).unwrap_or_else(|_| "{}".into())
+}
+fn pg_error_class_from_json(s: &str) -> Option<DeliveryErrorClass> {
+    serde_json::from_str::<PgErrorClassWire>(s)
+        .ok()
+        .map(Into::into)
+}
+fn pg_gave_up_reason_to_str(r: GaveUpReason) -> &'static str {
+    match r {
+        GaveUpReason::MaxAttemptsExhausted => "MaxAttemptsExhausted",
+        GaveUpReason::SsrfBlocked => "SsrfBlocked",
+        GaveUpReason::PayloadTooLarge => "PayloadTooLarge",
+        GaveUpReason::TlsRejected => "TlsRejected",
+    }
+}
+fn pg_abandoned_reason_to_str(r: AbandonedReason) -> &'static str {
+    match r {
+        AbandonedReason::ConfigDeleted => "ConfigDeleted",
+        AbandonedReason::TaskDeleted => "TaskDeleted",
+        AbandonedReason::NonHttpsUrlInProduction => "NonHttpsUrlInProduction",
+    }
+}
+
+#[async_trait]
+impl A2aPushDeliveryStore for PostgresA2aStorage {
+    fn backend_name(&self) -> &'static str {
+        "postgres"
+    }
+
+    async fn claim_delivery(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        config_id: &str,
+        claimant: &str,
+        claim_expiry: std::time::Duration,
+    ) -> Result<DeliveryClaim, A2aStorageError> {
+        let now = std::time::SystemTime::now();
+        let now_micros = pg_systime_to_micros(now);
+        let expires_micros = pg_systime_to_micros(now + claim_expiry);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        let existing: Option<(i64, i64, i64, String)> = sqlx::query_as(
+            "SELECT generation, expires_at_micros, delivery_attempt_count, status \
+             FROM a2a_push_deliveries \
+             WHERE tenant = $1 AND task_id = $2 AND event_sequence = $3 AND config_id = $4 \
+             FOR UPDATE",
+        )
+        .bind(tenant)
+        .bind(task_id)
+        .bind(event_sequence as i64)
+        .bind(config_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+        if let Some((prev_gen, prev_expires, prev_count, prev_status_s)) = existing {
+            let prev_status = pg_claim_status_from_str(&prev_status_s)?;
+            let is_terminal = matches!(
+                prev_status,
+                ClaimStatus::Succeeded | ClaimStatus::GaveUp | ClaimStatus::Abandoned
+            );
+            let still_live = prev_expires > now_micros;
+            if is_terminal || still_live {
+                return Err(A2aStorageError::ClaimAlreadyHeld {
+                    tenant: tenant.to_string(),
+                    task_id: task_id.to_string(),
+                    event_sequence,
+                    config_id: config_id.to_string(),
+                });
+            }
+            // Re-claim conditional on current state — see the
+            // SQLite impl for rationale. Guards against a stale read
+            // followed by a concurrent terminal commit.
+            let new_gen = prev_gen + 1;
+            let update_result = sqlx::query(
+                "UPDATE a2a_push_deliveries SET \
+                    claimant = $1, generation = $2, claimed_at_micros = $3, \
+                    expires_at_micros = $4, status = 'Pending', \
+                    gave_up_at_micros = NULL, gave_up_reason = NULL, abandoned_reason = NULL \
+                 WHERE tenant = $5 AND task_id = $6 AND event_sequence = $7 AND config_id = $8 \
+                   AND generation = $9 AND status IN ('Pending', 'Attempting') \
+                   AND expires_at_micros < $10",
+            )
+            .bind(claimant)
+            .bind(new_gen)
+            .bind(now_micros)
+            .bind(expires_micros)
+            .bind(tenant)
+            .bind(task_id)
+            .bind(event_sequence as i64)
+            .bind(config_id)
+            .bind(prev_gen)
+            .bind(now_micros)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            if update_result.rows_affected() == 0 {
+                return Err(A2aStorageError::ClaimAlreadyHeld {
+                    tenant: tenant.to_string(),
+                    task_id: task_id.to_string(),
+                    event_sequence,
+                    config_id: config_id.to_string(),
+                });
+            }
+            tx.commit()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            return Ok(DeliveryClaim {
+                claimant: claimant.to_string(),
+                generation: new_gen as u64,
+                claimed_at: now,
+                delivery_attempt_count: prev_count as u32,
+                status: ClaimStatus::Pending,
+            });
+        }
+
+        // ON CONFLICT DO NOTHING collapses concurrent fresh inserts.
+        let result = sqlx::query(
+            "INSERT INTO a2a_push_deliveries \
+                (tenant, task_id, event_sequence, config_id, claimant, generation, \
+                 claimed_at_micros, expires_at_micros, delivery_attempt_count, status) \
+             VALUES ($1, $2, $3, $4, $5, 1, $6, $7, 0, 'Pending') \
+             ON CONFLICT (tenant, task_id, event_sequence, config_id) DO NOTHING",
+        )
+        .bind(tenant)
+        .bind(task_id)
+        .bind(event_sequence as i64)
+        .bind(config_id)
+        .bind(claimant)
+        .bind(now_micros)
+        .bind(expires_micros)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        if result.rows_affected() == 0 {
+            return Err(A2aStorageError::ClaimAlreadyHeld {
+                tenant: tenant.to_string(),
+                task_id: task_id.to_string(),
+                event_sequence,
+                config_id: config_id.to_string(),
+            });
+        }
+        tx.commit()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        Ok(DeliveryClaim {
+            claimant: claimant.to_string(),
+            generation: 1,
+            claimed_at: now,
+            delivery_attempt_count: 0,
+            status: ClaimStatus::Pending,
+        })
+    }
+
+    async fn record_attempt_started(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        config_id: &str,
+        claimant: &str,
+        claim_generation: u64,
+    ) -> Result<u32, A2aStorageError> {
+        let now_micros = pg_systime_to_micros(std::time::SystemTime::now());
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        // Fenced on identity AND non-terminal status — terminal rows
+        // are frozen and cannot restart an attempt.
+        let rows: Option<(i64,)> = sqlx::query_as(
+            "UPDATE a2a_push_deliveries SET \
+                delivery_attempt_count = delivery_attempt_count + 1, \
+                status = CASE WHEN status = 'Pending' THEN 'Attempting' ELSE status END, \
+                first_attempted_at_micros = COALESCE(first_attempted_at_micros, $1), \
+                last_attempted_at_micros = $1 \
+             WHERE tenant = $2 AND task_id = $3 AND event_sequence = $4 \
+               AND config_id = $5 AND claimant = $6 AND generation = $7 \
+               AND status IN ('Pending', 'Attempting') \
+             RETURNING delivery_attempt_count",
+        )
+        .bind(now_micros)
+        .bind(tenant)
+        .bind(task_id)
+        .bind(event_sequence as i64)
+        .bind(config_id)
+        .bind(claimant)
+        .bind(claim_generation as i64)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        match rows {
+            Some((count,)) => {
+                tx.commit()
+                    .await
+                    .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+                Ok(count.max(0) as u32)
+            }
+            None => Err(A2aStorageError::StaleDeliveryClaim {
+                tenant: tenant.to_string(),
+                task_id: task_id.to_string(),
+                event_sequence,
+                config_id: config_id.to_string(),
+            }),
+        }
+    }
+
+    async fn record_delivery_outcome(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        config_id: &str,
+        claimant: &str,
+        claim_generation: u64,
+        outcome: DeliveryOutcome,
+    ) -> Result<(), A2aStorageError> {
+        let now_micros = pg_systime_to_micros(std::time::SystemTime::now());
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        let row: Option<(String, i64, String, i64)> = sqlx::query_as(
+            "SELECT claimant, generation, status, claimed_at_micros \
+             FROM a2a_push_deliveries \
+             WHERE tenant = $1 AND task_id = $2 AND event_sequence = $3 AND config_id = $4 \
+             FOR UPDATE",
+        )
+        .bind(tenant)
+        .bind(task_id)
+        .bind(event_sequence as i64)
+        .bind(config_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        let (cur_claimant, cur_gen, cur_status_s, cur_claimed) = match row {
+            Some(r) => r,
+            None => {
+                return Err(A2aStorageError::StaleDeliveryClaim {
+                    tenant: tenant.to_string(),
+                    task_id: task_id.to_string(),
+                    event_sequence,
+                    config_id: config_id.to_string(),
+                });
+            }
+        };
+        if cur_claimant != claimant || cur_gen as u64 != claim_generation {
+            return Err(A2aStorageError::StaleDeliveryClaim {
+                tenant: tenant.to_string(),
+                task_id: task_id.to_string(),
+                event_sequence,
+                config_id: config_id.to_string(),
+            });
+        }
+        let cur_status = pg_claim_status_from_str(&cur_status_s)?;
+        // Terminal-frozen gate: once Succeeded/GaveUp/Abandoned,
+        // further outcomes are silent no-ops.
+        if matches!(
+            cur_status,
+            ClaimStatus::Succeeded | ClaimStatus::GaveUp | ClaimStatus::Abandoned
+        ) {
+            tx.commit()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            return Ok(());
+        }
+        match outcome {
+            DeliveryOutcome::Succeeded { http_status } => {
+                sqlx::query(
+                    "UPDATE a2a_push_deliveries SET status = 'Succeeded', \
+                        last_http_status = $1, \
+                        first_attempted_at_micros = COALESCE(first_attempted_at_micros, $2), \
+                        last_attempted_at_micros = $2 \
+                     WHERE tenant = $3 AND task_id = $4 AND event_sequence = $5 AND config_id = $6",
+                )
+                .bind(http_status as i32)
+                .bind(now_micros)
+                .bind(tenant)
+                .bind(task_id)
+                .bind(event_sequence as i64)
+                .bind(config_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            }
+            DeliveryOutcome::Retry {
+                http_status,
+                error_class,
+                next_attempt_at: _,
+            } => {
+                sqlx::query(
+                    "UPDATE a2a_push_deliveries SET status = 'Attempting', \
+                        last_http_status = $1, last_error_class = $2, \
+                        last_attempted_at_micros = $3 \
+                     WHERE tenant = $4 AND task_id = $5 AND event_sequence = $6 AND config_id = $7",
+                )
+                .bind(http_status.map(|s| s as i32))
+                .bind(pg_error_class_to_json(error_class))
+                .bind(now_micros)
+                .bind(tenant)
+                .bind(task_id)
+                .bind(event_sequence as i64)
+                .bind(config_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            }
+            DeliveryOutcome::GaveUp {
+                reason,
+                last_error_class,
+                last_http_status,
+            } => {
+                sqlx::query(
+                    "UPDATE a2a_push_deliveries SET status = 'GaveUp', \
+                        gave_up_at_micros = $1, gave_up_reason = $2, \
+                        last_error_class = $3, last_http_status = $4, \
+                        first_attempted_at_micros = COALESCE(first_attempted_at_micros, $5), \
+                        last_attempted_at_micros = COALESCE(last_attempted_at_micros, $1) \
+                     WHERE tenant = $6 AND task_id = $7 AND event_sequence = $8 AND config_id = $9",
+                )
+                .bind(now_micros)
+                .bind(pg_gave_up_reason_to_str(reason))
+                .bind(pg_error_class_to_json(last_error_class))
+                .bind(last_http_status.map(|s| s as i32))
+                .bind(cur_claimed)
+                .bind(tenant)
+                .bind(task_id)
+                .bind(event_sequence as i64)
+                .bind(config_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            }
+            DeliveryOutcome::Abandoned { reason } => {
+                sqlx::query(
+                    "UPDATE a2a_push_deliveries SET status = 'Abandoned', \
+                        abandoned_reason = $1 \
+                     WHERE tenant = $2 AND task_id = $3 AND event_sequence = $4 AND config_id = $5",
+                )
+                .bind(pg_abandoned_reason_to_str(reason))
+                .bind(tenant)
+                .bind(task_id)
+                .bind(event_sequence as i64)
+                .bind(config_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        let _ = pg_claim_status_to_str(ClaimStatus::Pending); // silence unused warning on helper
+        Ok(())
+    }
+
+    async fn sweep_expired_claims(&self) -> Result<u64, A2aStorageError> {
+        let now_micros = pg_systime_to_micros(std::time::SystemTime::now());
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM a2a_push_deliveries \
+             WHERE expires_at_micros < $1 AND status IN ('Pending', 'Attempting')",
+        )
+        .bind(now_micros)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        Ok(row.0.max(0) as u64)
+    }
+
+    async fn list_failed_deliveries(
+        &self,
+        tenant: &str,
+        since: std::time::SystemTime,
+        limit: usize,
+    ) -> Result<Vec<FailedDelivery>, A2aStorageError> {
+        let since_micros = pg_systime_to_micros(since);
+        let rows: Vec<(
+            String,
+            String,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            i32,
+            Option<i32>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT task_id, config_id, event_sequence, claimed_at_micros, \
+                    first_attempted_at_micros, last_attempted_at_micros, \
+                    gave_up_at_micros, delivery_attempt_count, \
+                    last_http_status, last_error_class \
+             FROM a2a_push_deliveries \
+             WHERE tenant = $1 AND status = 'GaveUp' AND gave_up_at_micros >= $2 \
+             ORDER BY gave_up_at_micros DESC \
+             LIMIT $3",
+        )
+        .bind(tenant)
+        .bind(since_micros)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (task_id, config_id, seq, claimed, first, last, gave_up, count, http, err) in rows {
+            let gave_up = gave_up.unwrap_or(claimed);
+            out.push(FailedDelivery {
+                task_id,
+                config_id,
+                event_sequence: seq.max(0) as u64,
+                first_attempted_at: pg_micros_to_systime(first.unwrap_or(claimed)),
+                last_attempted_at: pg_micros_to_systime(last.unwrap_or(gave_up)),
+                gave_up_at: pg_micros_to_systime(gave_up),
+                delivery_attempt_count: count.max(0) as u32,
+                last_http_status: http.map(|s| s as u16),
+                last_error_class: err
+                    .as_deref()
+                    .and_then(pg_error_class_from_json)
+                    .unwrap_or(DeliveryErrorClass::NetworkError),
+            });
+        }
+        Ok(out)
+    }
+}
+
 /// PostgreSQL parity tests require a running PostgreSQL instance.
 ///
 /// Run tests:
@@ -1351,5 +1902,111 @@ mod tests {
     async fn test_atomic_sequence_continuity() {
         let s = storage().await;
         parity_tests::test_atomic_sequence_continuity(&s, &s).await;
+    }
+
+    // =========================================================
+    // A2aPushDeliveryStore parity (ADR-011 §10).
+    // =========================================================
+
+    #[tokio::test]
+    async fn test_push_claim_is_exclusive() {
+        let s = storage().await;
+        parity_tests::test_push_claim_is_exclusive(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_claim_expired_is_reclaimable() {
+        let s = storage().await;
+        parity_tests::test_push_claim_expired_is_reclaimable(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_outcome_fenced_to_current_claim() {
+        let s = storage().await;
+        parity_tests::test_push_outcome_fenced_to_current_claim(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_claim_terminal_succeeded_blocks_reclaim() {
+        let s = storage().await;
+        parity_tests::test_push_claim_terminal_succeeded_blocks_reclaim(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_claim_terminal_gaveup_blocks_reclaim() {
+        let s = storage().await;
+        parity_tests::test_push_claim_terminal_gaveup_blocks_reclaim(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_claim_terminal_abandoned_blocks_reclaim_and_not_listed() {
+        let s = storage().await;
+        parity_tests::test_push_claim_terminal_abandoned_blocks_reclaim_and_not_listed(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_attempt_started_advances_count_and_status() {
+        let s = storage().await;
+        parity_tests::test_push_attempt_started_advances_count_and_status(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_attempt_started_is_fenced() {
+        let s = storage().await;
+        parity_tests::test_push_attempt_started_is_fenced(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_retry_outcome_keeps_claim_open() {
+        let s = storage().await;
+        parity_tests::test_push_retry_outcome_keeps_claim_open(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_outcome_idempotent_on_terminal() {
+        let s = storage().await;
+        parity_tests::test_push_outcome_idempotent_on_terminal(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_sweep_counts_expired_nonterminal_and_preserves_status() {
+        let s = storage().await;
+        parity_tests::test_push_sweep_counts_expired_nonterminal_and_preserves_status(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_list_failed_filters_and_orders() {
+        let s = storage().await;
+        parity_tests::test_push_list_failed_filters_and_orders(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_list_failed_is_tenant_scoped() {
+        let s = storage().await;
+        parity_tests::test_push_list_failed_is_tenant_scoped(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_failed_delivery_diagnostics_roundtrip() {
+        let s = storage().await;
+        parity_tests::test_push_failed_delivery_diagnostics_roundtrip(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_attempt_started_rejected_after_terminal() {
+        let s = storage().await;
+        parity_tests::test_push_attempt_started_rejected_after_terminal(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_outcome_does_not_overwrite_terminal() {
+        let s = storage().await;
+        parity_tests::test_push_outcome_does_not_overwrite_terminal(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_concurrent_claim_race() {
+        let s = std::sync::Arc::new(storage().await);
+        parity_tests::test_push_concurrent_claim_race(s).await;
     }
 }

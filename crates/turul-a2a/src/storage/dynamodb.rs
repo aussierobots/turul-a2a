@@ -16,6 +16,10 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client;
 use turul_a2a_types::{Artifact, Message, Task, TaskState, TaskStatus};
 
+use crate::push::{
+    A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
+    DeliveryOutcome, FailedDelivery, GaveUpReason,
+};
 use crate::streaming::StreamEvent;
 use super::atomic::A2aAtomicStore;
 use super::error::A2aStorageError;
@@ -29,16 +33,23 @@ pub struct DynamoDbConfig {
     pub tasks_table: String,
     pub push_configs_table: String,
     pub events_table: String,
+    pub push_deliveries_table: String,
     /// TTL for task items in seconds. 0 = no expiry. Default: 7 days (604800).
     pub task_ttl_seconds: u64,
     /// TTL for event items in seconds. 0 = no expiry. Default: 24 hours (86400).
     pub event_ttl_seconds: u64,
+    /// TTL for push-delivery claim items in seconds. 0 = no expiry.
+    /// Default: 7 days (604800); GaveUp rows are retained for operator
+    /// inspection within this window per ADR-011 §5b.
+    pub push_delivery_ttl_seconds: u64,
 }
 
 /// 7 days in seconds.
 const DEFAULT_TASK_TTL: u64 = 7 * 24 * 3600;
 /// 24 hours in seconds.
 const DEFAULT_EVENT_TTL: u64 = 24 * 3600;
+/// 7 days in seconds.
+const DEFAULT_PUSH_DELIVERY_TTL: u64 = 7 * 24 * 3600;
 
 impl Default for DynamoDbConfig {
     fn default() -> Self {
@@ -46,8 +57,10 @@ impl Default for DynamoDbConfig {
             tasks_table: "a2a_tasks".into(),
             push_configs_table: "a2a_push_configs".into(),
             events_table: "a2a_task_events".into(),
+            push_deliveries_table: "a2a_push_deliveries".into(),
             task_ttl_seconds: DEFAULT_TASK_TTL,
             event_ttl_seconds: DEFAULT_EVENT_TTL,
+            push_delivery_ttl_seconds: DEFAULT_PUSH_DELIVERY_TTL,
         }
     }
 }
@@ -1367,6 +1380,702 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
     }
 }
 
+// ===========================================================================
+// A2aPushDeliveryStore (ADR-011 §10)
+//
+// Table shape: `pk` (HASH) + `sk` (RANGE). For this table,
+// `pk = "{tenant}#{task_id}#{event_sequence}"` and `sk = config_id`.
+// The composite key keeps all configs for one event co-located so a
+// Query can enumerate them, while still giving each (event, config)
+// pair a unique primary-key slot.
+//
+// Fencing: `record_attempt_started` and `record_delivery_outcome`
+// use ConditionExpression on `(claimant = :c AND generation = :g)`.
+// A condition failure returns `StaleDeliveryClaim`.
+//
+// Timestamps: stored as numeric `claimedAtMicros` / `expiresAtMicros`
+// / etc. so DynamoDB comparisons on expiry are numeric and correct
+// across clock boundaries.
+// ===========================================================================
+
+impl DynamoDbA2aStorage {
+    fn push_delivery_pk(tenant: &str, task_id: &str, event_sequence: u64) -> String {
+        format!("{tenant}#{task_id}#{event_sequence}")
+    }
+}
+
+fn ddb_systime_to_micros(t: std::time::SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+fn ddb_micros_to_systime(m: i64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_micros(m.max(0) as u64)
+}
+fn ddb_claim_status_to_str(s: ClaimStatus) -> &'static str {
+    match s {
+        ClaimStatus::Pending => "Pending",
+        ClaimStatus::Attempting => "Attempting",
+        ClaimStatus::Succeeded => "Succeeded",
+        ClaimStatus::GaveUp => "GaveUp",
+        ClaimStatus::Abandoned => "Abandoned",
+    }
+}
+fn ddb_claim_status_from_str(s: &str) -> Result<ClaimStatus, A2aStorageError> {
+    match s {
+        "Pending" => Ok(ClaimStatus::Pending),
+        "Attempting" => Ok(ClaimStatus::Attempting),
+        "Succeeded" => Ok(ClaimStatus::Succeeded),
+        "GaveUp" => Ok(ClaimStatus::GaveUp),
+        "Abandoned" => Ok(ClaimStatus::Abandoned),
+        other => Err(A2aStorageError::DatabaseError(format!(
+            "unknown claim status: {other}"
+        ))),
+    }
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "t", content = "s")]
+enum DdbErrorClassWire {
+    NetworkError,
+    Timeout,
+    HttpError4xx(u16),
+    HttpError5xx(u16),
+    HttpError429,
+    SSRFBlocked,
+    PayloadTooLarge,
+    ConfigDeleted,
+    TaskDeleted,
+    TlsRejected,
+}
+impl From<DeliveryErrorClass> for DdbErrorClassWire {
+    fn from(c: DeliveryErrorClass) -> Self {
+        match c {
+            DeliveryErrorClass::NetworkError => Self::NetworkError,
+            DeliveryErrorClass::Timeout => Self::Timeout,
+            DeliveryErrorClass::HttpError4xx { status } => Self::HttpError4xx(status),
+            DeliveryErrorClass::HttpError5xx { status } => Self::HttpError5xx(status),
+            DeliveryErrorClass::HttpError429 => Self::HttpError429,
+            DeliveryErrorClass::SSRFBlocked => Self::SSRFBlocked,
+            DeliveryErrorClass::PayloadTooLarge => Self::PayloadTooLarge,
+            DeliveryErrorClass::ConfigDeleted => Self::ConfigDeleted,
+            DeliveryErrorClass::TaskDeleted => Self::TaskDeleted,
+            DeliveryErrorClass::TlsRejected => Self::TlsRejected,
+        }
+    }
+}
+impl From<DdbErrorClassWire> for DeliveryErrorClass {
+    fn from(w: DdbErrorClassWire) -> Self {
+        match w {
+            DdbErrorClassWire::NetworkError => DeliveryErrorClass::NetworkError,
+            DdbErrorClassWire::Timeout => DeliveryErrorClass::Timeout,
+            DdbErrorClassWire::HttpError4xx(s) => DeliveryErrorClass::HttpError4xx { status: s },
+            DdbErrorClassWire::HttpError5xx(s) => DeliveryErrorClass::HttpError5xx { status: s },
+            DdbErrorClassWire::HttpError429 => DeliveryErrorClass::HttpError429,
+            DdbErrorClassWire::SSRFBlocked => DeliveryErrorClass::SSRFBlocked,
+            DdbErrorClassWire::PayloadTooLarge => DeliveryErrorClass::PayloadTooLarge,
+            DdbErrorClassWire::ConfigDeleted => DeliveryErrorClass::ConfigDeleted,
+            DdbErrorClassWire::TaskDeleted => DeliveryErrorClass::TaskDeleted,
+            DdbErrorClassWire::TlsRejected => DeliveryErrorClass::TlsRejected,
+        }
+    }
+}
+fn ddb_error_class_to_json(c: DeliveryErrorClass) -> String {
+    serde_json::to_string(&DdbErrorClassWire::from(c)).unwrap_or_else(|_| "{}".into())
+}
+fn ddb_error_class_from_json(s: &str) -> Option<DeliveryErrorClass> {
+    serde_json::from_str::<DdbErrorClassWire>(s)
+        .ok()
+        .map(Into::into)
+}
+fn ddb_gave_up_reason_to_str(r: GaveUpReason) -> &'static str {
+    match r {
+        GaveUpReason::MaxAttemptsExhausted => "MaxAttemptsExhausted",
+        GaveUpReason::SsrfBlocked => "SsrfBlocked",
+        GaveUpReason::PayloadTooLarge => "PayloadTooLarge",
+        GaveUpReason::TlsRejected => "TlsRejected",
+    }
+}
+fn ddb_abandoned_reason_to_str(r: AbandonedReason) -> &'static str {
+    match r {
+        AbandonedReason::ConfigDeleted => "ConfigDeleted",
+        AbandonedReason::TaskDeleted => "TaskDeleted",
+        AbandonedReason::NonHttpsUrlInProduction => "NonHttpsUrlInProduction",
+    }
+}
+
+#[async_trait]
+impl A2aPushDeliveryStore for DynamoDbA2aStorage {
+    fn backend_name(&self) -> &'static str {
+        "dynamodb"
+    }
+
+    async fn claim_delivery(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        config_id: &str,
+        claimant: &str,
+        claim_expiry: std::time::Duration,
+    ) -> Result<DeliveryClaim, A2aStorageError> {
+        let now = std::time::SystemTime::now();
+        let now_micros = ddb_systime_to_micros(now);
+        let expires_micros = ddb_systime_to_micros(now + claim_expiry);
+        let pk = Self::push_delivery_pk(tenant, task_id, event_sequence);
+        let sk = config_id.to_string();
+
+        let existing = self
+            .client
+            .get_item()
+            .table_name(&self.config.push_deliveries_table)
+            .key("pk", AttributeValue::S(pk.clone()))
+            .key("sk", AttributeValue::S(sk.clone()))
+            .send()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+
+        if let Some(item) = existing.item {
+            let prev_expires = item
+                .get("expiresAtMicros")
+                .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None })
+                .unwrap_or(0);
+            let prev_status_s = item
+                .get("status")
+                .and_then(|v| if let AttributeValue::S(s) = v { Some(s.as_str()) } else { None })
+                .unwrap_or("Pending");
+            let prev_status = ddb_claim_status_from_str(prev_status_s)?;
+            let is_terminal = matches!(
+                prev_status,
+                ClaimStatus::Succeeded | ClaimStatus::GaveUp | ClaimStatus::Abandoned
+            );
+            let still_live = prev_expires > now_micros;
+            if is_terminal || still_live {
+                return Err(A2aStorageError::ClaimAlreadyHeld {
+                    tenant: tenant.to_string(),
+                    task_id: task_id.to_string(),
+                    event_sequence,
+                    config_id: config_id.to_string(),
+                });
+            }
+            let prev_gen = item
+                .get("generation")
+                .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None })
+                .unwrap_or(0);
+            let prev_count = item
+                .get("deliveryAttemptCount")
+                .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None })
+                .unwrap_or(0);
+            let new_gen = prev_gen + 1;
+
+            // Re-claim UpdateItem fenced on generation match AND
+            // still-non-terminal status AND still-expired. Without
+            // all three guards, a stale read + concurrent terminal
+            // commit could let a re-claim reset the row to Pending —
+            // reopening a succeeded/gave-up delivery, which breaks
+            // at-least-once and freezes-terminal both.
+            let update = self
+                .client
+                .update_item()
+                .table_name(&self.config.push_deliveries_table)
+                .key("pk", AttributeValue::S(pk.clone()))
+                .key("sk", AttributeValue::S(sk.clone()))
+                .update_expression(
+                    "SET claimant = :claimant, generation = :newgen, \
+                     claimedAtMicros = :claimed, expiresAtMicros = :expires, \
+                     #status = :pending \
+                     REMOVE gaveUpAtMicros, gaveUpReason, abandonedReason",
+                )
+                .condition_expression(
+                    "generation = :prevgen \
+                     AND (#status = :pending OR #status = :attempting) \
+                     AND expiresAtMicros < :nowguard",
+                )
+                .expression_attribute_names("#status", "status")
+                .expression_attribute_values(":claimant", AttributeValue::S(claimant.to_string()))
+                .expression_attribute_values(":newgen", AttributeValue::N(new_gen.to_string()))
+                .expression_attribute_values(":prevgen", AttributeValue::N(prev_gen.to_string()))
+                .expression_attribute_values(":claimed", AttributeValue::N(now_micros.to_string()))
+                .expression_attribute_values(":expires", AttributeValue::N(expires_micros.to_string()))
+                .expression_attribute_values(":pending", AttributeValue::S("Pending".into()))
+                .expression_attribute_values(":attempting", AttributeValue::S("Attempting".into()))
+                .expression_attribute_values(":nowguard", AttributeValue::N(now_micros.to_string()));
+            let update = if let Some(ttl) = Self::ttl_epoch(self.config.push_delivery_ttl_seconds) {
+                update
+                    .update_expression(
+                        "SET claimant = :claimant, generation = :newgen, \
+                         claimedAtMicros = :claimed, expiresAtMicros = :expires, \
+                         #status = :pending, #ttl = :ttl \
+                         REMOVE gaveUpAtMicros, gaveUpReason, abandonedReason",
+                    )
+                    .expression_attribute_names("#ttl", "ttl")
+                    .expression_attribute_values(":ttl", ttl)
+            } else {
+                update
+            };
+            let res = update.send().await;
+            match res {
+                Ok(_) => {
+                    return Ok(DeliveryClaim {
+                        claimant: claimant.to_string(),
+                        generation: new_gen as u64,
+                        claimed_at: now,
+                        delivery_attempt_count: prev_count as u32,
+                        status: ClaimStatus::Pending,
+                    });
+                }
+                Err(e) => {
+                    let err_dbg = format!("{e:?}");
+                    if err_dbg.contains("ConditionalCheckFailed") {
+                        return Err(A2aStorageError::ClaimAlreadyHeld {
+                            tenant: tenant.to_string(),
+                            task_id: task_id.to_string(),
+                            event_sequence,
+                            config_id: config_id.to_string(),
+                        });
+                    }
+                    return Err(A2aStorageError::DatabaseError(err_dbg));
+                }
+            }
+        }
+
+        // Fresh INSERT with condition that (pk, sk) does not exist.
+        let mut put = self
+            .client
+            .put_item()
+            .table_name(&self.config.push_deliveries_table)
+            .item("pk", AttributeValue::S(pk))
+            .item("sk", AttributeValue::S(sk))
+            .item("tenant", AttributeValue::S(tenant.to_string()))
+            .item("taskId", AttributeValue::S(task_id.to_string()))
+            .item("eventSequence", AttributeValue::N(event_sequence.to_string()))
+            .item("configId", AttributeValue::S(config_id.to_string()))
+            .item("claimant", AttributeValue::S(claimant.to_string()))
+            .item("generation", AttributeValue::N("1".into()))
+            .item("claimedAtMicros", AttributeValue::N(now_micros.to_string()))
+            .item("expiresAtMicros", AttributeValue::N(expires_micros.to_string()))
+            .item("deliveryAttemptCount", AttributeValue::N("0".into()))
+            .item("status", AttributeValue::S("Pending".into()))
+            .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)");
+        if let Some(ttl) = Self::ttl_epoch(self.config.push_delivery_ttl_seconds) {
+            put = put.item("ttl", ttl);
+        }
+        match put.send().await {
+            Ok(_) => Ok(DeliveryClaim {
+                claimant: claimant.to_string(),
+                generation: 1,
+                claimed_at: now,
+                delivery_attempt_count: 0,
+                status: ClaimStatus::Pending,
+            }),
+            Err(e) => {
+                let err_dbg = format!("{e:?}");
+                if err_dbg.contains("ConditionalCheckFailed") {
+                    Err(A2aStorageError::ClaimAlreadyHeld {
+                        tenant: tenant.to_string(),
+                        task_id: task_id.to_string(),
+                        event_sequence,
+                        config_id: config_id.to_string(),
+                    })
+                } else {
+                    Err(A2aStorageError::DatabaseError(err_dbg))
+                }
+            }
+        }
+    }
+
+    async fn record_attempt_started(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        config_id: &str,
+        claimant: &str,
+        claim_generation: u64,
+    ) -> Result<u32, A2aStorageError> {
+        let now_micros = ddb_systime_to_micros(std::time::SystemTime::now());
+        let pk = Self::push_delivery_pk(tenant, task_id, event_sequence);
+        let sk = config_id.to_string();
+        let res = self
+            .client
+            .update_item()
+            .table_name(&self.config.push_deliveries_table)
+            .key("pk", AttributeValue::S(pk))
+            .key("sk", AttributeValue::S(sk))
+            // Condition fences on identity AND non-terminal status:
+            // terminal rows are frozen. If the row is Succeeded /
+            // GaveUp / Abandoned, the UpdateItem fails
+            // ConditionalCheckFailed and we map to
+            // StaleDeliveryClaim, which is what the worker's retry
+            // loop expects.
+            .update_expression(
+                "SET deliveryAttemptCount = deliveryAttemptCount + :one, \
+                     #status = :attempting, \
+                     firstAttemptedAtMicros = if_not_exists(firstAttemptedAtMicros, :now), \
+                     lastAttemptedAtMicros = :now",
+            )
+            .condition_expression(
+                "claimant = :claimant AND generation = :gen \
+                 AND (#status = :pending OR #status = :attempting)",
+            )
+            .expression_attribute_names("#status", "status")
+            .expression_attribute_values(":one", AttributeValue::N("1".into()))
+            .expression_attribute_values(":pending", AttributeValue::S("Pending".into()))
+            .expression_attribute_values(":attempting", AttributeValue::S("Attempting".into()))
+            .expression_attribute_values(":now", AttributeValue::N(now_micros.to_string()))
+            .expression_attribute_values(":claimant", AttributeValue::S(claimant.to_string()))
+            .expression_attribute_values(":gen", AttributeValue::N(claim_generation.to_string()))
+            .return_values(aws_sdk_dynamodb::types::ReturnValue::AllNew)
+            .send()
+            .await;
+        match res {
+            Ok(out) => {
+                let count = out
+                    .attributes
+                    .as_ref()
+                    .and_then(|m| m.get("deliveryAttemptCount"))
+                    .and_then(|v| {
+                        if let AttributeValue::N(n) = v {
+                            n.parse::<i64>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                Ok(count.max(0) as u32)
+            }
+            Err(e) => {
+                let err_dbg = format!("{e:?}");
+                if err_dbg.contains("ConditionalCheckFailed") {
+                    Err(A2aStorageError::StaleDeliveryClaim {
+                        tenant: tenant.to_string(),
+                        task_id: task_id.to_string(),
+                        event_sequence,
+                        config_id: config_id.to_string(),
+                    })
+                } else {
+                    Err(A2aStorageError::DatabaseError(err_dbg))
+                }
+            }
+        }
+    }
+
+    async fn record_delivery_outcome(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        config_id: &str,
+        claimant: &str,
+        claim_generation: u64,
+        outcome: DeliveryOutcome,
+    ) -> Result<(), A2aStorageError> {
+        let now_micros = ddb_systime_to_micros(std::time::SystemTime::now());
+        let pk = Self::push_delivery_pk(tenant, task_id, event_sequence);
+        let sk = config_id.to_string();
+
+        // Idempotency requires reading the current status; do that up
+        // front so we can short-circuit on an already-matching terminal.
+        let existing = self
+            .client
+            .get_item()
+            .table_name(&self.config.push_deliveries_table)
+            .key("pk", AttributeValue::S(pk.clone()))
+            .key("sk", AttributeValue::S(sk.clone()))
+            .send()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+        let cur_status = existing
+            .item
+            .as_ref()
+            .and_then(|m| m.get("status"))
+            .and_then(|v| if let AttributeValue::S(s) = v { Some(s.as_str()) } else { None })
+            .and_then(|s| ddb_claim_status_from_str(s).ok());
+
+        // Terminal-frozen gate: once Succeeded/GaveUp/Abandoned,
+        // further outcomes are silent no-ops regardless of which
+        // outcome the worker is trying to record.
+        if matches!(
+            cur_status,
+            Some(ClaimStatus::Succeeded) | Some(ClaimStatus::GaveUp) | Some(ClaimStatus::Abandoned)
+        ) {
+            return Ok(());
+        }
+
+        // Non-terminal-path UpdateItem: fenced on identity AND
+        // still-non-terminal status. The status guard protects
+        // against a race where the read above saw non-terminal but
+        // a concurrent commit landed a terminal before our
+        // UpdateItem; the condition fails and we map to
+        // StaleDeliveryClaim, leaving the terminal intact.
+        let builder = self
+            .client
+            .update_item()
+            .table_name(&self.config.push_deliveries_table)
+            .key("pk", AttributeValue::S(pk))
+            .key("sk", AttributeValue::S(sk))
+            .condition_expression(
+                "claimant = :claimant AND generation = :gen \
+                 AND (#status = :pending OR #status = :attempting)",
+            )
+            .expression_attribute_names("#status", "status")
+            .expression_attribute_values(":claimant", AttributeValue::S(claimant.to_string()))
+            .expression_attribute_values(":gen", AttributeValue::N(claim_generation.to_string()))
+            .expression_attribute_values(":pending", AttributeValue::S("Pending".into()))
+            .expression_attribute_values(":attempting", AttributeValue::S("Attempting".into()));
+
+        let res = match outcome {
+            DeliveryOutcome::Succeeded { http_status } => {
+                builder
+                    .update_expression(
+                        "SET #status = :st, lastHttpStatus = :hs, \
+                         firstAttemptedAtMicros = if_not_exists(firstAttemptedAtMicros, :now), \
+                         lastAttemptedAtMicros = :now",
+                    )
+                    .expression_attribute_names("#status", "status")
+                    .expression_attribute_values(":st", AttributeValue::S("Succeeded".into()))
+                    .expression_attribute_values(":hs", AttributeValue::N(http_status.to_string()))
+                    .expression_attribute_values(":now", AttributeValue::N(now_micros.to_string()))
+                    .send()
+                    .await
+            }
+            DeliveryOutcome::Retry {
+                http_status,
+                error_class,
+                next_attempt_at: _,
+            } => {
+                let mut b = builder
+                    .update_expression(
+                        "SET #status = :st, lastErrorClass = :ec, lastAttemptedAtMicros = :now",
+                    )
+                    .expression_attribute_names("#status", "status")
+                    .expression_attribute_values(":st", AttributeValue::S("Attempting".into()))
+                    .expression_attribute_values(
+                        ":ec",
+                        AttributeValue::S(ddb_error_class_to_json(error_class)),
+                    )
+                    .expression_attribute_values(":now", AttributeValue::N(now_micros.to_string()));
+                if let Some(hs) = http_status {
+                    b = b
+                        .update_expression(
+                            "SET #status = :st, lastErrorClass = :ec, lastAttemptedAtMicros = :now, lastHttpStatus = :hs",
+                        )
+                        .expression_attribute_values(":hs", AttributeValue::N(hs.to_string()));
+                }
+                b.send().await
+            }
+            DeliveryOutcome::GaveUp {
+                reason,
+                last_error_class,
+                last_http_status,
+            } => {
+                if matches!(cur_status, Some(ClaimStatus::GaveUp)) {
+                    return Ok(());
+                }
+                let mut b = builder
+                    .update_expression(
+                        "SET #status = :st, gaveUpAtMicros = :now, \
+                         gaveUpReason = :gr, lastErrorClass = :ec, \
+                         firstAttemptedAtMicros = if_not_exists(firstAttemptedAtMicros, :claimedGuard), \
+                         lastAttemptedAtMicros = if_not_exists(lastAttemptedAtMicros, :now)",
+                    )
+                    .expression_attribute_names("#status", "status")
+                    .expression_attribute_values(":st", AttributeValue::S("GaveUp".into()))
+                    .expression_attribute_values(":now", AttributeValue::N(now_micros.to_string()))
+                    .expression_attribute_values(
+                        ":gr",
+                        AttributeValue::S(ddb_gave_up_reason_to_str(reason).into()),
+                    )
+                    .expression_attribute_values(
+                        ":ec",
+                        AttributeValue::S(ddb_error_class_to_json(last_error_class)),
+                    )
+                    .expression_attribute_values(
+                        ":claimedGuard",
+                        AttributeValue::N(now_micros.to_string()),
+                    );
+                if let Some(hs) = last_http_status {
+                    b = b
+                        .update_expression(
+                            "SET #status = :st, gaveUpAtMicros = :now, \
+                             gaveUpReason = :gr, lastErrorClass = :ec, lastHttpStatus = :hs, \
+                             firstAttemptedAtMicros = if_not_exists(firstAttemptedAtMicros, :claimedGuard), \
+                             lastAttemptedAtMicros = if_not_exists(lastAttemptedAtMicros, :now)",
+                        )
+                        .expression_attribute_values(":hs", AttributeValue::N(hs.to_string()));
+                }
+                b.send().await
+            }
+            DeliveryOutcome::Abandoned { reason } => {
+                if matches!(cur_status, Some(ClaimStatus::Abandoned)) {
+                    return Ok(());
+                }
+                builder
+                    .update_expression("SET #status = :st, abandonedReason = :ar")
+                    .expression_attribute_names("#status", "status")
+                    .expression_attribute_values(":st", AttributeValue::S("Abandoned".into()))
+                    .expression_attribute_values(
+                        ":ar",
+                        AttributeValue::S(ddb_abandoned_reason_to_str(reason).into()),
+                    )
+                    .send()
+                    .await
+            }
+        };
+
+        match res {
+            Ok(_) => {
+                // Suppress unused-helper warnings for conversion utilities.
+                let _ = ddb_claim_status_to_str(ClaimStatus::Pending);
+                Ok(())
+            }
+            Err(e) => {
+                let err_dbg = format!("{e:?}");
+                if err_dbg.contains("ConditionalCheckFailed") {
+                    Err(A2aStorageError::StaleDeliveryClaim {
+                        tenant: tenant.to_string(),
+                        task_id: task_id.to_string(),
+                        event_sequence,
+                        config_id: config_id.to_string(),
+                    })
+                } else {
+                    Err(A2aStorageError::DatabaseError(err_dbg))
+                }
+            }
+        }
+    }
+
+    async fn sweep_expired_claims(&self) -> Result<u64, A2aStorageError> {
+        // Table-level Scan with FilterExpression. This is coarse; a
+        // production deployment that needs more efficient sweep
+        // should add a GSI on (expiresAtMicros, status). For ADR-011
+        // correctness, the contract is the return count — not
+        // throughput.
+        let now_micros = ddb_systime_to_micros(std::time::SystemTime::now());
+        let mut count: u64 = 0;
+        let mut last_key = None;
+        loop {
+            let mut scan = self
+                .client
+                .scan()
+                .table_name(&self.config.push_deliveries_table)
+                .filter_expression(
+                    "expiresAtMicros < :now AND (#status = :pending OR #status = :attempting)",
+                )
+                .expression_attribute_names("#status", "status")
+                .expression_attribute_values(":now", AttributeValue::N(now_micros.to_string()))
+                .expression_attribute_values(":pending", AttributeValue::S("Pending".into()))
+                .expression_attribute_values(":attempting", AttributeValue::S("Attempting".into()));
+            if let Some(k) = last_key.take() {
+                scan = scan.set_exclusive_start_key(Some(k));
+            }
+            let out = scan
+                .send()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            count += out.count as u64;
+            last_key = out.last_evaluated_key;
+            if last_key.is_none() {
+                break;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn list_failed_deliveries(
+        &self,
+        tenant: &str,
+        since: std::time::SystemTime,
+        limit: usize,
+    ) -> Result<Vec<FailedDelivery>, A2aStorageError> {
+        // Table-level Scan filtered by tenant + GaveUp + since. Same
+        // scalability note as sweep.
+        let since_micros = ddb_systime_to_micros(since);
+        let mut rows: Vec<FailedDelivery> = Vec::new();
+        let mut last_key = None;
+        loop {
+            let mut scan = self
+                .client
+                .scan()
+                .table_name(&self.config.push_deliveries_table)
+                .filter_expression(
+                    "tenant = :t AND #status = :st AND gaveUpAtMicros >= :since",
+                )
+                .expression_attribute_names("#status", "status")
+                .expression_attribute_values(":t", AttributeValue::S(tenant.to_string()))
+                .expression_attribute_values(":st", AttributeValue::S("GaveUp".into()))
+                .expression_attribute_values(":since", AttributeValue::N(since_micros.to_string()));
+            if let Some(k) = last_key.take() {
+                scan = scan.set_exclusive_start_key(Some(k));
+            }
+            let out = scan
+                .send()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            if let Some(items) = out.items {
+                for item in items {
+                    let task_id = item
+                        .get("taskId")
+                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .unwrap_or_default();
+                    let config_id = item
+                        .get("configId")
+                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .unwrap_or_default();
+                    let event_sequence = item
+                        .get("eventSequence")
+                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<u64>().ok() } else { None })
+                        .unwrap_or(0);
+                    let claimed = item
+                        .get("claimedAtMicros")
+                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None })
+                        .unwrap_or(0);
+                    let first = item
+                        .get("firstAttemptedAtMicros")
+                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None });
+                    let last = item
+                        .get("lastAttemptedAtMicros")
+                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None });
+                    let gave_up = item
+                        .get("gaveUpAtMicros")
+                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None })
+                        .unwrap_or(claimed);
+                    let attempt_count = item
+                        .get("deliveryAttemptCount")
+                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None })
+                        .unwrap_or(0);
+                    let http_status = item
+                        .get("lastHttpStatus")
+                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<u16>().ok() } else { None });
+                    let err_class_s = item
+                        .get("lastErrorClass")
+                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.as_str()) } else { None });
+                    let last_error_class = err_class_s
+                        .and_then(ddb_error_class_from_json)
+                        .unwrap_or(DeliveryErrorClass::NetworkError);
+                    rows.push(FailedDelivery {
+                        task_id,
+                        config_id,
+                        event_sequence,
+                        first_attempted_at: ddb_micros_to_systime(first.unwrap_or(claimed)),
+                        last_attempted_at: ddb_micros_to_systime(last.unwrap_or(gave_up)),
+                        gave_up_at: ddb_micros_to_systime(gave_up),
+                        delivery_attempt_count: attempt_count.max(0) as u32,
+                        last_http_status: http_status,
+                        last_error_class,
+                    });
+                }
+            }
+            last_key = out.last_evaluated_key;
+            if last_key.is_none() {
+                break;
+            }
+        }
+        rows.sort_by(|a, b| b.gave_up_at.cmp(&a.gave_up_at));
+        rows.truncate(limit);
+        Ok(rows)
+    }
+}
+
 /// DynamoDB parity tests require AWS credentials and DynamoDB access.
 ///
 /// Run sequentially (DynamoDB table creation is throttled):
@@ -1432,6 +2141,66 @@ mod tests {
     const TEST_TASKS_TABLE: &str = "test_a2a_tasks";
     const TEST_PUSH_TABLE: &str = "test_a2a_push_configs";
     const TEST_EVENTS_TABLE: &str = "test_a2a_task_events";
+    const TEST_PUSH_DELIVERIES_TABLE: &str = "test_a2a_push_deliveries";
+
+    /// Create the push-deliveries table: `pk` HASH (String) + `sk`
+    /// RANGE (String). Matches the shape used by the production
+    /// adapter (`{tenant}#{task_id}#{event_sequence}` as `pk`,
+    /// `config_id` as `sk`).
+    async fn create_push_deliveries_table(client: &Client, table_name: &str) {
+        let result = client
+            .create_table()
+            .table_name(table_name)
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name("pk")
+                    .key_type(KeyType::Hash)
+                    .build()
+                    .unwrap(),
+            )
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name("sk")
+                    .key_type(KeyType::Range)
+                    .build()
+                    .unwrap(),
+            )
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name("pk")
+                    .attribute_type(ScalarAttributeType::S)
+                    .build()
+                    .unwrap(),
+            )
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name("sk")
+                    .attribute_type(ScalarAttributeType::S)
+                    .build()
+                    .unwrap(),
+            )
+            .billing_mode(aws_sdk_dynamodb::types::BillingMode::PayPerRequest)
+            .send()
+            .await;
+        if let Err(e) = &result {
+            let err_debug = format!("{e:?}");
+            if !err_debug.contains("ResourceInUse") && !err_debug.contains("Table already exists") {
+                panic!("Failed to create push-deliveries table {table_name}: {err_debug}");
+            }
+        }
+        for _ in 0..30 {
+            let desc = client.describe_table().table_name(table_name).send().await;
+            if let Ok(resp) = desc {
+                if let Some(table) = resp.table {
+                    if table.table_status == Some(aws_sdk_dynamodb::types::TableStatus::Active) {
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        panic!("Push-deliveries table {table_name} did not become ACTIVE in time");
+    }
 
     /// Create the events table with `pk` (HASH) + `sk` (RANGE),
     /// matching the production schema. `eventSequence` is carried as
@@ -1539,6 +2308,7 @@ mod tests {
             create_test_table(&client, TEST_TASKS_TABLE).await;
             create_test_table(&client, TEST_PUSH_TABLE).await;
             create_events_table(&client, TEST_EVENTS_TABLE).await;
+            create_push_deliveries_table(&client, TEST_PUSH_DELIVERIES_TABLE).await;
         }
 
         let storage = DynamoDbA2aStorage::from_client(
@@ -1547,6 +2317,7 @@ mod tests {
                 tasks_table: TEST_TASKS_TABLE.into(),
                 push_configs_table: TEST_PUSH_TABLE.into(),
                 events_table: TEST_EVENTS_TABLE.into(),
+                push_deliveries_table: TEST_PUSH_DELIVERIES_TABLE.into(),
                 ..DynamoDbConfig::default()
             },
         );
@@ -1746,6 +2517,69 @@ mod tests {
         async fn update_task_with_events(&self, tenant: &str, owner: &str, task: Task, events: Vec<StreamEvent>)
             -> Result<Vec<u64>, A2aStorageError> {
             self.inner.update_task_with_events(&self.scoped_tenant(tenant), owner, task, events).await
+        }
+    }
+
+    #[async_trait]
+    impl A2aPushDeliveryStore for TestStorage {
+        fn backend_name(&self) -> &'static str { "dynamodb-test" }
+
+        async fn claim_delivery(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            event_sequence: u64,
+            config_id: &str,
+            claimant: &str,
+            claim_expiry: std::time::Duration,
+        ) -> Result<DeliveryClaim, A2aStorageError> {
+            self.inner
+                .claim_delivery(&self.scoped_tenant(tenant), task_id, event_sequence, config_id, claimant, claim_expiry)
+                .await
+        }
+
+        async fn record_attempt_started(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            event_sequence: u64,
+            config_id: &str,
+            claimant: &str,
+            claim_generation: u64,
+        ) -> Result<u32, A2aStorageError> {
+            self.inner
+                .record_attempt_started(&self.scoped_tenant(tenant), task_id, event_sequence, config_id, claimant, claim_generation)
+                .await
+        }
+
+        async fn record_delivery_outcome(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            event_sequence: u64,
+            config_id: &str,
+            claimant: &str,
+            claim_generation: u64,
+            outcome: DeliveryOutcome,
+        ) -> Result<(), A2aStorageError> {
+            self.inner
+                .record_delivery_outcome(&self.scoped_tenant(tenant), task_id, event_sequence, config_id, claimant, claim_generation, outcome)
+                .await
+        }
+
+        async fn sweep_expired_claims(&self) -> Result<u64, A2aStorageError> {
+            self.inner.sweep_expired_claims().await
+        }
+
+        async fn list_failed_deliveries(
+            &self,
+            tenant: &str,
+            since: std::time::SystemTime,
+            limit: usize,
+        ) -> Result<Vec<FailedDelivery>, A2aStorageError> {
+            self.inner
+                .list_failed_deliveries(&self.scoped_tenant(tenant), since, limit)
+                .await
         }
     }
 
@@ -2192,5 +3026,112 @@ mod tests {
             Some(got) => assert_eq!(got, &ttl_attr),
             None => panic!("ttl attribute should be present when provided"),
         }
+    }
+
+    // =========================================================
+    // A2aPushDeliveryStore parity (ADR-011 §10). Live-gated via
+    // A2A_DYNAMODB_TESTS; see storage()'s docstring for env vars.
+    // =========================================================
+
+    #[tokio::test]
+    async fn test_push_claim_is_exclusive() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_claim_is_exclusive(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_claim_expired_is_reclaimable() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_claim_expired_is_reclaimable(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_outcome_fenced_to_current_claim() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_outcome_fenced_to_current_claim(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_claim_terminal_succeeded_blocks_reclaim() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_claim_terminal_succeeded_blocks_reclaim(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_claim_terminal_gaveup_blocks_reclaim() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_claim_terminal_gaveup_blocks_reclaim(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_claim_terminal_abandoned_blocks_reclaim_and_not_listed() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_claim_terminal_abandoned_blocks_reclaim_and_not_listed(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_attempt_started_advances_count_and_status() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_attempt_started_advances_count_and_status(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_attempt_started_is_fenced() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_attempt_started_is_fenced(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_retry_outcome_keeps_claim_open() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_retry_outcome_keeps_claim_open(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_outcome_idempotent_on_terminal() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_outcome_idempotent_on_terminal(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_sweep_counts_expired_nonterminal_and_preserves_status() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_sweep_counts_expired_nonterminal_and_preserves_status(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_list_failed_filters_and_orders() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_list_failed_filters_and_orders(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_list_failed_is_tenant_scoped() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_list_failed_is_tenant_scoped(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_failed_delivery_diagnostics_roundtrip() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_failed_delivery_diagnostics_roundtrip(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_attempt_started_rejected_after_terminal() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_attempt_started_rejected_after_terminal(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_outcome_does_not_overwrite_terminal() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_outcome_does_not_overwrite_terminal(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_concurrent_claim_race() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_concurrent_claim_race(std::sync::Arc::new(s)).await;
     }
 }
