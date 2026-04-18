@@ -18,8 +18,12 @@
 //! [`crate::storage::parity_tests`] gate per-backend acceptance.
 
 pub mod claim;
+pub mod secret;
+pub mod ssrf;
 
 pub use claim::{
     A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
     DeliveryOutcome, FailedDelivery, GaveUpReason,
 };
+pub use secret::{redact_in_str, Secret};
+pub use ssrf::{decide as ssrf_decide, is_blocked_ip, SsrfBlockReason, SsrfDecision};

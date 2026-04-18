@@ -3604,6 +3604,7 @@ dependencies = [
  "turul-a2a-client",
  "turul-a2a-proto",
  "turul-a2a-types",
+ "url",
  "uuid",
 ]
 
