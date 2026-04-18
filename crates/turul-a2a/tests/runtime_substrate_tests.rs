@@ -1,4 +1,4 @@
-//! Phase A — Shared runtime substrate tests.
+//! Shared runtime substrate tests.
 //!
 //! Covers `InFlightRegistry`, `InFlightHandle`, `SupervisorSentinel`, and the
 //! `secrecy` integration. All synchronization is explicit (oneshots,
@@ -347,7 +347,9 @@ async fn supervisor_panic_emits_structured_event() {
     );
 
     // Invariant check: no secret-looking substrings in this event's fields.
-    // Phase A has no secrets yet, but this is the template used by phase E.
+    // No secret data flows through the supervisor-panic event today;
+    // this template applies to push-delivery observability events as
+    // they land.
     for value in evt.fields.values() {
         assert!(
             !value.contains("BEGIN PRIVATE KEY"),
@@ -476,7 +478,7 @@ async fn secrecy_newtype_never_leaks_in_debug_or_display() {
 }
 
 // ---------------------------------------------------------------------------
-// Collision-safety tests (blocker fix from phase A review).
+// Collision-safety tests for InFlightRegistry key insertion.
 // ---------------------------------------------------------------------------
 
 /// Helper: construct a handle wrapping a tokio task that waits on the given

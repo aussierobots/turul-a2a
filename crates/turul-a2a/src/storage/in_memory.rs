@@ -1052,7 +1052,7 @@ mod tests {
         parity_tests::test_atomic_update_task_with_events(&s, &s, &s).await;
     }
 
-    // Terminal-write CAS (ADR-010 §7.1) — phase B parity.
+    // Terminal-write CAS (ADR-010 §7.1) parity tests.
 
     #[tokio::test]
     async fn test_terminal_cas_single_winner_on_concurrent_terminals() {
@@ -1094,7 +1094,7 @@ mod tests {
         parity_tests::test_invalid_transition_distinct_from_terminal_already_set(&s, &s).await;
     }
 
-    // Cancel-marker parity (ADR-012 / phase C).
+    // Cancel-marker parity (ADR-012).
 
     #[tokio::test]
     async fn test_cancel_marker_roundtrip() {

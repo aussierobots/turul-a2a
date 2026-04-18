@@ -1,9 +1,11 @@
-//! Phase C — cancellation propagation (ADR-012) tests.
+//! Cancellation propagation (ADR-012) tests.
 //!
-//! Covers router and storage behavior; does not exercise EventSink or
-//! long-running send modes (those are phase D). Tests that inherently
-//! require the phase D send-mode rewrite are called out and deferred to
-//! the combined C/D integration gate.
+//! Covers router and storage-level cancel behaviour: same-instance
+//! token trip, owner-scoped marker writes, cross-instance marker
+//! supervisor reads, and the `CancelTask` handler's grace-wait +
+//! forced-CANCELED CAS path. Executor-driven cancellation races that
+//! require the spawn-and-track send path are called out inline and
+//! covered by `tests/send_mode_tests.rs`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -425,9 +427,10 @@ async fn marker_write_conditional_on_non_terminal() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 8: supervisor panic cleanup via sentinel — reuses the phase A
-// sentinel invariant under cancellation context. If a supervisor task
-// wrapping a cancellation workflow panics, its Drop-guard runs cleanup.
+// Test 8: supervisor panic cleanup via sentinel — reuses the
+// SupervisorSentinel invariant under cancellation context. If a
+// supervisor task wrapping a cancellation workflow panics, its
+// Drop-guard runs cleanup.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -467,13 +470,13 @@ async fn supervisor_panic_cleanup_via_sentinel_under_cancellation() {
 // ---------------------------------------------------------------------------
 // Test 9: SSE subscriber sees terminal CANCELED.
 //
-// Subscribe while the task is WORKING, call core_cancel_task, assert the
-// stream delivers the CANCELED terminal event. ADR-012 §11 test item #11.
-// This is observable in phase C without the phase D send-mode rewrite:
-// core_cancel_task already writes the CANCELED event via
-// A2aAtomicStore::update_task_status_with_events (phase B CAS path) and
-// notifies the event broker, while core_subscribe_to_task reads from the
-// same durable store and closes on terminal events.
+// Subscribe while the task is WORKING, call core_cancel_task, assert
+// the stream delivers the CANCELED terminal event (ADR-012 §11 test
+// item #11). The test does not rely on a spawned executor: the
+// `CancelTask` handler writes the CANCELED event via
+// `A2aAtomicStore::update_task_status_with_events` (terminal-CAS
+// path) and notifies the event broker, while `core_subscribe_to_task`
+// reads from the same durable store and closes on terminal events.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -565,24 +568,15 @@ async fn streaming_subscriber_sees_terminal_canceled() {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Deferred tests (documented, not implemented in phase C):
+// Executor-driven cancellation races (cancel-vs-complete deterministic
+// winner, cooperative-timeout-driven CANCELED, hard-timeout-driven
+// FAILED, last-moment executor-wins-CAS) require the spawn-and-track
+// send path to produce a real concurrent executor. Those scenarios
+// live in `tests/send_mode_tests.rs` alongside the other send-mode
+// coverage.
 //
-// - cancel_vs_complete_race (both winner directions): requires phase D
-//   EventSink / long-running executor to produce a COMPLETED from an
-//   executor that can run concurrently with the :cancel handler. In
-//   phase C the current send path completes synchronously, so races are
-//   not observable from test code without the send-mode rewrite.
-//   → Deferred to combined C/D integration gate.
-//
-// - blocking-send + cancel interop: same reason — requires phase D
-//   three-send-modes implementation to have a blocking send that can be
-//   interrupted by :cancel mid-flight.
-//   → Deferred to combined C/D integration gate.
-//
-// - cross-instance poll-load test (N=100 in-flight tasks): requires
-//   production-like in-flight registry population via the phase D
-//   spawn-and-track flow. Can be unit-tested here with a manual 100-entry
-//   registry, but that doesn't exercise a real deployment pattern.
-//   Included as an optimization-tracking item for phase D.
-//   → Deferred to combined C/D integration gate.
+// Cross-instance poll-load characterisation (sustained N=100+ in-flight
+// tasks polled against a shared marker store) is a scalability
+// concern, not a correctness invariant. Not captured in this file;
+// revisit if production deployments surface marker-poll contention.
 // ---------------------------------------------------------------------------

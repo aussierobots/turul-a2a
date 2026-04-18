@@ -1597,7 +1597,7 @@ pub async fn test_update_task_with_events_rejects_terminal_already_set(
 }
 
 // =========================================================
-// ADR-012 cancel-marker parity (phase C)
+// ADR-012 cancel-marker parity
 // =========================================================
 
 /// CS-001: `set_cancel_requested` + `supervisor_get_cancel_requested`

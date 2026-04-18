@@ -113,7 +113,7 @@ Google well-known types (`google.protobuf.Struct`, `Value`, `Timestamp`) mapped 
 ### Known Exceptions
 
 - **Push notification configs** use raw `turul_a2a_proto::TaskPushNotificationConfig` in storage traits and handler signatures. This is an intentional exception — push configs are simple CRUD with no state machine or invariants that warrant a wrapper. Keep this leakage isolated; do not let raw proto types spread into general handler/router code.
-- **`last_chunk` on `append_artifact`** is transport-level metadata for SSE streaming. Storage passes it through but does not persist completion state in v0.1. The server layer forwards it to streaming subscribers.
+- **`last_chunk` on `append_artifact`** is transport metadata for SSE streaming. Storage does not persist completion state; the server layer forwards `last_chunk` to streaming subscribers.
 
 ### Multi-Instance Streaming Limitation
 

@@ -1,5 +1,5 @@
-//! Phase C review fix: builder wiring tests for ADR-012 same-backend
-//! requirements on the Lambda adapter. Proves that:
+//! Builder wiring tests for ADR-012 same-backend requirements on the
+//! Lambda adapter. Proves that:
 //!
 //! - `.storage()` requires `A2aCancellationSupervisor` on the bundled
 //!   backend (bound at the type-system level).
@@ -355,9 +355,9 @@ fn build_rejects_cancellation_supervisor_backend_mismatch() {
 /// `AppState` directly (the `LambdaA2aHandler` wraps the router with no
 /// test-only accessor). The corresponding AppState-wiring coverage lives
 /// in `crates/turul-a2a/src/server/mod.rs::tests::runtime_config_setters_survive_build`
-/// for the main server builder, and in the Phase C cancellation
-/// integration tests which exercise the supervisor via the full cancel
-/// flow. Together those give end-to-end proof that the Arc reaches the
+/// for the main server builder, and in `tests/cancellation_tests.rs`
+/// which exercises the supervisor via the full cancel flow.
+/// Together those give end-to-end proof that the Arc reaches the
 /// router's handler state; this test is the compile-time + build-time
 /// slice for the Lambda builder's setter surface.
 #[test]
