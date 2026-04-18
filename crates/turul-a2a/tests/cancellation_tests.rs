@@ -465,6 +465,97 @@ async fn supervisor_panic_cleanup_via_sentinel_under_cancellation() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 9: SSE subscriber sees terminal CANCELED.
+//
+// Subscribe while the task is WORKING, call core_cancel_task, assert the
+// stream delivers the CANCELED terminal event. ADR-012 §11 test item #11.
+// This is observable in phase C without the phase D send-mode rewrite:
+// core_cancel_task already writes the CANCELED event via
+// A2aAtomicStore::update_task_status_with_events (phase B CAS path) and
+// notifies the event broker, while core_subscribe_to_task reads from the
+// same durable store and closes on terminal events.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn streaming_subscriber_sees_terminal_canceled() {
+    use axum::body::Body;
+    use http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let (state, storage) = make_state();
+    // Match the router's defaults: untenanted route uses empty tenant,
+    // and no-middleware requests land as AuthIdentity::Anonymous → owner
+    // == "anonymous". Seeding the task under those values lets the test
+    // drive the subscribe route via build_router without setting up a
+    // test middleware stack.
+    let tenant = "";
+    let owner = "anonymous";
+    let task_id = "t-sse-cancel";
+
+    // Set up a non-terminal task so subscribe is permitted.
+    seed_task(&storage, tenant, owner, task_id).await;
+    advance_to_working(&storage, tenant, owner, task_id).await;
+
+    // Open the subscribe stream via the router (full HTTP path).
+    let router = turul_a2a::router::build_router(state.clone());
+    let subscribe_req = Request::get(format!("/tasks/{task_id}:subscribe"))
+        .header("a2a-version", "1.0")
+        .body(Body::empty())
+        .expect("subscribe request");
+    let subscribe_resp = router
+        .clone()
+        .oneshot(subscribe_req)
+        .await
+        .expect("subscribe oneshot");
+    assert_eq!(subscribe_resp.status(), 200, "subscribe must 200 on non-terminal");
+
+    // Kick off a body-reader task that collects SSE frames until the
+    // stream closes (terminal delivery closes it cleanly per ADR-009 §4).
+    // Use an upper-bound timeout so a bug doesn't hang the test forever.
+    let body = subscribe_resp.into_body();
+    let collect = async move {
+        let collected = body.collect().await.expect("collect body").to_bytes();
+        String::from_utf8_lossy(&collected).to_string()
+    };
+
+    // Give the subscribe handler a chance to emit its initial Task
+    // snapshot before we trip the cancel. Yield once so the spawned
+    // SSE task runs; this is deterministic on a multi-threaded runtime.
+    let collector = tokio::spawn(collect);
+    tokio::task::yield_now().await;
+
+    // Fire :cancel via core_cancel_task. With default grace (5s) the
+    // handler blocks until it force-commits CANCELED. Speed it up with
+    // short grace so the test is snappy.
+    let mut fast_state = state.clone();
+    fast_state.runtime_config.cancel_handler_grace = Duration::from_millis(100);
+    fast_state.runtime_config.cancel_handler_poll_interval = Duration::from_millis(10);
+    let cancel_result =
+        turul_a2a::router::core_cancel_task(fast_state, tenant, owner, task_id).await;
+    let task_json = cancel_result.expect("cancel OK");
+    let persisted_state = task_json
+        .get("status")
+        .and_then(|s| s.get("state"))
+        .and_then(|v| v.as_str());
+    assert_eq!(persisted_state, Some("TASK_STATE_CANCELED"));
+
+    // Wait for the stream to close (terminal delivery triggers close).
+    let body_text = tokio::time::timeout(Duration::from_secs(3), collector)
+        .await
+        .expect("subscribe body must close within 3s of terminal commit")
+        .expect("collector task");
+
+    // The stream SHOULD contain the CANCELED status-update event. SSE
+    // body is `data: <json>\n\n` frames; we search for the proto wire
+    // name since that is spec-compliant and stable.
+    assert!(
+        body_text.contains("TASK_STATE_CANCELED"),
+        "subscribe stream must include the terminal CANCELED event; got body:\n{body_text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Compile-time guard: `supervisor_get_cancel_requested` MUST NOT be
 // reachable via `Arc<dyn A2aTaskStorage>`. Enforced structurally by the
 // trait split. The compile_fail doctest lives on the trait itself in
@@ -486,12 +577,6 @@ async fn supervisor_panic_cleanup_via_sentinel_under_cancellation() {
 // - blocking-send + cancel interop: same reason — requires phase D
 //   three-send-modes implementation to have a blocking send that can be
 //   interrupted by :cancel mid-flight.
-//   → Deferred to combined C/D integration gate.
-//
-// - SSE subscriber sees terminal CANCELED: relies on phase D's
-//   commit-hook → broker-notify path being wired through the send-mode
-//   rewrite. The existing SSE subscribe path does not emit the terminal
-//   through this new code path in phase C.
 //   → Deferred to combined C/D integration gate.
 //
 // - cross-instance poll-load test (N=100 in-flight tasks): requires

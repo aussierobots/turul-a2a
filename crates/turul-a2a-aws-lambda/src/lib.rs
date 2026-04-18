@@ -11,10 +11,40 @@
 //! Lambda streaming is request-scoped (not persistent SSE connections). The durable
 //! event store ensures events survive across invocations. Clients reconnect with
 //! `Last-Event-ID` for continuation.
+//!
+//! # Cross-instance cancellation (0.1.4 phase C scope)
+//!
+//! The Lambda adapter **does NOT run the cross-instance cancel poller**
+//! that `A2aServer::run()` spawns. Lambda invocations are stateless and
+//! short-lived; there is no persistent background task to drive
+//! `cross_instance_cancel_poll_interval` between requests. Consequences
+//! for ADR-012 cancellation:
+//!
+//! - **Marker writes** — `CancelTask` on a Lambda invocation writes the
+//!   marker to the shared backend (DynamoDB/Postgres). This part works.
+//! - **Propagation to a live executor on the SAME Lambda invocation** —
+//!   works via the same-instance token-trip path in `core_cancel_task`.
+//! - **Propagation to a live executor on a DIFFERENT Lambda invocation
+//!   (warm container)** — **not supported in 0.1.4 phase C**. There is
+//!   no poller to observe markers written by other invocations. A
+//!   subsequent request whose handler reads the marker directly may act
+//!   on it (phase D's per-invocation check), but that is out of scope
+//!   for phase C.
+//!
+//! The `LambdaA2aServerBuilder` still **requires** a proper
+//! `A2aCancellationSupervisor` implementation on the same backend so
+//! that (a) marker writes reach the correct backend and (b) the
+//! infrastructure is in place for phase D / a future polling-adapter
+//! variant to consume it. This is non-negotiable: if a Lambda
+//! deployment passes a non-matching supervisor, `build()` rejects
+//! the configuration.
 
 mod adapter;
 mod auth;
 mod no_streaming;
+
+#[cfg(test)]
+mod builder_tests;
 
 pub use adapter::{lambda_to_axum_request, axum_to_lambda_response};
 pub use auth::{AuthorizerMapping, LambdaAuthorizerMiddleware};
@@ -27,7 +57,8 @@ use turul_a2a::executor::AgentExecutor;
 use turul_a2a::middleware::{A2aMiddleware, MiddlewareStack};
 use turul_a2a::router::{build_router, AppState};
 use turul_a2a::storage::{
-    A2aAtomicStore, A2aEventStore, A2aPushNotificationStorage, A2aTaskStorage,
+    A2aAtomicStore, A2aCancellationSupervisor, A2aEventStore, A2aPushNotificationStorage,
+    A2aTaskStorage,
 };
 use turul_a2a::streaming::TaskEventBroker;
 
@@ -42,6 +73,7 @@ pub struct LambdaA2aServerBuilder {
     push_storage: Option<Arc<dyn A2aPushNotificationStorage>>,
     event_store: Option<Arc<dyn A2aEventStore>>,
     atomic_store: Option<Arc<dyn A2aAtomicStore>>,
+    cancellation_supervisor: Option<Arc<dyn A2aCancellationSupervisor>>,
     middleware: Vec<Arc<dyn A2aMiddleware>>,
 }
 
@@ -53,6 +85,7 @@ impl LambdaA2aServerBuilder {
             push_storage: None,
             event_store: None,
             atomic_store: None,
+            cancellation_supervisor: None,
             middleware: vec![],
         }
     }
@@ -64,26 +97,32 @@ impl LambdaA2aServerBuilder {
 
     /// Set all storage from a single backend instance.
     ///
-    /// This is the **preferred** method — a single struct implementing all storage
-    /// traits guarantees the same-backend requirement (ADR-009).
+    /// This is the **preferred** method — a single struct implementing all
+    /// storage traits guarantees the same-backend requirement (ADR-009)
+    /// AND ensures the cancellation supervisor reads the same backend
+    /// the cancel marker is written to. A mismatch here (e.g., DynamoDB
+    /// task storage + in-memory cancellation supervisor) silently
+    /// breaks cross-instance cancellation.
     pub fn storage<S>(mut self, storage: S) -> Self
     where
         S: A2aTaskStorage
             + A2aPushNotificationStorage
             + A2aEventStore
             + A2aAtomicStore
+            + A2aCancellationSupervisor
             + Clone
             + 'static,
     {
         self.task_storage = Some(Arc::new(storage.clone()));
         self.push_storage = Some(Arc::new(storage.clone()));
         self.event_store = Some(Arc::new(storage.clone()));
-        self.atomic_store = Some(Arc::new(storage));
+        self.atomic_store = Some(Arc::new(storage.clone()));
+        self.cancellation_supervisor = Some(Arc::new(storage));
         self
     }
 
     /// Set task storage individually. Must be paired with event_store/atomic_store
-    /// for same-backend compliance.
+    /// AND `cancellation_supervisor()` for same-backend compliance.
     pub fn task_storage(mut self, s: impl A2aTaskStorage + 'static) -> Self {
         self.task_storage = Some(Arc::new(s));
         self
@@ -104,6 +143,19 @@ impl LambdaA2aServerBuilder {
     /// Set atomic store individually. Must match task_storage backend.
     pub fn atomic_store(mut self, s: impl A2aAtomicStore + 'static) -> Self {
         self.atomic_store = Some(Arc::new(s));
+        self
+    }
+
+    /// Set the cancellation supervisor individually. Must match
+    /// task_storage backend — otherwise `:cancel` writes the marker to
+    /// one backend and the supervisor reads from another, silently
+    /// breaking cross-instance cancellation. Prefer `.storage()` for
+    /// unified wiring. Consumed by `core_cancel_task` (ADR-012).
+    pub fn cancellation_supervisor(
+        mut self,
+        s: impl A2aCancellationSupervisor + 'static,
+    ) -> Self {
+        self.cancellation_supervisor = Some(Arc::new(s));
         self
     }
 
@@ -128,32 +180,40 @@ impl LambdaA2aServerBuilder {
         let atomic_store: Arc<dyn A2aAtomicStore> = self.atomic_store.ok_or(A2aError::Internal(
             "atomic_store is required for Lambda (use .storage() for unified backend)".into(),
         ))?;
+        // ADR-012: the cancellation supervisor MUST be supplied. No
+        // InMemoryA2aStorage fallback: that would silently break
+        // cross-instance cancellation by reading markers from a
+        // different backend than they were written to.
+        let cancellation_supervisor: Arc<dyn A2aCancellationSupervisor> =
+            self.cancellation_supervisor.ok_or(A2aError::Internal(
+                "cancellation_supervisor is required for Lambda. Use .storage() for unified \
+                 backend wiring, or .cancellation_supervisor(...) alongside the individual \
+                 storage setters. Omitting it would silently break cross-instance \
+                 cancellation in ADR-012."
+                    .into(),
+            ))?;
 
-        // Same-backend enforcement (ADR-009)
+        // Same-backend enforcement (ADR-009 + ADR-012).
         let task_backend = task_storage.backend_name();
         let push_backend = push_storage.backend_name();
         let event_backend = event_store.backend_name();
         let atomic_backend = atomic_store.backend_name();
+        let supervisor_backend = cancellation_supervisor.backend_name();
         if task_backend != push_backend
             || task_backend != event_backend
             || task_backend != atomic_backend
+            || task_backend != supervisor_backend
         {
             return Err(A2aError::Internal(format!(
                 "Storage backend mismatch: task={task_backend}, push={push_backend}, \
-                 event={event_backend}, atomic={atomic_backend}. \
+                 event={event_backend}, atomic={atomic_backend}, \
+                 cancellation_supervisor={supervisor_backend}. \
                  ADR-009 requires all storage traits to share the same backend. \
+                 ADR-012 requires the cancellation supervisor on the same backend \
+                 so cross-instance cancel markers are observable. \
                  Use .storage() for unified backend."
             )));
         }
-
-        // Lambda adapter uses the same-backend InMemoryA2aStorage as the
-        // cancellation supervisor default (matches the framework default).
-        // Real Lambda deployments pass a shared-storage backend via the
-        // full `.storage()` path below, which would cover the supervisor
-        // too once the API is extended. For 0.1.4 phase C, just match
-        // the builder's fallback pattern.
-        let cancellation_supervisor: Arc<dyn turul_a2a::storage::A2aCancellationSupervisor> =
-            Arc::new(turul_a2a::storage::InMemoryA2aStorage::new());
 
         let state = AppState {
             executor,
