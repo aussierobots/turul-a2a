@@ -60,6 +60,10 @@ pub(crate) struct SpawnDeps {
     pub atomic_store: Arc<dyn A2aAtomicStore>,
     pub event_broker: TaskEventBroker,
     pub in_flight: Arc<InFlightRegistry>,
+    /// Push-delivery dispatcher (ADR-011 §2). Threaded into every
+    /// sink constructed here so executor-emitted terminal status
+    /// commits fan out to registered push configs.
+    pub push_dispatcher: Option<Arc<crate::push::PushDispatcher>>,
 }
 
 /// Per-spawn scope: identifies the task whose executor we are spawning
@@ -128,6 +132,7 @@ pub(crate) fn spawn_tracked_executor(
         deps.task_storage.clone(),
         deps.event_broker.clone(),
         handle.clone(),
+        deps.push_dispatcher.clone(),
     );
 
     let exec_deps = deps.clone();

@@ -1246,6 +1246,7 @@ impl From<ErrorClassWire> for DeliveryErrorClass {
 fn gave_up_reason_to_str(r: GaveUpReason) -> &'static str {
     match r {
         GaveUpReason::MaxAttemptsExhausted => "MaxAttemptsExhausted",
+        GaveUpReason::NonRetryableHttpStatus => "NonRetryableHttpStatus",
         GaveUpReason::SsrfBlocked => "SsrfBlocked",
         GaveUpReason::PayloadTooLarge => "PayloadTooLarge",
         GaveUpReason::TlsRejected => "TlsRejected",

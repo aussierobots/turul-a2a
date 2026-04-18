@@ -442,7 +442,14 @@ pub enum DeliveryOutcome {
 #[non_exhaustive]
 pub enum GaveUpReason {
     /// `push_max_attempts` reached without a 2xx/3xx response.
+    /// Use [`Self::NonRetryableHttpStatus`] instead for 4xx
+    /// responses that are rejected on the first attempt — those
+    /// didn't exhaust the retry budget, they short-circuited it.
     MaxAttemptsExhausted,
+    /// Receiver returned a permanent HTTP error (4xx other than
+    /// 408/429). No retry was attempted; `last_http_status` on the
+    /// failed-delivery row pinpoints the exact code.
+    NonRetryableHttpStatus,
     /// Destination IP blocked by the SSRF guard. No POST attempted;
     /// listed as a failed delivery so operators can correct the
     /// config.

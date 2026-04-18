@@ -300,6 +300,7 @@ async fn dispatch_send_streaming_message(
         atomic_store: state.atomic_store.clone(),
         event_broker: state.event_broker.clone(),
         in_flight: state.in_flight.clone(),
+        push_dispatcher: state.push_dispatcher.clone(),
     };
     let scope = crate::server::spawn::SpawnScope {
         tenant: tenant.to_string(),

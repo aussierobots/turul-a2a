@@ -21,12 +21,14 @@
 //! knobs are shrunk to milliseconds so wall-clock assertions stay
 //! under a second.
 
-use std::sync::Arc;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use futures::future::BoxFuture;
 use turul_a2a::push::claim::A2aPushDeliveryStore;
 use turul_a2a::push::delivery::{
-    DeliveryReport, PushDeliveryConfig, PushDeliveryWorker, PushTarget,
+    DeliveryReport, PushDeliveryConfig, PushDeliveryWorker, PushDnsResolver, PushTarget,
 };
 use turul_a2a::push::secret::Secret;
 use turul_a2a::push::{DeliveryErrorClass, GaveUpReason};
@@ -185,12 +187,15 @@ async fn no_retry_on_4xx() {
     let target = sentinel_target(&server.uri());
 
     let report = worker.deliver(&target, b"{}").await;
-    // Worker classifies non-408/429 4xx as permanent failure → GaveUp
-    // with HttpError4xx on the row.
-    match report {
-        DeliveryReport::GaveUp(_) => {}
-        other => panic!("400 must produce GaveUp, got {other:?}"),
-    }
+    // Non-retryable 4xx is NOT `MaxAttemptsExhausted` — the retry
+    // budget is never consumed. The dedicated reason lets operators
+    // distinguish "receiver said no" from "we retried until we gave
+    // up".
+    assert_eq!(
+        report,
+        DeliveryReport::GaveUp(GaveUpReason::NonRetryableHttpStatus),
+        "400 must produce GaveUp(NonRetryableHttpStatus), got {report:?}"
+    );
 
     let failed = store
         .list_failed_deliveries(&target.tenant, SystemTime::UNIX_EPOCH, 10)
@@ -239,6 +244,24 @@ async fn giveup_after_max_attempts_on_sustained_5xx() {
     assert_eq!(
         failed[0].delivery_attempt_count, max_attempts,
         "delivery_attempt_count must equal configured max"
+    );
+    // Regression: the final GaveUp used to clobber the retry
+    // diagnostics with `NetworkError` + `None`. With the fix, the
+    // failed-delivery row preserves the last-seen HTTP status and
+    // the classified 5xx error — exactly what an operator needs to
+    // triage the webhook receiver.
+    assert_eq!(
+        failed[0].last_http_status,
+        Some(500),
+        "final FailedDelivery must carry the last HTTP status"
+    );
+    assert!(
+        matches!(
+            failed[0].last_error_class,
+            DeliveryErrorClass::HttpError5xx { status: 500 }
+        ),
+        "final FailedDelivery must carry the classified 5xx, got {:?}",
+        failed[0].last_error_class
     );
 
     // wiremock's `.expect(max_attempts)` is asserted on drop — this
@@ -313,3 +336,99 @@ async fn secret_sentinel_never_leaks_on_giveup() {
         "FailedDelivery leaked token: {rendered}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// §13.18 — DNS rebinding defence.
+//
+// The worker must connect to the IP that passed SSRF validation, not
+// whatever a subsequent DNS lookup would return. We prove this by:
+//
+// 1. Crafting a URL with a hostname that no real DNS zone can resolve
+//    (`.invalid` is reserved for exactly this purpose, RFC 2606).
+// 2. Injecting a `PushDnsResolver` that returns the wiremock IP for
+//    that hostname — this is the "validation" step's output.
+// 3. Running delivery. With the rebinding pin in place (reqwest
+//    `resolve()` override), the POST reaches wiremock. Without the
+//    pin, reqwest falls back to the system resolver, the `.invalid`
+//    hostname fails to resolve, and the POST errors out before hitting
+//    wiremock at all.
+//
+// Also tracks DNS resolver calls: the worker must resolve once per
+// attempt. In the one-attempt happy path that's exactly one call.
+// ---------------------------------------------------------------------------
+
+/// DNS resolver that returns a fixed IP for any hostname and counts calls.
+struct PinResolver {
+    ip: IpAddr,
+    call_count: Arc<Mutex<u32>>,
+}
+
+impl PushDnsResolver for PinResolver {
+    fn resolve(
+        &self,
+        _host: &str,
+        _port: u16,
+    ) -> BoxFuture<'_, Result<Vec<IpAddr>, String>> {
+        *self.call_count.lock().unwrap() += 1;
+        let ip = self.ip;
+        Box::pin(async move { Ok(vec![ip]) })
+    }
+}
+
+#[tokio::test]
+async fn reqwest_connects_to_validated_ip_not_system_dns() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let server_addr = *server.address();
+    let store = Arc::new(InMemoryA2aStorage::new());
+
+    let call_count = Arc::new(Mutex::new(0u32));
+    let resolver = Arc::new(PinResolver {
+        ip: server_addr.ip(),
+        call_count: call_count.clone(),
+    });
+    let worker = fast_worker(store.clone(), 1).with_dns_resolver(resolver);
+
+    // `.invalid` is RFC-2606 reserved — guaranteed NXDOMAIN via system
+    // DNS. If the worker bypassed our pin, reqwest would fail to
+    // connect and wiremock's `.expect(1)` would fail on drop.
+    let url = format!(
+        "http://rebind-defence.invalid:{}/webhook",
+        server_addr.port()
+    );
+
+    let target = PushTarget {
+        tenant: "tenant-1".into(),
+        task_id: format!("task-{}", uuid::Uuid::now_v7()),
+        event_sequence: 1,
+        config_id: "cfg-A".into(),
+        url: Url::parse(&url).unwrap(),
+        auth_scheme: "Bearer".into(),
+        auth_credentials: Secret::new("cred".into()),
+        token: None,
+    };
+
+    let report = worker.deliver(&target, b"{}").await;
+    assert_eq!(
+        report,
+        DeliveryReport::Succeeded(200),
+        "pinned resolver must let the POST reach wiremock despite .invalid hostname"
+    );
+
+    // DNS is resolved exactly once per attempt (ADR-011 §5, §R4).
+    assert_eq!(
+        *call_count.lock().unwrap(),
+        1,
+        "resolver must be consulted exactly once per attempt"
+    );
+
+    // Wiremock `.expect(1)` asserts on drop.
+    drop(server);
+}
+

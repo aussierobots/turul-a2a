@@ -60,6 +60,15 @@ pub struct AppState {
     /// configs are stored, just not delivered. Set via
     /// [`crate::server::A2aServerBuilder::push_delivery_store`].
     pub push_delivery_store: Option<Arc<dyn crate::push::A2aPushDeliveryStore>>,
+
+    /// Push-delivery dispatcher (ADR-011 §2, §13.13). Populated by the
+    /// server builder iff `push_delivery_store` is wired. Handler and
+    /// executor commit paths call [`PushDispatcher::dispatch`] after a
+    /// successful terminal atomic-store write so every terminal —
+    /// executor-driven, framework-forced CANCEL, or hard-timeout
+    /// FAILED — fans out to registered push configs by the same
+    /// contract.
+    pub push_dispatcher: Option<Arc<crate::push::PushDispatcher>>,
 }
 
 /// Build the axum router with all proto-defined routes.
@@ -462,6 +471,7 @@ pub(crate) async fn core_send_streaming_message(
         atomic_store: state.atomic_store.clone(),
         event_broker: state.event_broker.clone(),
         in_flight: state.in_flight.clone(),
+        push_dispatcher: state.push_dispatcher.clone(),
     };
     let scope = crate::server::spawn::SpawnScope {
         tenant: tenant.to_string(),
@@ -853,6 +863,7 @@ pub async fn core_send_message(
         atomic_store: state.atomic_store.clone(),
         event_broker: state.event_broker.clone(),
         in_flight: state.in_flight.clone(),
+        push_dispatcher: state.push_dispatcher.clone(),
     };
     let scope = crate::server::spawn::SpawnScope {
         tenant: tenant.to_string(),
@@ -982,6 +993,7 @@ async fn await_yielded_with_two_deadlines(
         },
     };
 
+    let failed_event_for_dispatch = failed_event.clone();
     let result = state
         .atomic_store
         .update_task_status_with_events(
@@ -994,7 +1006,7 @@ async fn await_yielded_with_two_deadlines(
         .await;
 
     match result {
-        Ok((task, _)) => {
+        Ok((task, seqs)) => {
             // Abort the spawned executor. The cloneable AbortHandle
             // is independent of the supervisor's JoinHandle
             // ownership, so this works whether or not the supervisor
@@ -1004,6 +1016,17 @@ async fn await_yielded_with_two_deadlines(
             // once the abort propagates at the next executor yield
             // point.
             handle.abort();
+            // ADR-011 §13.13: framework-committed terminals fan out
+            // to push configs identically to executor-emitted ones.
+            // Hard-timeout FAILED lands here.
+            if let Some(dispatcher) = &state.push_dispatcher {
+                let seq = seqs.first().copied().unwrap_or(0);
+                dispatcher.dispatch(
+                    tenant.to_string(),
+                    task.clone(),
+                    vec![(seq, failed_event_for_dispatch)],
+                );
+            }
             state.event_broker.notify(task_id).await;
             Ok(task)
         }
@@ -1221,6 +1244,7 @@ pub async fn core_cancel_task(
                 .unwrap_or_default(),
         },
     };
+    let cancel_event_for_dispatch = cancel_event.clone();
 
     let result = state
         .atomic_store
@@ -1234,7 +1258,19 @@ pub async fn core_cancel_task(
         .await;
 
     match result {
-        Ok((task, _seqs)) => {
+        Ok((task, seqs)) => {
+            // ADR-011 §13.13: framework-committed CANCELED must
+            // trigger push delivery exactly like an executor-emitted
+            // cancel. The :cancel grace-expiry path reaches this
+            // arm after the executor failed to react in time.
+            if let Some(dispatcher) = &state.push_dispatcher {
+                let seq = seqs.first().copied().unwrap_or(0);
+                dispatcher.dispatch(
+                    tenant.to_string(),
+                    task.clone(),
+                    vec![(seq, cancel_event_for_dispatch)],
+                );
+            }
             state.event_broker.notify(task_id).await;
             Ok(Json(serde_json::to_value(&task).unwrap_or_default()))
         }

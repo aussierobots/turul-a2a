@@ -55,6 +55,7 @@ fn make_state(executor: Arc<dyn AgentExecutor>) -> AppState {
         in_flight: Arc::new(InFlightRegistry::new()),
         cancellation_supervisor: storage,
         push_delivery_store: None,
+            push_dispatcher: None,
     }
 }
 

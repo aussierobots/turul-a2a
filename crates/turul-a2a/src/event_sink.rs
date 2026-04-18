@@ -95,6 +95,12 @@ struct EventSinkInner {
     /// other's merges. The lock is per-sink; sinks for different
     /// tasks do not contend.
     commit_lock: AsyncMutex<()>,
+    /// Push-delivery dispatcher (ADR-011 §2). `None` on deployments
+    /// that don't run push delivery. When set, the sink calls
+    /// `dispatch` after every successful status commit — terminal
+    /// events fan out to registered push configs; non-terminal events
+    /// are filtered out inside the dispatcher.
+    push_dispatcher: Option<Arc<crate::push::PushDispatcher>>,
 }
 
 impl EventSink {
@@ -112,6 +118,7 @@ impl EventSink {
         task_storage: Arc<dyn A2aTaskStorage>,
         event_broker: TaskEventBroker,
         handle: Arc<InFlightHandle>,
+        push_dispatcher: Option<Arc<crate::push::PushDispatcher>>,
     ) -> Self {
         Self {
             inner: Some(Arc::new(EventSinkInner {
@@ -125,6 +132,7 @@ impl EventSink {
                 handle,
                 is_closed: AtomicBool::new(false),
                 commit_lock: AsyncMutex::new(()),
+                push_dispatcher,
             })),
         }
     }
@@ -318,6 +326,32 @@ impl EventSinkInner {
                 let is_terminal = turul_a2a_types::state_machine::is_terminal(state);
                 let is_interrupted =
                     matches!(state, TaskState::InputRequired | TaskState::AuthRequired);
+
+                // Push delivery fan-out (ADR-011 §2). The dispatcher
+                // filters for terminal status events internally; we
+                // can call it on every status commit without worrying
+                // about misfires on non-terminals.
+                if let Some(dispatcher) = &self.push_dispatcher {
+                    // Re-synthesise the single committed event so the
+                    // dispatcher can inspect it. We already hold
+                    // `status` + `state`, so serialisation cannot
+                    // fail.
+                    let ev = StreamEvent::StatusUpdate {
+                        status_update: StatusUpdatePayload {
+                            task_id: self.task_id.clone(),
+                            context_id: self.context_id.clone(),
+                            status: serde_json::to_value(
+                                &turul_a2a_types::TaskStatus::new(state),
+                            )
+                            .unwrap_or_default(),
+                        },
+                    };
+                    dispatcher.dispatch(
+                        self.tenant.clone(),
+                        task.clone(),
+                        vec![(seq, ev)],
+                    );
+                }
 
                 if is_terminal {
                     self.is_closed.store(true, Ordering::Release);
@@ -569,6 +603,7 @@ mod tests {
             task_storage,
             broker.clone(),
             handle.clone(),
+            None,
         );
 
         (sink, storage, handle, yielded_rx, broker)
@@ -844,6 +879,7 @@ mod tests {
             task_storage2,
             broker,
             handle2.clone(),
+            None,
         );
         assert!(!late_sink.is_closed());
 

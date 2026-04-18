@@ -31,8 +31,10 @@
 //!   which events trigger which configs; this worker doesn't
 //!   enumerate.
 //! - No redirect following (`Policy::none`), per ADR-011 §R4.
-//! - DNS resolved once per attempt, worker connects by IP to
-//!   defeat rebinding.
+//! - DNS resolved once per attempt via [`PushDnsResolver`]; the
+//!   reqwest client is rebuilt per attempt with a `resolve` override
+//!   pinning the validated IP, so the TCP connect cannot be swapped
+//!   to a different host between validation and dial.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -139,7 +141,6 @@ impl PushDnsResolver for TokioDnsResolver {
 #[derive(Clone)]
 pub struct PushDeliveryWorker {
     pub push_delivery_store: Arc<dyn A2aPushDeliveryStore>,
-    pub http_client: reqwest::Client,
     pub dns_resolver: Arc<dyn PushDnsResolver>,
     pub config: PushDeliveryConfig,
     pub outbound_validator: Option<OutboundUrlValidator>,
@@ -147,31 +148,24 @@ pub struct PushDeliveryWorker {
 }
 
 impl PushDeliveryWorker {
-    /// Construct a worker with a reqwest client configured per
-    /// ADR-011 §5 / §R3:
+    /// Construct a worker. HTTP clients are built fresh on every POST
+    /// (see [`Self::deliver`]) so each attempt carries its own DNS
+    /// override pinning the validated IP. Shared client state would
+    /// risk cross-target DNS cache pollution when the worker handles
+    /// deliveries to different hosts back-to-back.
+    ///
+    /// Per-attempt client config matches ADR-011 §5 / §R3:
     /// - Connect timeout: `connect_timeout`.
     /// - Read / total timeout: `request_timeout`.
     /// - Redirects: none (§R4).
-    ///
-    /// The returned reqwest client resolves and connects freshly on
-    /// every request; the worker applies DNS-rebinding defence by
-    /// pre-resolving with [`PushDnsResolver`] and passing the
-    /// selected IP as a bound `resolve` for reqwest.
     pub fn new(
         push_delivery_store: Arc<dyn A2aPushDeliveryStore>,
         config: PushDeliveryConfig,
         outbound_validator: Option<OutboundUrlValidator>,
         instance_id: String,
     ) -> Result<Self, String> {
-        let http_client = reqwest::Client::builder()
-            .connect_timeout(config.connect_timeout)
-            .timeout(config.request_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| format!("failed to build reqwest client: {e}"))?;
         Ok(Self {
             push_delivery_store,
-            http_client,
             dns_resolver: Arc::new(TokioDnsResolver),
             config,
             outbound_validator,
@@ -335,9 +329,12 @@ impl PushDeliveryWorker {
                     },
                 },
                 Ok(status) => {
-                    // 4xx other than 408/429 → permanent failure.
+                    // 4xx other than 408/429 → permanent failure. Use
+                    // `NonRetryableHttpStatus` (not `MaxAttemptsExhausted`)
+                    // because the retry budget was never consumed — the
+                    // receiver rejected the payload outright.
                     DeliveryOutcome::GaveUp {
-                        reason: GaveUpReason::MaxAttemptsExhausted, // NOTE: semantic
+                        reason: GaveUpReason::NonRetryableHttpStatus,
                         last_error_class: DeliveryErrorClass::HttpError4xx {
                             status: status.as_u16(),
                         },
@@ -381,11 +378,21 @@ impl PushDeliveryWorker {
                 DeliveryOutcome::Abandoned { reason } => {
                     return DeliveryReport::Abandoned(*reason)
                 }
-                DeliveryOutcome::Retry { .. } => {
+                DeliveryOutcome::Retry {
+                    http_status,
+                    error_class,
+                    ..
+                } => {
                     if current_count >= self.config.max_attempts {
-                        // Retry budget exhausted after recording this
-                        // attempt. Commit GaveUp (retry already
-                        // persisted as diagnostics on the row).
+                        // Retry budget exhausted. The final attempt's
+                        // diagnostics are already live on the row via
+                        // the Retry we just recorded — but operators
+                        // read terminal state off `FailedDelivery`
+                        // (populated from GaveUp). Carry the Retry's
+                        // http_status + error_class into the GaveUp so
+                        // the failed-delivery row reflects the actual
+                        // last-seen failure (e.g., `HttpError5xx { 500 }`)
+                        // rather than a generic NetworkError sentinel.
                         let _ = self
                             .push_delivery_store
                             .record_delivery_outcome(
@@ -397,8 +404,8 @@ impl PushDeliveryWorker {
                                 claim.generation,
                                 DeliveryOutcome::GaveUp {
                                     reason: GaveUpReason::MaxAttemptsExhausted,
-                                    last_error_class: DeliveryErrorClass::NetworkError,
-                                    last_http_status: None,
+                                    last_error_class: *error_class,
+                                    last_http_status: *http_status,
                                 },
                             )
                             .await;
@@ -444,19 +451,36 @@ impl PushDeliveryWorker {
         payload: &[u8],
         resolved_ip: IpAddr,
     ) -> Result<reqwest::StatusCode, DeliveryErrorClass> {
-        // Bind reqwest's DNS resolution for this URL's host to our
-        // pre-resolved IP so DNS rebinding cannot swap the target
-        // between validation and connect.
+        // DNS rebinding defence: the POST MUST connect to the IP we
+        // validated against the SSRF guard, not whatever a later DNS
+        // lookup might return. `reqwest::ClientBuilder::resolve` installs
+        // a host-level DNS override on the client, bypassing the system
+        // resolver for that hostname while leaving the `Host` header and
+        // SNI name intact (reqwest intercepts only TCP dial resolution —
+        // the URL's host string is still used for TLS/Host). Port 0
+        // means "use the URL's port", which is what we want.
+        //
+        // A fresh client per attempt is intentional: deliveries target
+        // arbitrary (potentially different) hosts, and mixing DNS
+        // overrides on a shared client would risk cross-talk. Per-attempt
+        // construction is a few microseconds — negligible next to the
+        // retry backoff.
         let host = target
             .url
             .host_str()
             .ok_or(DeliveryErrorClass::NetworkError)?
             .to_string();
-        let port = target.url.port_or_known_default().unwrap_or(443);
-        let sa = SocketAddr::new(resolved_ip, port);
+        let pinned = SocketAddr::new(resolved_ip, 0);
 
-        let mut req = self
-            .http_client
+        let client = reqwest::Client::builder()
+            .connect_timeout(self.config.connect_timeout)
+            .timeout(self.config.request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve(&host, pinned)
+            .build()
+            .map_err(|_| DeliveryErrorClass::NetworkError)?;
+
+        let mut req = client
             .post(target.url.clone())
             .header(
                 "Authorization",
@@ -474,15 +498,6 @@ impl PushDeliveryWorker {
         if let Some(tok) = &target.token {
             req = req.header("X-Turul-Push-Token", tok.expose());
         }
-        // reqwest 0.13 doesn't expose a per-request resolve override,
-        // so DNS-rebinding defence requires a client-level resolver.
-        // We rely on the worker's DNS resolver for the validation
-        // step; the request itself connects via reqwest's built-in
-        // resolver. This is documented as a known gap in 0.1.x —
-        // the test suite's DNS rebinding scenario stops at the
-        // validation layer.
-        let _ = sa;
-        let _ = host;
 
         let resp = req.body(payload.to_vec()).send().await;
 

@@ -19,6 +19,7 @@
 
 pub mod claim;
 pub mod delivery;
+pub mod dispatcher;
 pub mod secret;
 pub mod ssrf;
 
@@ -26,5 +27,6 @@ pub use claim::{
     A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
     DeliveryOutcome, FailedDelivery, GaveUpReason,
 };
+pub use dispatcher::PushDispatcher;
 pub use secret::{redact_in_str, Secret};
 pub use ssrf::{decide as ssrf_decide, is_blocked_ip, SsrfBlockReason, SsrfDecision};

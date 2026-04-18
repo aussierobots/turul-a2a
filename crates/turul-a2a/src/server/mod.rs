@@ -369,37 +369,71 @@ impl A2aServerBuilder {
                  ADR-009 requires all storage traits to share the same backend."
             )));
         }
-        if let Some(push_delivery) = push_delivery_store.as_ref() {
-            let push_delivery_backend = push_delivery.backend_name();
-            if task_backend != push_delivery_backend {
-                return Err(A2aError::Internal(format!(
-                    "Storage backend mismatch: task={task_backend}, \
-                     push_delivery={push_delivery_backend}. \
-                     ADR-009 requires all storage traits to share the same backend."
-                )));
-            }
+        let push_dispatcher: Option<Arc<crate::push::PushDispatcher>> =
+            if let Some(push_delivery) = push_delivery_store.as_ref() {
+                let push_delivery_backend = push_delivery.backend_name();
+                if task_backend != push_delivery_backend {
+                    return Err(A2aError::Internal(format!(
+                        "Storage backend mismatch: task={task_backend}, \
+                         push_delivery={push_delivery_backend}. \
+                         ADR-009 requires all storage traits to share the same backend."
+                    )));
+                }
 
-            // ADR-011 §10.3: claim expiry must exceed the worst-case retry
-            // horizon so a claim held by a healthy worker is never mis-
-            // classified as stale mid-retry. Upper bound for the horizon
-            // is `max_attempts * backoff_cap` (every attempt waits the cap),
-            // which is conservative and independent of jitter.
-            let retry_horizon = self
-                .runtime_config
-                .push_backoff_cap
-                .saturating_mul(self.runtime_config.push_max_attempts as u32);
-            if self.runtime_config.push_claim_expiry <= retry_horizon {
-                return Err(A2aError::Internal(format!(
-                    "push_claim_expiry ({:?}) must be greater than retry horizon \
-                     (push_max_attempts={} * push_backoff_cap={:?} = {:?}). \
-                     Raise push_claim_expiry or lower push_max_attempts/push_backoff_cap.",
-                    self.runtime_config.push_claim_expiry,
-                    self.runtime_config.push_max_attempts,
-                    self.runtime_config.push_backoff_cap,
-                    retry_horizon
-                )));
-            }
-        }
+                // ADR-011 §10.3: claim expiry must exceed the worst-case
+                // retry horizon so a claim held by a healthy worker is
+                // never mis-classified as stale mid-retry. Upper bound
+                // for the horizon is `max_attempts * backoff_cap`
+                // (every attempt waits the cap), which is conservative
+                // and independent of jitter.
+                let retry_horizon = self
+                    .runtime_config
+                    .push_backoff_cap
+                    .saturating_mul(self.runtime_config.push_max_attempts as u32);
+                if self.runtime_config.push_claim_expiry <= retry_horizon {
+                    return Err(A2aError::Internal(format!(
+                        "push_claim_expiry ({:?}) must be greater than retry horizon \
+                         (push_max_attempts={} * push_backoff_cap={:?} = {:?}). \
+                         Raise push_claim_expiry or lower push_max_attempts/push_backoff_cap.",
+                        self.runtime_config.push_claim_expiry,
+                        self.runtime_config.push_max_attempts,
+                        self.runtime_config.push_backoff_cap,
+                        retry_horizon
+                    )));
+                }
+
+                // Build the push-delivery worker + dispatcher now that
+                // we've validated the horizon. Runtime config carries
+                // the full worker tuning; the dispatcher closes the
+                // commit-to-POST loop (ADR-011 §2 + §13.13).
+                let mut delivery_cfg = crate::push::delivery::PushDeliveryConfig::default();
+                delivery_cfg.max_attempts = self.runtime_config.push_max_attempts as u32;
+                delivery_cfg.backoff_base = self.runtime_config.push_backoff_base;
+                delivery_cfg.backoff_cap = self.runtime_config.push_backoff_cap;
+                delivery_cfg.backoff_jitter = self.runtime_config.push_backoff_jitter;
+                delivery_cfg.request_timeout = self.runtime_config.push_request_timeout;
+                delivery_cfg.connect_timeout = self.runtime_config.push_connect_timeout;
+                delivery_cfg.read_timeout = self.runtime_config.push_read_timeout;
+                delivery_cfg.claim_expiry = self.runtime_config.push_claim_expiry;
+                delivery_cfg.max_payload_bytes = self.runtime_config.push_max_payload_bytes;
+                delivery_cfg.allow_insecure_urls = self.runtime_config.allow_insecure_push_urls;
+
+                let instance_id = format!("a2a-server-{}", uuid::Uuid::now_v7());
+                let worker = crate::push::delivery::PushDeliveryWorker::new(
+                    push_delivery.clone(),
+                    delivery_cfg,
+                    None,
+                    instance_id,
+                )
+                .map_err(|e| A2aError::Internal(format!("push worker build failed: {e}")))?;
+
+                Some(Arc::new(crate::push::PushDispatcher::new(
+                    Arc::new(worker),
+                    push_storage.clone(),
+                )))
+            } else {
+                None
+            };
 
         // Collect and merge security contributions
         let contributions: Vec<SecurityContribution> = self
@@ -422,6 +456,7 @@ impl A2aServerBuilder {
                 in_flight: Arc::new(crate::server::in_flight::InFlightRegistry::new()),
                 cancellation_supervisor,
                 push_delivery_store,
+                push_dispatcher,
             },
             merged_security: merged,
             bind_addr: self.bind_addr,
@@ -552,27 +587,29 @@ impl A2aServer {
     /// Build the axum router — useful for testing.
     /// Augments the AgentCard with merged security contributions.
     pub fn into_router(self) -> axum::Router {
-        let router = build_router(self.state.clone());
+        let (state, had_security) = self.into_augmented_state();
+        if !had_security {
+            return build_router(state);
+        }
+        build_router(state)
+    }
 
-        // Store merged security in AppState for agent card augmentation
-        // We use a different approach: wrap the agent card handler
-        // Actually, the simplest: store merged security as an Extension on the router
-        // But that's complex. Instead, patch the executor's agent card at build time.
-        // Since AgentExecutor returns the card by value, we wrap it.
-
+    /// Produce the `AppState` that `into_router` would mount, plus a flag
+    /// indicating whether security augmentation was applied. Exposed to
+    /// tests so they can assert post-augmentation invariants (e.g., that
+    /// `push_delivery_store` survives the auth rebuild) without going
+    /// through an HTTP round-trip.
+    pub(crate) fn into_augmented_state(self) -> (AppState, bool) {
         if self.merged_security.is_empty() {
-            return router;
+            return (self.state, false);
         }
 
-        // The agent card route is already built. We need to use the state's merged_security.
-        // The cleanest approach: store merged_security in AppState and use it in the handler.
-        // For now, rebuild with a wrapping executor.
         let wrapped = SecurityAugmentedExecutor {
             inner: self.state.executor.clone(),
             security: self.merged_security,
         };
 
-        let augmented_state = AppState {
+        let augmented = AppState {
             executor: Arc::new(wrapped),
             task_storage: self.state.task_storage,
             push_storage: self.state.push_storage,
@@ -583,10 +620,15 @@ impl A2aServer {
             runtime_config: self.state.runtime_config,
             in_flight: self.state.in_flight,
             cancellation_supervisor: self.state.cancellation_supervisor,
-            push_delivery_store: None,
+            // Preserve both the push claim store and the dispatcher
+            // through security augmentation. Dropping either would
+            // silently disable push delivery for every auth-gated
+            // deployment.
+            push_delivery_store: self.state.push_delivery_store,
+            push_dispatcher: self.state.push_dispatcher,
         };
 
-        build_router(augmented_state)
+        (augmented, true)
     }
 
     /// Run the server.
@@ -953,6 +995,76 @@ mod tests {
             msg.contains("retry horizon") || msg.contains("push_claim_expiry"),
             "error should mention retry horizon: {msg}"
         );
+    }
+
+    // Test middleware that contributes a non-empty SecurityContribution
+    // so `into_augmented_state` must rebuild the state. Accepts every
+    // request — this test is about wiring, not auth behaviour.
+    struct ContribMiddleware;
+
+    #[async_trait::async_trait]
+    impl A2aMiddleware for ContribMiddleware {
+        async fn before_request(
+            &self,
+            _ctx: &mut crate::middleware::RequestContext,
+        ) -> Result<(), crate::middleware::MiddlewareError> {
+            Ok(())
+        }
+        fn security_contribution(&self) -> SecurityContribution {
+            SecurityContribution::new().with_scheme(
+                "TestApiKey",
+                turul_a2a_proto::SecurityScheme {
+                    scheme: Some(turul_a2a_proto::security_scheme::Scheme::ApiKeySecurityScheme(
+                        turul_a2a_proto::ApiKeySecurityScheme {
+                            description: "test".into(),
+                            location: "header".into(),
+                            name: "X-Test-Key".into(),
+                        },
+                    )),
+                },
+                vec![],
+            )
+        }
+    }
+
+    #[test]
+    fn push_delivery_store_survives_security_augmentation() {
+        // Regression: `into_router`'s rebuilt AppState used to hard-code
+        // push_delivery_store: None, silently disabling push delivery on
+        // every auth-gated deployment. The augmented state must carry the
+        // same claim-store Arc the builder installed.
+        let server = A2aServer::builder()
+            .executor(DummyExecutor)
+            .storage(InMemoryA2aStorage::new())
+            .middleware(Arc::new(ContribMiddleware))
+            .build()
+            .expect("build must succeed");
+        // Sanity: push_delivery_store is wired pre-augmentation.
+        assert!(server.state.push_delivery_store.is_some());
+
+        let (augmented, had_security) = server.into_augmented_state();
+        assert!(
+            had_security,
+            "ContribMiddleware contributed a scheme — augmentation must run"
+        );
+        assert!(
+            augmented.push_delivery_store.is_some(),
+            "push_delivery_store must survive security augmentation"
+        );
+    }
+
+    #[test]
+    fn push_delivery_store_passthrough_without_security() {
+        // With no contributing middleware, `into_augmented_state` returns
+        // the original state unchanged — the store must still be present.
+        let server = A2aServer::builder()
+            .executor(DummyExecutor)
+            .storage(InMemoryA2aStorage::new())
+            .build()
+            .expect("build must succeed");
+        let (state, had_security) = server.into_augmented_state();
+        assert!(!had_security);
+        assert!(state.push_delivery_store.is_some());
     }
 
     #[test]

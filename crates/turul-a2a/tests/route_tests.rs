@@ -73,6 +73,7 @@ fn test_state() -> AppState {
         in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
+            push_dispatcher: None,
     }
 }
 

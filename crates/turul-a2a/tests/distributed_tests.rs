@@ -58,6 +58,7 @@ fn two_instances() -> (axum::Router, axum::Router) {
         in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
+            push_dispatcher: None,
     };
 
     let state_b = AppState {
@@ -72,6 +73,7 @@ fn two_instances() -> (axum::Router, axum::Router) {
         in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
+            push_dispatcher: None,
     };
 
     (build_router(state_a), build_router(state_b))

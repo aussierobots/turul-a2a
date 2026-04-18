@@ -1217,6 +1217,7 @@ fn pg_error_class_from_json(s: &str) -> Option<DeliveryErrorClass> {
 fn pg_gave_up_reason_to_str(r: GaveUpReason) -> &'static str {
     match r {
         GaveUpReason::MaxAttemptsExhausted => "MaxAttemptsExhausted",
+        GaveUpReason::NonRetryableHttpStatus => "NonRetryableHttpStatus",
         GaveUpReason::SsrfBlocked => "SsrfBlocked",
         GaveUpReason::PayloadTooLarge => "PayloadTooLarge",
         GaveUpReason::TlsRejected => "TlsRejected",
