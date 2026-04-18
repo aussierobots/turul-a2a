@@ -57,14 +57,26 @@ pub trait A2aAtomicStore: Send + Sync {
     ///   lock as the state inspection; the in-process lock is the
     ///   boundary.
     /// - **SQLite / PostgreSQL**: a conditional `UPDATE` whose `WHERE`
-    ///   clause excludes terminal states (equivalent to `WHERE
-    ///   status_state NOT IN ('TASK_STATE_COMPLETED', …)`). Affected-rows
-    ///   equal to zero ⇒ terminal was already set and no task/event writes
-    ///   committed (the surrounding transaction is rolled back).
+    ///   clause excludes terminal states. The `status_state` column
+    ///   stores Rust `Debug` forms of [`turul_a2a_types::TaskState`], so
+    ///   the conditional is `WHERE status_state NOT IN ('Completed',
+    ///   'Failed', 'Canceled', 'Rejected')`. Affected-rows equal to zero
+    ///   ⇒ terminal was already set and no task/event writes commit (the
+    ///   surrounding transaction is rolled back).
     /// - **DynamoDB**: a `TransactWriteItems` with a `ConditionExpression`
-    ///   on the task item's `statusState` attribute asserting it is a
-    ///   non-terminal. `TransactionCanceledException` with the task-item's
-    ///   condition-check failure ⇒ terminal was already set.
+    ///   on the task item's `statusState` attribute asserting it is not
+    ///   one of the same four Debug-format values (`Completed`, `Failed`,
+    ///   `Canceled`, `Rejected`). A `TransactionCanceledException`
+    ///   referencing the task-item's condition-check failure ⇒ terminal
+    ///   was already set; the transaction as a whole aborts so no events
+    ///   commit.
+    ///
+    /// Storage column values (`"Completed"`, etc.) are distinct from the
+    /// proto wire names (`"TASK_STATE_COMPLETED"`, etc.). Error reporting
+    /// on [`A2aStorageError::TerminalStateAlreadySet`] converts to the
+    /// wire name so log and telemetry consumers see spec-compliant
+    /// identifiers. See [`crate::storage::terminal_cas`] for the helper
+    /// functions.
     ///
     /// `TerminalStateAlreadySet` is **distinct** from
     /// [`A2aStorageError::InvalidTransition`]. The latter is the

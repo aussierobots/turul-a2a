@@ -255,6 +255,10 @@ Executor can emit progress, interrupted, and terminal events via `ctx.events`. T
   - `crates/turul-a2a/src/streaming/mod.rs` — stream events from durable store include executor-emitted sink events (via existing ADR-009 infrastructure; no new channel)
   - `crates/turul-a2a/src/server/builder.rs` — activate `blocking_task_timeout`, `timeout_abort_grace` knobs
   - Legacy-executor-detection rule (ADR-010 §7.2) in the router: if `execute()` returns with task state terminal AND sink was never used, synthesize the corresponding event
+  - **Terminal fallback MUST route through `A2aAtomicStore::update_task_status_with_events`** (the CAS-guarded path from phase B), NOT through `update_task_with_events` (the full-replacement path). Concern from phase B review: `update_task_with_events` replaces the entire task without the terminal-CAS docstring contract, so a legacy executor's synthesized terminal could bypass the single-terminal-writer invariant and overwrite a terminal already committed by another path (e.g., `:cancel` force-commit). Two acceptable solutions, pick one in phase D:
+    - **(a)** Always convert the legacy terminal fallback into a `new_status` + synthesized event pair and call `update_task_status_with_events`. Preferred — reuses the existing CAS path.
+    - **(b)** Extend the terminal-CAS contract to `update_task_with_events` when the replacement task's status is terminal. Requires a second parity test matrix for the replacement-path CAS.
+  - A phase D guard test MUST cover the race: framework commits CANCELED via `:cancel` at T=0, legacy executor's sync `execute()` returns with `task.state = Completed` at T=1ms, framework's legacy fallback runs. Expected: persisted terminal is CANCELED (first commit), executor's synthesized terminal surfaces as `TerminalStateAlreadySet` (rejected by the CAS), and no COMPLETED event lands in the store.
 
 ### Tests (maps 1:1 to ADR-010 §9)
 

@@ -957,7 +957,21 @@ mod tests {
     use crate::storage::parity_tests;
 
     async fn storage() -> SqliteA2aStorage {
-        SqliteA2aStorage::new(SqliteConfig::default()).await.unwrap()
+        // Single-connection in-memory SQLite. The pool is capped at 1 so
+        // all queries serialize on one connection — this matches SQLite's
+        // actual multi-writer model (one writer at a time) and avoids
+        // SQLITE_LOCKED deadlocks on concurrent `BEGIN DEFERRED`
+        // transactions. The conditional-UPDATE CAS is still exercised
+        // because the test issues multiple SEQUENTIAL tx attempts: once
+        // a terminal writer commits, subsequent transactions see the
+        // terminal and the conditional UPDATE affects zero rows, returning
+        // TerminalStateAlreadySet as required.
+        SqliteA2aStorage::new(SqliteConfig {
+            database_url: "sqlite::memory:".into(),
+            max_connections: 1,
+        })
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -1114,6 +1128,17 @@ mod tests {
     async fn test_terminal_cas_single_winner_on_concurrent_terminals() {
         let s = std::sync::Arc::new(storage().await);
         parity_tests::test_terminal_cas_single_winner_on_concurrent_terminals(
+            s.clone(),
+            s.clone(),
+            s,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_terminal_cas_single_winner_from_submitted_includes_rejected() {
+        let s = std::sync::Arc::new(storage().await);
+        parity_tests::test_terminal_cas_single_winner_from_submitted_includes_rejected(
             s.clone(),
             s.clone(),
             s,

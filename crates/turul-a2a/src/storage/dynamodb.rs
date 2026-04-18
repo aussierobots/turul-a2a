@@ -1532,6 +1532,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_terminal_cas_single_winner_from_submitted_includes_rejected() {
+        let s = std::sync::Arc::new(storage().await);
+        parity_tests::test_terminal_cas_single_winner_from_submitted_includes_rejected(
+            s.clone(),
+            s.clone(),
+            s,
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_terminal_cas_rejects_sequential_second_terminal() {
         let s = storage().await;
         parity_tests::test_terminal_cas_rejects_sequential_second_terminal(&s, &s, &s).await;

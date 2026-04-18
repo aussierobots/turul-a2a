@@ -1258,6 +1258,139 @@ pub async fn test_terminal_cas_single_winner_on_concurrent_terminals(
     );
 }
 
+/// AT-CAS-001b: same race from SUBMITTED, proving REJECTED participates
+/// in the single-terminal-writer CAS.
+///
+/// The first race (`test_terminal_cas_single_winner_on_concurrent_terminals`)
+/// starts from WORKING, where the valid terminal exits are COMPLETED /
+/// FAILED / CANCELED — REJECTED is not a legal exit from WORKING per the
+/// A2A v1.0 state machine (only from SUBMITTED). This test covers the gap:
+/// race FAILED / CANCELED / REJECTED from SUBMITTED, proving that all four
+/// terminal variants (COMPLETED covered in the other test, FAILED /
+/// CANCELED / REJECTED here) participate in the CAS invariant.
+pub async fn test_terminal_cas_single_winner_from_submitted_includes_rejected(
+    atomic: Arc<dyn A2aAtomicStore>,
+    tasks: Arc<dyn A2aTaskStorage>,
+    events: Arc<dyn A2aEventStore>,
+) {
+    // Create task in SUBMITTED (no state transition needed; `create_task`
+    // defaults to SUBMITTED).
+    let task = make_task("cas-sub-1", "ctx-cas-sub");
+    tasks
+        .create_task("default", "owner-cas-sub", task)
+        .await
+        .unwrap();
+
+    let pre_race_events = events
+        .get_events_after("default", "cas-sub-1", 0)
+        .await
+        .unwrap();
+    let pre_race_count = pre_race_events.len();
+
+    // All three are valid terminal exits from SUBMITTED per the state
+    // machine (SUBMITTED → { Working, Rejected, Failed, Canceled }).
+    let terminals = [
+        TaskState::Rejected,
+        TaskState::Failed,
+        TaskState::Canceled,
+    ];
+    let mut handles = Vec::with_capacity(terminals.len());
+    let barrier = Arc::new(tokio::sync::Barrier::new(terminals.len() + 1));
+    for (i, terminal) in terminals.into_iter().enumerate() {
+        let atomic = Arc::clone(&atomic);
+        let barrier = Arc::clone(&barrier);
+        let evt = make_status_event_for(
+            "cas-sub-1",
+            "ctx-cas-sub",
+            crate::storage::terminal_cas::task_state_wire_name(terminal),
+        );
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let result = atomic
+                .update_task_status_with_events(
+                    "default",
+                    "cas-sub-1",
+                    "owner-cas-sub",
+                    TaskStatus::new(terminal),
+                    vec![evt],
+                )
+                .await;
+            (i, terminal, result)
+        }));
+    }
+    barrier.wait().await;
+
+    let mut winners = Vec::new();
+    let mut losers = Vec::new();
+    for handle in handles {
+        let (_i, terminal, result) = handle.await.unwrap();
+        match result {
+            Ok((task, seqs)) => winners.push((terminal, task, seqs)),
+            Err(crate::storage::A2aStorageError::TerminalStateAlreadySet {
+                task_id,
+                current_state,
+            }) => losers.push((terminal, task_id, current_state)),
+            Err(other) => panic!(
+                "unexpected error from terminal-CAS attempt ({terminal:?}) from SUBMITTED: {other:?}"
+            ),
+        }
+    }
+
+    assert_eq!(winners.len(), 1, "exactly one terminal write must win from SUBMITTED");
+    assert_eq!(
+        losers.len(),
+        terminals.len() - 1,
+        "all non-winners must surface TerminalStateAlreadySet"
+    );
+
+    let (winning_terminal, _winning_task, winning_seqs) = &winners[0];
+    assert_eq!(winning_seqs.len(), 1, "winner appended exactly one event");
+
+    // Explicit invariant: REJECTED either wins or is one of the
+    // CAS losers — but never a non-CAS error class. This is the
+    // property that was previously unproven.
+    let rejected_outcome_ok = winners.iter().any(|(t, _, _)| *t == TaskState::Rejected)
+        || losers.iter().any(|(t, _, _)| *t == TaskState::Rejected);
+    assert!(
+        rejected_outcome_ok,
+        "REJECTED must participate in the CAS race — either as the winner or a TerminalStateAlreadySet loser"
+    );
+
+    let terminal_wire_names = [
+        "TASK_STATE_FAILED",
+        "TASK_STATE_CANCELED",
+        "TASK_STATE_REJECTED",
+    ];
+    for (_t, task_id, current_state) in &losers {
+        assert_eq!(task_id, "cas-sub-1", "loser carries the task_id");
+        assert!(
+            terminal_wire_names.contains(&current_state.as_str()),
+            "loser current_state must be a terminal wire name from the racing set: got {current_state}"
+        );
+    }
+
+    let fetched = tasks
+        .get_task("default", "cas-sub-1", "owner-cas-sub", None)
+        .await
+        .unwrap()
+        .expect("task still exists");
+    assert_eq!(
+        fetched.status().unwrap().state().unwrap(),
+        *winning_terminal,
+        "persisted state matches winner"
+    );
+
+    let post_race_events = events
+        .get_events_after("default", "cas-sub-1", 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        post_race_events.len(),
+        pre_race_count + 1,
+        "exactly one terminal event appended; losers must NOT persist events"
+    );
+}
+
 /// AT-CAS-002: terminal-already-set rejects a follow-up terminal write
 /// sequentially, not just under race. Sanity check that the CAS contract
 /// is not only about concurrency — a later write to a terminal row also
