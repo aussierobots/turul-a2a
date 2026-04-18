@@ -46,6 +46,10 @@ aws-sdk-dynamodb = { workspace = true, optional = true }
 # Secret redaction for credentials/tokens used by later phases.
 # Scoped to turul-a2a only; NOT added to turul-a2a-types.
 secrecy = { workspace = true }
+# Push delivery worker (ADR-011): outbound HTTP client.
+reqwest = { workspace = true }
+# Retry jitter (push delivery).
+rand = { workspace = true }
 
 [dev-dependencies]
 sqlx = { workspace = true }

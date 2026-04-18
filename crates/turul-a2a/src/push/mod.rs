@@ -18,6 +18,7 @@
 //! [`crate::storage::parity_tests`] gate per-backend acceptance.
 
 pub mod claim;
+pub mod delivery;
 pub mod secret;
 pub mod ssrf;
 
