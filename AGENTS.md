@@ -2,13 +2,13 @@
 
 ## Current State
 
-- 9 crates in workspace, 3 example agents, 10 ADRs.
+- 7 publish crates, 5 workspace examples, 13 ADRs.
 - **Strong for** (server deployment):
   - Durable event coordination: atomic task+event writes with terminal-preservation CAS on all four storage backends (in-memory, SQLite, PostgreSQL, DynamoDB).
   - Multi-instance request/response correctness and cross-instance streaming subscription via shared backend. Verified by `tests/distributed_tests.rs` and `tests/d3_streaming_tests.rs`.
   - Executor `EventSink` with spawn-and-track, two-deadline blocking timeout, and cross-instance cancellation propagation via the in-process cancel-marker poller (ADR-010, ADR-012).
   - Auth middleware (Bearer JWT + API Key), client library.
-- **Lambda adapter** supports request/response and buffered-streaming SSE against the shared event store. Same-invocation cancellation works. The Lambda adapter does **not** run the persistent cross-instance cancel-marker poller that the server runtime uses, so cross-instance cancellation propagation to a live executor on a different warm Lambda invocation is not currently supported; see `crates/turul-a2a-aws-lambda/src/lib.rs` module docs for the exact scope.
+- **Lambda adapter** supports request/response, buffered-streaming SSE against the shared event store, and ADR-013 push-delivery recovery via stream and scheduled workers. Same-invocation cancellation works. The Lambda adapter does **not** run the persistent cross-instance cancel-marker poller that the server runtime uses, so cross-instance cancellation propagation to a live executor on a different warm Lambda invocation is not currently supported; see `crates/turul-a2a-aws-lambda/src/lib.rs` module docs for the exact scope.
 - Compliance and maturity claims still require a fresh upstream-spec diff per the Version Hygiene and Compliance Audit Gate sections before new public claims land.
 
 ## Source of Truth
@@ -36,6 +36,15 @@ If these conflict, the normative A2A proto wins for wire-level behavior.
   - auth and deployment correctness
 - Do not make implementation changes unless the user explicitly asks for code changes.
 - For review requests, lead with concrete findings, not summaries.
+
+## Response Style
+
+- Answer the user's direct question first.
+- Keep responses concise. Prefer the shortest answer that preserves the key technical caveat or next action.
+- Do not overexplain settled context, repeat long prior histories, or restate every passing gate unless the user asks for that detail.
+- When advising a go/no-go decision, state the decision clearly, then list only blocking issues and essential guardrails.
+- Separate confirmed facts from assumptions. If a claim depends on freshness, say what was verified and when.
+- For review requests, emit findings first. If there are no findings, say that directly and mention only residual risk that should affect the decision.
 
 ## Non-Negotiable A2A Rules
 
