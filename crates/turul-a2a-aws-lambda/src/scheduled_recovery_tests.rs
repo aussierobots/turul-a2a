@@ -10,8 +10,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use turul_a2a::error::A2aError;
-use turul_a2a::executor::AgentExecutor;
 use turul_a2a::push::delivery::{PushDeliveryConfig, PushDeliveryWorker};
 use turul_a2a::push::{
     A2aPushDeliveryStore, PendingDispatch, PushDispatcher, ReclaimableClaim,
@@ -28,22 +26,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use crate::scheduled_recovery::{
     LambdaScheduledRecoveryConfig, LambdaScheduledRecoveryHandler,
 };
-
-struct NoopExecutor;
-#[async_trait]
-impl AgentExecutor for NoopExecutor {
-    async fn execute(
-        &self,
-        _task: &mut Task,
-        _msg: &Message,
-        _ctx: &turul_a2a::executor::ExecutionContext,
-    ) -> Result<(), A2aError> {
-        Ok(())
-    }
-    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
-        turul_a2a_proto::AgentCard::default()
-    }
-}
 
 async fn build_stack() -> (
     Arc<InMemoryA2aStorage>,

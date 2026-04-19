@@ -20,8 +20,6 @@ use async_trait::async_trait;
 use aws_lambda_events::event::dynamodb::{Event as DynamoDbEvent, EventRecord, StreamRecord};
 use chrono::{TimeZone, Utc};
 use serde::Serialize;
-use turul_a2a::error::A2aError;
-use turul_a2a::executor::AgentExecutor;
 use turul_a2a::push::delivery::{PushDeliveryConfig, PushDeliveryWorker};
 use turul_a2a::push::{A2aPushDeliveryStore, PushDispatcher};
 use turul_a2a::storage::{
@@ -34,22 +32,6 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::stream_recovery::LambdaStreamRecoveryHandler;
-
-struct NoopExecutor;
-#[async_trait]
-impl AgentExecutor for NoopExecutor {
-    async fn execute(
-        &self,
-        _task: &mut Task,
-        _msg: &Message,
-        _ctx: &turul_a2a::executor::ExecutionContext,
-    ) -> Result<(), A2aError> {
-        Ok(())
-    }
-    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
-        turul_a2a_proto::AgentCard::default()
-    }
-}
 
 /// Helper: build an in-memory storage with push dispatch enabled,
 /// plus a dispatcher wired against it.
