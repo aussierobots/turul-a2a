@@ -140,115 +140,13 @@ impl PushDispatcher {
         task: Task,
         terminal_seqs: Vec<u64>,
     ) {
-        // Record a pending-dispatch marker for each terminal
-        // sequence BEFORE calling list_configs. This is the durable
-        // evidence the event needs fan-out — if list_configs fails
-        // persistently, the reclaim sweep enumerates these markers
-        // via `list_stale_pending_dispatches` and re-invokes this
-        // fan-out. Failure to record the marker is non-fatal (it
-        // reduces recovery to the existing bounded-retry behaviour)
-        // but emits a warning so operators can alert on a claim
-        // store outage that's coincident with a dispatch wave.
-        for seq in &terminal_seqs {
-            if let Err(e) = self
-                .push_delivery_store_handle()
-                .record_pending_dispatch(&tenant, &owner, &task_id, *seq)
-                .await
-            {
-                tracing::warn!(
-                    target: "turul_a2a::push_pending_dispatch_record_failed",
-                    tenant = %tenant,
-                    task_id = %task_id,
-                    event_sequence = seq,
-                    error = %e,
-                    "pending-dispatch marker write failed; dispatch continues \
-                     but reclaim cannot recover if list_configs also fails"
-                );
-            }
-        }
-
-        // Load every config for this task by walking the full
-        // pagination chain. Each page read gets a bounded retry
-        // with exponential backoff: a transient config-store blip
-        // would otherwise drop the notification even though the
-        // pending-dispatch marker is now in place. `next_page_token
-        // == ""` marks the end of iteration per the storage trait
-        // contract.
-        const LIST_MAX_ATTEMPTS: u32 = 3;
-        let backoffs = [
-            std::time::Duration::from_millis(50),
-            std::time::Duration::from_millis(150),
-            std::time::Duration::from_millis(500),
-        ];
-
-        let mut configs: Vec<turul_a2a_proto::TaskPushNotificationConfig> = Vec::new();
-        let mut page_token: Option<String> = None;
-        let page_fetch_outcome: Result<(), crate::storage::A2aStorageError> = loop {
-            let mut last_err: Option<crate::storage::A2aStorageError> = None;
-            let page = 'retry: loop {
-                for attempt in 0..LIST_MAX_ATTEMPTS {
-                    if attempt > 0 {
-                        tokio::time::sleep(
-                            backoffs[(attempt as usize).min(backoffs.len() - 1)],
-                        )
-                        .await;
-                    }
-                    match self
-                        .push_storage
-                        .list_configs(&tenant, &task_id, page_token.as_deref(), None)
-                        .await
-                    {
-                        Ok(p) => break 'retry Some(p),
-                        Err(e) => last_err = Some(e),
-                    }
-                }
-                break 'retry None;
-            };
-            match page {
-                Some(p) => {
-                    configs.extend(p.configs);
-                    if p.next_page_token.is_empty() {
-                        break Ok(());
-                    }
-                    page_token = Some(p.next_page_token);
-                }
-                None => {
-                    break Err(last_err.unwrap_or_else(|| {
-                        crate::storage::A2aStorageError::DatabaseError(
-                            "list_configs exhausted retry budget without recording an error"
-                                .into(),
-                        )
-                    }));
-                }
-            }
-        };
-
-        if let Err(e) = page_fetch_outcome {
-            // Markers stay in place so the reclaim sweep will retry
-            // this dispatch on its next tick once the config store
-            // recovers.
-            tracing::error!(
-                target: "turul_a2a::push_dispatch_config_list_failed",
-                tenant = %tenant,
-                task_id = %task_id,
-                error = %e,
-                "push dispatch aborted: list_configs failed after bounded retry; \
-                 pending-dispatch markers retained for reclaim sweep"
-            );
-            return;
-        }
-
-        // No configs registered for this task — delete markers
-        // (there's nothing to deliver) and return.
-        if configs.is_empty() {
-            for seq in &terminal_seqs {
-                let _ = self
-                    .push_delivery_store_handle()
-                    .delete_pending_dispatch(&tenant, &task_id, *seq)
-                    .await;
-            }
-            return;
-        }
+        // ADR-013 §4.3: fresh-dispatch markers are written atomically
+        // with the task + event commit when the backend opts in to
+        // `push_dispatch_enabled`. The redispatch path refreshes
+        // `recorded_at` before calling us (see `redispatch_pending`),
+        // so this path no longer performs `record_pending_dispatch` —
+        // it would be either redundant (fresh-dispatch) or already
+        // handled by the caller (reclaim).
 
         // Serialise the task payload once — every config receives
         // the same JSON body (ADR-011 §3).
@@ -257,13 +155,98 @@ impl PushDispatcher {
             Err(_) => return,
         };
 
-        // Fan out per (event, config), awaiting each task so the
-        // pending-dispatch marker isn't deleted until every
-        // per-config deliver has returned — at which point each
-        // claim row exists (or was durably attempted and the
-        // reclaim-claims path will recover it).
-        let mut join_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        // ADR-013 §4.5 / §5.5: fan out per-seq using the eligibility
+        // filter. Each terminal sequence gets its own eligible config
+        // set: configs registered with `registered_after_event_sequence
+        // < seq` only. This preserves the no-backfill invariant
+        // against any late-config registration that landed between
+        // the marker commit and this dispatch.
+        const LIST_MAX_ATTEMPTS: u32 = 3;
+        let backoffs = [
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(500),
+        ];
+
         for seq in &terminal_seqs {
+            let mut configs: Vec<turul_a2a_proto::TaskPushNotificationConfig> = Vec::new();
+            let mut page_token: Option<String> = None;
+            let fetch_outcome: Result<(), crate::storage::A2aStorageError> = loop {
+                let mut last_err: Option<crate::storage::A2aStorageError> = None;
+                let page = 'retry: loop {
+                    for attempt in 0..LIST_MAX_ATTEMPTS {
+                        if attempt > 0 {
+                            tokio::time::sleep(
+                                backoffs[(attempt as usize).min(backoffs.len() - 1)],
+                            )
+                            .await;
+                        }
+                        match self
+                            .push_storage
+                            .list_configs_eligible_at_event(
+                                &tenant,
+                                &task_id,
+                                *seq,
+                                page_token.as_deref(),
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(p) => break 'retry Some(p),
+                            Err(e) => last_err = Some(e),
+                        }
+                    }
+                    break 'retry None;
+                };
+                match page {
+                    Some(p) => {
+                        configs.extend(p.configs);
+                        if p.next_page_token.is_empty() {
+                            break Ok(());
+                        }
+                        page_token = Some(p.next_page_token);
+                    }
+                    None => {
+                        break Err(last_err.unwrap_or_else(|| {
+                            crate::storage::A2aStorageError::DatabaseError(
+                                "list_configs_eligible_at_event exhausted retry budget \
+                                 without recording an error"
+                                    .into(),
+                            )
+                        }));
+                    }
+                }
+            };
+
+            if let Err(e) = fetch_outcome {
+                // Marker stays in place so the reclaim sweep will
+                // retry this dispatch once the config store recovers.
+                tracing::error!(
+                    target: "turul_a2a::push_dispatch_config_list_failed",
+                    tenant = %tenant,
+                    task_id = %task_id,
+                    event_sequence = *seq,
+                    error = %e,
+                    "push dispatch aborted: list_configs_eligible_at_event failed after \
+                     bounded retry; pending-dispatch marker retained for reclaim sweep"
+                );
+                continue;
+            }
+
+            // No eligible configs — either none registered, or all
+            // registered AFTER this event's commit. Either way,
+            // delete the marker and move on.
+            if configs.is_empty() {
+                let _ = self
+                    .push_delivery_store_handle()
+                    .delete_pending_dispatch(&tenant, &task_id, *seq)
+                    .await;
+                continue;
+            }
+
+            // Fan out per config, awaiting each task so the marker
+            // isn't deleted until every per-config deliver has returned.
+            let mut join_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
             for cfg in &configs {
                 let Some(target) =
                     PushTarget::from_config(&tenant, &owner, &task_id, *seq, cfg)
@@ -291,17 +274,10 @@ impl PushDispatcher {
                     }
                 }));
             }
-        }
-        for h in join_handles {
-            let _ = h.await;
-        }
+            for h in join_handles {
+                let _ = h.await;
+            }
 
-        // All per-config deliveries have returned. Each either has
-        // a terminal claim row (nothing more to do) or a
-        // non-terminal claim row that `list_reclaimable_claims`
-        // will surface — both cases are beyond what the
-        // pending-dispatch marker protects. Delete the markers.
-        for seq in &terminal_seqs {
             let _ = self
                 .push_delivery_store_handle()
                 .delete_pending_dispatch(&tenant, &task_id, *seq)
@@ -366,9 +342,31 @@ impl PushDispatcher {
             }
         };
 
-        // Re-run the fan-out for this event. The inner logic
-        // refreshes the marker's recorded_at before list_configs
-        // and deletes it after completion.
+        // Refresh `recorded_at` on the marker so a long-running
+        // redispatch doesn't have the scheduler re-pick the same
+        // marker via `list_stale_pending_dispatches`. The marker
+        // itself was written atomically at commit time (ADR-013 §4.3);
+        // the atomic-store opt-in already guarantees its durable
+        // presence. This call is an idempotent upsert solely to
+        // advance the staleness clock for the in-progress sweep.
+        if let Err(e) = self
+            .push_delivery_store_handle()
+            .record_pending_dispatch(&tenant, &owner, &task_id, event_sequence)
+            .await
+        {
+            tracing::warn!(
+                target: "turul_a2a::push_pending_dispatch_refresh_failed",
+                tenant = %tenant,
+                task_id = %task_id,
+                event_sequence = event_sequence,
+                error = %e,
+                "redispatch marker refresh failed; fan-out continues but \
+                 scheduler may re-pick the marker before this tick finishes"
+            );
+        }
+
+        // Re-run the fan-out for this event. run_fanout deletes the
+        // marker after completion.
         self.run_fanout(tenant, owner, task_id, task, vec![event_sequence])
             .await;
     }

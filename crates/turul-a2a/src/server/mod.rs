@@ -398,6 +398,39 @@ impl A2aServerBuilder {
                  ADR-009 requires all storage traits to share the same backend."
             )));
         }
+
+        // Push-dispatch consistency (ADR-013 §4.3): the atomic store's
+        // opt-in flag and the presence of `push_delivery_store` MUST
+        // agree. Both-true = push fully wired; both-false = non-push
+        // deployment. The mixed cases are build errors — one orphans a
+        // load-bearing marker table without a consumer, the other
+        // wires a dispatcher that will never receive durable markers.
+        match (
+            push_delivery_store.is_some(),
+            atomic_store.push_dispatch_enabled(),
+        ) {
+            (true, true) | (false, false) => {}
+            (true, false) => {
+                return Err(A2aError::Internal(
+                    "push_delivery_store wired but atomic_store.push_dispatch_enabled() \
+                     is false. Call .with_push_dispatch_enabled(true) on the backend \
+                     storage before passing it to .storage()."
+                        .into(),
+                ));
+            }
+            (false, true) => {
+                return Err(A2aError::Internal(
+                    "atomic_store.push_dispatch_enabled() is true but no \
+                     push_delivery_store is wired. Pending-dispatch markers would be \
+                     written with no consumer, imposing load-bearing infra for no \
+                     benefit. If you need to populate markers for an external \
+                     consumer, open an issue for a distinctly-named opt-in — for now, \
+                     this configuration is rejected."
+                        .into(),
+                ));
+            }
+        }
+
         let push_dispatcher: Option<Arc<crate::push::PushDispatcher>> =
             if let Some(push_delivery) = push_delivery_store.as_ref() {
                 let push_delivery_backend = push_delivery.backend_name();
@@ -894,7 +927,7 @@ mod tests {
 
     #[test]
     fn builder_with_explicit_storage() {
-        let storage = InMemoryA2aStorage::new();
+        let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
         let server = A2aServer::builder()
             .executor(DummyExecutor)
             .storage(storage)
@@ -987,7 +1020,7 @@ mod tests {
         // Single .storage() call — the preferred path
         let result = A2aServer::builder()
             .executor(DummyExecutor)
-            .storage(InMemoryA2aStorage::new())
+            .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
             .build();
 
         assert!(result.is_ok(), "Unified .storage() should be accepted");
@@ -1069,7 +1102,7 @@ mod tests {
         // somewhere to claim against.
         let server = A2aServer::builder()
             .executor(DummyExecutor)
-            .storage(InMemoryA2aStorage::new())
+            .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
             .build()
             .expect("build must succeed");
         assert!(
@@ -1097,7 +1130,7 @@ mod tests {
         // The individual setter exists for mixed-backend tests. It should
         // also satisfy the same-backend check when paired with matching
         // storage.
-        let storage = InMemoryA2aStorage::new();
+        let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
         let server = A2aServer::builder()
             .executor(DummyExecutor)
             .storage(storage.clone())
@@ -1107,6 +1140,93 @@ mod tests {
         assert!(server.state.push_delivery_store.is_some());
     }
 
+    // -----------------------------------------------------------------
+    // Push-dispatch consistency (ADR-013 §4.3 / §10.2)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn builder_rejects_push_consumer_without_dispatch_enabled() {
+        // `push_delivery_store` wired + atomic store's
+        // `push_dispatch_enabled=false` ⇒ consumer would never receive
+        // durable markers. Build must fail and cite `with_push_dispatch_enabled`.
+        let storage = InMemoryA2aStorage::new(); // flag defaults to false
+        let res = A2aServer::builder()
+            .executor(DummyExecutor)
+            .task_storage(storage.clone())
+            .push_storage(storage.clone())
+            .event_store(storage.clone())
+            .atomic_store(storage.clone())
+            .cancellation_supervisor(storage.clone())
+            .push_delivery_store(storage)
+            .build();
+        let err = match res {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("orphan delivery store must be rejected"),
+        };
+        assert!(
+            err.contains("push_delivery_store wired")
+                && err.contains("push_dispatch_enabled")
+                && err.contains("with_push_dispatch_enabled(true)"),
+            "error should name the fix: {err}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_push_dispatch_without_consumer() {
+        // `push_dispatch_enabled=true` + no `push_delivery_store` ⇒
+        // markers would accumulate with no reader. Build must fail and
+        // mention the no-consumer rationale.
+        let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
+        let res = A2aServer::builder()
+            .executor(DummyExecutor)
+            .task_storage(storage.clone())
+            .push_storage(storage.clone())
+            .event_store(storage.clone())
+            .atomic_store(storage.clone())
+            .cancellation_supervisor(storage)
+            // deliberately no .push_delivery_store(...)
+            .build();
+        let err = match res {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("orphan dispatch flag must be rejected"),
+        };
+        assert!(
+            err.contains("push_dispatch_enabled() is true")
+                && err.contains("no consumer"),
+            "error should cite the orphaned-marker rationale: {err}"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_push_fully_wired() {
+        // Positive case: both flag on and delivery store wired.
+        let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
+        let res = A2aServer::builder()
+            .executor(DummyExecutor)
+            .storage(storage)
+            .build();
+        assert!(res.is_ok(), "push fully wired must build: {:?}", res.err());
+    }
+
+    #[test]
+    fn builder_accepts_non_push_deployment() {
+        // Positive case: both flag off and no delivery store.
+        let storage = InMemoryA2aStorage::new(); // flag defaults to false
+        let res = A2aServer::builder()
+            .executor(DummyExecutor)
+            .task_storage(storage.clone())
+            .push_storage(storage.clone())
+            .event_store(storage.clone())
+            .atomic_store(storage.clone())
+            .cancellation_supervisor(storage)
+            .build();
+        assert!(
+            res.is_ok(),
+            "non-push deployment must build: {:?}",
+            res.err()
+        );
+    }
+
     #[test]
     fn retry_horizon_violation_rejected() {
         // push_claim_expiry <= max_attempts * backoff_cap must fail fast
@@ -1114,7 +1234,7 @@ mod tests {
         // trigger the check.
         let res = A2aServer::builder()
             .executor(DummyExecutor)
-            .storage(InMemoryA2aStorage::new())
+            .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
             .push_max_attempts(10)
             .push_backoff_cap(Duration::from_secs(60))
             // 10 * 60s = 600s — equal to claim expiry, which is <=, so rejected.
@@ -1169,7 +1289,7 @@ mod tests {
         // same claim-store Arc the builder installed.
         let server = A2aServer::builder()
             .executor(DummyExecutor)
-            .storage(InMemoryA2aStorage::new())
+            .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
             .middleware(Arc::new(ContribMiddleware))
             .build()
             .expect("build must succeed");
@@ -1193,7 +1313,7 @@ mod tests {
         // the original state unchanged — the store must still be present.
         let server = A2aServer::builder()
             .executor(DummyExecutor)
-            .storage(InMemoryA2aStorage::new())
+            .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
             .build()
             .expect("build must succeed");
         let (state, had_security) = server.into_augmented_state();
@@ -1206,7 +1326,7 @@ mod tests {
         // push_claim_expiry > max_attempts * backoff_cap succeeds.
         let server = A2aServer::builder()
             .executor(DummyExecutor)
-            .storage(InMemoryA2aStorage::new())
+            .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
             .push_max_attempts(5)
             .push_backoff_cap(Duration::from_secs(60))
             .push_claim_expiry(Duration::from_secs(5 * 60 + 1))

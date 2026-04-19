@@ -3045,3 +3045,413 @@ where
         "loser must see ClaimAlreadyHeld (not a raw DB error); got {results:?}"
     );
 }
+
+// =========================================================
+// Atomic pending-dispatch marker parity (ADR-013 §4.3 / §10.1)
+//
+// When the atomic store opts into `push_dispatch_enabled`, a
+// terminal `StatusUpdate` commit MUST also insert a row into
+// `a2a_push_pending_dispatches` in the same native transaction;
+// non-terminal status commits and artifact-only commits MUST NOT.
+// =========================================================
+
+/// PDM-001: a terminal `StatusUpdate` commit writes a marker row
+/// in the same transaction.
+pub async fn test_atomic_marker_written_for_terminal_status(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    delivery: &dyn A2aPushDeliveryStore,
+) {
+    assert!(
+        atomic.push_dispatch_enabled(),
+        "PDM parity test requires an atomic store that has opted in \
+         via with_push_dispatch_enabled(true)"
+    );
+
+    // Seed Working so the terminal transition is valid.
+    let task = Task::new("pdm-001", TaskStatus::new(TaskState::Working))
+        .with_context_id("ctx-pdm-001");
+    tasks
+        .create_task("default", "owner-1", task)
+        .await
+        .expect("seed task");
+
+    let terminal = make_status_event_for("pdm-001", "ctx-pdm-001", "TASK_STATE_COMPLETED");
+    let (_task, seqs) = atomic
+        .update_task_status_with_events(
+            "default",
+            "pdm-001",
+            "owner-1",
+            TaskStatus::new(TaskState::Completed),
+            vec![terminal],
+        )
+        .await
+        .expect("terminal atomic commit");
+    assert_eq!(seqs.len(), 1);
+
+    let pending = delivery
+        .list_stale_pending_dispatches(SystemTime::now() + Duration::from_secs(60), 16)
+        .await
+        .expect("list markers");
+    let hit = pending
+        .iter()
+        .find(|p| p.task_id == "pdm-001" && p.event_sequence == seqs[0]);
+    assert!(
+        hit.is_some(),
+        "terminal commit must produce a pending-dispatch marker; got {pending:?}"
+    );
+}
+
+/// PDM-002: a non-terminal `StatusUpdate` commit does NOT produce
+/// a marker row.
+pub async fn test_atomic_marker_skipped_for_non_terminal_status(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    delivery: &dyn A2aPushDeliveryStore,
+) {
+    assert!(atomic.push_dispatch_enabled());
+
+    let task = Task::new("pdm-002", TaskStatus::new(TaskState::Submitted))
+        .with_context_id("ctx-pdm-002");
+    tasks
+        .create_task("default", "owner-1", task)
+        .await
+        .expect("seed task");
+
+    let working = make_status_event_for("pdm-002", "ctx-pdm-002", "TASK_STATE_WORKING");
+    atomic
+        .update_task_status_with_events(
+            "default",
+            "pdm-002",
+            "owner-1",
+            TaskStatus::new(TaskState::Working),
+            vec![working],
+        )
+        .await
+        .expect("non-terminal commit");
+
+    let pending = delivery
+        .list_stale_pending_dispatches(SystemTime::now() + Duration::from_secs(60), 64)
+        .await
+        .expect("list markers");
+    assert!(
+        pending.iter().all(|p| p.task_id != "pdm-002"),
+        "non-terminal commit must NOT write a marker; got {pending:?}"
+    );
+}
+
+/// PDM-003: an `ArtifactUpdate` event (even if the task is terminal
+/// at the time of commit — e.g. an emit_artifact against a Working
+/// task) does NOT produce a marker row.
+pub async fn test_atomic_marker_skipped_for_artifact_event(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+    delivery: &dyn A2aPushDeliveryStore,
+) {
+    assert!(atomic.push_dispatch_enabled());
+
+    let task = Task::new("pdm-003", TaskStatus::new(TaskState::Working))
+        .with_context_id("ctx-pdm-003");
+    tasks
+        .create_task("default", "owner-1", task.clone())
+        .await
+        .expect("seed task");
+
+    // Update the task with an artifact-only event — no status change.
+    let artifact_event = StreamEvent::ArtifactUpdate {
+        artifact_update: crate::streaming::ArtifactUpdatePayload {
+            task_id: "pdm-003".into(),
+            context_id: "ctx-pdm-003".into(),
+            artifact: serde_json::json!({"id": "a-1", "parts": []}),
+            append: false,
+            last_chunk: true,
+        },
+    };
+    let mut mutated = task.clone();
+    mutated.push_text_artifact("a-1", "r", "hello");
+    atomic
+        .update_task_with_events("default", "owner-1", mutated, vec![artifact_event])
+        .await
+        .expect("artifact commit");
+
+    // Ensure the event landed.
+    let stored = events
+        .get_events_after("default", "pdm-003", 0)
+        .await
+        .expect("events");
+    assert!(!stored.is_empty(), "artifact event must be appended");
+
+    let pending = delivery
+        .list_stale_pending_dispatches(SystemTime::now() + Duration::from_secs(60), 64)
+        .await
+        .expect("list markers");
+    assert!(
+        pending.iter().all(|p| p.task_id != "pdm-003"),
+        "artifact-only commit must NOT write a marker; got {pending:?}"
+    );
+}
+
+/// PDM-004: with the opt-in OFF, a terminal commit does NOT
+/// produce a marker row (existing non-push deployments remain
+/// untouched). Backend test modules call this with a SEPARATE
+/// storage instance that does NOT enable `push_dispatch_enabled`.
+pub async fn test_atomic_marker_absent_when_opt_in_off(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    delivery: &dyn A2aPushDeliveryStore,
+) {
+    assert!(
+        !atomic.push_dispatch_enabled(),
+        "PDM-004 expects an atomic store with push_dispatch_enabled() == false"
+    );
+
+    let task = Task::new("pdm-004", TaskStatus::new(TaskState::Working))
+        .with_context_id("ctx-pdm-004");
+    tasks
+        .create_task("default", "owner-1", task)
+        .await
+        .expect("seed task");
+
+    let terminal = make_status_event_for("pdm-004", "ctx-pdm-004", "TASK_STATE_COMPLETED");
+    atomic
+        .update_task_status_with_events(
+            "default",
+            "pdm-004",
+            "owner-1",
+            TaskStatus::new(TaskState::Completed),
+            vec![terminal],
+        )
+        .await
+        .expect("terminal commit");
+
+    let pending = delivery
+        .list_stale_pending_dispatches(SystemTime::now() + Duration::from_secs(60), 64)
+        .await
+        .expect("list markers");
+    assert!(
+        pending.iter().all(|p| p.task_id != "pdm-004"),
+        "opt-in OFF: no marker expected; got {pending:?}"
+    );
+}
+
+// =========================================================
+// Causal eligibility parity (ADR-013 §4.5 / §10.3)
+//
+// `list_configs_eligible_at_event(seq)` filters configs whose
+// `registered_after_event_sequence < seq`. STRICT less-than:
+// a config registered AT seq N is not eligible for event seq N.
+// =========================================================
+
+/// PEF-001 (ADR-013 §10.3): commit two non-terminal events, register
+/// config C1, commit terminal event (seq=3), register config C2.
+/// `list_configs_eligible_at_event(3)` returns C1 only.
+pub async fn test_config_registered_at_or_after_event_not_eligible(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    push: &dyn A2aPushNotificationStorage,
+) {
+    let tenant = "t-pef-001";
+    let task_id = "task-pef-001";
+    let owner = "owner-1";
+
+    // Seed Working so the terminal transition is valid.
+    let task = Task::new(task_id, TaskStatus::new(TaskState::Working))
+        .with_context_id("ctx-pef-001");
+    tasks
+        .create_task(tenant, owner, task.clone())
+        .await
+        .expect("seed task");
+
+    // Commit two artifact events via `update_task_with_events` —
+    // this bumps `latest_event_sequence` to 2 without altering the
+    // state machine. Artifact events exercise the same unconditional
+    // latest_event_sequence maintenance that ADR-013 §6.3 requires.
+    let artifact_evt = |n: u32| StreamEvent::ArtifactUpdate {
+        artifact_update: crate::streaming::ArtifactUpdatePayload {
+            task_id: task_id.into(),
+            context_id: "ctx-pef-001".into(),
+            artifact: serde_json::json!({"id": format!("a-{n}"), "parts": []}),
+            append: false,
+            last_chunk: true,
+        },
+    };
+    atomic
+        .update_task_with_events(tenant, owner, task.clone(), vec![artifact_evt(1)])
+        .await
+        .expect("commit 1");
+    atomic
+        .update_task_with_events(tenant, owner, task.clone(), vec![artifact_evt(2)])
+        .await
+        .expect("commit 2");
+
+    // Register C1 — CAS reads latest_event_sequence = 2, stamps C1 with
+    // registered_after_event_sequence = 2.
+    push.create_config(
+        tenant,
+        turul_a2a_proto::TaskPushNotificationConfig {
+            tenant: tenant.into(),
+            id: "cfg-pef-c1".into(),
+            task_id: task_id.into(),
+            url: "https://example.invalid/c1".into(),
+            token: String::new(),
+            authentication: None,
+        },
+    )
+    .await
+    .expect("register C1");
+
+    // Commit terminal event → sequence 3.
+    let completed_status = TaskStatus::new(TaskState::Completed);
+    let terminal = make_status_event_for(task_id, "ctx-pef-001", "TASK_STATE_COMPLETED");
+    let (_t, seqs) = atomic
+        .update_task_status_with_events(
+            tenant,
+            task_id,
+            owner,
+            completed_status,
+            vec![terminal],
+        )
+        .await
+        .expect("terminal commit");
+    let terminal_seq = seqs[0];
+    assert_eq!(terminal_seq, 3, "expected seq 3 after two working + one terminal");
+
+    // Register C2 AFTER the terminal commit. CAS reads
+    // latest_event_sequence = 3, stamps C2 with seq=3.
+    push.create_config(
+        tenant,
+        turul_a2a_proto::TaskPushNotificationConfig {
+            tenant: tenant.into(),
+            id: "cfg-pef-c2".into(),
+            task_id: task_id.into(),
+            url: "https://example.invalid/c2".into(),
+            token: String::new(),
+            authentication: None,
+        },
+    )
+    .await
+    .expect("register C2");
+
+    // Eligibility for terminal seq 3: C1 (2 < 3 true), C2 (3 < 3 false).
+    let eligible = push
+        .list_configs_eligible_at_event(tenant, task_id, terminal_seq, None, Some(100))
+        .await
+        .expect("list eligible");
+    let ids: Vec<_> = eligible.configs.iter().map(|c| c.id.clone()).collect();
+    assert!(
+        ids.contains(&"cfg-pef-c1".to_string()),
+        "C1 must be eligible for seq 3 (registered at seq 2); got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"cfg-pef-c2".to_string()),
+        "C2 must NOT be eligible for seq 3 (registered at seq 3); got {ids:?}"
+    );
+
+    // And for completeness: `list_configs` (unfiltered) includes both.
+    let all = push
+        .list_configs(tenant, task_id, None, Some(100))
+        .await
+        .expect("list all");
+    let all_ids: Vec<_> = all.configs.iter().map(|c| c.id.clone()).collect();
+    assert!(
+        all_ids.contains(&"cfg-pef-c1".to_string())
+            && all_ids.contains(&"cfg-pef-c2".to_string()),
+        "list_configs must still return both configs; got {all_ids:?}"
+    );
+}
+
+/// PEF-002 (ADR-013 §10.4 — sequential half): a `create_config`
+/// call that runs AFTER a terminal commit sees the advanced
+/// `latest_event_sequence` and stamps its config accordingly —
+/// so the stamped config is excluded from fan-out for the event
+/// that advanced the floor.
+///
+/// NOTE: this test covers only the simple sequential ordering and
+/// does NOT exercise the interleaving race between `create_config`'s
+/// CAS read and CAS write. The interleaving case is pinned by
+/// `test_create_config_cas_retries_under_interleaving` (in-memory
+/// backend only, with a test instrumentation hook). For SQL and
+/// DynamoDB, the CAS race is protected by their native transaction
+/// mechanisms — SQLite's conditional UPDATE detection, PostgreSQL's
+/// SERIALIZABLE isolation with SQLSTATE 40001 retry, DynamoDB's
+/// TransactWriteItems `ConditionCheck` on `latestEventSequence` —
+/// and is exercised under live-backend stress but not pinned with
+/// a parity-level deterministic test.
+pub async fn test_late_create_config_stamps_advanced_sequence(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    push: &dyn A2aPushNotificationStorage,
+) {
+    let tenant = "t-pef-002";
+    let task_id = "task-pef-002";
+    let owner = "owner-1";
+
+    let task = Task::new(task_id, TaskStatus::new(TaskState::Working))
+        .with_context_id("ctx-pef-002");
+    tasks
+        .create_task(tenant, owner, task.clone())
+        .await
+        .expect("seed task");
+
+    // Bump latest_event_sequence to 5 via artifact-only commits —
+    // avoids the state-machine constraint on repeated Working→Working
+    // transitions while still exercising the unconditional
+    // latest_event_sequence maintenance.
+    for i in 0..5 {
+        let evt = StreamEvent::ArtifactUpdate {
+            artifact_update: crate::streaming::ArtifactUpdatePayload {
+                task_id: task_id.into(),
+                context_id: "ctx-pef-002".into(),
+                artifact: serde_json::json!({"id": format!("a-{i}"), "parts": []}),
+                append: false,
+                last_chunk: true,
+            },
+        };
+        atomic
+            .update_task_with_events(tenant, owner, task.clone(), vec![evt])
+            .await
+            .expect("working commit");
+    }
+
+    // Commit terminal → seq 6.
+    let terminal = make_status_event_for(task_id, "ctx-pef-002", "TASK_STATE_COMPLETED");
+    let (_t, seqs) = atomic
+        .update_task_status_with_events(
+            tenant,
+            task_id,
+            owner,
+            TaskStatus::new(TaskState::Completed),
+            vec![terminal],
+        )
+        .await
+        .expect("terminal commit");
+    let terminal_seq = seqs[0];
+    assert_eq!(terminal_seq, 6);
+
+    // Register config AFTER the terminal commit. Floor is read at
+    // 6, so this config is excluded from fan-out of seq 6.
+    push.create_config(
+        tenant,
+        turul_a2a_proto::TaskPushNotificationConfig {
+            tenant: tenant.into(),
+            id: "cfg-pef-late".into(),
+            task_id: task_id.into(),
+            url: "https://example.invalid/late".into(),
+            token: String::new(),
+            authentication: None,
+        },
+    )
+    .await
+    .expect("register late config");
+
+    let eligible = push
+        .list_configs_eligible_at_event(tenant, task_id, terminal_seq, None, Some(100))
+        .await
+        .expect("list eligible");
+    assert!(
+        eligible.configs.is_empty(),
+        "late config must not be eligible for the terminal event; got {:?}",
+        eligible.configs.iter().map(|c| &c.id).collect::<Vec<_>>()
+    );
+}

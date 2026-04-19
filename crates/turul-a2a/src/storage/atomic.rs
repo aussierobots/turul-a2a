@@ -26,6 +26,30 @@ use super::error::A2aStorageError;
 pub trait A2aAtomicStore: Send + Sync {
     fn backend_name(&self) -> &'static str;
 
+    /// Does this atomic store also write pending-dispatch markers atomically
+    /// with terminal status commits? (ADR-013 §4.3, §6.1 — normative)
+    ///
+    /// `false` (default): task + event rows only. Non-push deployments never
+    /// touch `a2a_push_pending_dispatches`; no marker writes, no IAM, no
+    /// table to provision.
+    ///
+    /// `true`: after the task and event rows are written in the native
+    /// transaction, the implementation iterates the events and, for each
+    /// terminal `StreamEvent::StatusUpdate`, writes a row to
+    /// `a2a_push_pending_dispatches` in the same transaction. Failure of
+    /// the marker write rolls the whole transaction back.
+    ///
+    /// Opted in via a backend-specific constructor (for example
+    /// `InMemoryA2aStorage::with_push_dispatch_enabled(true)`). The server
+    /// and Lambda builders reject inconsistent wiring in both directions:
+    /// `push_delivery_store` present with the flag off is a build error;
+    /// the flag on with no `push_delivery_store` is also a build error
+    /// (ADR-013 §4.3) — pending-dispatch markers are never written without
+    /// a consumer.
+    fn push_dispatch_enabled(&self) -> bool {
+        false
+    }
+
     /// Create a task and append initial events atomically.
     /// Returns the created task and assigned event sequences.
     async fn create_task_with_events(

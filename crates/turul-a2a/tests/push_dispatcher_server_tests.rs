@@ -132,7 +132,7 @@ async fn framework_cancel_triggers_push_delivery_with_canceled_state() {
     // deployments the default 5s grace is plenty. The wiremock URL
     // resolves to 127.0.0.1, which the SSRF guard would reject
     // without `allow_insecure_push_urls(true)`.
-    let storage = InMemoryA2aStorage::new();
+    let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
     let server = A2aServer::builder()
         .executor(DummyExecutor)
         .storage(storage.clone())
@@ -305,6 +305,22 @@ impl turul_a2a::storage::A2aPushNotificationStorage for TinyPageStorage {
     ) -> Result<(), turul_a2a::storage::A2aStorageError> {
         self.inner.delete_config(tenant, task_id, config_id).await
     }
+    async fn list_configs_eligible_at_event(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        page_token: Option<&str>,
+        _page_size: Option<i32>,
+    ) -> Result<turul_a2a::storage::PushConfigListPage, turul_a2a::storage::A2aStorageError> {
+        // Force page_size=1 on the eligibility path too, so the
+        // dispatcher-pagination regression test still exercises the
+        // multi-page traversal after ADR-013's list_configs → eligible
+        // switch.
+        self.inner
+            .list_configs_eligible_at_event(tenant, task_id, event_sequence, page_token, Some(1))
+            .await
+    }
 }
 
 #[tokio::test]
@@ -323,7 +339,7 @@ async fn dispatcher_paginates_through_all_push_configs() {
         .mount(&mock)
         .await;
 
-    let inner = Arc::new(InMemoryA2aStorage::new());
+    let inner = Arc::new(InMemoryA2aStorage::new().with_push_dispatch_enabled(true));
     let tiny_push: Arc<dyn turul_a2a::storage::A2aPushNotificationStorage> =
         Arc::new(TinyPageStorage {
             inner: inner.clone(),
@@ -422,7 +438,7 @@ async fn dispatcher_paginates_through_all_push_configs() {
 
 #[tokio::test]
 async fn push_config_create_rejects_unparseable_url() {
-    let storage = InMemoryA2aStorage::new();
+    let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
     let server = A2aServer::builder()
         .executor(DummyExecutor)
         .storage(storage.clone())
@@ -527,7 +543,7 @@ async fn executor_completion_triggers_push_delivery_with_completed_state() {
         .await;
 
     // --- Server with gated executor -------------------------------
-    let storage = InMemoryA2aStorage::new();
+    let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
     let gate = Arc::new(Notify::new());
     let server = A2aServer::builder()
         .executor(GatedExecutor {

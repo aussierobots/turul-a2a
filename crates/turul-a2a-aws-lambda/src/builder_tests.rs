@@ -182,6 +182,19 @@ impl A2aPushNotificationStorage for FakeBackend {
     ) -> Result<(), A2aStorageError> {
         Ok(())
     }
+    async fn list_configs_eligible_at_event(
+        &self,
+        _t: &str,
+        _tid: &str,
+        _seq: u64,
+        _p: Option<&str>,
+        _ps: Option<i32>,
+    ) -> Result<turul_a2a::storage::PushConfigListPage, A2aStorageError> {
+        Ok(turul_a2a::storage::PushConfigListPage {
+            configs: vec![],
+            next_page_token: String::new(),
+        })
+    }
 }
 
 #[async_trait]

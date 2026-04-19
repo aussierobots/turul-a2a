@@ -1137,6 +1137,35 @@ impl turul_a2a::storage::A2aPushNotificationStorage for FailingPushStorage {
     ) -> Result<(), A2aStorageError> {
         self.inner.delete_config(tenant, task_id, config_id).await
     }
+    async fn list_configs_eligible_at_event(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        page_token: Option<&str>,
+        page_size: Option<i32>,
+    ) -> Result<turul_a2a::storage::PushConfigListPage, A2aStorageError> {
+        // Mirror the list_configs outage simulation for the
+        // eligibility path that the dispatcher now calls (ADR-013 §4.5).
+        *self.list_configs_calls.lock().unwrap() += 1;
+        let should_fail = {
+            let mut remaining = self.list_configs_failures_remaining.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                true
+            } else {
+                false
+            }
+        };
+        if should_fail {
+            return Err(A2aStorageError::DatabaseError(
+                "simulated push-config store list failure".into(),
+            ));
+        }
+        self.inner
+            .list_configs_eligible_at_event(tenant, task_id, event_sequence, page_token, page_size)
+            .await
+    }
 }
 
 #[tokio::test]
@@ -1272,7 +1301,10 @@ async fn pending_dispatch_marker_recovers_persistent_list_configs_outage() {
         .mount(&server)
         .await;
 
-    let inner = Arc::new(InMemoryA2aStorage::new());
+    // ADR-013 §4.3: opt in to atomic marker writes so the terminal
+    // transition below records the pending-dispatch marker in the
+    // same atomic boundary as the task/event commit.
+    let inner = Arc::new(InMemoryA2aStorage::new().with_push_dispatch_enabled(true));
     // Fail list_configs 4 times: 3 initial retries + 1 more after a
     // potential redispatch to ensure the first full fan-out attempt
     // fails. All later calls pass through.
@@ -1303,24 +1335,25 @@ async fn pending_dispatch_marker_recovers_persistent_list_configs_outage() {
     let tenant = "tenant-pd";
     let task_id = "task-pd-1";
     let owner = "anonymous";
-    let task = turul_a2a_types::Task::new(
+    // Seed task as Working, register the config, then transition
+    // to Completed via the atomic commit — which is where the
+    // pending-dispatch marker is now written (ADR-013 §4.3).
+    let working = turul_a2a_types::Task::new(
         task_id,
-        turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Completed),
+        turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Working),
     )
     .with_context_id("ctx-pd");
+    let completed_status = turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Completed);
     let completed = turul_a2a::streaming::StreamEvent::StatusUpdate {
         status_update: turul_a2a::streaming::StatusUpdatePayload {
             task_id: task_id.into(),
             context_id: "ctx-pd".into(),
-            status: serde_json::to_value(&turul_a2a_types::TaskStatus::new(
-                turul_a2a_types::TaskState::Completed,
-            ))
-            .unwrap(),
+            status: serde_json::to_value(&completed_status).unwrap(),
         },
     };
     use turul_a2a::storage::A2aAtomicStore;
     inner
-        .create_task_with_events(tenant, owner, task.clone(), vec![])
+        .create_task_with_events(tenant, owner, working, vec![])
         .await
         .expect("seed task");
     inner
@@ -1338,9 +1371,28 @@ async fn pending_dispatch_marker_recovers_persistent_list_configs_outage() {
         .await
         .expect("seed config");
 
+    // Atomic commit: writes task + event + pending-dispatch marker.
+    let (terminal_task, seqs) = inner
+        .update_task_status_with_events(
+            tenant,
+            task_id,
+            owner,
+            completed_status,
+            vec![completed.clone()],
+        )
+        .await
+        .expect("terminal commit");
+    let terminal_seq = seqs[0];
+
     // First dispatch: list_configs fails through its bounded retry,
-    // so the fan-out aborts after recording a pending marker.
-    dispatcher.dispatch(tenant.into(), owner.into(), task, vec![(1, completed)]);
+    // so the fan-out aborts. The marker written by the atomic commit
+    // remains in the store.
+    dispatcher.dispatch(
+        tenant.into(),
+        owner.into(),
+        terminal_task,
+        vec![(terminal_seq, completed)],
+    );
     tokio::time::sleep(Duration::from_millis(900)).await;
 
     // Marker must be present. `list_stale_pending_dispatches` with
@@ -1355,7 +1407,7 @@ async fn pending_dispatch_marker_recovers_persistent_list_configs_outage() {
         "persistent list_configs outage MUST leave a pending-dispatch marker; got {pending:?}"
     );
     assert_eq!(pending[0].task_id, task_id);
-    assert_eq!(pending[0].event_sequence, 1);
+    assert_eq!(pending[0].event_sequence, terminal_seq);
 
     // Simulate the reclaim sweep tick: drive redispatch. The
     // FailingPushStorage has one retry budget left, but the

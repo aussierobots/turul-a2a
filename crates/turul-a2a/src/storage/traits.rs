@@ -213,6 +213,25 @@ pub trait A2aPushNotificationStorage: Send + Sync {
         page_size: Option<i32>,
     ) -> Result<PushConfigListPage, A2aStorageError>;
 
+    /// List configs eligible for fan-out of a specific terminal event
+    /// (ADR-013 §4.5 / §6.2).
+    ///
+    /// Returns configs whose `registered_after_event_sequence <
+    /// event_sequence`. Strictly less-than: a config recorded AT
+    /// sequence N is not eligible for event sequence N, because the
+    /// event was already in flight when the config's create-time CAS
+    /// succeeded. The unfiltered `list_configs` remains for CRUD
+    /// endpoints; this method is for the dispatcher's fan-out path
+    /// and the Lambda recovery workers.
+    async fn list_configs_eligible_at_event(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        page_token: Option<&str>,
+        page_size: Option<i32>,
+    ) -> Result<PushConfigListPage, A2aStorageError>;
+
     /// Delete a push notification config. Idempotent — no error if not found.
     async fn delete_config(
         &self,

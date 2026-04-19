@@ -74,17 +74,33 @@ impl Default for DynamoDbConfig {
 pub struct DynamoDbA2aStorage {
     client: Client,
     config: DynamoDbConfig,
+    /// ADR-013 §4.3 opt-in — see `InMemoryA2aStorage::push_dispatch_enabled`.
+    push_dispatch_enabled: bool,
 }
 
 impl DynamoDbA2aStorage {
     pub async fn new(config: DynamoDbConfig) -> Result<Self, A2aStorageError> {
         let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = Client::new(&aws_config);
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            push_dispatch_enabled: false,
+        })
     }
 
     pub fn from_client(client: Client, config: DynamoDbConfig) -> Self {
-        Self { client, config }
+        Self {
+            client,
+            config,
+            push_dispatch_enabled: false,
+        }
+    }
+
+    /// Opt in to atomic pending-dispatch marker writes (ADR-013 §4.3).
+    pub fn with_push_dispatch_enabled(mut self, enabled: bool) -> Self {
+        self.push_dispatch_enabled = enabled;
+        self
     }
 
     fn task_key(tenant: &str, task_id: &str) -> String {
@@ -752,26 +768,127 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
         if config.id.is_empty() {
             config.id = uuid::Uuid::now_v7().to_string();
         }
-        let pk = format!("{tenant}#{}#{}", config.task_id, config.id);
+        let config_pk = format!("{tenant}#{}#{}", config.task_id, config.id);
+        let task_pk = Self::task_key(tenant, &config.task_id);
         let json = serde_json::to_string(&config)
             .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
 
-        let mut req = self.client
-            .put_item()
-            .table_name(&self.config.push_configs_table)
-            .item("pk", AttributeValue::S(pk))
-            .item("tenant", AttributeValue::S(tenant.to_string()))
-            .item("taskId", AttributeValue::S(config.task_id.clone()))
-            .item("configId", AttributeValue::S(config.id.clone()))
-            .item("configJson", AttributeValue::S(json));
-        if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
-            req = req.item("ttl", ttl);
-        }
-        req.send()
-            .await
-            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+        // ADR-013 §6.4 causal-floor CAS: read
+        // `a2a_tasks[task_pk].latestEventSequence`, then issue
+        // `TransactWriteItems { ConditionCheck on latestEventSequence =
+        // :seq_read, Put config }`. A concurrent atomic commit that
+        // advanced `latestEventSequence` between our read and the
+        // transaction surfaces as `TransactionCanceledException`
+        // whose CancellationReason cites the ConditionCheck; the
+        // outer loop retries with backoff.
+        //
+        // If the task row does not exist yet, the CAS targets
+        // `attribute_not_exists(pk)` — no concurrent writer can race
+        // us on a task that does not exist.
+        const MAX_ATTEMPTS: u32 = 5;
+        let backoffs_ms: [u64; 4] = [10, 50, 250, 1000];
+        for attempt in 0..MAX_ATTEMPTS {
+            // Read current latest_event_sequence (0 if row absent).
+            let seq_read =
+                query_latest_event_sequence(&self.client, &self.config.tasks_table, &task_pk)
+                    .await?;
 
-        Ok(config)
+            // Build the ConditionCheck — branch on task existence.
+            let task_exists = self
+                .client
+                .get_item()
+                .table_name(&self.config.tasks_table)
+                .key("pk", AttributeValue::S(task_pk.clone()))
+                .projection_expression("pk")
+                .send()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?
+                .item
+                .is_some();
+
+            let condition_check = if task_exists {
+                aws_sdk_dynamodb::types::ConditionCheck::builder()
+                    .table_name(&self.config.tasks_table)
+                    .key("pk", AttributeValue::S(task_pk.clone()))
+                    .condition_expression(
+                        "latestEventSequence = :seq OR \
+                         (attribute_not_exists(latestEventSequence) AND :seq = :zero)",
+                    )
+                    .expression_attribute_values(
+                        ":seq",
+                        AttributeValue::N(seq_read.to_string()),
+                    )
+                    .expression_attribute_values(":zero", AttributeValue::N("0".into()))
+                    .build()
+                    .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?
+            } else {
+                aws_sdk_dynamodb::types::ConditionCheck::builder()
+                    .table_name(&self.config.tasks_table)
+                    .key("pk", AttributeValue::S(task_pk.clone()))
+                    .condition_expression("attribute_not_exists(pk)")
+                    .build()
+                    .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?
+            };
+
+            let mut config_put = aws_sdk_dynamodb::types::Put::builder()
+                .table_name(&self.config.push_configs_table)
+                .item("pk", AttributeValue::S(config_pk.clone()))
+                .item("tenant", AttributeValue::S(tenant.to_string()))
+                .item("taskId", AttributeValue::S(config.task_id.clone()))
+                .item("configId", AttributeValue::S(config.id.clone()))
+                .item("configJson", AttributeValue::S(json.clone()))
+                .item(
+                    "registeredAfterEventSequence",
+                    AttributeValue::N(seq_read.to_string()),
+                );
+            if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
+                config_put = config_put.item("ttl", ttl);
+            }
+            let config_put = config_put
+                .build()
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+
+            let items = vec![
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .condition_check(condition_check)
+                    .build(),
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(config_put)
+                    .build(),
+            ];
+
+            let send_result = self
+                .client
+                .transact_write_items()
+                .set_transact_items(Some(items))
+                .send()
+                .await;
+
+            match send_result {
+                Ok(_) => return Ok(config),
+                Err(e) => {
+                    let err_dbg = format!("{e:?}");
+                    let is_cas_loss = err_dbg.contains("TransactionCanceledException")
+                        && err_dbg.contains("ConditionalCheckFailed");
+                    if is_cas_loss && attempt + 1 < MAX_ATTEMPTS {
+                        let ms = backoffs_ms[attempt as usize];
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                        continue;
+                    }
+                    if is_cas_loss {
+                        return Err(A2aStorageError::CreateConfigCasTimeout {
+                            tenant: tenant.into(),
+                            task_id: config.task_id.clone(),
+                        });
+                    }
+                    return Err(A2aStorageError::DatabaseError(err_dbg));
+                }
+            }
+        }
+        Err(A2aStorageError::CreateConfigCasTimeout {
+            tenant: tenant.into(),
+            task_id: config.task_id.clone(),
+        })
     }
 
     async fn get_config(
@@ -875,9 +992,104 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
         Ok(())
     }
+
+    async fn list_configs_eligible_at_event(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        page_token: Option<&str>,
+        page_size: Option<i32>,
+    ) -> Result<PushConfigListPage, A2aStorageError> {
+        let page_size = page_size.map(|ps| ps.clamp(1, 100)).unwrap_or(50);
+
+        // Scan with filter on tenant + taskId + strict registeredAfter
+        // upper bound. Pre-migration rows have the attribute absent;
+        // default-0 semantics require `attribute_not_exists(...)` to
+        // count as 0 < event_sequence when event_sequence > 0.
+        let result = self
+            .client
+            .scan()
+            .table_name(&self.config.push_configs_table)
+            .filter_expression(
+                "tenant = :t AND taskId = :tid AND \
+                 (registeredAfterEventSequence < :seq OR \
+                  attribute_not_exists(registeredAfterEventSequence))",
+            )
+            .expression_attribute_values(":t", AttributeValue::S(tenant.to_string()))
+            .expression_attribute_values(":tid", AttributeValue::S(task_id.to_string()))
+            .expression_attribute_values(
+                ":seq",
+                AttributeValue::N(event_sequence.to_string()),
+            )
+            .send()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+
+        let items = result.items.unwrap_or_default();
+        let mut configs: Vec<turul_a2a_proto::TaskPushNotificationConfig> = items
+            .iter()
+            .filter_map(|item| {
+                item.get("configJson")
+                    .and_then(|v| v.as_s().ok())
+                    .and_then(|json| serde_json::from_str(json).ok())
+            })
+            .collect();
+        configs.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let start_idx = if let Some(token) = page_token {
+            configs
+                .iter()
+                .position(|c| c.id.as_str() > token)
+                .unwrap_or(configs.len())
+        } else {
+            0
+        };
+
+        let end_idx = (start_idx + page_size as usize).min(configs.len());
+        let page_configs = configs[start_idx..end_idx].to_vec();
+
+        let next_page_token = if end_idx < configs.len() {
+            page_configs.last().map(|c| c.id.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        Ok(PushConfigListPage {
+            configs: page_configs,
+            next_page_token,
+        })
+    }
 }
 
 /// Helper: query the current max event sequence for a task.
+/// Read the stored `latestEventSequence` attribute for a task row.
+/// Returns 0 for a missing task or missing attribute — the Put/Update
+/// caller then overwrites with `max(0, new_seqs)` which preserves the
+/// ADR-013 §6.3 monotonic invariant.
+async fn query_latest_event_sequence(
+    client: &Client,
+    tasks_table: &str,
+    pk: &str,
+) -> Result<u64, A2aStorageError> {
+    let result = client
+        .get_item()
+        .table_name(tasks_table)
+        .key("pk", AttributeValue::S(pk.to_string()))
+        .projection_expression("latestEventSequence")
+        .send()
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+    if let Some(item) = result.item {
+        if let Some(AttributeValue::N(n)) = item.get("latestEventSequence") {
+            return n
+                .parse::<u64>()
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()));
+        }
+    }
+    Ok(0)
+}
+
 async fn query_max_sequence(
     client: &Client,
     table: &str,
@@ -1017,6 +1229,10 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         "dynamodb"
     }
 
+    fn push_dispatch_enabled(&self) -> bool {
+        self.push_dispatch_enabled
+    }
+
     async fn create_task_with_events(
         &self,
         tenant: &str,
@@ -1028,7 +1244,15 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let task_json = Self::task_to_json(&task)?;
         let state_str = Self::status_state_str(&task);
 
-        // Build TransactWriteItems: task put + event puts
+        // Sequence allocation: create_task_with_events always starts
+        // at seq=1 (no prior events for a fresh task), so the max
+        // sequence is simply events.len() when events are non-empty.
+        let sequences: Vec<u64> = (1..=events.len() as u64).collect();
+        let latest_event_sequence = sequences.last().copied().unwrap_or(0);
+
+        // Build TransactWriteItems: task put + event puts. The task
+        // put carries `latestEventSequence` directly (ADR-013 §6.3) so
+        // one Put covers the causal-floor maintenance.
         let mut task_put = aws_sdk_dynamodb::types::Put::builder()
             .table_name(&self.config.tasks_table)
             .item("pk", AttributeValue::S(pk.clone()))
@@ -1038,7 +1262,11 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             .item("taskJson", AttributeValue::S(task_json))
             .item("contextId", AttributeValue::S(task.context_id().to_string()))
             .item("statusState", AttributeValue::S(state_str))
-            .item("updatedAt", AttributeValue::S(Self::now_iso()));
+            .item("updatedAt", AttributeValue::S(Self::now_iso()))
+            .item(
+                "latestEventSequence",
+                AttributeValue::N(latest_event_sequence.to_string()),
+            );
         if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
             task_put = task_put.item("ttl", ttl);
         }
@@ -1051,10 +1279,8 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 .build(),
         ];
 
-        let mut sequences = Vec::with_capacity(events.len());
         for (i, event) in events.iter().enumerate() {
-            let seq = (i + 1) as u64;
-            sequences.push(seq);
+            let seq = sequences[i];
             let event_data = serde_json::to_string(event)
                 .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
 
@@ -1135,8 +1361,13 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let task_json = Self::task_to_json(&updated_task)?;
         let state_str = Self::status_state_str(&updated_task);
 
-        // Get current max sequence for event numbering
+        // Get current max sequence for event numbering AND the
+        // prior latest_event_sequence so the Put preserves it when
+        // events is empty (ADR-013 §6.3 monotonic invariant).
         let max_seq = query_max_sequence(&self.client, &self.config.events_table, &pk).await?;
+        let prior_latest =
+            query_latest_event_sequence(&self.client, &self.config.tasks_table, &pk).await?;
+        let new_latest_event_sequence = prior_latest.max(max_seq + events.len() as u64);
 
         // Build TransactWriteItems: task update + event puts.
         //
@@ -1158,6 +1389,10 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                         .item("contextId", AttributeValue::S(updated_task.context_id().to_string()))
                         .item("statusState", AttributeValue::S(state_str))
                         .item("updatedAt", AttributeValue::S(Self::now_iso()))
+                        .item(
+                            "latestEventSequence",
+                            AttributeValue::N(new_latest_event_sequence.to_string()),
+                        )
                         .condition_expression(
                             "#owner = :owner AND (attribute_not_exists(statusState) \
                              OR NOT statusState IN (:completed, :failed, :canceled, :rejected))",
@@ -1174,6 +1409,13 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 .build(),
         ];
 
+        // Append events and, when the push_dispatch opt-in is on,
+        // add a Put for the pending-dispatch marker inside the same
+        // TransactWriteItems (ADR-013 §4.3). Terminal `StatusUpdate`
+        // events only — non-terminal / artifact events do not produce
+        // markers.
+        let now_micros = ddb_systime_to_micros(std::time::SystemTime::now());
+        let marker_ttl = Self::ttl_epoch(self.config.push_delivery_ttl_seconds);
         let mut sequences = Vec::with_capacity(events.len());
         for (i, event) in events.iter().enumerate() {
             let seq = max_seq + (i as u64) + 1;
@@ -1201,6 +1443,37 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                     )
                     .build(),
             );
+
+            if self.push_dispatch_enabled
+                && event.is_terminal()
+                && matches!(event, StreamEvent::StatusUpdate { .. })
+            {
+                let marker_sk = seq.to_string();
+                let mut marker_put = aws_sdk_dynamodb::types::Put::builder()
+                    .table_name(&self.config.push_pending_dispatches_table)
+                    .item("pk", AttributeValue::S(pk.clone()))
+                    .item("sk", AttributeValue::S(marker_sk))
+                    .item("tenant", AttributeValue::S(tenant.to_string()))
+                    .item("taskId", AttributeValue::S(task_id.to_string()))
+                    .item("eventSequence", AttributeValue::N(seq.to_string()))
+                    .item("owner", AttributeValue::S(owner.to_string()))
+                    .item(
+                        "recordedAtMicros",
+                        AttributeValue::N(now_micros.to_string()),
+                    );
+                if let Some(ttl) = marker_ttl.clone() {
+                    marker_put = marker_put.item("ttl", ttl);
+                }
+                items.push(
+                    aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                        .put(
+                            marker_put
+                                .build()
+                                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
+                        )
+                        .build(),
+                );
+            }
         }
 
         let send_result = self
@@ -1267,8 +1540,13 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let task_json = Self::task_to_json(&task)?;
         let state_str = Self::status_state_str(&task);
 
-        // Get current max sequence
+        // Get current max sequence AND prior latest_event_sequence
+        // (ADR-013 §6.3: full-replacement Put must not regress the
+        // causal floor when events is empty).
         let max_seq = query_max_sequence(&self.client, &self.config.events_table, &pk).await?;
+        let prior_latest =
+            query_latest_event_sequence(&self.client, &self.config.tasks_table, &pk).await?;
+        let new_latest_event_sequence = prior_latest.max(max_seq + events.len() as u64);
 
         // Build TransactWriteItems: task put (with owner check + terminal
         // CAS) + event puts. ADR-010 §7.1 extension: the ConditionExpression
@@ -1285,6 +1563,10 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             .item("contextId", AttributeValue::S(task.context_id().to_string()))
             .item("statusState", AttributeValue::S(state_str))
             .item("updatedAt", AttributeValue::S(Self::now_iso()))
+            .item(
+                "latestEventSequence",
+                AttributeValue::N(new_latest_event_sequence.to_string()),
+            )
             .condition_expression(
                 "#owner = :owner AND (attribute_not_exists(statusState) \
                  OR NOT statusState IN (:completed, :failed, :canceled, :rejected))",
@@ -2563,6 +2845,11 @@ mod tests {
         fn scoped_tenant(&self, tenant: &str) -> String {
             format!("{}_{}", self.tenant_prefix, tenant)
         }
+
+        fn with_push_dispatch_enabled(mut self, enabled: bool) -> Self {
+            self.inner = self.inner.with_push_dispatch_enabled(enabled);
+            self
+        }
     }
 
     #[async_trait]
@@ -2678,6 +2965,21 @@ mod tests {
             -> Result<(), A2aStorageError> {
             self.inner.delete_config(&self.scoped_tenant(tenant), task_id, config_id).await
         }
+
+        async fn list_configs_eligible_at_event(
+            &self, tenant: &str, task_id: &str, event_sequence: u64,
+            page_token: Option<&str>, page_size: Option<i32>,
+        ) -> Result<PushConfigListPage, A2aStorageError> {
+            self.inner
+                .list_configs_eligible_at_event(
+                    &self.scoped_tenant(tenant),
+                    task_id,
+                    event_sequence,
+                    page_token,
+                    page_size,
+                )
+                .await
+        }
     }
 
     #[async_trait]
@@ -2707,6 +3009,10 @@ mod tests {
     #[async_trait]
     impl A2aAtomicStore for TestStorage {
         fn backend_name(&self) -> &'static str { "dynamodb-test" }
+
+        fn push_dispatch_enabled(&self) -> bool {
+            self.inner.push_dispatch_enabled()
+        }
 
         async fn create_task_with_events(&self, tenant: &str, owner: &str, task: Task, events: Vec<StreamEvent>)
             -> Result<(Task, Vec<u64>), A2aStorageError> {
@@ -3384,5 +3690,49 @@ mod tests {
     async fn test_push_concurrent_claim_race() {
         skip_unless_dynamodb_env!(s);
         parity_tests::test_push_concurrent_claim_race(std::sync::Arc::new(s)).await;
+    }
+
+    // Atomic pending-dispatch marker parity (ADR-013 §4.3 / §10.1).
+
+    #[tokio::test]
+    async fn test_atomic_marker_written_for_terminal_status() {
+        skip_unless_dynamodb_env!(s);
+        let s = s.with_push_dispatch_enabled(true);
+        parity_tests::test_atomic_marker_written_for_terminal_status(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_marker_skipped_for_non_terminal_status() {
+        skip_unless_dynamodb_env!(s);
+        let s = s.with_push_dispatch_enabled(true);
+        parity_tests::test_atomic_marker_skipped_for_non_terminal_status(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_marker_skipped_for_artifact_event() {
+        skip_unless_dynamodb_env!(s);
+        let s = s.with_push_dispatch_enabled(true);
+        parity_tests::test_atomic_marker_skipped_for_artifact_event(&s, &s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_marker_absent_when_opt_in_off() {
+        skip_unless_dynamodb_env!(s);
+        // default: push_dispatch_enabled=false
+        parity_tests::test_atomic_marker_absent_when_opt_in_off(&s, &s, &s).await;
+    }
+
+    // Causal-floor eligibility parity (ADR-013 §4.5 / §10.3 / §10.4).
+
+    #[tokio::test]
+    async fn test_config_registered_at_or_after_event_not_eligible() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_config_registered_at_or_after_event_not_eligible(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_late_create_config_stamps_advanced_sequence() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_late_create_config_stamps_advanced_sequence(&s, &s, &s).await;
     }
 }

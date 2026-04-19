@@ -133,7 +133,7 @@ impl AgentExecutor for ComplianceAgent {
 fn compliance_router() -> axum::Router {
     A2aServer::builder()
         .executor(ComplianceAgent)
-        .storage(InMemoryA2aStorage::new())
+        .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
         .build()
         .expect("server build")
         .into_router()

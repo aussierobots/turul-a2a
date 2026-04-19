@@ -26,6 +26,14 @@ struct StoredTask {
     updated_at: String,
     /// ADR-012 cancel-requested marker. Storage-internal; never on wire.
     cancel_requested: bool,
+    /// ADR-013 §6.3 causal floor: monotonic per-task event sequence
+    /// maintained UNCONDITIONALLY on every atomic commit (regardless
+    /// of `push_dispatch_enabled`). `create_config` reads this value
+    /// to stamp the config's `registered_after_event_sequence`; the
+    /// eligibility filter uses strict `<` against this floor so a
+    /// config recorded at or after a terminal event is excluded from
+    /// that event's fan-out. Zero until the first event commits.
+    latest_event_sequence: u64,
 }
 
 /// Current UTC timestamp as ISO 8601 string.
@@ -90,13 +98,28 @@ impl StoredDeliveryClaim {
 #[derive(Clone)]
 pub struct InMemoryA2aStorage {
     tasks: Arc<RwLock<HashMap<TaskKey, StoredTask>>>,
-    push_configs: Arc<RwLock<HashMap<PushConfigKey, turul_a2a_proto::TaskPushNotificationConfig>>>,
+    push_configs: Arc<RwLock<HashMap<PushConfigKey, StoredPushConfig>>>,
     events: Arc<RwLock<HashMap<EventKey, Vec<(u64, StreamEvent)>>>>,
     event_counters: Arc<RwLock<HashMap<EventKey, u64>>>,
     push_delivery_claims: Arc<RwLock<HashMap<PushDeliveryKey, StoredDeliveryClaim>>>,
     pending_dispatches: Arc<
         RwLock<HashMap<(String, String, u64), StoredPendingDispatch>>,
     >,
+    /// ADR-013 §4.3 opt-in: when true, `update_task_status_with_events`
+    /// writes an `a2a_push_pending_dispatches` row atomically with the
+    /// task/event commit for terminal `StreamEvent::StatusUpdate` events.
+    /// When false (default), the atomic commit is task + events only —
+    /// non-push deployments never touch the pending-dispatches map.
+    push_dispatch_enabled: bool,
+    #[cfg(test)]
+    cas_hook: Arc<RwLock<Option<CasHook>>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct CasHook {
+    paused: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
 }
 
 /// Backing row for a pending-dispatch marker. Mirrors the public
@@ -108,6 +131,16 @@ struct StoredPendingDispatch {
     recorded_at: std::time::SystemTime,
 }
 
+/// Backing row for a push notification config plus the causal-floor
+/// stamp written at CAS time (ADR-013 §6.3). The proto shape is what
+/// the wire format requires; `registered_after_event_sequence` is
+/// storage-internal and used only by the eligibility filter.
+#[derive(Debug, Clone)]
+struct StoredPushConfig {
+    config: turul_a2a_proto::TaskPushNotificationConfig,
+    registered_after_event_sequence: u64,
+}
+
 impl InMemoryA2aStorage {
     pub fn new() -> Self {
         Self {
@@ -117,7 +150,30 @@ impl InMemoryA2aStorage {
             event_counters: Arc::new(RwLock::new(HashMap::new())),
             push_delivery_claims: Arc::new(RwLock::new(HashMap::new())),
             pending_dispatches: Arc::new(RwLock::new(HashMap::new())),
+            push_dispatch_enabled: false,
+            #[cfg(test)]
+            cas_hook: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Opt in to atomic pending-dispatch marker writes (ADR-013 §4.3).
+    ///
+    /// Set to `true` when the deployment wires `push_delivery_store`; the
+    /// server builder rejects any configuration where the flag and the
+    /// delivery store disagree, in either direction.
+    pub fn with_push_dispatch_enabled(mut self, enabled: bool) -> Self {
+        self.push_dispatch_enabled = enabled;
+        self
+    }
+
+    #[cfg(test)]
+    async fn install_cas_race_hook(&self) -> CasHook {
+        let hook = CasHook {
+            paused: Arc::new(tokio::sync::Notify::new()),
+            resume: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.cas_hook.write().await = Some(hook.clone());
+        hook
     }
 }
 
@@ -181,6 +237,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
             task: task.clone(),
             updated_at: now_iso(),
             cancel_requested: false,
+            latest_event_sequence: 0,
         };
         let mut tasks = self.tasks.write().await;
         tasks.insert(key, stored);
@@ -215,8 +272,10 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         match tasks.get(&key) {
             Some(stored) if stored.owner == owner => {
                 // Preserve cancel_requested marker (monotonic; never
-                // cleared by a full-task replacement).
+                // cleared by a full-task replacement) and latest_event_sequence
+                // (monotonic; maintained by atomic commits).
                 let cancel_requested = stored.cancel_requested;
+                let latest_event_sequence = stored.latest_event_sequence;
                 tasks.insert(
                     key,
                     StoredTask {
@@ -225,6 +284,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
                         task,
                         updated_at: now_iso(),
                         cancel_requested,
+                        latest_event_sequence,
                     },
                 );
                 Ok(())
@@ -399,8 +459,10 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         let updated_task =
             Task::try_from(proto).map_err(|e| A2aStorageError::TypeError(e))?;
 
-        // Preserve cancel_requested (monotonic).
+        // Preserve cancel_requested (monotonic) and latest_event_sequence
+        // (ADR-013 §6.3 — monotonic, maintained by atomic commits only).
         let cancel_requested = stored.cancel_requested;
+        let latest_event_sequence = stored.latest_event_sequence;
         tasks.insert(
             key,
             StoredTask {
@@ -409,6 +471,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
                 task: updated_task.clone(),
                 updated_at: now_iso(),
                 cancel_requested,
+                latest_event_sequence,
             },
         );
 
@@ -584,13 +647,83 @@ impl A2aPushNotificationStorage for InMemoryA2aStorage {
         if config.id.is_empty() {
             config.id = uuid::Uuid::now_v7().to_string();
         }
-        let key = (
+        let task_key = (tenant.to_string(), config.task_id.clone());
+        let push_key = (
             tenant.to_string(),
             config.task_id.clone(),
             config.id.clone(),
         );
-        self.push_configs.write().await.insert(key, config.clone());
-        Ok(config)
+
+        // ADR-013 §6.4 causal-floor CAS. Two-phase:
+        //   1. Read `latest_event_sequence` (brief `tasks` read guard).
+        //   2. Re-read under a held `tasks` read guard and compare; if
+        //      unchanged, insert the config + stamp under a `push_configs`
+        //      write guard held concurrently with the `tasks` read guard.
+        //      If the re-read disagrees, a concurrent atomic commit
+        //      advanced the floor — retry with bounded backoff.
+        //
+        // The two-phase structure leaves an observable window between
+        // phase 1 and phase 2 that the test hook instruments; in
+        // production the window is nanoseconds.
+        const MAX_ATTEMPTS: u32 = 5;
+        let backoffs_ms: [u64; 4] = [10, 50, 250, 1000];
+        for attempt in 0..MAX_ATTEMPTS {
+            let seq_read = {
+                let tasks = self.tasks.read().await;
+                tasks
+                    .get(&task_key)
+                    .map(|t| t.latest_event_sequence)
+                    .unwrap_or(0)
+            };
+
+            #[cfg(test)]
+            {
+                // Test-only: allow a deterministic interleaving between
+                // the initial read and the re-read below so the CAS
+                // retry path is exercised.
+                let hook = { self.cas_hook.read().await.clone() };
+                if let Some(h) = hook {
+                    h.paused.notify_waiters();
+                    h.resume.notified().await;
+                }
+            }
+
+            // Phase 2: re-acquire tasks read guard. While we hold it,
+            // no `update_task_*_with_events` can acquire tasks.write().
+            // Re-read under the guard; if it matches `seq_read`, the
+            // CAS has succeeded and we insert while the guard is held.
+            let tasks_guard = self.tasks.read().await;
+            let seq_now = tasks_guard
+                .get(&task_key)
+                .map(|t| t.latest_event_sequence)
+                .unwrap_or(0);
+            if seq_now != seq_read {
+                drop(tasks_guard);
+                if attempt + 1 >= MAX_ATTEMPTS {
+                    return Err(A2aStorageError::CreateConfigCasTimeout {
+                        tenant: tenant.into(),
+                        task_id: config.task_id.clone(),
+                    });
+                }
+                let ms = backoffs_ms[attempt as usize];
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                continue;
+            }
+
+            self.push_configs.write().await.insert(
+                push_key,
+                StoredPushConfig {
+                    config: config.clone(),
+                    registered_after_event_sequence: seq_read,
+                },
+            );
+            drop(tasks_guard);
+            return Ok(config);
+        }
+        Err(A2aStorageError::CreateConfigCasTimeout {
+            tenant: tenant.into(),
+            task_id: config.task_id.clone(),
+        })
     }
 
     async fn get_config(
@@ -604,7 +737,12 @@ impl A2aPushNotificationStorage for InMemoryA2aStorage {
             task_id.to_string(),
             config_id.to_string(),
         );
-        Ok(self.push_configs.read().await.get(&key).cloned())
+        Ok(self
+            .push_configs
+            .read()
+            .await
+            .get(&key)
+            .map(|s| s.config.clone()))
     }
 
     async fn list_configs(
@@ -618,7 +756,7 @@ impl A2aPushNotificationStorage for InMemoryA2aStorage {
         let mut matching: Vec<_> = configs
             .iter()
             .filter(|((t, tid, _), _)| t == tenant && tid == task_id)
-            .map(|(_, v)| v.clone())
+            .map(|(_, v)| v.config.clone())
             .collect();
 
         // Deterministic order by config id
@@ -663,6 +801,49 @@ impl A2aPushNotificationStorage for InMemoryA2aStorage {
         );
         self.push_configs.write().await.remove(&key);
         Ok(()) // Idempotent
+    }
+
+    async fn list_configs_eligible_at_event(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        page_token: Option<&str>,
+        page_size: Option<i32>,
+    ) -> Result<PushConfigListPage, A2aStorageError> {
+        let configs = self.push_configs.read().await;
+        let mut matching: Vec<_> = configs
+            .iter()
+            .filter(|((t, tid, _), stored)| {
+                t == tenant
+                    && tid == task_id
+                    && stored.registered_after_event_sequence < event_sequence
+            })
+            .map(|(_, v)| v.config.clone())
+            .collect();
+
+        matching.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let page_size = page_size.map(|ps| ps.clamp(1, 100)).unwrap_or(50) as usize;
+        let start_idx = if let Some(token) = page_token {
+            matching
+                .iter()
+                .position(|c| c.id.as_str() > token)
+                .unwrap_or(matching.len())
+        } else {
+            0
+        };
+        let end_idx = (start_idx + page_size).min(matching.len());
+        let page_configs = matching[start_idx..end_idx].to_vec();
+        let next_page_token = if end_idx < matching.len() {
+            page_configs.last().map(|c| c.id.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Ok(PushConfigListPage {
+            configs: page_configs,
+            next_page_token,
+        })
     }
 }
 
@@ -740,6 +921,10 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         "in-memory"
     }
 
+    fn push_dispatch_enabled(&self) -> bool {
+        self.push_dispatch_enabled
+    }
+
     async fn create_task_with_events(
         &self,
         tenant: &str,
@@ -755,19 +940,8 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         let task_key = (tenant.to_string(), task.id().to_string());
         let event_key = (tenant.to_string(), task.id().to_string());
 
-        // Insert task
-        tasks.insert(
-            task_key,
-            StoredTask {
-                tenant: tenant.to_string(),
-                owner: owner.to_string(),
-                task: task.clone(),
-                updated_at: now_iso(),
-                cancel_requested: false,
-            },
-        );
-
-        // Append events with atomic sequence assignment
+        // Append events with atomic sequence assignment first so we
+        // know the max sequence to stamp on the task row.
         let mut sequences = Vec::with_capacity(events.len());
         let task_events = event_map.entry(event_key.clone()).or_default();
         let counter = counters.entry(event_key).or_insert(0);
@@ -778,6 +952,23 @@ impl A2aAtomicStore for InMemoryA2aStorage {
             sequences.push(seq);
             task_events.push((seq, event));
         }
+
+        // latest_event_sequence = max(0, new_seqs). Maintained
+        // UNCONDITIONALLY per ADR-013 §6.3 so the causal floor stays
+        // valid if push is enabled later.
+        let latest_event_sequence = sequences.iter().copied().max().unwrap_or(0);
+
+        tasks.insert(
+            task_key,
+            StoredTask {
+                tenant: tenant.to_string(),
+                owner: owner.to_string(),
+                task: task.clone(),
+                updated_at: now_iso(),
+                cancel_requested: false,
+                latest_event_sequence,
+            },
+        );
 
         Ok((task, sequences))
     }
@@ -790,10 +981,18 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         new_status: TaskStatus,
         events: Vec<StreamEvent>,
     ) -> Result<(Task, Vec<u64>), A2aStorageError> {
-        // Acquire all locks in consistent order: tasks → event_counters → events
+        // Acquire all locks in consistent order:
+        // tasks → event_counters → events → pending_dispatches.
+        // The last guard is held only when the push_dispatch opt-in is on
+        // so the non-push path never contends on it.
         let mut tasks = self.tasks.write().await;
         let mut counters = self.event_counters.write().await;
         let mut event_map = self.events.write().await;
+        let mut pending_dispatches = if self.push_dispatch_enabled {
+            Some(self.pending_dispatches.write().await)
+        } else {
+            None
+        };
 
         let task_key = (tenant.to_string(), task_id.to_string());
         let event_key = (tenant.to_string(), task_id.to_string());
@@ -846,20 +1045,15 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         proto.status = Some(new_status.into_proto());
         let updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
 
-        // Preserve cancel_requested (monotonic).
+        // Preserve cancel_requested (monotonic) and snapshot previous
+        // latest_event_sequence; the final value is max(prev, new_seqs).
         let cancel_requested = stored.cancel_requested;
-        tasks.insert(
-            task_key,
-            StoredTask {
-                tenant: tenant.to_string(),
-                owner: owner.to_string(),
-                task: updated_task.clone(),
-                updated_at: now_iso(),
-                cancel_requested,
-            },
-        );
+        let prev_latest = stored.latest_event_sequence;
 
-        // Append events with atomic sequence assignment
+        // Append events with atomic sequence assignment. When the
+        // push_dispatch opt-in is on, also write a pending-dispatch
+        // marker for each terminal StatusUpdate in the same atomic
+        // boundary (ADR-013 §4.3 / §5.1).
         let mut sequences = Vec::with_capacity(events.len());
         let task_events = event_map.entry(event_key.clone()).or_default();
         let counter = counters.entry(event_key).or_insert(0);
@@ -868,8 +1062,41 @@ impl A2aAtomicStore for InMemoryA2aStorage {
             *counter += 1;
             let seq = *counter;
             sequences.push(seq);
+
+            if let Some(guard) = pending_dispatches.as_mut() {
+                if event.is_terminal() && matches!(event, StreamEvent::StatusUpdate { .. }) {
+                    guard.insert(
+                        (tenant.to_string(), task_id.to_string(), seq),
+                        StoredPendingDispatch {
+                            owner: owner.to_string(),
+                            recorded_at: std::time::SystemTime::now(),
+                        },
+                    );
+                }
+            }
+
             task_events.push((seq, event));
         }
+
+        // Maintain latest_event_sequence UNCONDITIONALLY — ADR-013 §6.3.
+        let new_latest = sequences
+            .iter()
+            .copied()
+            .max()
+            .map(|m| m.max(prev_latest))
+            .unwrap_or(prev_latest);
+
+        tasks.insert(
+            task_key,
+            StoredTask {
+                tenant: tenant.to_string(),
+                owner: owner.to_string(),
+                task: updated_task.clone(),
+                updated_at: now_iso(),
+                cancel_requested,
+                latest_event_sequence: new_latest,
+            },
+        );
 
         Ok((updated_task, sequences))
     }
@@ -921,24 +1148,15 @@ impl A2aAtomicStore for InMemoryA2aStorage {
             }
         }
 
-        // Replace task, preserving cancel_requested marker (monotonic;
-        // full-task replacement must not wipe it).
-        let cancel_requested = tasks
+        // Preserve cancel_requested (monotonic) and snapshot
+        // latest_event_sequence so it can extend (never shrink) even
+        // when the full-task replacement rewrites task JSON.
+        let (cancel_requested, prev_latest) = tasks
             .get(&task_key)
-            .map(|s| s.cancel_requested)
-            .unwrap_or(false);
-        tasks.insert(
-            task_key,
-            StoredTask {
-                tenant: tenant.to_string(),
-                owner: owner.to_string(),
-                task,
-                updated_at: now_iso(),
-                cancel_requested,
-            },
-        );
+            .map(|s| (s.cancel_requested, s.latest_event_sequence))
+            .unwrap_or((false, 0));
 
-        // Append events with atomic sequence assignment
+        // Append events with atomic sequence assignment.
         let mut sequences = Vec::with_capacity(events.len());
         let task_events = event_map.entry(event_key.clone()).or_default();
         let counter = counters.entry(event_key).or_insert(0);
@@ -949,6 +1167,26 @@ impl A2aAtomicStore for InMemoryA2aStorage {
             sequences.push(seq);
             task_events.push((seq, event));
         }
+
+        // Maintain latest_event_sequence UNCONDITIONALLY — ADR-013 §6.3.
+        let new_latest = sequences
+            .iter()
+            .copied()
+            .max()
+            .map(|m| m.max(prev_latest))
+            .unwrap_or(prev_latest);
+
+        tasks.insert(
+            task_key,
+            StoredTask {
+                tenant: tenant.to_string(),
+                owner: owner.to_string(),
+                task,
+                updated_at: now_iso(),
+                cancel_requested,
+                latest_event_sequence: new_latest,
+            },
+        );
 
         Ok(sequences)
     }
@@ -1693,5 +1931,197 @@ mod tests {
     async fn test_push_concurrent_claim_race() {
         let s = std::sync::Arc::new(storage());
         parity_tests::test_push_concurrent_claim_race(s).await;
+    }
+
+    // Atomic pending-dispatch marker parity (ADR-013 §4.3 / §10.1).
+
+    fn opted_in_storage() -> InMemoryA2aStorage {
+        InMemoryA2aStorage::new().with_push_dispatch_enabled(true)
+    }
+
+    #[tokio::test]
+    async fn test_atomic_marker_written_for_terminal_status() {
+        let s = opted_in_storage();
+        parity_tests::test_atomic_marker_written_for_terminal_status(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_marker_skipped_for_non_terminal_status() {
+        let s = opted_in_storage();
+        parity_tests::test_atomic_marker_skipped_for_non_terminal_status(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_marker_skipped_for_artifact_event() {
+        let s = opted_in_storage();
+        parity_tests::test_atomic_marker_skipped_for_artifact_event(&s, &s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_marker_absent_when_opt_in_off() {
+        let s = storage(); // default: push_dispatch_enabled=false
+        parity_tests::test_atomic_marker_absent_when_opt_in_off(&s, &s, &s).await;
+    }
+
+    // Causal-floor eligibility parity (ADR-013 §4.5 / §10.3 / §10.4).
+
+    #[tokio::test]
+    async fn test_config_registered_at_or_after_event_not_eligible() {
+        let s = storage();
+        parity_tests::test_config_registered_at_or_after_event_not_eligible(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_late_create_config_stamps_advanced_sequence() {
+        let s = storage();
+        parity_tests::test_late_create_config_stamps_advanced_sequence(&s, &s, &s).await;
+    }
+
+    /// ADR-013 §10.4 — real interleaving race.
+    ///
+    /// Uses the `CasHook` instrumentation to force `create_config` to
+    /// pause AFTER its initial `latest_event_sequence` read and BEFORE
+    /// the re-read/insert. While paused, a concurrent
+    /// `update_task_status_with_events` commits a terminal event that
+    /// advances the floor. When `create_config` resumes, its CAS
+    /// re-read detects the mismatch, the backoff fires, and the next
+    /// attempt stamps the config with the ADVANCED sequence — not the
+    /// stale one. Fan-out for the terminal event then excludes the
+    /// config.
+    ///
+    /// A backend without a CAS retry loop would fail this test:
+    /// create_config would write the stale sequence and the config
+    /// would incorrectly appear in the terminal event's eligible set.
+    #[tokio::test]
+    async fn test_create_config_cas_retries_under_interleaving() {
+        use crate::storage::A2aAtomicStore;
+        use crate::streaming::{ArtifactUpdatePayload, StreamEvent};
+        use turul_a2a_types::TaskState;
+
+        let s = storage();
+        let tenant = "t-race";
+        let task_id = "task-race";
+        let owner = "owner-1";
+
+        // Seed Working, bump latest_event_sequence to 3.
+        let task = Task::new(task_id, TaskStatus::new(TaskState::Working))
+            .with_context_id("ctx-race");
+        A2aTaskStorage::create_task(&s, tenant, owner, task.clone())
+            .await
+            .expect("seed");
+        for i in 0..3 {
+            let evt = StreamEvent::ArtifactUpdate {
+                artifact_update: ArtifactUpdatePayload {
+                    task_id: task_id.into(),
+                    context_id: "ctx-race".into(),
+                    artifact: serde_json::json!({"id": format!("a-{i}"), "parts": []}),
+                    append: false,
+                    last_chunk: true,
+                },
+            };
+            s.update_task_with_events(tenant, owner, task.clone(), vec![evt])
+                .await
+                .expect("bump");
+        }
+
+        // Install the CAS race hook. create_config will pause after
+        // reading latest_event_sequence (=3) and await `resume`.
+        let hook = s.install_cas_race_hook().await;
+
+        let storage_for_task = s.clone();
+        let create_handle = tokio::spawn(async move {
+            A2aPushNotificationStorage::create_config(
+                &storage_for_task,
+                tenant,
+                turul_a2a_proto::TaskPushNotificationConfig {
+                    tenant: tenant.into(),
+                    id: "cfg-race".into(),
+                    task_id: task_id.into(),
+                    url: "https://example.invalid/race".into(),
+                    token: String::new(),
+                    authentication: None,
+                },
+            )
+            .await
+        });
+
+        // Wait for create_config to reach the pause point.
+        hook.paused.notified().await;
+
+        // Sanity: create_config has NOT yet inserted — the config map
+        // must still be empty at this moment.
+        {
+            let pc = s.push_configs.read().await;
+            assert!(
+                pc.is_empty(),
+                "create_config must not have written yet; state: {pc:?}"
+            );
+        }
+
+        // Concurrent commit advances latest_event_sequence to 4
+        // (terminal). The hook is cleared so this call itself does
+        // not re-pause.
+        *s.cas_hook.write().await = None;
+        let terminal = StreamEvent::StatusUpdate {
+            status_update: crate::streaming::StatusUpdatePayload {
+                task_id: task_id.into(),
+                context_id: "ctx-race".into(),
+                status: serde_json::to_value(&TaskStatus::new(TaskState::Completed))
+                    .unwrap(),
+            },
+        };
+        let (_t, seqs) = s
+            .update_task_status_with_events(
+                tenant,
+                task_id,
+                owner,
+                TaskStatus::new(TaskState::Completed),
+                vec![terminal],
+            )
+            .await
+            .expect("terminal commit");
+        let terminal_seq = seqs[0];
+        assert_eq!(terminal_seq, 4);
+
+        // Release create_config. Its re-read will see seq=4 ≠ 3, retry,
+        // and stamp the config with seq=4.
+        hook.resume.notify_waiters();
+        create_handle
+            .await
+            .expect("join")
+            .expect("create_config eventually succeeds after retry");
+
+        // Proof: the created config is NOT eligible for the terminal
+        // event. Strict less-than: 4 < 4 is false.
+        let eligible = A2aPushNotificationStorage::list_configs_eligible_at_event(
+            &s,
+            tenant,
+            task_id,
+            terminal_seq,
+            None,
+            Some(100),
+        )
+        .await
+        .expect("list eligible");
+        assert!(
+            eligible.configs.is_empty(),
+            "config written concurrently with the terminal commit MUST NOT be eligible \
+             for that terminal event (CAS retry must have advanced its floor); got {:?}",
+            eligible.configs.iter().map(|c| &c.id).collect::<Vec<_>>()
+        );
+
+        // And the config IS actually stored (registered_after_event_sequence = 4).
+        let cfg = A2aPushNotificationStorage::get_config(&s, tenant, task_id, "cfg-race")
+            .await
+            .expect("get");
+        assert!(cfg.is_some(), "config must exist after CAS retry completed");
+        let pc = s.push_configs.read().await;
+        let stored = pc
+            .get(&(tenant.to_string(), task_id.to_string(), "cfg-race".into()))
+            .expect("stored row");
+        assert_eq!(
+            stored.registered_after_event_sequence, terminal_seq,
+            "CAS retry must have re-stamped with the advanced sequence (4), not the stale one (3)"
+        );
     }
 }

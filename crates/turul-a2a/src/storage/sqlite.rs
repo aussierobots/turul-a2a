@@ -35,6 +35,8 @@ impl Default for SqliteConfig {
 #[derive(Clone)]
 pub struct SqliteA2aStorage {
     pool: SqlitePool,
+    /// ADR-013 §4.3 opt-in — see `InMemoryA2aStorage::push_dispatch_enabled`.
+    push_dispatch_enabled: bool,
 }
 
 impl SqliteA2aStorage {
@@ -45,9 +47,18 @@ impl SqliteA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        let storage = Self { pool };
+        let storage = Self {
+            pool,
+            push_dispatch_enabled: false,
+        };
         storage.create_tables().await?;
         Ok(storage)
+    }
+
+    /// Opt in to atomic pending-dispatch marker writes (ADR-013 §4.3).
+    pub fn with_push_dispatch_enabled(mut self, enabled: bool) -> Self {
+        self.push_dispatch_enabled = enabled;
+        self
     }
 
     async fn create_tables(&self) -> Result<(), A2aStorageError> {
@@ -86,18 +97,55 @@ impl SqliteA2aStorage {
             Err(e) => return Err(A2aStorageError::DatabaseError(e.to_string())),
         }
 
+        // ADR-013 §6.3: unconditional latest_event_sequence column.
+        // Legacy rows default to 0; the first post-migration commit
+        // extends it monotonically via MAX(existing, new).
+        let alter_latest =
+            sqlx::query("ALTER TABLE a2a_tasks ADD COLUMN latest_event_sequence INTEGER NOT NULL DEFAULT 0")
+                .execute(&self.pool)
+                .await;
+        match alter_latest {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(A2aStorageError::DatabaseError(e.to_string())),
+        }
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS a2a_push_configs (
                 tenant TEXT NOT NULL DEFAULT '',
                 task_id TEXT NOT NULL,
                 config_id TEXT NOT NULL,
                 config_json TEXT NOT NULL,
+                registered_after_event_sequence INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (tenant, task_id, config_id)
             )",
         )
         .execute(&self.pool)
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+        // ADR-013 §6.3: additive migration for pre-0.1.4 push config
+        // rows — default 0 is permissive by design (legacy configs
+        // become eligible for any event with seq > 0).
+        let alter_registered = sqlx::query(
+            "ALTER TABLE a2a_push_configs \
+             ADD COLUMN registered_after_event_sequence INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
+        match alter_registered {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(A2aStorageError::DatabaseError(e.to_string())),
+        }
+
+        // Index to make eligibility scans cheap (ADR-013 §6.3).
+        let _ = sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_a2a_push_configs_eligibility \
+             ON a2a_push_configs (tenant, task_id, registered_after_event_sequence)",
+        )
+        .execute(&self.pool)
+        .await;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS a2a_task_events (
@@ -643,19 +691,98 @@ impl A2aPushNotificationStorage for SqliteA2aStorage {
         let json = serde_json::to_string(&config)
             .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
 
-        sqlx::query(
-            "INSERT OR REPLACE INTO a2a_push_configs (tenant, task_id, config_id, config_json)
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(tenant)
-        .bind(&config.task_id)
-        .bind(&config.id)
-        .bind(&json)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        // ADR-013 §6.4 causal-floor CAS: read `latest_event_sequence`
+        // and INSERT the config row with
+        // `registered_after_event_sequence = seq_read` in the SAME
+        // transaction, conditional on `latest_event_sequence` still
+        // equalling `seq_read`. SQLite serialises writers, so the
+        // conditional UPDATE that re-writes `latest_event_sequence`
+        // to itself within the tx is a cheap detection: if another
+        // writer committed a concurrent event commit between our
+        // read and our insert, our follow-up zero-row UPDATE surfaces
+        // it as a ConcurrentModification signal; the outer retry loop
+        // backs off and re-reads.
+        const MAX_ATTEMPTS: u32 = 5;
+        let backoffs_ms: [u64; 4] = [10, 50, 250, 1000];
+        for attempt in 0..MAX_ATTEMPTS {
+            let mut tx = self.pool.begin().await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        Ok(config)
+            let latest: Option<(i64,)> = sqlx::query_as(
+                "SELECT latest_event_sequence FROM a2a_tasks
+                 WHERE tenant = ? AND task_id = ?",
+            )
+            .bind(tenant)
+            .bind(&config.task_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            let seq_read = latest.map(|(s,)| s).unwrap_or(0);
+
+            sqlx::query(
+                "INSERT OR REPLACE INTO a2a_push_configs
+                    (tenant, task_id, config_id, config_json, registered_after_event_sequence)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(tenant)
+            .bind(&config.task_id)
+            .bind(&config.id)
+            .bind(&json)
+            .bind(seq_read)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+            // CAS: succeed only if latest_event_sequence still matches
+            // what we read. The UPDATE rewrites the same value (idempotent)
+            // but the WHERE clause detects a concurrent advance.
+            let cas = sqlx::query(
+                "UPDATE a2a_tasks SET latest_event_sequence = latest_event_sequence
+                 WHERE tenant = ? AND task_id = ? AND latest_event_sequence = ?",
+            )
+            .bind(tenant)
+            .bind(&config.task_id)
+            .bind(seq_read)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+            // If the task row is missing (seq_read=0, no task yet),
+            // cas.rows_affected()=0 is not a CAS loss — it's just
+            // "no task row". Accept the insert.
+            let task_exists = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM a2a_tasks WHERE tenant = ? AND task_id = ?",
+            )
+            .bind(tenant)
+            .bind(&config.task_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+            if task_exists > 0 && cas.rows_affected() == 0 {
+                // Concurrent event commit advanced latest_event_sequence.
+                // Roll back and retry.
+                drop(tx);
+                if attempt + 1 >= MAX_ATTEMPTS {
+                    return Err(A2aStorageError::CreateConfigCasTimeout {
+                        tenant: tenant.into(),
+                        task_id: config.task_id.clone(),
+                    });
+                }
+                let ms = backoffs_ms[attempt as usize];
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                continue;
+            }
+
+            tx.commit().await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            return Ok(config);
+        }
+        // Unreachable — loop returns on every path.
+        Err(A2aStorageError::CreateConfigCasTimeout {
+            tenant: tenant.into(),
+            task_id: config.task_id.clone(),
+        })
     }
 
     async fn get_config(
@@ -756,6 +883,65 @@ impl A2aPushNotificationStorage for SqliteA2aStorage {
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         Ok(())
+    }
+
+    async fn list_configs_eligible_at_event(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        page_token: Option<&str>,
+        page_size: Option<i32>,
+    ) -> Result<PushConfigListPage, A2aStorageError> {
+        let page_size = page_size.map(|ps| ps.clamp(1, 100)).unwrap_or(50);
+        let (sql, has_token) = if page_token.is_some() {
+            (
+                "SELECT config_json FROM a2a_push_configs
+                 WHERE tenant = ? AND task_id = ?
+                   AND registered_after_event_sequence < ?
+                   AND config_id > ?
+                 ORDER BY config_id LIMIT ?",
+                true,
+            )
+        } else {
+            (
+                "SELECT config_json FROM a2a_push_configs
+                 WHERE tenant = ? AND task_id = ?
+                   AND registered_after_event_sequence < ?
+                 ORDER BY config_id LIMIT ?",
+                false,
+            )
+        };
+
+        let mut q = sqlx::query_as::<_, (String,)>(sql)
+            .bind(tenant)
+            .bind(task_id)
+            .bind(event_sequence as i64);
+        if has_token {
+            q = q.bind(page_token.unwrap_or(""));
+        }
+        q = q.bind(page_size);
+
+        let rows: Vec<(String,)> = q
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+        let configs: Vec<turul_a2a_proto::TaskPushNotificationConfig> = rows
+            .iter()
+            .filter_map(|(json,)| serde_json::from_str(json).ok())
+            .collect();
+
+        let next_page_token = if configs.len() as i32 >= page_size {
+            configs.last().map(|c| c.id.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        Ok(PushConfigListPage {
+            configs,
+            next_page_token,
+        })
     }
 }
 
@@ -863,6 +1049,10 @@ impl A2aAtomicStore for SqliteA2aStorage {
         "sqlite"
     }
 
+    fn push_dispatch_enabled(&self) -> bool {
+        self.push_dispatch_enabled
+    }
+
     async fn create_task_with_events(
         &self,
         tenant: &str,
@@ -920,6 +1110,21 @@ impl A2aAtomicStore for SqliteA2aStorage {
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
             sequences.push(seq.0 as u64);
+        }
+
+        // ADR-013 §6.3: maintain latest_event_sequence UNCONDITIONALLY.
+        if let Some(&max_seq) = sequences.iter().max() {
+            sqlx::query(
+                "UPDATE a2a_tasks SET latest_event_sequence = ?
+                 WHERE tenant = ? AND task_id = ? AND latest_event_sequence < ?",
+            )
+            .bind(max_seq as i64)
+            .bind(tenant)
+            .bind(task.id())
+            .bind(max_seq as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         }
 
         tx.commit().await
@@ -1030,7 +1235,9 @@ impl A2aAtomicStore for SqliteA2aStorage {
             });
         }
 
-        // Append events
+        // Append events and, when the push_dispatch opt-in is on,
+        // insert a pending-dispatch marker row for each terminal
+        // StatusUpdate in the SAME transaction (ADR-013 §4.3).
         let mut sequences = Vec::with_capacity(events.len());
         for event in &events {
             let seq: (i64,) = sqlx::query_as(
@@ -1058,7 +1265,45 @@ impl A2aAtomicStore for SqliteA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
+            if self.push_dispatch_enabled
+                && event.is_terminal()
+                && matches!(event, StreamEvent::StatusUpdate { .. })
+            {
+                let now_micros = systime_to_micros(std::time::SystemTime::now());
+                sqlx::query(
+                    "INSERT INTO a2a_push_pending_dispatches \
+                        (tenant, task_id, event_sequence, owner, recorded_at_micros) \
+                     VALUES (?1, ?2, ?3, ?4, ?5) \
+                     ON CONFLICT (tenant, task_id, event_sequence) DO UPDATE SET \
+                        owner = excluded.owner, \
+                        recorded_at_micros = excluded.recorded_at_micros",
+                )
+                .bind(tenant)
+                .bind(task_id)
+                .bind(seq.0)
+                .bind(owner)
+                .bind(now_micros)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            }
+
             sequences.push(seq.0 as u64);
+        }
+
+        // ADR-013 §6.3: maintain latest_event_sequence UNCONDITIONALLY.
+        if let Some(&max_seq) = sequences.iter().max() {
+            sqlx::query(
+                "UPDATE a2a_tasks SET latest_event_sequence = ?
+                 WHERE tenant = ? AND task_id = ? AND latest_event_sequence < ?",
+            )
+            .bind(max_seq as i64)
+            .bind(tenant)
+            .bind(task_id)
+            .bind(max_seq as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         }
 
         tx.commit().await
@@ -1152,6 +1397,21 @@ impl A2aAtomicStore for SqliteA2aStorage {
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
             sequences.push(seq.0 as u64);
+        }
+
+        // ADR-013 §6.3: maintain latest_event_sequence UNCONDITIONALLY.
+        if let Some(&max_seq) = sequences.iter().max() {
+            sqlx::query(
+                "UPDATE a2a_tasks SET latest_event_sequence = ?
+                 WHERE tenant = ? AND task_id = ? AND latest_event_sequence < ?",
+            )
+            .bind(max_seq as i64)
+            .bind(tenant)
+            .bind(task.id())
+            .bind(max_seq as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         }
 
         tx.commit().await
@@ -2196,5 +2456,49 @@ mod tests {
     async fn test_push_concurrent_claim_race() {
         let s = std::sync::Arc::new(storage().await);
         parity_tests::test_push_concurrent_claim_race(s).await;
+    }
+
+    // Atomic pending-dispatch marker parity (ADR-013 §4.3 / §10.1).
+
+    async fn opted_in_storage() -> SqliteA2aStorage {
+        storage().await.with_push_dispatch_enabled(true)
+    }
+
+    #[tokio::test]
+    async fn test_atomic_marker_written_for_terminal_status() {
+        let s = opted_in_storage().await;
+        parity_tests::test_atomic_marker_written_for_terminal_status(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_marker_skipped_for_non_terminal_status() {
+        let s = opted_in_storage().await;
+        parity_tests::test_atomic_marker_skipped_for_non_terminal_status(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_marker_skipped_for_artifact_event() {
+        let s = opted_in_storage().await;
+        parity_tests::test_atomic_marker_skipped_for_artifact_event(&s, &s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_marker_absent_when_opt_in_off() {
+        let s = storage().await; // default: push_dispatch_enabled=false
+        parity_tests::test_atomic_marker_absent_when_opt_in_off(&s, &s, &s).await;
+    }
+
+    // Causal-floor eligibility parity (ADR-013 §4.5 / §10.3 / §10.4).
+
+    #[tokio::test]
+    async fn test_config_registered_at_or_after_event_not_eligible() {
+        let s = storage().await;
+        parity_tests::test_config_registered_at_or_after_event_not_eligible(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_late_create_config_stamps_advanced_sequence() {
+        let s = storage().await;
+        parity_tests::test_late_create_config_stamps_advanced_sequence(&s, &s, &s).await;
     }
 }

@@ -35,6 +35,8 @@ impl Default for PostgresConfig {
 #[derive(Clone)]
 pub struct PostgresA2aStorage {
     pool: PgPool,
+    /// ADR-013 §4.3 opt-in — see `InMemoryA2aStorage::push_dispatch_enabled`.
+    push_dispatch_enabled: bool,
 }
 
 impl PostgresA2aStorage {
@@ -45,9 +47,18 @@ impl PostgresA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        let storage = Self { pool };
+        let storage = Self {
+            pool,
+            push_dispatch_enabled: false,
+        };
         storage.create_tables().await?;
         Ok(storage)
+    }
+
+    /// Opt in to atomic pending-dispatch marker writes (ADR-013 §4.3).
+    pub fn with_push_dispatch_enabled(mut self, enabled: bool) -> Self {
+        self.push_dispatch_enabled = enabled;
+        self
     }
 
     async fn create_tables(&self) -> Result<(), A2aStorageError> {
@@ -83,18 +94,42 @@ impl PostgresA2aStorage {
         .execute(&self.pool)
         .await;
 
+        // ADR-013 §6.3: unconditional latest_event_sequence column.
+        let _ = sqlx::query(
+            "ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS latest_event_sequence BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS a2a_push_configs (
                 tenant TEXT NOT NULL DEFAULT '',
                 task_id TEXT NOT NULL,
                 config_id TEXT NOT NULL,
                 config_json JSONB NOT NULL,
+                registered_after_event_sequence BIGINT NOT NULL DEFAULT 0,
                 PRIMARY KEY (tenant, task_id, config_id)
             )",
         )
         .execute(&self.pool)
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+        // ADR-013 §6.3: additive migration; default 0 is permissive
+        // for legacy configs by design.
+        let _ = sqlx::query(
+            "ALTER TABLE a2a_push_configs \
+             ADD COLUMN IF NOT EXISTS registered_after_event_sequence BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
+
+        let _ = sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_a2a_push_configs_eligibility \
+             ON a2a_push_configs (tenant, task_id, registered_after_event_sequence)",
+        )
+        .execute(&self.pool)
+        .await;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS a2a_task_events (
@@ -623,20 +658,88 @@ impl A2aPushNotificationStorage for PostgresA2aStorage {
         let json = serde_json::to_value(&config)
             .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
 
-        sqlx::query(
-            "INSERT INTO a2a_push_configs (tenant, task_id, config_id, config_json)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (tenant, task_id, config_id) DO UPDATE SET config_json = EXCLUDED.config_json",
-        )
-        .bind(tenant)
-        .bind(&config.task_id)
-        .bind(&config.id)
-        .bind(&json)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        // ADR-013 §6.4 causal-floor CAS: SERIALIZABLE tx reading
+        // `latest_event_sequence` and inserting the config with
+        // `registered_after_event_sequence = seq_read`. A concurrent
+        // `update_task_status_with_events` committing between our
+        // read and our INSERT triggers a serialization failure
+        // (SQLSTATE 40001); the outer loop retries with backoff.
+        const MAX_ATTEMPTS: u32 = 5;
+        let backoffs_ms: [u64; 4] = [10, 50, 250, 1000];
+        for attempt in 0..MAX_ATTEMPTS {
+            let mut conn = self.pool.acquire().await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            sqlx::query("BEGIN ISOLATION LEVEL SERIALIZABLE")
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        Ok(config)
+            let read_result: Result<Option<i64>, _> = sqlx::query_scalar(
+                "SELECT latest_event_sequence FROM a2a_tasks
+                 WHERE tenant = $1 AND task_id = $2",
+            )
+            .bind(tenant)
+            .bind(&config.task_id)
+            .fetch_optional(&mut *conn)
+            .await;
+            let seq_read = match read_result {
+                Ok(r) => r.unwrap_or(0),
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    if is_serialization_failure(&e) && attempt + 1 < MAX_ATTEMPTS {
+                        let ms = backoffs_ms[attempt as usize];
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                        continue;
+                    }
+                    return Err(A2aStorageError::DatabaseError(e.to_string()));
+                }
+            };
+
+            let insert_result = sqlx::query(
+                "INSERT INTO a2a_push_configs
+                    (tenant, task_id, config_id, config_json, registered_after_event_sequence)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (tenant, task_id, config_id) DO UPDATE SET
+                    config_json = EXCLUDED.config_json,
+                    registered_after_event_sequence = EXCLUDED.registered_after_event_sequence",
+            )
+            .bind(tenant)
+            .bind(&config.task_id)
+            .bind(&config.id)
+            .bind(&json)
+            .bind(seq_read)
+            .execute(&mut *conn)
+            .await;
+
+            let commit_result = match insert_result {
+                Ok(_) => sqlx::query("COMMIT").execute(&mut *conn).await,
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    if is_serialization_failure(&e) && attempt + 1 < MAX_ATTEMPTS {
+                        let ms = backoffs_ms[attempt as usize];
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                        continue;
+                    }
+                    return Err(A2aStorageError::DatabaseError(e.to_string()));
+                }
+            };
+
+            match commit_result {
+                Ok(_) => return Ok(config),
+                Err(e) => {
+                    if is_serialization_failure(&e) && attempt + 1 < MAX_ATTEMPTS {
+                        let ms = backoffs_ms[attempt as usize];
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                        continue;
+                    }
+                    return Err(A2aStorageError::DatabaseError(e.to_string()));
+                }
+            }
+        }
+        Err(A2aStorageError::CreateConfigCasTimeout {
+            tenant: tenant.into(),
+            task_id: config.task_id.clone(),
+        })
     }
 
     async fn get_config(
@@ -734,6 +837,65 @@ impl A2aPushNotificationStorage for PostgresA2aStorage {
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         Ok(())
+    }
+
+    async fn list_configs_eligible_at_event(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+        page_token: Option<&str>,
+        page_size: Option<i32>,
+    ) -> Result<PushConfigListPage, A2aStorageError> {
+        let page_size = page_size.map(|ps| ps.clamp(1, 100)).unwrap_or(50);
+        let (sql, has_token) = if page_token.is_some() {
+            (
+                "SELECT config_json FROM a2a_push_configs
+                 WHERE tenant = $1 AND task_id = $2
+                   AND registered_after_event_sequence < $3
+                   AND config_id > $4
+                 ORDER BY config_id LIMIT $5",
+                true,
+            )
+        } else {
+            (
+                "SELECT config_json FROM a2a_push_configs
+                 WHERE tenant = $1 AND task_id = $2
+                   AND registered_after_event_sequence < $3
+                 ORDER BY config_id LIMIT $4",
+                false,
+            )
+        };
+
+        let mut q = sqlx::query_as::<_, (serde_json::Value,)>(sql)
+            .bind(tenant)
+            .bind(task_id)
+            .bind(event_sequence as i64);
+        if has_token {
+            q = q.bind(page_token.unwrap_or(""));
+        }
+        q = q.bind(page_size);
+
+        let rows: Vec<(serde_json::Value,)> = q
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+        let configs: Vec<turul_a2a_proto::TaskPushNotificationConfig> = rows
+            .into_iter()
+            .filter_map(|(json,)| serde_json::from_value(json).ok())
+            .collect();
+
+        let next_page_token = if configs.len() as i32 >= page_size {
+            configs.last().map(|c| c.id.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        Ok(PushConfigListPage {
+            configs,
+            next_page_token,
+        })
     }
 }
 
@@ -841,6 +1003,10 @@ impl A2aAtomicStore for PostgresA2aStorage {
         "postgres"
     }
 
+    fn push_dispatch_enabled(&self) -> bool {
+        self.push_dispatch_enabled
+    }
+
     async fn create_task_with_events(
         &self,
         tenant: &str,
@@ -897,6 +1063,20 @@ impl A2aAtomicStore for PostgresA2aStorage {
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
             sequences.push(seq as u64);
+        }
+
+        // ADR-013 §6.3: maintain latest_event_sequence UNCONDITIONALLY.
+        if let Some(&max_seq) = sequences.iter().max() {
+            sqlx::query(
+                "UPDATE a2a_tasks SET latest_event_sequence = $1
+                 WHERE tenant = $2 AND task_id = $3 AND latest_event_sequence < $1",
+            )
+            .bind(max_seq as i64)
+            .bind(tenant)
+            .bind(task.id())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         }
 
         tx.commit().await
@@ -1006,6 +1186,9 @@ impl A2aAtomicStore for PostgresA2aStorage {
             });
         }
 
+        // Append events and, when the push_dispatch opt-in is on,
+        // insert a pending-dispatch marker row for each terminal
+        // StatusUpdate in the SAME transaction (ADR-013 §4.3).
         let mut sequences = Vec::with_capacity(events.len());
         for event in &events {
             let seq: Option<i64> = sqlx::query_scalar(
@@ -1034,7 +1217,44 @@ impl A2aAtomicStore for PostgresA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
+            if self.push_dispatch_enabled
+                && event.is_terminal()
+                && matches!(event, StreamEvent::StatusUpdate { .. })
+            {
+                let now_micros = pg_systime_to_micros(std::time::SystemTime::now());
+                sqlx::query(
+                    "INSERT INTO a2a_push_pending_dispatches \
+                        (tenant, task_id, event_sequence, owner, recorded_at_micros) \
+                     VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT (tenant, task_id, event_sequence) DO UPDATE SET \
+                        owner = EXCLUDED.owner, \
+                        recorded_at_micros = EXCLUDED.recorded_at_micros",
+                )
+                .bind(tenant)
+                .bind(task_id)
+                .bind(seq)
+                .bind(owner)
+                .bind(now_micros)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            }
+
             sequences.push(seq as u64);
+        }
+
+        // ADR-013 §6.3: maintain latest_event_sequence UNCONDITIONALLY.
+        if let Some(&max_seq) = sequences.iter().max() {
+            sqlx::query(
+                "UPDATE a2a_tasks SET latest_event_sequence = $1
+                 WHERE tenant = $2 AND task_id = $3 AND latest_event_sequence < $1",
+            )
+            .bind(max_seq as i64)
+            .bind(tenant)
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         }
 
         tx.commit().await
@@ -1129,6 +1349,20 @@ impl A2aAtomicStore for PostgresA2aStorage {
             sequences.push(seq as u64);
         }
 
+        // ADR-013 §6.3: maintain latest_event_sequence UNCONDITIONALLY.
+        if let Some(&max_seq) = sequences.iter().max() {
+            sqlx::query(
+                "UPDATE a2a_tasks SET latest_event_sequence = $1
+                 WHERE tenant = $2 AND task_id = $3 AND latest_event_sequence < $1",
+            )
+            .bind(max_seq as i64)
+            .bind(tenant)
+            .bind(task.id())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        }
+
         tx.commit().await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
@@ -1144,6 +1378,18 @@ impl A2aAtomicStore for PostgresA2aStorage {
 // GaveUpReason, AbandonedReason serialise to stable string tokens;
 // DeliveryErrorClass serialises via a local wire enum.
 // ===========================================================================
+
+/// True if this sqlx error surfaces a Postgres serialization failure
+/// (SQLSTATE 40001). Used by the create_config CAS retry loop to
+/// distinguish a losable race from a hard error.
+fn is_serialization_failure(e: &sqlx::Error) -> bool {
+    if let Some(db_err) = e.as_database_error() {
+        if let Some(code) = db_err.code() {
+            return code == "40001";
+        }
+    }
+    false
+}
 
 fn pg_systime_to_micros(t: std::time::SystemTime) -> i64 {
     t.duration_since(std::time::UNIX_EPOCH)
@@ -2142,5 +2388,49 @@ mod tests {
     async fn test_push_concurrent_claim_race() {
         let s = std::sync::Arc::new(storage().await);
         parity_tests::test_push_concurrent_claim_race(s).await;
+    }
+
+    // Atomic pending-dispatch marker parity (ADR-013 §4.3 / §10.1).
+
+    async fn opted_in_storage() -> PostgresA2aStorage {
+        storage().await.with_push_dispatch_enabled(true)
+    }
+
+    #[tokio::test]
+    async fn test_atomic_marker_written_for_terminal_status() {
+        let s = opted_in_storage().await;
+        parity_tests::test_atomic_marker_written_for_terminal_status(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_marker_skipped_for_non_terminal_status() {
+        let s = opted_in_storage().await;
+        parity_tests::test_atomic_marker_skipped_for_non_terminal_status(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_marker_skipped_for_artifact_event() {
+        let s = opted_in_storage().await;
+        parity_tests::test_atomic_marker_skipped_for_artifact_event(&s, &s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_marker_absent_when_opt_in_off() {
+        let s = storage().await; // default: push_dispatch_enabled=false
+        parity_tests::test_atomic_marker_absent_when_opt_in_off(&s, &s, &s).await;
+    }
+
+    // Causal-floor eligibility parity (ADR-013 §4.5 / §10.3 / §10.4).
+
+    #[tokio::test]
+    async fn test_config_registered_at_or_after_event_not_eligible() {
+        let s = storage().await;
+        parity_tests::test_config_registered_at_or_after_event_not_eligible(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_late_create_config_stamps_advanced_sequence() {
+        let s = storage().await;
+        parity_tests::test_late_create_config_stamps_advanced_sequence(&s, &s, &s).await;
     }
 }

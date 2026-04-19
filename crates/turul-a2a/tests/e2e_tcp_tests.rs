@@ -73,7 +73,7 @@ impl AgentExecutor for PausingExecutor {
 /// Start a real TCP server and return its base URL.
 /// Server runs in a background task and shuts down when the returned guard is dropped.
 async fn start_server(executor: impl AgentExecutor + 'static) -> String {
-    let storage = InMemoryA2aStorage::new();
+    let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
     let server = turul_a2a::server::A2aServer::builder()
         .executor(executor)
         .storage(storage)
@@ -113,7 +113,7 @@ async fn start_server_with_api_key(
         }
     }
 
-    let storage = InMemoryA2aStorage::new();
+    let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
     let auth = ApiKeyMiddleware::new(
         Arc::new(StaticKeyLookup { key: expected_key.to_string() }),
         "X-API-Key",
