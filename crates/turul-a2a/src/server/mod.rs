@@ -678,6 +678,8 @@ impl A2aServer {
             self.state.runtime_config.push_reclaim_sweep_interval;
         let sweep_batch_for_task =
             self.state.runtime_config.push_reclaim_sweep_batch;
+        let push_claim_expiry_for_sweep =
+            self.state.runtime_config.push_claim_expiry;
 
         let app = self.into_router();
         let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -699,14 +701,25 @@ impl A2aServer {
             poller_shutdown,
         ));
 
-        // Push-claim reclaim-and-redispatch loop (ADR-011 §10.5).
-        // Every `push_reclaim_sweep_interval` we pull up to
-        // `push_reclaim_sweep_batch` expired-but-non-terminal rows
-        // and hand each to the dispatcher. A row returned here means
-        // some earlier delivery attempt could not finalise (terminal
-        // store write exhausted its bounded retry) — the sweeper's
-        // job is to drive those back to terminal by re-POSTing,
-        // rather than just counting them for observability.
+        // Push-delivery reclaim loop (ADR-011 §10.5). Two
+        // enumerations run per tick:
+        //
+        // 1. `list_stale_pending_dispatches` — events whose initial
+        //    fan-out died (e.g. persistent config-store outage)
+        //    before any claim rows were created. The dispatcher
+        //    reloads the task and re-runs the fan-out; each
+        //    per-config delivery then creates or refreshes its
+        //    claim row.
+        //
+        // 2. `list_reclaimable_claims` — claim rows that reached a
+        //    non-terminal expired state (worker exhausted its
+        //    bounded persist retry). The dispatcher re-invokes
+        //    `deliver()` which re-claims and re-POSTs.
+        //
+        // Staleness threshold for pending dispatches: claim_expiry,
+        // the same budget the builder already validates must exceed
+        // the retry horizon. In-progress dispatches stay under this
+        // threshold; only genuinely stuck markers get picked up.
         let sweep_handle = match (
             push_delivery_store_for_sweep,
             self_push_dispatcher_for_sweep,
@@ -715,6 +728,7 @@ impl A2aServer {
                 let shutdown = shutdown.clone();
                 let interval = sweep_interval_for_task;
                 let batch = sweep_batch_for_task;
+                let pending_stale_threshold = push_claim_expiry_for_sweep;
                 Some(tokio::spawn(async move {
                     let mut ticker = tokio::time::interval(interval);
                     ticker.set_missed_tick_behavior(
@@ -724,6 +738,33 @@ impl A2aServer {
                         tokio::select! {
                             _ = shutdown.cancelled() => break,
                             _ = ticker.tick() => {
+                                let cutoff = std::time::SystemTime::now()
+                                    .checked_sub(pending_stale_threshold)
+                                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                                match store
+                                    .list_stale_pending_dispatches(cutoff, batch)
+                                    .await
+                                {
+                                    Ok(rows) if !rows.is_empty() => {
+                                        tracing::warn!(
+                                            target: "turul_a2a::push_pending_dispatches_stale",
+                                            count = rows.len(),
+                                            "reclaim sweep found stale pending-dispatch \
+                                             markers; re-running fan-out"
+                                        );
+                                        for row in rows {
+                                            dispatcher.redispatch_pending(row).await;
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        tracing::error!(
+                                            target: "turul_a2a::push_pending_sweep_error",
+                                            error = %e,
+                                            "pending-dispatch sweep failed"
+                                        );
+                                    }
+                                }
                                 match store.list_reclaimable_claims(batch).await {
                                     Ok(rows) if !rows.is_empty() => {
                                         tracing::warn!(

@@ -25,7 +25,7 @@ pub mod ssrf;
 
 pub use claim::{
     A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
-    DeliveryOutcome, FailedDelivery, GaveUpReason,
+    DeliveryOutcome, FailedDelivery, GaveUpReason, PendingDispatch, ReclaimableClaim,
 };
 pub use dispatcher::PushDispatcher;
 pub use secret::{redact_in_str, Secret};

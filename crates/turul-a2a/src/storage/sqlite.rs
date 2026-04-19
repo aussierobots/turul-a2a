@@ -144,6 +144,20 @@ impl SqliteA2aStorage {
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS a2a_push_pending_dispatches (
+                tenant TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                event_sequence INTEGER NOT NULL,
+                owner TEXT NOT NULL,
+                recorded_at_micros INTEGER NOT NULL,
+                PRIMARY KEY (tenant, task_id, event_sequence)
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
         Ok(())
     }
 
@@ -1680,6 +1694,87 @@ impl A2aPushDeliveryStore for SqliteA2aStorage {
                     }
                 },
             )
+            .collect())
+    }
+
+    async fn record_pending_dispatch(
+        &self,
+        tenant: &str,
+        owner: &str,
+        task_id: &str,
+        event_sequence: u64,
+    ) -> Result<(), A2aStorageError> {
+        let now_micros = systime_to_micros(std::time::SystemTime::now());
+        // Idempotent insert-or-refresh: a repeat write on the same
+        // tuple updates recorded_at + owner. Using ON CONFLICT DO
+        // UPDATE keeps the call cheap for the in-progress dispatch
+        // path where the marker may already exist.
+        sqlx::query(
+            "INSERT INTO a2a_push_pending_dispatches \
+                (tenant, task_id, event_sequence, owner, recorded_at_micros) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (tenant, task_id, event_sequence) DO UPDATE SET \
+                owner = excluded.owner, \
+                recorded_at_micros = excluded.recorded_at_micros",
+        )
+        .bind(tenant)
+        .bind(task_id)
+        .bind(event_sequence as i64)
+        .bind(owner)
+        .bind(now_micros)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn delete_pending_dispatch(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+    ) -> Result<(), A2aStorageError> {
+        sqlx::query(
+            "DELETE FROM a2a_push_pending_dispatches \
+             WHERE tenant = ?1 AND task_id = ?2 AND event_sequence = ?3",
+        )
+        .bind(tenant)
+        .bind(task_id)
+        .bind(event_sequence as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_stale_pending_dispatches(
+        &self,
+        older_than_recorded_at: std::time::SystemTime,
+        limit: usize,
+    ) -> Result<Vec<crate::push::claim::PendingDispatch>, A2aStorageError> {
+        let cutoff_micros = systime_to_micros(older_than_recorded_at);
+        let rows: Vec<(String, String, String, i64, i64)> = sqlx::query_as(
+            "SELECT tenant, owner, task_id, event_sequence, recorded_at_micros \
+             FROM a2a_push_pending_dispatches \
+             WHERE recorded_at_micros <= ?1 \
+             LIMIT ?2",
+        )
+        .bind(cutoff_micros)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|(tenant, owner, task_id, event_sequence, recorded_at_micros)| {
+                crate::push::claim::PendingDispatch {
+                    tenant,
+                    owner,
+                    task_id,
+                    event_sequence: event_sequence.max(0) as u64,
+                    recorded_at: micros_to_systime(recorded_at_micros),
+                }
+            })
             .collect())
     }
 

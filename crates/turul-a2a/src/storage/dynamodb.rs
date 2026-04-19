@@ -34,6 +34,9 @@ pub struct DynamoDbConfig {
     pub push_configs_table: String,
     pub events_table: String,
     pub push_deliveries_table: String,
+    /// Pending-dispatch marker table. See
+    /// [`crate::push::A2aPushDeliveryStore::record_pending_dispatch`].
+    pub push_pending_dispatches_table: String,
     /// TTL for task items in seconds. 0 = no expiry. Default: 7 days (604800).
     pub task_ttl_seconds: u64,
     /// TTL for event items in seconds. 0 = no expiry. Default: 24 hours (86400).
@@ -58,6 +61,7 @@ impl Default for DynamoDbConfig {
             push_configs_table: "a2a_push_configs".into(),
             events_table: "a2a_task_events".into(),
             push_deliveries_table: "a2a_push_deliveries".into(),
+            push_pending_dispatches_table: "a2a_push_pending_dispatches".into(),
             task_ttl_seconds: DEFAULT_TASK_TTL,
             event_ttl_seconds: DEFAULT_EVENT_TTL,
             push_delivery_ttl_seconds: DEFAULT_PUSH_DELIVERY_TTL,
@@ -2062,6 +2066,125 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
         Ok(out)
     }
 
+    async fn record_pending_dispatch(
+        &self,
+        tenant: &str,
+        owner: &str,
+        task_id: &str,
+        event_sequence: u64,
+    ) -> Result<(), A2aStorageError> {
+        let now_micros = ddb_systime_to_micros(std::time::SystemTime::now());
+        let pk = format!("{tenant}#{task_id}");
+        let sk = event_sequence.to_string();
+        // Unconditional PutItem — idempotent by key; overwrite
+        // refreshes recorded_at so an in-progress redispatch isn't
+        // treated as stale.
+        let mut put = self
+            .client
+            .put_item()
+            .table_name(&self.config.push_pending_dispatches_table)
+            .item("pk", AttributeValue::S(pk))
+            .item("sk", AttributeValue::S(sk))
+            .item("tenant", AttributeValue::S(tenant.to_string()))
+            .item("taskId", AttributeValue::S(task_id.to_string()))
+            .item("eventSequence", AttributeValue::N(event_sequence.to_string()))
+            .item("owner", AttributeValue::S(owner.to_string()))
+            .item("recordedAtMicros", AttributeValue::N(now_micros.to_string()));
+        if let Some(ttl) = Self::ttl_epoch(self.config.push_delivery_ttl_seconds) {
+            put = put.item("ttl", ttl);
+        }
+        put.send()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+        Ok(())
+    }
+
+    async fn delete_pending_dispatch(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+    ) -> Result<(), A2aStorageError> {
+        let pk = format!("{tenant}#{task_id}");
+        let sk = event_sequence.to_string();
+        self.client
+            .delete_item()
+            .table_name(&self.config.push_pending_dispatches_table)
+            .key("pk", AttributeValue::S(pk))
+            .key("sk", AttributeValue::S(sk))
+            .send()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+        Ok(())
+    }
+
+    async fn list_stale_pending_dispatches(
+        &self,
+        older_than_recorded_at: std::time::SystemTime,
+        limit: usize,
+    ) -> Result<Vec<crate::push::claim::PendingDispatch>, A2aStorageError> {
+        let cutoff_micros = ddb_systime_to_micros(older_than_recorded_at);
+        let mut out: Vec<crate::push::claim::PendingDispatch> = Vec::new();
+        let mut last_key = None;
+        while out.len() < limit {
+            let mut scan = self
+                .client
+                .scan()
+                .table_name(&self.config.push_pending_dispatches_table)
+                .filter_expression("recordedAtMicros <= :cutoff")
+                .expression_attribute_values(
+                    ":cutoff",
+                    AttributeValue::N(cutoff_micros.to_string()),
+                );
+            if let Some(k) = last_key.take() {
+                scan = scan.set_exclusive_start_key(Some(k));
+            }
+            let page = scan
+                .send()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            if let Some(items) = page.items {
+                for item in items {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    let tenant = item
+                        .get("tenant")
+                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .unwrap_or_default();
+                    let owner = item
+                        .get("owner")
+                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .unwrap_or_default();
+                    let task_id = item
+                        .get("taskId")
+                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .unwrap_or_default();
+                    let event_sequence = item
+                        .get("eventSequence")
+                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<u64>().ok() } else { None })
+                        .unwrap_or(0);
+                    let recorded_at_micros = item
+                        .get("recordedAtMicros")
+                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None })
+                        .unwrap_or(0);
+                    out.push(crate::push::claim::PendingDispatch {
+                        tenant,
+                        owner,
+                        task_id,
+                        event_sequence,
+                        recorded_at: ddb_micros_to_systime(recorded_at_micros),
+                    });
+                }
+            }
+            last_key = page.last_evaluated_key;
+            if last_key.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     async fn list_failed_deliveries(
         &self,
         tenant: &str,
@@ -2658,6 +2781,39 @@ mod tests {
             limit: usize,
         ) -> Result<Vec<crate::push::claim::ReclaimableClaim>, A2aStorageError> {
             self.inner.list_reclaimable_claims(limit).await
+        }
+
+        async fn record_pending_dispatch(
+            &self,
+            tenant: &str,
+            owner: &str,
+            task_id: &str,
+            event_sequence: u64,
+        ) -> Result<(), A2aStorageError> {
+            self.inner
+                .record_pending_dispatch(&self.scoped_tenant(tenant), owner, task_id, event_sequence)
+                .await
+        }
+
+        async fn delete_pending_dispatch(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            event_sequence: u64,
+        ) -> Result<(), A2aStorageError> {
+            self.inner
+                .delete_pending_dispatch(&self.scoped_tenant(tenant), task_id, event_sequence)
+                .await
+        }
+
+        async fn list_stale_pending_dispatches(
+            &self,
+            older_than_recorded_at: std::time::SystemTime,
+            limit: usize,
+        ) -> Result<Vec<crate::push::claim::PendingDispatch>, A2aStorageError> {
+            self.inner
+                .list_stale_pending_dispatches(older_than_recorded_at, limit)
+                .await
         }
 
         async fn list_failed_deliveries(

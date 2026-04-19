@@ -318,6 +318,61 @@ pub trait A2aPushDeliveryStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<ReclaimableClaim>, A2aStorageError>;
 
+    /// Record a durable "this terminal event needs fan-out" marker.
+    ///
+    /// The dispatcher writes a marker for `(tenant, task_id,
+    /// event_sequence)` BEFORE calling `list_configs`. If
+    /// `list_configs` fails persistently, the marker is the only
+    /// evidence the event ever wanted to be dispatched — claim
+    /// rows haven't been created yet, so `list_reclaimable_claims`
+    /// has nothing to return. The server's reclaim loop enumerates
+    /// stale markers via [`Self::list_stale_pending_dispatches`]
+    /// and invokes a redispatch that re-runs `list_configs` +
+    /// fan-out.
+    ///
+    /// Idempotent: writing a marker for a tuple that already has
+    /// one is a no-op (or refreshes `recorded_at` — backends choose,
+    /// as long as repeated calls do not fail). The dispatcher may
+    /// call this on every dispatch attempt for defence in depth.
+    async fn record_pending_dispatch(
+        &self,
+        tenant: &str,
+        owner: &str,
+        task_id: &str,
+        event_sequence: u64,
+    ) -> Result<(), A2aStorageError>;
+
+    /// Delete a pending-dispatch marker after fan-out completes.
+    ///
+    /// Called once all per-config deliveries have had a chance to
+    /// create their claim rows — whether each POST succeeded or
+    /// not. After deletion, the event's recovery is handled by the
+    /// claim-row reclaim path; the marker's job of ensuring
+    /// *something* survives `list_configs` failure is done.
+    ///
+    /// Idempotent: deleting a non-existent marker is a no-op.
+    async fn delete_pending_dispatch(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+    ) -> Result<(), A2aStorageError>;
+
+    /// Enumerate pending-dispatch markers whose `recorded_at` is
+    /// older than the given threshold.
+    ///
+    /// The threshold MUST exceed the dispatcher's bounded
+    /// `list_configs` retry horizon (typically set to
+    /// `push_claim_expiry`) so in-progress dispatches don't get
+    /// prematurely "redispatched". The server's reclaim sweep
+    /// uses this to recover events whose initial fan-out died
+    /// before producing any claim rows.
+    async fn list_stale_pending_dispatches(
+        &self,
+        older_than_recorded_at: SystemTime,
+        limit: usize,
+    ) -> Result<Vec<PendingDispatch>, A2aStorageError>;
+
     /// Operator inspection: list failed deliveries for a tenant.
     ///
     /// Returns rows with status `GaveUp` whose `gave_up_at >= since`,
@@ -589,4 +644,19 @@ pub struct ReclaimableClaim {
     pub task_id: String,
     pub event_sequence: u64,
     pub config_id: String,
+}
+
+/// Row returned by
+/// [`A2aPushDeliveryStore::list_stale_pending_dispatches`]. Enough
+/// identity for the reclaim loop to call
+/// [`crate::storage::A2aTaskStorage::get_task`] and re-run the
+/// fan-out logic a fresh dispatch would perform.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct PendingDispatch {
+    pub tenant: String,
+    pub owner: String,
+    pub task_id: String,
+    pub event_sequence: u64,
+    pub recorded_at: SystemTime,
 }

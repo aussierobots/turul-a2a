@@ -531,6 +531,39 @@ impl A2aPushDeliveryStore for FailingTerminalStore {
         self.inner.list_reclaimable_claims(limit).await
     }
 
+    async fn record_pending_dispatch(
+        &self,
+        tenant: &str,
+        owner: &str,
+        task_id: &str,
+        event_sequence: u64,
+    ) -> Result<(), A2aStorageError> {
+        self.inner
+            .record_pending_dispatch(tenant, owner, task_id, event_sequence)
+            .await
+    }
+
+    async fn delete_pending_dispatch(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+    ) -> Result<(), A2aStorageError> {
+        self.inner
+            .delete_pending_dispatch(tenant, task_id, event_sequence)
+            .await
+    }
+
+    async fn list_stale_pending_dispatches(
+        &self,
+        older_than_recorded_at: std::time::SystemTime,
+        limit: usize,
+    ) -> Result<Vec<turul_a2a::push::claim::PendingDispatch>, A2aStorageError> {
+        self.inner
+            .list_stale_pending_dispatches(older_than_recorded_at, limit)
+            .await
+    }
+
     async fn record_attempt_started(
         &self,
         tenant: &str,
@@ -1217,6 +1250,126 @@ async fn redispatch_read_error_leaves_row_reclaimable() {
         1,
         "transient get_config error must NOT terminalise the row; \
          it should remain reclaimable for the next sweep tick"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn pending_dispatch_marker_recovers_persistent_list_configs_outage() {
+    use turul_a2a::push::dispatcher::PushDispatcher;
+
+    let server = MockServer::start().await;
+    // Exactly one POST: the first dispatch attempt fails (list_configs
+    // keeps returning errors past the bounded-retry budget). The
+    // marker survives, the reclaim pulls it, the second dispatch
+    // attempt runs list_configs against a recovered store and the
+    // POST lands.
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let inner = Arc::new(InMemoryA2aStorage::new());
+    // Fail list_configs 4 times: 3 initial retries + 1 more after a
+    // potential redispatch to ensure the first full fan-out attempt
+    // fails. All later calls pass through.
+    let push_storage = Arc::new(FailingPushStorage::new(inner.clone(), 0, 4));
+
+    let delivery_store: Arc<dyn A2aPushDeliveryStore> = inner.clone();
+    let mut cfg = PushDeliveryConfig::default();
+    cfg.max_attempts = 1;
+    cfg.backoff_base = Duration::from_millis(1);
+    cfg.backoff_cap = Duration::from_millis(1);
+    cfg.backoff_jitter = 0.0;
+    cfg.request_timeout = Duration::from_secs(1);
+    cfg.connect_timeout = Duration::from_millis(500);
+    cfg.read_timeout = Duration::from_secs(1);
+    cfg.claim_expiry = Duration::from_millis(50);
+    cfg.max_payload_bytes = 64 * 1024;
+    cfg.allow_insecure_urls = true;
+    let worker = Arc::new(
+        PushDeliveryWorker::new(delivery_store.clone(), cfg, None, "instance-pd".into())
+            .expect("worker build"),
+    );
+
+    let task_storage: Arc<dyn turul_a2a::storage::A2aTaskStorage> = inner.clone();
+    let push_storage_trait: Arc<dyn turul_a2a::storage::A2aPushNotificationStorage> =
+        push_storage.clone();
+    let dispatcher = PushDispatcher::new(worker, push_storage_trait, task_storage);
+
+    let tenant = "tenant-pd";
+    let task_id = "task-pd-1";
+    let owner = "anonymous";
+    let task = turul_a2a_types::Task::new(
+        task_id,
+        turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Completed),
+    )
+    .with_context_id("ctx-pd");
+    let completed = turul_a2a::streaming::StreamEvent::StatusUpdate {
+        status_update: turul_a2a::streaming::StatusUpdatePayload {
+            task_id: task_id.into(),
+            context_id: "ctx-pd".into(),
+            status: serde_json::to_value(&turul_a2a_types::TaskStatus::new(
+                turul_a2a_types::TaskState::Completed,
+            ))
+            .unwrap(),
+        },
+    };
+    use turul_a2a::storage::A2aAtomicStore;
+    inner
+        .create_task_with_events(tenant, owner, task.clone(), vec![])
+        .await
+        .expect("seed task");
+    inner
+        .create_config(
+            tenant,
+            turul_a2a_proto::TaskPushNotificationConfig {
+                tenant: tenant.into(),
+                id: "cfg-pd".into(),
+                task_id: task_id.into(),
+                url: format!("{}/webhook", server.uri()),
+                token: String::new(),
+                authentication: None,
+            },
+        )
+        .await
+        .expect("seed config");
+
+    // First dispatch: list_configs fails through its bounded retry,
+    // so the fan-out aborts after recording a pending marker.
+    dispatcher.dispatch(tenant.into(), owner.into(), task, vec![(1, completed)]);
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    // Marker must be present. `list_stale_pending_dispatches` with
+    // cutoff = now returns everything recorded before now.
+    let pending = delivery_store
+        .list_stale_pending_dispatches(std::time::SystemTime::now(), 16)
+        .await
+        .expect("list_stale_pending_dispatches");
+    assert_eq!(
+        pending.len(),
+        1,
+        "persistent list_configs outage MUST leave a pending-dispatch marker; got {pending:?}"
+    );
+    assert_eq!(pending[0].task_id, task_id);
+    assert_eq!(pending[0].event_sequence, 1);
+
+    // Simulate the reclaim sweep tick: drive redispatch. The
+    // FailingPushStorage has one retry budget left, but the
+    // redispatch's own retry will cycle past it.
+    dispatcher.redispatch_pending(pending.into_iter().next().unwrap()).await;
+
+    // After recovery, the marker is gone and wiremock saw one POST.
+    let pending_after = delivery_store
+        .list_stale_pending_dispatches(std::time::SystemTime::now(), 16)
+        .await
+        .expect("list after recovery");
+    assert!(
+        pending_after.is_empty(),
+        "after successful redispatch the marker must be deleted; got {pending_after:?}"
     );
 
     drop(server);

@@ -94,6 +94,18 @@ pub struct InMemoryA2aStorage {
     events: Arc<RwLock<HashMap<EventKey, Vec<(u64, StreamEvent)>>>>,
     event_counters: Arc<RwLock<HashMap<EventKey, u64>>>,
     push_delivery_claims: Arc<RwLock<HashMap<PushDeliveryKey, StoredDeliveryClaim>>>,
+    pending_dispatches: Arc<
+        RwLock<HashMap<(String, String, u64), StoredPendingDispatch>>,
+    >,
+}
+
+/// Backing row for a pending-dispatch marker. Mirrors the public
+/// `PendingDispatch` shape plus the owner/tenant the reclaim
+/// sweeper needs to call owner-scoped `get_task`.
+#[derive(Debug, Clone)]
+struct StoredPendingDispatch {
+    owner: String,
+    recorded_at: std::time::SystemTime,
 }
 
 impl InMemoryA2aStorage {
@@ -104,6 +116,7 @@ impl InMemoryA2aStorage {
             events: Arc::new(RwLock::new(HashMap::new())),
             event_counters: Arc::new(RwLock::new(HashMap::new())),
             push_delivery_claims: Arc::new(RwLock::new(HashMap::new())),
+            pending_dispatches: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -1223,6 +1236,65 @@ impl A2aPushDeliveryStore for InMemoryA2aStorage {
                     event_sequence: *event_sequence,
                     config_id: config_id.clone(),
                 })
+            })
+            .collect();
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    async fn record_pending_dispatch(
+        &self,
+        tenant: &str,
+        owner: &str,
+        task_id: &str,
+        event_sequence: u64,
+    ) -> Result<(), A2aStorageError> {
+        let key = (tenant.to_string(), task_id.to_string(), event_sequence);
+        let mut map = self.pending_dispatches.write().await;
+        // Idempotent: a repeat record refreshes recorded_at so
+        // in-progress redispatches don't trip the staleness threshold.
+        map.insert(
+            key,
+            StoredPendingDispatch {
+                owner: owner.to_string(),
+                recorded_at: std::time::SystemTime::now(),
+            },
+        );
+        Ok(())
+    }
+
+    async fn delete_pending_dispatch(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event_sequence: u64,
+    ) -> Result<(), A2aStorageError> {
+        let key = (tenant.to_string(), task_id.to_string(), event_sequence);
+        let mut map = self.pending_dispatches.write().await;
+        map.remove(&key);
+        Ok(())
+    }
+
+    async fn list_stale_pending_dispatches(
+        &self,
+        older_than_recorded_at: std::time::SystemTime,
+        limit: usize,
+    ) -> Result<Vec<crate::push::claim::PendingDispatch>, A2aStorageError> {
+        let map = self.pending_dispatches.read().await;
+        let mut out: Vec<crate::push::claim::PendingDispatch> = map
+            .iter()
+            .filter_map(|((tenant, task_id, seq), row)| {
+                if row.recorded_at <= older_than_recorded_at {
+                    Some(crate::push::claim::PendingDispatch {
+                        tenant: tenant.clone(),
+                        owner: row.owner.clone(),
+                        task_id: task_id.clone(),
+                        event_sequence: *seq,
+                        recorded_at: row.recorded_at,
+                    })
+                } else {
+                    None
+                }
             })
             .collect();
         out.truncate(limit);
