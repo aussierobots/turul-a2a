@@ -8,14 +8,14 @@ Turul-a2a is a Rust implementation of the A2A (Agent-to-Agent) Protocol v1.0. Li
 
 **Proto-first architecture**: Types are generated from the normative `proto/a2a.proto` (package `lf.a2a.v1`) using `prost` + `pbjson`, then wrapped in ergonomic Rust types.
 
-**Maturity**: D3 durable event coordination complete across all deployment surfaces (359+ tests, 455 with all backends). Four parity-proven backends (in-memory, SQLite, PostgreSQL, DynamoDB) implement event store + atomic task/event writes. Cross-instance streaming verified: store is truth, broker is wake-up signal; subscribers attached while a task is non-terminal receive replay of earlier events and then live delivery up to and including the terminal event; `Last-Event-ID` reconnection for still-running tasks is proven. Subscribing to an already-terminal task returns `UnsupportedOperationError` per A2A v1.0 §3.1.6 (terminal state is retrieved via `GetTask`). Lambda streaming verified via cargo-lambda: SSE events with durable IDs, `Last-Event-ID` reconnection while non-terminal. Same-backend enforcement on both server and Lambda builders.
+**Current release**: 0.1.5 — see `CHANGELOG.md` for the per-release contract. §Completed below tracks which ADRs have shipped.
 
 ## Build & Development Commands
 
 ```bash
 cargo build --workspace                    # Build all crates
 cargo check --workspace                    # Type-check
-cargo test --workspace                     # Run all tests (391+)
+cargo test --workspace                     # Run all tests
 cargo test --workspace --features sqlite   # Include SQLite parity tests
 cargo clippy --workspace -- -D warnings    # Lint (deny warnings)
 cargo fmt --all -- --check                 # Format check
@@ -77,13 +77,17 @@ The workspace publishes 7 crates. The workflow is:
    - Workspace-root `[workspace.dependencies]` internal refs (`turul-a2a-proto`, `turul-a2a-types`) also get bumped to the new version.
 
 6. **Tag after successful publish** with annotated tags:
-   - `git tag -a vX.Y.Z -m "Release X.Y.Z — <one-liner>"`
+   - `git tag -a vX.Y.Z <release-bump-sha> -m "Release X.Y.Z — <one-liner>"` — **always pass the commit SHA explicitly**. Do not let `git tag` default to `HEAD`; other work may have landed between the publish walk and the tag (v0.1.4 landed on a post-release docs commit for exactly this reason).
    - `git push origin vX.Y.Z`
    - This matches the CHANGELOG release-link convention (`/releases/tag/vX.Y.Z`) and populates GitHub's Releases UI.
 
 7. **Proto file location:** `crates/turul-a2a-proto/proto/` is the canonical location so `cargo package` includes it. A workspace-root `proto/` symlink preserves historical paths in ADRs and docs — do not replace it with a real directory.
 
 8. **Commit the release-prep changes** before running `cargo publish` — cargo will complain about dirty state otherwise. Never use `--allow-dirty` on real publishes, only on `cargo package` dry-runs.
+
+9. **Per-crate LICENSE files:** every publish crate has `LICENSE-APACHE` and `LICENSE-MIT` symlinks to `../../LICENSE-*`. When adding a new publish crate, add both symlinks or the `.crate` archive ships with only the SPDX identifier.
+
+10. **Lambda example `doc = false`:** all three Lambda example crates declare `[[bin]] name = "bootstrap"` (cargo-lambda requirement). Each has `doc = false` on the bin target so `cargo doc --workspace` does not collide on output filenames.
 
 ## Architecture
 
@@ -115,6 +119,15 @@ Google well-known types (`google.protobuf.Struct`, `Value`, `Timestamp`) mapped 
 - **Push notification configs** use raw `turul_a2a_proto::TaskPushNotificationConfig` in storage traits and handler signatures. This is an intentional exception — push configs are simple CRUD with no state machine or invariants that warrant a wrapper. Keep this leakage isolated; do not let raw proto types spread into general handler/router code.
 - **`last_chunk` on `append_artifact`** is transport metadata for SSE streaming. Storage does not persist completion state; the server layer forwards `last_chunk` to streaming subscribers.
 
+### Server Wiring: Push Delivery Is Strict Opt-In (0.1.5+)
+
+`.storage(storage)` wires storage traits only, even though all four first-party backends implement `A2aPushDeliveryStore` on the same struct (ADR-009 same-backend requirement). Push delivery is opt-in at **both** levels:
+
+- **Storage**: `InMemoryA2aStorage::new().with_push_dispatch_enabled(true)` (and equivalents per backend) so atomic commits write the pending-dispatch marker.
+- **Builder**: `.push_delivery_store(storage.clone())` to register the consumer.
+
+The builder rejects inconsistent configurations (ADR-013 §4.3). Non-push adopters need neither call.
+
 ### Multi-Instance Streaming Limitation
 
 - The in-process event broker (`TaskEventBroker`) provides local fanout for attached clients on the **same instance only**.
@@ -135,6 +148,10 @@ Documented under `docs/adr/`:
 - **ADR-007**: Auth middleware — transport-level Tower layer, AuthIdentity enum, SecurityContribution, local JWT validator
 - **ADR-008**: Lambda adapter — request/response only, streaming deferred to D3, authorizer anti-spoofing
 - **ADR-009**: Durable event coordination — same-backend transaction atomicity, tenant-scoped, per-task monotonic sequences
+- **ADR-010**: Executor `EventSink` — finer-grained streaming events from inside the executor; proto-only variant surface
+- **ADR-011**: Push notification delivery — claim-based fan-out, retry horizon, SSRF, secret redaction
+- **ADR-012**: Cancellation propagation — cross-instance cancel marker, supervisor sweep, same-backend requirement
+- **ADR-013**: Lambda push-delivery parity — atomic pending-dispatch marker, causal no-backfill CAS, stream + scheduled recovery workers. §4.3 errata (0.1.5): `.storage()` does not auto-wire push delivery; explicit `.push_delivery_store(...)` required.
 
 For non-trivial architecture changes, the ADR should be accepted before implementation starts.
 
@@ -189,11 +206,14 @@ Before describing a release as "A2A v1.0 compliant", re-verify the vendored `pro
 
 ### Completed
 
-- **D3: Durable event coordination** — ADR-009 accepted and implemented across all deployment surfaces. Durable event store is source of truth, broker is wake-up signal only. Atomic task+event writes via `A2aAtomicStore`. Terminal replay, Last-Event-ID reconnection, cross-instance streaming all verified. Four parity-proven backends. Lambda streaming verified via cargo-lambda.
+- **ADR-009 — Durable event coordination**: store is truth, broker is wake-up signal. Atomic task+event writes via `A2aAtomicStore`. Terminal replay, Last-Event-ID reconnection, cross-instance streaming all verified. Four parity-proven backends.
+- **ADR-010 — Executor `EventSink`**: proto-variant-only surface; `emit_*`/`set_status` serialize per-sink.
+- **ADR-011 — Push notification delivery**: `PushDispatcher` + `PushDeliveryWorker`, claim-based fan-out, bounded retry horizon (`push_claim_expiry > max_attempts * backoff_cap`), SSRF allowlist, secret redaction.
+- **ADR-012 — Cancellation propagation**: cross-instance cancel marker + supervisor sweep; same-backend check on the builder.
+- **ADR-013 — Lambda push-delivery parity**: atomic `a2a_push_pending_dispatches` marker, causal `latest_event_sequence` CAS, `LambdaStreamRecoveryHandler` (BatchItemFailures) + `LambdaScheduledRecoveryHandler` (EventBridge backstop).
 
 ### Deferred (ordered by priority)
 
 1. **gRPC transport** — feature-gated in `turul-a2a-proto`
 2. **Skill-level `security_requirements`** — agent-level only for now
 3. **Shared `turul-jwt-validator` extraction** — currently local, see ADR-007
-4. **Executor `EventSink`** — finer-grained streaming events from within executor, deferred per ADR-009 §13
