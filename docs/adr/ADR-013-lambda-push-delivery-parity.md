@@ -1,12 +1,35 @@
 # ADR-013: Lambda Push Delivery Parity
 
-- **Status:** Proposed
-- **Date:** 2026-04-19
+- **Status:** Proposed (rev 2 — 2026-04-19)
 - **Depends on:** ADR-008 (Lambda adapter), ADR-009 (durable event coordination),
-  ADR-011 (push notification delivery)
-- **Supersedes (partially):** E.20 — the dedicated `a2a_push_pending_dispatches`
-  table is rescinded in favor of streaming the existing events table; see
-  Decision §3 and Follow-ups §11.
+  ADR-011 (push notification delivery), E.20 (`a2a_push_pending_dispatches`
+  table)
+- **Spec reference:** A2A v1.0 §9 "Push Notifications"; ADR-011 §8 "Config
+  lifecycle edge cases" (no backfill invariant)
+
+## Revision history
+
+- **rev 1 (rejected, 2026-04-19)** — proposed streaming the
+  `a2a_task_events` table and rescinding E.20's
+  `a2a_push_pending_dispatches` table. Rejected by agent-team review:
+  - Event rows don't carry `owner`; `A2aTaskStorage::get_task` requires
+    owner, so the stream worker's "load the task to get owner" step
+    was circular.
+  - `list_tasks(status=Terminal)` is owner-scoped; the scheduled
+    backstop's cross-owner terminal-task scan has no framework API.
+  - A time-window event scan can retroactively deliver old terminal
+    events to configs registered after commit time, violating
+    ADR-011 §8 "no backfill."
+  - Schema-enrichment cost (4 backend migrations + 1 DDB GSI + 1 new
+    trait method) exceeded the marker-atomicity cost (1 extra write
+    inside an existing transaction per backend).
+- **rev 2 (this doc)** — keeps `a2a_push_pending_dispatches` and
+  fixes its atomicity by moving the marker write from the dispatcher's
+  post-commit tokio-spawned task into
+  `A2aAtomicStore::update_task_status_with_events`'s existing
+  transaction. Stream the pending-dispatch table directly; every
+  record is real work. EventBridge Scheduler remains the mandatory
+  backstop.
 
 ## 1. Context
 
@@ -21,10 +44,10 @@ AWS Lambda's execution model is request-scoped. Between invocations the
 execution environment MAY be frozen indefinitely. `tokio::spawn`ed tasks
 created inside an invocation are only guaranteed to run while the
 handler is still awaiting — once the handler returns, a spawn may
-complete, may be frozen for minutes, or may never run again. `A2aServer
-::run`'s sweep loops are never called under Lambda; the Lambda adapter
-uses a bespoke `LambdaA2aHandler` that only translates events to the
-shared axum router and back.
+complete, may be frozen for minutes, or may never run again.
+`A2aServer::run`'s sweep loops are never called under Lambda; the
+Lambda adapter uses a bespoke `LambdaA2aHandler` that only translates
+events to the shared axum router and back.
 
 Today (commit `47d3694`):
 
@@ -35,23 +58,22 @@ Today (commit `47d3694`):
 - Neither the reclaim loop nor the pending-dispatch scan runs.
 - No test or doc claims Lambda push delivery works.
 
-This ADR decides the correct Lambda push architecture, picks a
-DynamoDB-specific stream trigger, retains a scheduler-driven backstop,
-and answers the question that E.20 left un-litigated: **which existing
-storage artifact is the durable "this terminal event needs push fan-out"
-record?**
+This ADR decides the correct Lambda push architecture and answers the
+question that E.20 left un-litigated: **how is the "this terminal event
+needs push fan-out" intent durably recorded atomically with the task
+commit, so a Lambda-driven recovery path can reliably pick it up?**
 
-## 2. The five logical tables
+## 2. The five logical tables (inventory)
 
 Before picking a stream source, enumerate what storage already exists.
 The framework's `storage/` module exposes five logical tables; names
-below are the default SQL/DynamoDB names.
+below are the default SQL / DynamoDB names.
 
 | Logical table | Default name | Purpose | Trait |
 |---|---|---|---|
 | Tasks | `a2a_tasks` | Current task state (full Task JSON), owner, context, status, updated_at, cancel marker | `A2aTaskStorage`, `A2aCancellationSupervisor` |
 | Task events | `a2a_task_events` | Append-only event stream with `event_sequence`; drives SSE / history / replay | `A2aEventStore` |
-| Push configs | `a2a_push_configs` | Registered webhook configs per task (URL, auth, token) | `A2aPushNotificationStorage` |
+| Push configs | `a2a_push_configs` | Registered webhook configs per task (URL, auth, token) — the "hooks" | `A2aPushNotificationStorage` |
 | Push delivery claims | `a2a_push_deliveries` | Per (tenant, task_id, event_sequence, config_id) delivery state: claimant, generation, attempt count, succeeded/gave-up/abandoned diagnostics | `A2aPushDeliveryStore` |
 | Pending dispatch markers | `a2a_push_pending_dispatches` | E.20 addition — durable marker that a terminal event still needs push fan-out | `A2aPushDeliveryStore` |
 
@@ -61,138 +83,100 @@ Notes:
   read through `A2aCancellationSupervisor::supervisor_get_cancel_requested`.
 - **Atomic task/event commits span `a2a_tasks` + `a2a_task_events`.**
   `A2aAtomicStore::update_task_status_with_events` writes both rows
-  transactionally (SQL: single tx; DynamoDB: `TransactWriteItems`; in-
-  memory: combined lock).
-- The push-config **hooks** table (`a2a_push_configs`) stores
-  webhook registrations. It is not a dispatch trigger — new config
-  CRUD doesn't mean "deliver now."
-- Per-recipient delivery execution state lives in `a2a_push_deliveries`,
-  keyed per (event × config). Rows appear only after `claim_delivery`
-  runs — which happens after `list_configs` succeeds.
+  transactionally (SQL: single tx; DynamoDB: `TransactWriteItems`;
+  in-memory: combined lock).
+- `a2a_push_configs` holds webhook **registrations**. Streaming it
+  would fire on config CRUD, not on terminal events — wrong trigger
+  semantics. Not a dispatch source.
+- `a2a_push_deliveries` holds per-recipient execution state. Rows
+  appear only after `claim_delivery` has run, which is after
+  `list_configs` succeeded. Streaming it cannot recover the pre-claim
+  gap. Not a viable primary trigger.
+- `a2a_push_pending_dispatches` is purpose-built for "this terminal
+  event still needs fan-out." When its write is atomic with the
+  task/event commit, it is the correct durable intent record.
 
-## 3. The deciding question, and why E.20 answered it with the wrong table
+## 3. Stream source options: a decision matrix
 
-The Lambda recovery worker (stream-triggered OR scheduler-triggered)
-must be able to answer:
+Five candidate stream sources were evaluated by the agent team. Their
+assessments:
 
-> Given the stream record (or the tick) at my disposal, what terminal
-> events committed to storage that have NOT yet had their push
-> delivery completed (or at least attempted to create claim rows)?
+| Option | Stream source | Pros | Cons | Verdict |
+|---|---|---|---|---|
+| A | `a2a_push_pending_dispatches` (E.20) | Every stream record is real work. No parse-and-discard. Semantic purity preserved: markers = intent, events = history. Late-created configs cannot receive old terminal events (marker is deleted after first successful fan-out — ADR-011 §8 enforced by construction). | Requires marker write to be atomic with commit. rev 1 claimed this wasn't possible without coupling; agent team showed it IS possible with one additional write inside the existing transaction per backend. | **Selected (with atomicity fix).** |
+| B | `a2a_task_events` | Events are already atomic with task commit (ADR-009). No new table. | Event rows don't carry `owner`; stream worker would need a secondary `get_task` read with no owner in scope. Scheduled backstop needs cross-owner terminal-task enumeration — no framework API. Event rows would need enriching with owner + committed_at + is_terminal + a GSI. Time-window event scan violates ADR-011 §8 (retroactive delivery to late configs). | Rejected. |
+| C | `a2a_tasks` | Task row has owner. | Fires on every task mutation, not just terminal transitions. No `event_sequence` on the stream record — needs auxiliary read to `a2a_task_events`. Noisy; filter logic complex. | Rejected. |
+| D | `a2a_push_deliveries` | Fires on claim row creation. | Claim rows only exist AFTER `list_configs` succeeded — this stream cannot recover the pre-claim gap that E.20 was designed to cover. | Rejected as primary. |
+| E | `a2a_push_configs` | None relevant. | CRUD changes to hooks, unrelated to terminal events. | Rejected. |
 
-Five sources could carry this signal durably. Ranked:
+### 3.1 Why atomicity of the marker write is cheap per backend
 
-### A. Stream `a2a_push_pending_dispatches` (E.20's design)
+The rev 1 assumption that atomic marker writes would "couple atomic_store
+to push semantics" was over-stated. In every backend the atomic-store
+impl already knows about events (it's writing them); adding a third
+row write inside the same native transaction is a one-line extension.
+Cost per backend:
 
-A dedicated marker table, one row per (tenant, task_id, event_sequence).
-The stream worker consumes INSERTs; the backstop scans stale rows.
+| Backend | How the marker join lands |
+|---|---|
+| DynamoDB | `TransactWriteItems` already combines task update + event puts. Add one more `Put` item for the pending-dispatch row when any incoming event satisfies `StreamEvent::is_terminal() && matches!(.., StatusUpdate { .. })`. Limit is 100 items per transaction; one extra is free. |
+| SQLite / Postgres | `sqlx::Transaction` already wraps the task update + event inserts. Add one more `INSERT INTO a2a_push_pending_dispatches ... ON CONFLICT DO UPDATE` in the same tx. |
+| In-memory | `update_task_status_with_events` already takes the `tasks` and `events` write guards. Extend to also take the `pending_dispatches` write guard and insert when the event is terminal. All three guards in consistent lock order. |
 
-**Requirement for correctness:** the marker MUST be written atomically
-with the terminal event commit. Otherwise there is a loss window
-between commit return and marker insert during which a crash silently
-drops the notification.
+The decision flag (`is_terminal_status_update_event`) is already computable
+by the caller's existing `StreamEvent` — no new field or tracking
+required. `StreamEvent::is_terminal()` exists today (see
+`crates/turul-a2a/src/streaming/mod.rs`).
 
-**E.20's implementation FAILS this requirement.** In
-`crates/turul-a2a/src/push/dispatcher.rs` (commit `47d3694`), the call
-order is:
+### 3.2 Why streaming the pending-dispatch table beats streaming the events table
 
-1. `event_sink::commit_status` → `atomic_store.update_task_status_with_events`
-   returns `Ok((task, seqs))` — task + event committed durably.
-2. Sink calls `dispatcher.dispatch(tenant, owner, task, vec![(seq, ev)])`.
-3. `dispatcher.dispatch` immediately spawns a tokio task:
-   ```rust
-   tokio::spawn(async move {
-       self_clone.run_fanout(tenant, owner, task_id, task, terminal_seqs).await;
-   });
-   ```
-4. Inside `run_fanout`, the FIRST await is `record_pending_dispatch`.
-5. The outer await returns to the HTTP handler long before step 4 runs.
+Beyond the atomicity / §8 arguments, two operational reasons favour A
+over B:
 
-Between step 1 and step 4 there is a real loss window. On Lambda the
-window is even worse: if the handler returns before the spawned task
-runs even once, the Lambda environment may freeze and the marker may
-never be written.
-
-Making the marker write atomic would require either:
-1. Extending `A2aAtomicStore::update_task_status_with_events` to also
-   write the marker when the event is terminal (couples atomic_store
-   to push semantics — bad separation), OR
-2. Wrapping commit + marker in a single backend-native transaction per
-   commit path (DDB `TransactWriteItems`, SQL tx, in-memory locks).
-   Workable but requires every commit caller to know whether the
-   event is terminal.
-
-Both impose non-trivial design debt for a feature we already get for
-free below.
-
-### B. Stream `a2a_task_events` (the events table)
-
-The events table is already the durable record. Every terminal
-`StatusUpdate` is committed atomically with the task row via
-`A2aAtomicStore`; the commit either succeeds and the row is visible,
-or fails and no row appears.
-
-A DynamoDB stream on the events table with `NEW_IMAGE` projection fires
-once per committed event. The stream worker parses the record,
-filters on `event_json.statusUpdate.status.state ∈ {COMPLETED, FAILED,
-CANCELED, REJECTED}`, extracts `(tenant, task_id, event_sequence)`,
-loads the task to fetch the owner, then runs the fan-out.
-
-**Atomicity is free:** the event row IS the terminal-commit record.
-No new loss window.
-
-**Backstop enumeration:** `list_tasks(filter.status=Terminal)` returns
-terminal tasks per tenant; for each, `get_events_after(tenant, task_id,
-0)` locates the terminal event's sequence; we delegate to the same
-fan-out. Idempotency is guaranteed by the existing claim fencing
-(`ClaimAlreadyHeld` short-circuits re-delivery of a row already in a
-terminal claim status).
-
-Cost: one `get_task` call per stream record; backstop scan is O(terminal
-tasks per tenant), bounded by the event-table retention window
-(`push_failed_delivery_retention` / `task_ttl_seconds`).
-
-### C. Stream `a2a_tasks`
-
-Fires on every task mutation, not just terminal. Detecting "this mutation
-is a terminal transition" requires comparing `OLD_IMAGE.status.state`
-to `NEW_IMAGE.status.state` — noisy, and the stream record doesn't
-carry `event_sequence` so the worker would need an extra read to find
-the correct event. **Not preferred.**
-
-### D. Stream `a2a_push_deliveries`
-
-Fires on claim row creation. But claim rows only exist AFTER
-`list_configs` has succeeded — this stream cannot recover the pre-claim
-gap we specifically care about. **Not a viable primary trigger.**
-
-### E. Stream `a2a_push_configs`
-
-CRUD changes to hooks. Irrelevant for dispatch. **Not viable.**
+- **Every stream record is real work.** On a busy deployment the
+  events table churns with non-terminal `StatusUpdate` events, artifact
+  updates, and submitted/working transitions. Streaming that table
+  wastes Lambda invocation budget on parse-and-discard for records
+  that produce no action. The pending-dispatch table has exactly one
+  row per terminal-event fan-out; every stream record triggers fan-out.
+- **Backstop enumeration is natively queryable.** `list_stale_pending_dispatches(older_than, limit)` (from E.20) already gives the exact
+  enumeration the scheduled worker needs: markers past the freshness
+  threshold. No cross-owner task scan, no time-window event GSI.
 
 ## 4. Decision
 
 1. **Primary trigger (DynamoDB-backed Lambda):** DynamoDB Stream on
-   `a2a_task_events` with `StreamViewType::NEW_IMAGE`. The stream worker
-   Lambda filters for terminal `StatusUpdate` events, loads owner via
-   `get_task`, and runs the fan-out. **No new table.**
-2. **Backstop (all Lambda backends):** EventBridge Scheduler-invoked
-   worker Lambda. Enumerates terminal tasks via `list_tasks(status=
-   Terminal)`, walks events, runs the same fan-out. Also sweeps
-   `list_reclaimable_claims` for stuck claim rows (existing ADR-011 §10.5
-   path).
-3. **Atomicity posture:** No new durable-intent record. The events table
-   is the durable intent record, atomically committed with the task
-   row via the existing `A2aAtomicStore` contract.
-4. **Request-Lambda role:** commit durable state only; do NOT attempt
-   the HTTP POST inline. Any in-process fan-out is opportunistic best-
-   effort and MUST NOT be relied on for correctness.
-5. **`tokio::spawn` is not a correctness primitive under Lambda.** The
-   framework treats post-return spawns as opportunistic latency
-   optimisation only.
-6. **E.20's `a2a_push_pending_dispatches` table and its three trait
-   methods are rescinded** (see §11). The events-table stream makes them
-   redundant, and their current non-atomic write semantics would be
-   a latent loss window anyway.
+   `a2a_push_pending_dispatches` with `StreamViewType::NEW_IMAGE`. Every
+   INSERT is a committed terminal-event dispatch intent. The stream
+   worker Lambda reads `(tenant, owner, task_id, event_sequence)` from
+   the row and drives the existing fan-out.
+2. **Mandatory backstop (all Lambda backends):** EventBridge Scheduler-
+   invoked worker Lambda. Calls `list_stale_pending_dispatches` (from
+   E.20) + `list_reclaimable_claims` (from E.17) and delegates each
+   row to the dispatcher. Required because DynamoDB Streams have 24h
+   retention and can be stalled by poison records.
+3. **Atomicity fix (global, not Lambda-only):** the marker write
+   moves from the dispatcher's tokio-spawned `run_fanout` into
+   `A2aAtomicStore::update_task_status_with_events`. The marker is
+   written inside the same native transaction as the task update +
+   event puts. Applies to ALL deployments (main server, Lambda) —
+   not a Lambda-specific change.
+4. **Request-Lambda role:** commit durable state only; do NOT block
+   the response on HTTP POSTs. The existing opportunistic
+   `tokio::spawn`ed fan-out remains for the main-server path (where
+   it reliably runs) and is a free fast-path for Lambda whenever the
+   execution environment stays alive long enough (best-effort, NOT
+   load-bearing).
+5. **`tokio::spawn` is not a correctness primitive under Lambda.**
+   The framework treats post-return spawns as opportunistic latency
+   optimisation only. Correctness is carried by the atomically-
+   written marker + stream trigger + scheduler backstop.
+6. **ADR-011 §8 "no backfill" is preserved by construction.** Markers
+   are deleted at the end of `run_fanout`. A config created after a
+   terminal event is committed therefore has no marker to fire
+   against — the claim path short-circuits cleanly and no old event
+   is retroactively POSTed. No `config_created_at` timestamp or
+   registration-floor sequence is required.
 
 ## 5. Architecture
 
@@ -200,78 +184,120 @@ CRUD changes to hooks. Irrelevant for dispatch. **Not viable.**
 
 ```
 message:send / message:stream / :cancel / force-commit paths
-  → A2aAtomicStore.update_task_status_with_events (task + event atomic)
+  → A2aAtomicStore::update_task_status_with_events
+        ├── update a2a_tasks                     \
+        ├── append a2a_task_events                >  one native
+        └── insert a2a_push_pending_dispatches   /   transaction
+            (when StreamEvent::is_terminal() && StatusUpdate)
   → handler returns response to client
   → [opportunistic] dispatcher.dispatch spawned; may run or be frozen;
     correctness does NOT depend on it completing
 ```
 
+The `A2aAtomicStore::update_task_status_with_events` trait surface
+does not change. The caller still passes `(tenant, task_id, owner,
+new_status, events)`. Inside each backend impl, after writing the
+task + event rows, the impl iterates `events`; for each event where
+`event.is_terminal() && matches!(event, StreamEvent::StatusUpdate { .. })`
+it also writes a row to `a2a_push_pending_dispatches` with
+`(tenant, owner, task_id, event_sequence, recorded_at=now_micros)`.
+Failure of the marker write inside the transaction rolls the whole
+transaction back — the task commit and the marker commit are either
+both visible or both absent.
+
 ### 5.2 Stream worker Lambda
 
 ```
-DynamoDB Stream on a2a_task_events (NEW_IMAGE)
+DynamoDB Stream on a2a_push_pending_dispatches (NEW_IMAGE)
   → Lambda invoked with records
   → for each record:
-      parse event_json
-      if !is_terminal_status_update: skip
-      extract (tenant, task_id, event_sequence)
-      load task via A2aTaskStorage.get_task(..., owner=<owner-from-task>)
-      if task gone: mark batch-item-failure OR silently skip per policy
-      else: dispatcher.run_fanout(...) — reuses existing fan-out logic
-  → return BatchItemFailures with the SequenceNumbers of records that failed
+      parse pk/sk → (tenant, task_id, event_sequence)
+      extract owner from the NEW_IMAGE
+      reconstruct a PendingDispatch struct
+      dispatcher.redispatch_pending(pending) — existing method
+        → loads task via get_task (owner-scoped; owner available)
+        → list_configs with bounded retry
+        → per-config claim + POST
+        → delete_pending_dispatch after fan-out completes
+  → return BatchItemFailures with SequenceNumbers of any failed records
 ```
 
-### 5.3 Scheduled worker Lambda (backstop, required for all Lambda deployments)
+Every stream record is real work. No parse-and-discard. Owner is
+carried on the row (E.20 stores it; the DynamoDB backend has an
+`owner` attribute alongside `tenant`, `taskId`, `eventSequence`,
+`recordedAtMicros`).
+
+### 5.3 Scheduled worker Lambda (mandatory backstop)
 
 ```
 EventBridge Scheduler cron → Lambda invoked
-  → list_reclaimable_claims(limit) → dispatcher.redispatch_one per row
-  → list_tasks(filter.status=Terminal, page_size=N) per tenant iteration
-      → for each task:
-          get_events_after(tenant, task_id, 0)
-          → find terminal StatusUpdate event
-          → dispatcher.run_fanout(...)
-          → claim fencing short-circuits already-delivered events
-          → dispatcher idempotent by design
-  → return summary (events scanned, dispatched, errors)
+  → store.list_stale_pending_dispatches(cutoff, limit)
+        → dispatcher.redispatch_pending(p) for each
+  → store.list_reclaimable_claims(limit)
+        → dispatcher.redispatch_one(c) for each
+  → return summary (counts, errors)
 ```
+
+Both enumerations are backend-native queries added by E.17 + E.20 —
+no cross-owner task scan, no time-window GSI.
 
 ### 5.4 Idempotency
 
 Every path in §5.2 and §5.3 ultimately calls `worker.deliver(target,
-payload)`, which calls `claim_delivery`. Three cases:
+payload)`, which calls `claim_delivery`. Three cases, all safe:
 
-1. **No prior claim** — `claim_delivery` creates a Pending claim (generation=1).
+1. **No prior claim** — `claim_delivery` creates a Pending claim
+   (generation=1).
 2. **Live non-terminal claim exists** — `ClaimAlreadyHeld`; worker
    reports `ClaimLostOrFinal`; no POST.
-3. **Terminal claim exists** — `ClaimAlreadyHeld` (terminal never
-   re-claimable per ADR-011 §10); no POST, no side effects.
+3. **Terminal claim exists** — `ClaimAlreadyHeld` (terminal rows are
+   frozen per ADR-011 §10); no POST.
 
 Duplicate stream records, stream × scheduler races, request-Lambda
-opportunistic fan-out colliding with stream worker — all safe by
-construction.
+opportunistic fan-out colliding with stream-worker fan-out — all safe
+by construction. `delete_pending_dispatch` is idempotent
+(ON CONFLICT DO NOTHING on SQL; unconditional DeleteItem on DDB;
+`HashMap::remove` in-memory).
 
-## 6. Storage additions (trait-level, no new tables)
+### 5.5 Late-config handling (ADR-011 §8 preserved)
 
-Stream worker shipping requires only one backend-neutral trait
-addition:
+Workflow: task completes at T1 → marker written atomically → stream
+worker fires at T2 (shortly after) → fan-out queries
+`a2a_push_configs`, finds zero configs registered → marker deleted
+(no work to do). Operator registers a config at T3. No marker exists
+for the old terminal event — claim path produces no claim row — no
+POST is issued. Late-created configs receive only events committed
+after their registration.
 
-```rust
-/// Find the terminal StatusUpdate event in a task's event stream,
-/// if any. Used by the scheduled backstop to locate the event
-/// sequence to fan out from. Returns None for non-terminal tasks.
-async fn find_terminal_event_sequence(
-    &self,
-    tenant: &str,
-    task_id: &str,
-) -> Result<Option<u64>, A2aStorageError>;
-```
+This matches ADR-011 §8 exactly:
 
-This is added to `A2aEventStore` (not `A2aPushDeliveryStore` — it's an
-event-store query). Every backend implements it by walking its existing
-event rows; no schema change.
+> Config added after events exist (backfill): no backfill. Configs
+> capture events commit-timestamped after registration. This avoids
+> weird catch-up storms when a client registers many configs against
+> long-running tasks.
 
-No new tables. No new columns. No new atomic-store contracts.
+## 6. Storage additions
+
+**rev 1 proposed** adding `A2aEventStore::find_terminal_event_sequence`
+and enriching `a2a_task_events` with owner/committed_at/is_terminal
+attributes. **rev 2 requires neither.**
+
+- No new trait methods on `A2aEventStore`.
+- No schema changes on `a2a_task_events`.
+- No DynamoDB GSI.
+- No new trait methods on `A2aPushDeliveryStore` beyond what E.20
+  already added (`record_pending_dispatch`, `delete_pending_dispatch`,
+  `list_stale_pending_dispatches`).
+- One behavioural change per backend inside
+  `A2aAtomicStore::update_task_status_with_events` to include the
+  marker in the existing transaction.
+
+The existing `record_pending_dispatch` trait method on
+`A2aPushDeliveryStore` remains — it's still useful for redispatch
+paths that refresh `recorded_at` — but its call from
+`dispatcher.rs::run_fanout` at dispatch time moves into the atomic
+store. Downstream callers (`run_fanout` on redispatch,
+`redispatch_pending`, tests) keep using it.
 
 ## 7. Lambda builder wiring
 
@@ -283,28 +309,25 @@ impl LambdaA2aServerBuilder {
         store: impl A2aPushDeliveryStore + 'static,
     ) -> Self { ... }
 
-    // Extend existing .storage() bound to include A2aPushDeliveryStore.
+    // Extend existing .storage() bound to include A2aPushDeliveryStore
+    // (mirrors the main server).
 }
 ```
 
-On build:
-- If `push_delivery_store` is present, construct `PushDeliveryWorker` +
-  `PushDispatcher` exactly like the main server builder.
-- Same-backend check extended to the delivery store.
-- Retry-horizon validation mirrors the main server builder.
-- The dispatcher is installed in the Lambda's `AppState.push_dispatcher`
-  so the commit-hook call sites in `event_sink` / `router` fire it.
-
-The dispatcher's behaviour under Lambda:
-- `dispatch` continues to spawn fan-out. Correctness does not depend
-  on the spawn completing — the stream worker + scheduler will recover
-  any unfired delivery. This keeps the commit-path surface identical
-  to the main server.
+On build, if `push_delivery_store` is present: construct
+`PushDeliveryWorker` + `PushDispatcher`, run the same-backend check
+including the delivery store, run the retry-horizon validation that
+the main server already does, and install the dispatcher in the
+Lambda `AppState.push_dispatcher`. After this, the commit-hook call
+sites in `event_sink` / `router` fire the dispatcher — but because
+the atomic store now writes the marker, the dispatcher's main job on
+Lambda becomes marker deletion and opportunistic POST; correctness
+does not depend on the dispatcher completing before handler return.
 
 ## 8. New crate surface — `turul-a2a-aws-lambda`
 
 ```rust
-pub struct LambdaStreamRecoveryHandler { /* dispatcher + task_storage */ }
+pub struct LambdaStreamRecoveryHandler { /* dispatcher + push_delivery_store */ }
 impl LambdaStreamRecoveryHandler {
     pub async fn handle_stream_event(
         &self,
@@ -312,7 +335,7 @@ impl LambdaStreamRecoveryHandler {
     ) -> LambdaStreamRecoveryResponse; // BatchItemFailures on partial failure
 }
 
-pub struct LambdaScheduledRecoveryHandler { /* dispatcher + task_storage + claim store */ }
+pub struct LambdaScheduledRecoveryHandler { /* dispatcher + push_delivery_store */ }
 impl LambdaScheduledRecoveryHandler {
     pub async fn handle_scheduled_event(
         &self,
@@ -321,80 +344,112 @@ impl LambdaScheduledRecoveryHandler {
 }
 ```
 
-Both handlers share a private `redispatch_terminal_event(tenant, owner,
-task_id, sequence)` helper that invokes `dispatcher.run_fanout` — made
-pub(crate) for this purpose.
+Both handlers share a private `redispatch_from_marker(pending)` helper
+that unconditionally awaits `dispatcher.redispatch_pending(pending)`.
+No new trait surface; consumes the existing dispatcher API.
 
 ## 9. Operator responsibilities (IaC)
 
 The framework does NOT create AWS resources. The adopter's
 CloudFormation / CDK / Terraform wires:
 
-1. **DynamoDB Streams** on the `a2a_task_events` table (view type:
-   NEW_IMAGE).
-2. **Lambda event-source mapping** from the stream to the stream
+1. **DynamoDB Streams** on the `a2a_push_pending_dispatches` table
+   (view type: NEW_IMAGE).
+2. **Lambda event-source mapping** from the stream to the stream-
    worker Lambda. Include a DLQ and a reserved concurrency ceiling.
-3. **EventBridge Scheduler rule** firing the scheduled worker Lambda
+   Configure `BisectBatchOnFunctionError: true` and
+   `MaximumRetryAttempts` so poison records route to the DLQ.
+3. **EventBridge Scheduler rule** firing the scheduled-worker Lambda
    at the operator's chosen cadence. Default recommendation: every
    5 minutes.
-4. **Retention policy** on the events table sufficient to cover worst-
-   case scheduler outage windows.
+4. **Retention / TTL** on `a2a_push_pending_dispatches` sufficient to
+   outlive the worst-case scheduler outage window. Default TTL
+   matches `push_delivery_ttl_seconds` (7 days).
 
-The framework emits a `tracing::warn!` on Lambda cold-start stating
-these resources are required — a loud signal if an operator forgets
-to wire them.
+The framework emits a `tracing::warn!` on Lambda cold-start when
+`push_delivery_store` is wired, stating these resources are required.
 
 ## 10. Test plan
 
-- **Builder:** `push_delivery_store` setter wires the dispatcher;
-  absent setter leaves `push_dispatcher: None`.
-- **Stream worker unit:** synthetic DDB stream event with mixed
-  records (terminal StatusUpdate, non-terminal StatusUpdate, artifact
-  update, non-event row). Only the terminal triggers a fan-out.
-- **Stream worker partial batch:** one of three records targets a
-  deleted task; assert BatchItemFailures contains only that record's
-  SequenceNumber.
-- **Duplicate stream record:** same record delivered twice; assert
-  exactly one POST; second observes ClaimAlreadyHeld.
-- **Stream × scheduler race:** both handlers invoked on the same
-  terminal event within milliseconds; claim fencing makes one win,
-  the other no-ops; exactly one POST.
-- **Scheduled worker enumerates stuck events:** seed three terminal
-  tasks, delete all their claim rows (simulating complete stream
-  outage); scheduled worker runs; three POSTs arrive.
-- **Scheduled worker enumerates reclaimable claims:** existing E.17
-  test shape applies unchanged.
-- **Docs assertion:** README Lambda section warns that push recovery
-  requires EventBridge + (optionally) DDB Stream wiring.
+**Atomicity tests (global, not Lambda-only):**
 
-## 11. Follow-up: revert E.20
+- Parity: `update_task_status_with_events` with a terminal StatusUpdate
+  event writes a row to `a2a_push_pending_dispatches` in the same
+  transaction as the task + event rows. Injected transaction failure
+  leaves neither row persisted (atomic rollback).
+- Parity: `update_task_status_with_events` with a non-terminal status
+  event does NOT write a pending_dispatch row.
+- Parity: `update_task_status_with_events` with an artifact-update
+  event does NOT write a pending_dispatch row.
+- Parity: `update_task_with_events` (artifact-only) does NOT write a
+  pending_dispatch row regardless.
 
-The `a2a_push_pending_dispatches` table added in commit `47d3694` is
-rescinded. Concrete changes:
+**Late-config test (ADR-011 §8 preserved):**
 
-- Remove `record_pending_dispatch`, `delete_pending_dispatch`,
-  `list_stale_pending_dispatches` from `A2aPushDeliveryStore`.
-- Remove the corresponding table / hashmap / attribute from all four
-  backend impls.
-- Remove the pending-dispatch arm of the reclaim sweep in
-  `A2aServer::run`.
-- Remove the `record_pending_dispatch` calls at the top of `run_fanout`.
-- Revert
-  `pending_dispatch_marker_recovers_persistent_list_configs_outage` —
-  replace with an equivalent test that:
-  - Uses a stream-worker simulation (pass a synthetic stream record
-    directly to `LambdaStreamRecoveryHandler`).
-  - Asserts the fan-out fires.
-- Drop the parity test for `list_stale_pending_dispatches`.
+- Task completes, marker written, fan-out runs with zero configs,
+  marker deleted. Config created afterwards. Scheduled worker tick
+  runs — list_stale_pending_dispatches returns empty; no POST to the
+  new config. Asserts ADR-011 §8 compliance at the integration level.
 
-The original motivation for E.20 — "persistent config-list failure
-must not drop the terminal event" — is preserved by the events-table
-stream (fires on commit, regardless of list_configs) and the
-scheduler backstop (walks events independently).
+**Builder tests:**
+
+- `push_delivery_store` setter wires the dispatcher; absent setter
+  leaves `push_dispatcher: None`.
+- Mismatched backend rejected; horizon violation rejected (mirror
+  main-server builder tests).
+
+**Stream worker tests:**
+
+- Synthetic DDB stream event with mixed records (valid marker
+  inserts, MODIFY records, a DELETE record). Only INSERTs trigger
+  redispatch.
+- Partial-batch failure: one record targets a task that's been
+  deleted between marker write and stream delivery; handler returns
+  BatchItemFailures with only that SequenceNumber.
+- Duplicate stream record: same record delivered twice; exactly one
+  POST; second observes `ClaimAlreadyHeld`.
+- Stream × scheduler race: both trigger on the same marker within
+  milliseconds; claim fencing makes one win; exactly one POST.
+
+**Scheduled worker tests:**
+
+- Seed three stale pending-dispatch markers (recorded_at before
+  cutoff) — scheduled worker processes all three, markers cleared.
+- Seed stuck claim rows — scheduled worker redispatches via
+  `redispatch_one` (existing E.17 path).
+
+**Docs assertion:**
+
+- README Lambda section warns that push recovery requires EventBridge
+  + (optionally) DDB Stream wiring. ADR-008 cross-references ADR-013.
+
+## 11. Follow-up: amend E.20 (do not revert)
+
+rev 1 proposed reverting E.20. **rev 2 keeps E.20's table and methods
+in place and instead amends the atomicity contract.** Concrete changes:
+
+- In each `A2aAtomicStore::update_task_status_with_events` impl, after
+  writing the task + event rows in the existing transaction, iterate
+  the events; for each `event` where `event.is_terminal() &&
+  matches!(event, StreamEvent::StatusUpdate { .. })`, write a
+  pending-dispatch row `(tenant, owner, task_id, event_sequence,
+  recorded_at_micros=now)` in the same transaction.
+- Remove the `record_pending_dispatch` call at the top of
+  `dispatcher.rs::run_fanout`. (The redispatch path still calls it to
+  refresh `recorded_at` when a scheduled sweep runs —
+  `record_pending_dispatch` is idempotent upsert per E.20.)
+- Keep `delete_pending_dispatch` at the end of `run_fanout` — marker
+  deletion is still the dispatcher's responsibility after fan-out
+  completes.
+- Keep the existing test
+  `pending_dispatch_marker_recovers_persistent_list_configs_outage`
+  — its assertions still hold.
+- Add the new atomicity parity test described in §10.
 
 ## 12. Risks and non-goals
 
 **Non-goals:**
+
 - In-Lambda periodic background tasks. `tokio::spawn` post-return is
   opportunistic only.
 - Automatic provisioning of AWS resources. That's IaC territory; the
@@ -403,45 +458,77 @@ scheduler backstop (walks events independently).
   only recovery, scheduler-interval latency. Documented, not blocked.
 
 **Risks:**
+
 - **Operator forgets to wire EventBridge.** Push recovery is silently
   non-functional. Mitigation: cold-start warn, README call-out, worked
   example in `examples/`.
-- **Scheduled worker scan cost at scale.** `list_tasks(status=Terminal)`
-  grows with retention. Mitigation: operators can tune
-  `task_ttl_seconds`; scheduler default cadence is 5 min, not aggressive.
-  Backend-specific indexes (a GSI on DDB) are a future optimisation if
-  large-tenant deployments hit the wall.
-- **Stream worker poison record.** Bad event_json or missing task could
-  block a shard. Mitigation: DLQ configured by operator; backstop
-  sweep runs independently of stream health.
-- **Retention window mismatch.** If the events table TTL is shorter
-  than the scheduler cadence, the backstop misses terminal events.
-  Mitigation: builder validation rejects configurations where
-  `scheduled_sweep_interval >= task_ttl_seconds / 2`.
+- **Stream worker poison record.** Bad marker row or missing task
+  could block a shard. Mitigation: DLQ configured by operator;
+  backstop sweep runs independently of stream health and processes
+  the same markers via `list_stale_pending_dispatches`.
+- **Retention window mismatch.** If the pending-dispatch table TTL is
+  shorter than the scheduler cadence, the backstop misses stale
+  markers. Mitigation: builder validation rejects configurations
+  where `scheduled_sweep_interval >= pending_dispatch_ttl / 2`. (Future
+  work — not a release blocker.)
+- **Atomic-store write amplification.** Each terminal commit now does
+  three atomic writes (task + event + marker) instead of two. Cost:
+  one additional DDB write unit per terminal commit. For most
+  deployments this is negligible; high-throughput tenants with very
+  frequent terminals should monitor.
 
 ## 13. Open questions
 
-- Should the backstop scheduled worker use `list_tasks(status=
-  Terminal)` (O(terminal tasks per tenant) per tick) or a more efficient
-  secondary-index scan? For 0.1.x, list_tasks is sufficient; a DDB GSI
-  is an optimisation we can defer.
-- Should the framework ship an `examples/lambda-push-worker/` reference
-  crate with CDK snippets, or just a README section? Lean toward a
-  reference crate — operators copy-paste more reliably than they read.
-- Should `A2aEventStore::find_terminal_event_sequence` instead return
-  the full event (including context_id, etc.) so the worker doesn't
-  re-parse? Keep it minimal for now; callers who need the full event
-  can follow up with `get_events_after`.
+- Should `a2a_push_pending_dispatches` be written unconditionally on
+  commit, or gated on "at least one config registered for this task"?
+  Gating would avoid pointless markers when a task never had a hook.
+  Arguments against gating: (a) extra read on the commit path,
+  (b) race where a config is added between "check configs exist" and
+  "fan-out runs"; the scheduler would not recover this. **rev 2
+  recommends unconditional marker write.** `run_fanout` deletes
+  markers when it finds zero configs, so the lifecycle cost is short.
+- Should the stream worker call `redispatch_pending` in parallel for
+  records in the same batch, or serially? Start serial; concurrency
+  controls live on the Lambda side (reserved concurrency, max batch
+  window).
 
 ## 14. Decision summary
 
-- **Stream source:** `a2a_task_events` (existing), NEW_IMAGE projection.
-- **Trigger topology:** DDB Stream worker Lambda (fast path) +
-  EventBridge-scheduled worker Lambda (mandatory backstop).
+- **Stream source:** `a2a_push_pending_dispatches` (existing, from
+  E.20), with NEW_IMAGE projection.
+- **Trigger topology:** DynamoDB Stream → stream worker Lambda (fast
+  path) + EventBridge-scheduled worker Lambda (mandatory backstop).
 - **New tables:** none.
-- **New trait methods:** one
-  (`A2aEventStore::find_terminal_event_sequence`).
-- **Rescinded:** E.20's `a2a_push_pending_dispatches` table and its
-  three `A2aPushDeliveryStore` methods.
-- **Release gate:** Phase G blocked on this ADR being accepted and
-  §11 + §7 + §8 + §10 implemented.
+- **New trait methods on `A2aPushDeliveryStore`:** none.
+- **New trait methods on `A2aEventStore`:** none.
+- **Behavioural change:** `A2aAtomicStore::update_task_status_with_events`
+  writes the marker in the same transaction as task + event rows when
+  the event is a terminal `StatusUpdate`. Trait signature unchanged.
+- **Preserved invariants:** ADR-009 atomic-commit contract, ADR-011 §8
+  "no backfill" (by construction).
+- **Release gate:** Phase G (0.1.4) is blocked on this ADR being
+  accepted and §7 + §8 + §10 + §11 implemented.
+
+## 15. Agent-team review trace (rev 2)
+
+rev 2 was produced after a four-agent team audit on 2026-04-19:
+
+- **Storage/schema agent** mapped the cost of event-row enrichment
+  (rev 1's path) — quantified it as 4 backend migrations + 1 DDB GSI
+  + 1 new trait method + schema pollution of an append-only history
+  table. Concluded enrichment is feasible but expensive.
+- **A2A compliance agent** confirmed push configs are first-class
+  A2A v1.0 (`crates/turul-a2a-proto/proto/a2a.proto:89–139`,
+  A2A v1.0 §9, ADR-011 §6) and flagged ADR-011 §8 "no backfill" as a
+  framework-enforced policy. Rev 1's event-scan-on-schedule would
+  violate §8 by retroactively delivering terminal events to
+  late-created configs.
+- **Devil's-advocate agent** argued for keeping E.20's marker table
+  and fixing atomicity instead. Decisive point: per-backend atomicity
+  cost (one additional write inside an existing transaction) is
+  smaller than rev 1's enrichment cost (schema × 4 + GSI + trait
+  method) AND preserves the §8 invariant by construction.
+- **Synthesis (this document):** rev 2 accepts the devil's advocate's
+  recommendation. §11 changes from "revert E.20" to "amend E.20 to
+  move marker write into atomic store." No new trait surface. No
+  schema changes. No GSI.
