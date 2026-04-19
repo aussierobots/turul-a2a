@@ -276,6 +276,13 @@ impl A2aServerBuilder {
     /// traits guarantees the same-backend requirement (ADR-009). Works with any
     /// backend: `InMemoryA2aStorage`, `SqliteA2aStorage`, `PostgresA2aStorage`,
     /// `DynamoDbA2aStorage`, etc.
+    ///
+    /// ADR-013 §4.3 errata: `.storage()` wires storage traits only. It does
+    /// **not** auto-register the storage as a push-delivery store, even if the
+    /// backend happens to implement [`crate::push::A2aPushDeliveryStore`]. To
+    /// opt in to push delivery, call [`Self::push_delivery_store`] explicitly
+    /// and call `with_push_dispatch_enabled(true)` on the storage instance
+    /// before passing it here. Non-push deployments need neither.
     pub fn storage<S>(mut self, storage: S) -> Self
     where
         S: A2aTaskStorage
@@ -283,7 +290,6 @@ impl A2aServerBuilder {
             + crate::storage::A2aEventStore
             + A2aAtomicStore
             + crate::storage::A2aCancellationSupervisor
-            + crate::push::A2aPushDeliveryStore
             + Clone
             + 'static,
     {
@@ -291,8 +297,7 @@ impl A2aServerBuilder {
         self.push_storage = Some(Arc::new(storage.clone()));
         self.event_store = Some(Arc::new(storage.clone()));
         self.atomic_store = Some(Arc::new(storage.clone()));
-        self.cancellation_supervisor = Some(Arc::new(storage.clone()));
-        self.push_delivery_store = Some(Arc::new(storage));
+        self.cancellation_supervisor = Some(Arc::new(storage));
         self
     }
 
@@ -933,7 +938,9 @@ mod tests {
 
     #[test]
     fn builder_with_explicit_storage() {
-        let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
+        // `.storage()` alone wires storage traits only. No push delivery
+        // is implied — matches the common non-push-consumer deployment.
+        let storage = InMemoryA2aStorage::new();
         let server = A2aServer::builder()
             .executor(DummyExecutor)
             .storage(storage)
@@ -1075,10 +1082,11 @@ mod tests {
 
     #[test]
     fn unified_storage_accepted() {
-        // Single .storage() call — the preferred path
+        // Single .storage() call — the preferred path. No push-delivery
+        // wiring implied (ADR-013 §4.3 errata).
         let result = A2aServer::builder()
             .executor(DummyExecutor)
-            .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
+            .storage(InMemoryA2aStorage::new())
             .build();
 
         assert!(result.is_ok(), "Unified .storage() should be accepted");
@@ -1163,18 +1171,19 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn unified_storage_wires_push_delivery_store() {
-        // `.storage()` must populate AppState.push_delivery_store so that
-        // a PushDeliveryWorker spawned from the built state has
-        // somewhere to claim against.
+    fn unified_storage_does_not_auto_wire_push_delivery_store() {
+        // ADR-013 §4.3 errata: `.storage()` wires storage traits only.
+        // Implementing the push-delivery trait is not intent to deliver —
+        // a non-push deployment must be able to pass any all-in-one
+        // backend without opting in to push semantics.
         let server = A2aServer::builder()
             .executor(DummyExecutor)
-            .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
+            .storage(InMemoryA2aStorage::new())
             .build()
             .expect("build must succeed");
         assert!(
-            server.state.push_delivery_store.is_some(),
-            "storage() must wire push_delivery_store"
+            server.state.push_delivery_store.is_none(),
+            ".storage() must NOT auto-wire push_delivery_store — push is opt-in via .push_delivery_store()"
         );
     }
 
@@ -1265,11 +1274,13 @@ mod tests {
 
     #[test]
     fn builder_accepts_push_fully_wired() {
-        // Positive case: both flag on and delivery store wired.
+        // Positive case: storage opted in via `with_push_dispatch_enabled(true)`
+        // AND delivery store explicitly wired via `.push_delivery_store(...)`.
         let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
         let res = A2aServer::builder()
             .executor(DummyExecutor)
-            .storage(storage)
+            .storage(storage.clone())
+            .push_delivery_store(storage)
             .build();
         assert!(res.is_ok(), "push fully wired must build: {:?}", res.err());
     }
@@ -1297,10 +1308,12 @@ mod tests {
     fn retry_horizon_violation_rejected() {
         // push_claim_expiry <= max_attempts * backoff_cap must fail fast
         // (ADR-011 §10.3). The in-memory delivery store is required to
-        // trigger the check.
+        // trigger the check — so push must be explicitly wired.
+        let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
         let res = A2aServer::builder()
             .executor(DummyExecutor)
-            .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
+            .storage(storage.clone())
+            .push_delivery_store(storage)
             .push_max_attempts(10)
             .push_backoff_cap(Duration::from_secs(60))
             // 10 * 60s = 600s — equal to claim expiry, which is <=, so rejected.
@@ -1355,9 +1368,11 @@ mod tests {
         // push_delivery_store: None, silently disabling push delivery on
         // every auth-gated deployment. The augmented state must carry the
         // same claim-store Arc the builder installed.
+        let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
         let server = A2aServer::builder()
             .executor(DummyExecutor)
-            .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
+            .storage(storage.clone())
+            .push_delivery_store(storage)
             .middleware(Arc::new(ContribMiddleware))
             .build()
             .expect("build must succeed");
@@ -1379,9 +1394,11 @@ mod tests {
     fn push_delivery_store_passthrough_without_security() {
         // With no contributing middleware, `into_augmented_state` returns
         // the original state unchanged — the store must still be present.
+        let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
         let server = A2aServer::builder()
             .executor(DummyExecutor)
-            .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
+            .storage(storage.clone())
+            .push_delivery_store(storage)
             .build()
             .expect("build must succeed");
         let (state, had_security) = server.into_augmented_state();
@@ -1392,9 +1409,11 @@ mod tests {
     #[test]
     fn retry_horizon_satisfied_accepted() {
         // push_claim_expiry > max_attempts * backoff_cap succeeds.
+        let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
         let server = A2aServer::builder()
             .executor(DummyExecutor)
-            .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
+            .storage(storage.clone())
+            .push_delivery_store(storage)
             .push_max_attempts(5)
             .push_backoff_cap(Duration::from_secs(60))
             .push_claim_expiry(Duration::from_secs(5 * 60 + 1))

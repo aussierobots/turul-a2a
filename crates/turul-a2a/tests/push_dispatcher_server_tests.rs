@@ -136,6 +136,7 @@ async fn framework_cancel_triggers_push_delivery_with_canceled_state() {
     let server = A2aServer::builder()
         .executor(DummyExecutor)
         .storage(storage.clone())
+        .push_delivery_store(storage.clone())
         .allow_insecure_push_urls(true)
         .cancel_handler_grace(Duration::from_millis(50))
         .cancel_handler_poll_interval(Duration::from_millis(10))
@@ -440,6 +441,7 @@ async fn push_config_create_rejects_unparseable_url() {
     let server = A2aServer::builder()
         .executor(DummyExecutor)
         .storage(storage.clone())
+        .push_delivery_store(storage.clone())
         .allow_insecure_push_urls(true)
         .build()
         .expect("server build");
@@ -546,6 +548,7 @@ async fn executor_completion_triggers_push_delivery_with_completed_state() {
     let server = A2aServer::builder()
         .executor(GatedExecutor { gate: gate.clone() })
         .storage(storage.clone())
+        .push_delivery_store(storage.clone())
         .allow_insecure_push_urls(true)
         .push_max_attempts(1)
         .push_backoff_cap(Duration::from_millis(10))

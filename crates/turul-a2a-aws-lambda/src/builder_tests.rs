@@ -277,7 +277,7 @@ fn storage_bundle_requires_cancellation_supervisor_trait_bound() {
     // the runtime rejection.
     let result = LambdaA2aHandler::builder()
         .executor(DummyExecutor)
-        .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
+        .storage(InMemoryA2aStorage::new())
         .build();
     assert!(result.is_ok(), "unified storage bundle should build");
 }
@@ -428,10 +428,15 @@ fn lambda_builder_rejects_push_dispatch_without_consumer() {
 
 #[test]
 fn lambda_builder_accepts_push_fully_wired() {
+    // ADR-013 §4.3 errata: `.storage()` wires storage traits only; push
+    // delivery is an explicit opt-in via `.push_delivery_store()`. The
+    // storage instance itself must also opt in via
+    // `with_push_dispatch_enabled(true)` so atomic commits write markers.
     let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
     let result = LambdaA2aHandler::builder()
         .executor(DummyExecutor)
-        .storage(storage)
+        .storage(storage.clone())
+        .push_delivery_store(storage)
         .build();
     assert!(
         result.is_ok(),
@@ -473,7 +478,8 @@ fn lambda_builder_rejects_retry_horizon_violation() {
     cfg.push_claim_expiry = Duration::from_secs(600);
     let result = LambdaA2aHandler::builder()
         .executor(DummyExecutor)
-        .storage(storage)
+        .storage(storage.clone())
+        .push_delivery_store(storage)
         .runtime_config(cfg)
         .build();
     let err = match result {

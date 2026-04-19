@@ -156,11 +156,12 @@ impl LambdaA2aServerBuilder {
     /// task storage + in-memory cancellation supervisor) silently
     /// breaks cross-instance cancellation.
     ///
-    /// The bound also requires [`A2aPushDeliveryStore`] so push-delivery
-    /// infrastructure is wired by the same call. Backends that implement
-    /// push delivery MUST also opt in via `with_push_dispatch_enabled(true)`
-    /// on the storage instance; the builder rejects the inconsistent cases
-    /// (ADR-013 §4.3).
+    /// ADR-013 §4.3 errata: `.storage()` wires storage traits only. It does
+    /// **not** auto-register the storage as a push-delivery store, even if
+    /// the backend happens to implement [`A2aPushDeliveryStore`]. To opt in
+    /// to push delivery, call [`Self::push_delivery_store`] explicitly and
+    /// call `with_push_dispatch_enabled(true)` on the storage instance
+    /// before passing it here. Non-push deployments need neither.
     pub fn storage<S>(mut self, storage: S) -> Self
     where
         S: A2aTaskStorage
@@ -168,7 +169,6 @@ impl LambdaA2aServerBuilder {
             + A2aEventStore
             + A2aAtomicStore
             + A2aCancellationSupervisor
-            + A2aPushDeliveryStore
             + Clone
             + 'static,
     {
@@ -176,8 +176,7 @@ impl LambdaA2aServerBuilder {
         self.push_storage = Some(Arc::new(storage.clone()));
         self.event_store = Some(Arc::new(storage.clone()));
         self.atomic_store = Some(Arc::new(storage.clone()));
-        self.cancellation_supervisor = Some(Arc::new(storage.clone()));
-        self.push_delivery_store = Some(Arc::new(storage));
+        self.cancellation_supervisor = Some(Arc::new(storage));
         self
     }
 
