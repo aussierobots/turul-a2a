@@ -39,8 +39,8 @@
 //!    A CAS loss (another writer committed first) also closes the sink.
 //!
 //! 4. **Emits on a single sink are serialised.** All `emit_*` and
-//!    `set_status` methods acquire an async mutex on
-//!    [`EventSinkInner`] for the read-mutate-write critical section
+//!    `set_status` methods acquire an async mutex on the sink's
+//!    internal state for the read-mutate-write critical section
 //!    that commits to storage. This eliminates the lost-update window
 //!    in `emit_artifact`'s full-task replacement: two concurrent
 //!    artifact emits on the same task from cloned sink handles

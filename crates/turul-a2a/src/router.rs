@@ -66,7 +66,7 @@ pub struct AppState {
 
     /// Push-delivery dispatcher (ADR-011 §2, §13.13). Populated by the
     /// server builder iff `push_delivery_store` is wired. Handler and
-    /// executor commit paths call [`PushDispatcher::dispatch`] after a
+    /// executor commit paths call [`crate::push::PushDispatcher::dispatch`] after a
     /// successful terminal atomic-store write so every terminal —
     /// executor-driven, framework-forced CANCEL, or hard-timeout
     /// FAILED — fans out to registered push configs by the same

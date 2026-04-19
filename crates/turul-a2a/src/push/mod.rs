@@ -15,7 +15,8 @@
 //!
 //! See ADR-011 for the full design. The trait docstrings carry the
 //! normative contract; backend parity tests in
-//! [`crate::storage::parity_tests`] gate per-backend acceptance.
+//! `crates/turul-a2a/src/storage/parity_tests.rs` gate per-backend
+//! acceptance.
 
 pub mod claim;
 pub mod delivery;
