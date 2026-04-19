@@ -293,7 +293,7 @@ but no amount of retry will resurrect the task. BatchItemFailure is
 reserved for:
 
 - Transient `A2aStorageError` from `get_task`, `get_config`, or
-  `list_configs_eligible_at`
+  `list_configs_eligible_at_event`
 - Unparseable stream records (malformed NEW_IMAGE)
 - Lambda-internal failures during `redispatch_pending`
 
@@ -325,7 +325,7 @@ DynamoDB Stream on a2a_push_pending_dispatches (NEW_IMAGE)
   → Lambda invoked with records
   → for each INSERT record:
       parse pk/sk → (tenant, task_id, event_sequence)
-      extract owner + recorded_at_micros from NEW_IMAGE
+      extract owner + event_sequence + recorded_at_micros from NEW_IMAGE
       reconstruct a PendingDispatch struct
       dispatcher.redispatch_pending(pending):
           get_task(tenant, task_id, owner):
@@ -333,8 +333,8 @@ DynamoDB Stream on a2a_push_pending_dispatches (NEW_IMAGE)
               Ok(None)       → delete marker; return success (no
                               BatchItemFailure)
               Err(_)         → return BatchItemFailure (transient)
-          list_configs_eligible_at(tenant, task_id,
-                                   pending.recorded_at_micros, …):
+          list_configs_eligible_at_event(tenant, task_id,
+                                         pending.event_sequence, …):
               Ok(configs) → per-config fan-out
               Err(_)      → return BatchItemFailure (transient)
           delete_pending_dispatch after fan-out completes
@@ -446,13 +446,22 @@ flight when the config CAS succeeded. The existing
 - SQL: `ALTER TABLE a2a_tasks ADD COLUMN latest_event_sequence
   BIGINT NOT NULL DEFAULT 0;`
 - DynamoDB: new attribute `latestEventSequence` (Number).
-  Initialised to 0 on task creation; updated atomically by every
-  `A2aAtomicStore::update_task_status_with_events` and
-  `update_task_with_events` to the max of its previous value and
-  the newly-assigned event sequences. The update goes inside the
-  same native transaction that writes the event rows, so the
-  counter is causally consistent with event assignment.
 - In-memory: new field on `StoredTask`.
+
+**The column write is unconditional in every backend, regardless
+of the `push_dispatch_enabled` flag.** It's updated atomically by
+every `A2aAtomicStore::update_task_status_with_events` and
+`update_task_with_events` to the max of its previous value and the
+newly-assigned event sequences, inside the same native transaction
+that writes the event rows. Why unconditional: a deployment that
+has push disabled today can enable it later — and configs created
+AFTER enable would need to compare against a latest_event_sequence
+that reflects ALL events committed since the task existed, not just
+the ones committed after push was enabled. Universally maintaining
+the counter is the simplest guarantee of that invariant, and the
+cost is one additional BIGINT write per commit — negligible vs.
+the existing task + event writes. ONLY the marker write on
+`a2a_push_pending_dispatches` is gated by `push_dispatch_enabled`.
 
 **`a2a_push_configs` gains `registered_after_event_sequence`:**
 
@@ -463,16 +472,20 @@ flight when the config CAS succeeded. The existing
 - DynamoDB: new attribute `registeredAfterEventSequence` (Number).
 - In-memory: new field on `StoredPushConfig`.
 
-**Pre-migration rows** (created before this ADR lands) have both
-columns defaulted to 0. For `a2a_tasks`, the default means the
-task acts as if it had never received an event; the first
-post-migration commit populates `latest_event_sequence` correctly.
-For `a2a_push_configs`, the default means legacy configs are
-eligible for any event with sequence > 0 — i.e., every event.
-Operators who need strict causal semantics on legacy data should
-run a one-off backfill script; otherwise legacy configs remain
-permissive (documented as migration behaviour, not a framework
-guarantee).
+**Pre-migration rows** (tasks and configs existing before this
+ADR lands) have both new columns defaulted to 0. For `a2a_tasks`,
+the default is harmless: the first post-migration commit updates
+`latest_event_sequence` to the correct value (max of previous 0
+and the new event's sequence equals the new sequence; subsequent
+commits extend correctly). For `a2a_push_configs`, the default
+means legacy configs have `registered_after_event_sequence = 0`
+— eligible for any event with sequence > 0 (i.e., all real
+events). This is permissive by design: legacy configs predate the
+causal floor and the framework does not retroactively invent a
+registration sequence for them. Operators who need strict causal
+semantics on legacy configs should run a one-off backfill script
+that sets `registered_after_event_sequence = latest_event_sequence`
+per `(tenant, task_id)` at migration time.
 
 ### 6.4 `create_config` CAS
 
@@ -768,30 +781,55 @@ amendments across four coordinated changes:
   Mitigation: clear error message naming the method to call.
 - **Operator forgets to wire EventBridge.** Push recovery silently
   non-functional. Mitigation: cold-start warn, README call-out.
-- **Stream worker poison record.** DLQ; backstop sweep independent.
-- **Retention window mismatch.** Builder validation rejects
-  configurations where `scheduled_sweep_interval >=
+- **Stream worker poison record.** DLQ; backstop sweep runs
+  independently.
+- **Retention window mismatch.** If operator sets a TTL on
+  `a2a_push_pending_dispatches` shorter than the scheduler cadence,
+  the backstop can miss stale markers. Builder validation SHOULD
+  reject configurations where `scheduled_sweep_interval >=
   pending_dispatch_ttl / 2`. (Nice-to-have, not a release blocker.)
-- **Atomic-store write amplification.** Each terminal commit writes
-  three rows instead of two when `push_dispatch_enabled`. Negligible
-  for typical workloads; high-terminal-throughput tenants should
-  monitor.
-- **Pre-migration push_configs have `created_at_micros = 0`.** Treated
-  as "registered at the dawn of time" — always eligible. Permissive.
-  Operators doing a schema migration should re-stamp these rows via
-  a backfill script if they need strict §8 semantics for legacy data.
+- **Commit write amplification.** Every commit writes one
+  additional BIGINT column on `a2a_tasks` (`latest_event_sequence`),
+  unconditionally, whether or not push is enabled. This is
+  necessary for the causal floor to remain valid if push is enabled
+  later. Cost: one integer update per commit tx — negligible.
+  Push-enabled commits additionally write one marker row per
+  terminal StatusUpdate.
+- **Legacy configs are permissive.** Pre-migration
+  `a2a_push_configs` rows have `registered_after_event_sequence = 0`
+  and are eligible for any real event. This is documented migration
+  behaviour, not a framework guarantee. Operators who need strict
+  §8 semantics on legacy data run a one-off backfill as described
+  in §6.3.
+- **CAS retry storm.** Very-high-frequency event commits on a
+  single task could starve `create_config` against
+  `a2a_tasks.latest_event_sequence`. Bounded in practice — the
+  config create is typically issued against a SUBMITTED or WORKING
+  task whose commit rate is limited to handler throughput. Document
+  the retry budget (recommended 5 attempts with 10ms/50ms/...ms
+  backoff) and surface a `CreateConfigCasTimeout` error if
+  exhausted.
 
 ## 13. Open questions
 
-- Should `list_configs_eligible_at` replace `list_configs` on the
-  trait? Rev 3 keeps both — CRUD endpoints need the unfiltered list;
-  fan-out needs the filtered list. Some adopter tooling may also
-  want the unfiltered list. Two methods, two purposes.
-- Should the pre-migration `created_at_micros = 0` default be
-  something other than permissive (e.g., "registered at the epoch"
-  treated as effectively "never"/"always"/"unknown")? Rev 3 picks
-  "always eligible" to avoid breaking existing deployments;
-  adopters who need stricter semantics can run a backfill.
+- Should `list_configs_eligible_at_event` replace `list_configs`
+  on the trait? Rev 4 keeps both — CRUD endpoints (`ListTask
+  PushNotificationConfigs`) need the unfiltered list; fan-out
+  needs the event-sequence-filtered list. Two methods, two
+  purposes.
+- Should the pre-migration `registered_after_event_sequence = 0`
+  default be treated as "always eligible" (rev 4 choice) or
+  "never eligible"? Rev 4 picks permissive to avoid breaking
+  existing deployments; adopters who need strict causal semantics
+  on legacy configs run the backfill script in §6.3.
+- Should the CAS retry budget on `create_config` be surfaced to
+  the adopter via `RuntimeConfig`? Rev 4 hardcodes a bounded
+  default; if CAS-starvation proves real in production workloads,
+  promote to configurable.
+- Should a separate `external_push_dispatch_consumer_enabled` flag
+  ship if real external-consumer use cases emerge? Rev 4 does NOT
+  ship it; the strict builder rejects the orphan-marker case.
+  Revisit if an adopter files a concrete need.
 
 ## 14. Decision summary
 
@@ -820,9 +858,14 @@ amendments across four coordinated changes:
 - **Schema additions:** `a2a_tasks.latest_event_sequence` and
   `a2a_push_configs.registered_after_event_sequence`. Both integer
   columns, DEFAULT 0 on migration. No GSI required.
-- **Non-push deployments:** completely unaffected. No flag to set,
-  no table required, no marker writes, no new `a2a_tasks` column
-  writes (still zero; just unused).
+- **Non-push deployments:** no marker writes, no pending_dispatch
+  table required, no push_dispatch flag needed. `a2a_tasks.
+  latest_event_sequence` IS maintained on every commit regardless of
+  push state, because configs created AFTER push is later enabled
+  need a valid causal floor on tasks that already have events. Cost
+  is one additional BIGINT column update per atomic commit —
+  negligible. Only the pending-dispatch MARKER write is gated by
+  the opt-in flag.
 - **Release gate:** Phase G (0.1.4) blocked on §7 + §8 + §10 + §11
   landing.
 
