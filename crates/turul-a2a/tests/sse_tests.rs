@@ -119,10 +119,8 @@ async fn collect_sse_events(
     })
     .await;
 
-    match collected {
-        Ok(events) => events,
-        Err(_) => vec![], // Timeout — stream didn't close
-    }
+    // `Err(_)` is a timeout — stream didn't close in time; return empty.
+    collected.unwrap_or_default()
 }
 
 /// Parsed SSE event with both data and id.
@@ -450,7 +448,7 @@ async fn subscribe_terminal_task_returns_error() {
 
     // Subscribe to the completed task — should error
     let router = build_router(state);
-    let req = Request::get(&format!("/tasks/{task_id}:subscribe"))
+    let req = Request::get(format!("/tasks/{task_id}:subscribe"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
@@ -480,7 +478,7 @@ async fn subscribe_tenant_scoped_missing_returns_404() {
 
     // Subscribe under wrong tenant — should 404
     let router = build_router(state);
-    let req = Request::get(&format!("/other/tasks/{task_id}:subscribe"))
+    let req = Request::get(format!("/other/tasks/{task_id}:subscribe"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();

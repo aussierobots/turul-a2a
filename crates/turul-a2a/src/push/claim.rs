@@ -137,6 +137,12 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     /// (derived from `push_max_attempts` + `push_backoff_cap`) MUST
     /// be shorter than `claim_expiry` so live retries never race
     /// re-claim; the server builder validates this constraint.
+    // `claim_delivery` takes 8 args because it's the canonical
+    // primary-key + identity + expiry tuple the atomic claim table
+    // needs. Bundling into a struct would force every call site to
+    // repeat the builder boilerplate with no real readability gain
+    // — the arguments are the PK.
+    #[allow(clippy::too_many_arguments)]
     async fn claim_delivery(
         &self,
         tenant: &str,

@@ -17,17 +17,14 @@ pub use sse::{SseEvent, SseStream, StreamEvent, TypedSseEvent, TypedSseStream};
 
 /// Auth configuration for the client.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum ClientAuth {
+    #[default]
     None,
     Bearer(String),
     ApiKey { header: String, key: String },
 }
 
-impl Default for ClientAuth {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 /// A2A client for communicating with A2A agents.
 #[derive(Debug, Clone)]

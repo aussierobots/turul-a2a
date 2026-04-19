@@ -142,7 +142,7 @@ async fn collect_sse(body: Body, timeout: Duration) -> Vec<(Option<String>, serd
 /// Returns (task_id, number_of_events_stored).
 async fn create_non_terminal_task(state: &AppState, task_id: &str) -> usize {
     let task = Task::new(task_id, TaskStatus::new(TaskState::Submitted))
-        .with_context_id(&format!("ctx-{task_id}"));
+        .with_context_id(format!("ctx-{task_id}"));
 
     let submitted = StreamEvent::StatusUpdate {
         status_update: streaming::StatusUpdatePayload {
@@ -266,7 +266,7 @@ async fn d3_subscribe_replays_stored_events() {
 
     // Task snapshot + stored events
     assert!(
-        events.len() >= num_events + 1,
+        events.len() > num_events,
         "Should get Task snapshot + {} stored events, got {}",
         num_events, events.len()
     );

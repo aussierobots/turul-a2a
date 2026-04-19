@@ -95,16 +95,23 @@ impl StoredDeliveryClaim {
 /// Implements A2aTaskStorage, A2aPushNotificationStorage, A2aEventStore,
 /// and A2aPushDeliveryStore on the same struct — enforcing the
 /// same-backend requirement from ADR-009.
+/// `(tenant, task_id, event_sequence)` lookup key for the
+/// in-memory pending-dispatch map. Matches the tuple
+/// `A2aPushDeliveryStore::record_pending_dispatch` writes.
+type PendingDispatchKey = (String, String, u64);
+
+/// In-memory event-log shape: per `EventKey`, the full history of
+/// `(event_sequence, event)` pairs the atomic store appended.
+type EventLog = Vec<(u64, StreamEvent)>;
+
 #[derive(Clone)]
 pub struct InMemoryA2aStorage {
     tasks: Arc<RwLock<HashMap<TaskKey, StoredTask>>>,
     push_configs: Arc<RwLock<HashMap<PushConfigKey, StoredPushConfig>>>,
-    events: Arc<RwLock<HashMap<EventKey, Vec<(u64, StreamEvent)>>>>,
+    events: Arc<RwLock<HashMap<EventKey, EventLog>>>,
     event_counters: Arc<RwLock<HashMap<EventKey, u64>>>,
     push_delivery_claims: Arc<RwLock<HashMap<PushDeliveryKey, StoredDeliveryClaim>>>,
-    pending_dispatches: Arc<
-        RwLock<HashMap<(String, String, u64), StoredPendingDispatch>>,
-    >,
+    pending_dispatches: Arc<RwLock<HashMap<PendingDispatchKey, StoredPendingDispatch>>>,
     /// ADR-013 §4.3 opt-in: when true, `update_task_status_with_events`
     /// writes an `a2a_push_pending_dispatches` row atomically with the
     /// task/event commit for terminal `StreamEvent::StatusUpdate` events.
@@ -433,9 +440,9 @@ impl A2aTaskStorage for InMemoryA2aStorage {
             .status()
             .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?
             .state()
-            .map_err(|e| A2aStorageError::TypeError(e))?;
+            .map_err(A2aStorageError::TypeError)?;
 
-        let new_state = new_status.state().map_err(|e| A2aStorageError::TypeError(e))?;
+        let new_state = new_status.state().map_err(A2aStorageError::TypeError)?;
 
         // Validate state machine transition
         turul_a2a_types::state_machine::validate_transition(current_state, new_state).map_err(
@@ -457,7 +464,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         let mut proto = stored.task.as_proto().clone();
         proto.status = Some(new_status.into_proto());
         let updated_task =
-            Task::try_from(proto).map_err(|e| A2aStorageError::TypeError(e))?;
+            Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
 
         // Preserve cancel_requested (monotonic) and latest_event_sequence
         // (ADR-013 §6.3 — monotonic, maintained by atomic commits only).
@@ -1572,7 +1579,7 @@ impl A2aPushDeliveryStore for InMemoryA2aStorage {
             })
             .collect();
         // Newest-first by gave_up_at.
-        out.sort_by(|a, b| b.gave_up_at.cmp(&a.gave_up_at));
+        out.sort_by_key(|r| std::cmp::Reverse(r.gave_up_at));
         out.truncate(limit);
         Ok(out)
     }
@@ -2066,7 +2073,7 @@ mod tests {
             status_update: crate::streaming::StatusUpdatePayload {
                 task_id: task_id.into(),
                 context_id: "ctx-race".into(),
-                status: serde_json::to_value(&TaskStatus::new(TaskState::Completed))
+                status: serde_json::to_value(TaskStatus::new(TaskState::Completed))
                     .unwrap(),
             },
         };

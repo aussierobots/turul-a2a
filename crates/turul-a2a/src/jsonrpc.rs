@@ -81,7 +81,7 @@ pub async fn jsonrpc_dispatch_handler(
     let method = raw_method.to_string();
 
     // 3. Check if this is a notification (no "id" field = notification, must not reply)
-    let is_notification = !value.as_object().map_or(false, |o| o.contains_key("id"));
+    let is_notification = !value.as_object().is_some_and(|o| o.contains_key("id"));
     let id = value.get("id").cloned().unwrap_or(Value::Null);
 
     // 4. Validate params: must be object, null, or absent. Arrays/scalars are -32602.
@@ -258,7 +258,7 @@ async fn dispatch_send_streaming_message(
         status_update: streaming::StatusUpdatePayload {
             task_id: task_id.clone(),
             context_id: context_id.clone(),
-            status: serde_json::to_value(&TaskStatus::new(TaskState::Submitted)).unwrap_or_default(),
+            status: serde_json::to_value(TaskStatus::new(TaskState::Submitted)).unwrap_or_default(),
         },
     };
 
@@ -275,7 +275,7 @@ async fn dispatch_send_streaming_message(
         status_update: streaming::StatusUpdatePayload {
             task_id: task_id.clone(),
             context_id: context_id.clone(),
-            status: serde_json::to_value(&TaskStatus::new(TaskState::Working))
+            status: serde_json::to_value(TaskStatus::new(TaskState::Working))
                 .unwrap_or_default(),
         },
     };
@@ -361,7 +361,7 @@ async fn dispatch_subscribe_to_task(
 
     // Parse Last-Event-ID for replay (Turul extension — proto has no cursor field)
     let after_sequence = last_event_id
-        .and_then(|header| replay::parse_last_event_id(header))
+        .and_then(replay::parse_last_event_id)
         .filter(|parsed| parsed.task_id == task_id)
         .map(|parsed| parsed.sequence)
         .unwrap_or(0);

@@ -34,9 +34,9 @@
 //! 3. Create an event source mapping from the stream to this Lambda
 //!    with:
 //!    - `FunctionResponseTypes: ["ReportBatchItemFailures"]` (so the
-//!       response's `batch_item_failures` field is honoured)
+//!      response's `batch_item_failures` field is honoured)
 //!    - `MaximumRetryAttempts` and a DLQ configured per your ops
-//!       posture
+//!      posture
 //! 4. Grant the execution role `Put/Delete` on the deliveries and
 //!    pending-dispatch tables plus `Get`/`Query` on the tasks table.
 

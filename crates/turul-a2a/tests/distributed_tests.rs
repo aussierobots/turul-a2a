@@ -110,7 +110,7 @@ async fn create_on_a_fetch_on_b() {
     let task_id = body["task"]["id"].as_str().unwrap();
 
     // Fetch the same task on instance B
-    let req = Request::get(&format!("/tasks/{task_id}"))
+    let req = Request::get(format!("/tasks/{task_id}"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
@@ -165,7 +165,7 @@ async fn create_on_a_cancel_on_b() {
     let task_id = body["task"]["id"].as_str().unwrap();
 
     // Cancel on B — task is already completed, so this should return 409
-    let req = Request::post(&format!("/tasks/{task_id}:cancel"))
+    let req = Request::post(format!("/tasks/{task_id}:cancel"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
@@ -192,7 +192,7 @@ async fn tenant_isolation_across_instances() {
     let task_id = body["task"]["id"].as_str().unwrap();
 
     // Instance B under "acme" can see it
-    let req = Request::get(&format!("/acme/tasks/{task_id}"))
+    let req = Request::get(format!("/acme/tasks/{task_id}"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
@@ -200,7 +200,7 @@ async fn tenant_isolation_across_instances() {
     assert_eq!(status, 200, "Same tenant on B should see A's task");
 
     // Instance B under different tenant cannot see it
-    let req = Request::get(&format!("/other/tasks/{task_id}"))
+    let req = Request::get(format!("/other/tasks/{task_id}"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
@@ -208,7 +208,7 @@ async fn tenant_isolation_across_instances() {
     assert_eq!(status, 404, "Different tenant on B should not see A's task");
 
     // Instance B default tenant cannot see it
-    let req = Request::get(&format!("/tasks/{task_id}"))
+    let req = Request::get(format!("/tasks/{task_id}"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
@@ -239,7 +239,7 @@ async fn push_config_across_instances() {
         "url": "https://example.com/webhook"
     })
     .to_string();
-    let req = Request::post(&format!("/tasks/{task_id}/pushNotificationConfigs"))
+    let req = Request::post(format!("/tasks/{task_id}/pushNotificationConfigs"))
         .header("content-type", "application/json")
         .header("a2a-version", "1.0")
         .body(Body::from(config_body))
@@ -249,7 +249,7 @@ async fn push_config_across_instances() {
     let config_id = body["id"].as_str().unwrap();
 
     // Get push config on B
-    let req = Request::get(&format!("/tasks/{task_id}/pushNotificationConfigs/{config_id}"))
+    let req = Request::get(format!("/tasks/{task_id}/pushNotificationConfigs/{config_id}"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();

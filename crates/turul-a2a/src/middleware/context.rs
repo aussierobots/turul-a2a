@@ -6,8 +6,10 @@ use std::collections::HashMap;
 ///
 /// Per ADR-007: auth state is an enum, not `owner != "anonymous"`.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum AuthIdentity {
     /// No auth middleware configured or no credentials provided.
+    #[default]
     Anonymous,
     /// Authenticated principal with owner and optional claims.
     Authenticated {
@@ -38,11 +40,6 @@ impl AuthIdentity {
     }
 }
 
-impl Default for AuthIdentity {
-    fn default() -> Self {
-        Self::Anonymous
-    }
-}
 
 /// Request context threaded through middleware and handlers.
 #[derive(Debug, Clone)]

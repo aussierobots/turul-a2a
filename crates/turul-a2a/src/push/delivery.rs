@@ -12,16 +12,16 @@
 //!
 //! 1. `claim_delivery` — acquire the cross-instance lock.
 //! 2. For each retry iteration (up to `max_attempts`):
-//!    a. Pre-flight checks: config still exists, task still exists,
+//!    1. Pre-flight checks: config still exists, task still exists,
 //!       payload under size cap, SSRF guard allows the URL.
-//!    b. `record_attempt_started` — advance the counter + set
+//!    2. `record_attempt_started` — advance the counter + set
 //!       Attempting, fenced on identity + non-terminal status.
-//!    c. POST the Task body with `Authorization: {scheme}
+//!    3. POST the Task body with `Authorization: {scheme}
 //!       {credentials}` (from `Secret`, exposed at the header
 //!       build call only) and `X-Turul-Push-Token: {token}`.
-//!    d. Classify the response into `DeliveryOutcome::{Succeeded,
+//!    4. Classify the response into `DeliveryOutcome::{Succeeded,
 //!       Retry, GaveUp, Abandoned}`.
-//!    e. `record_delivery_outcome` — idempotent on terminals;
+//!    5. `record_delivery_outcome` — idempotent on terminals;
 //!       Retry keeps the claim open.
 //! 3. Sleep backoff between retries; give up at `max_attempts`.
 //!

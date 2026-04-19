@@ -68,7 +68,7 @@ async fn send_message_returns_send_message_response() {
         .mount(&server)
         .await;
 
-    let client = A2aClient::new(&server.uri());
+    let client = A2aClient::new(server.uri());
     let request = turul_a2a_proto::SendMessageRequest {
         tenant: String::new(),
         message: Some(turul_a2a_proto::Message {
@@ -114,7 +114,7 @@ async fn get_task_returns_task() {
         .mount(&server)
         .await;
 
-    let client = A2aClient::new(&server.uri());
+    let client = A2aClient::new(server.uri());
     let task = client.get_task("task-42", None).await.unwrap();
     assert_eq!(task.id(), "task-42");
 }
@@ -138,7 +138,7 @@ async fn get_task_not_found_returns_a2a_error() {
         .mount(&server)
         .await;
 
-    let client = A2aClient::new(&server.uri());
+    let client = A2aClient::new(server.uri());
     let err = client.get_task("nonexistent", None).await.unwrap_err();
     assert_eq!(err.status(), Some(404));
     assert_eq!(err.reason(), Some("TASK_NOT_FOUND"));
@@ -167,7 +167,7 @@ async fn cancel_terminal_task_returns_409_error() {
         .mount(&server)
         .await;
 
-    let client = A2aClient::new(&server.uri());
+    let client = A2aClient::new(server.uri());
     let err = client.cancel_task("completed-task").await.unwrap_err();
     assert_eq!(err.status(), Some(409));
     assert_eq!(err.reason(), Some("TASK_NOT_CANCELABLE"));
@@ -192,7 +192,7 @@ async fn list_tasks_with_pagination() {
         .mount(&server)
         .await;
 
-    let client = A2aClient::new(&server.uri());
+    let client = A2aClient::new(server.uri());
     let response = client.list_tasks(&ListTasksParams::default()).await.unwrap();
     assert_eq!(response.tasks.len(), 1);
     assert_eq!(response.next_page_token, "token-2");
@@ -216,7 +216,7 @@ async fn bearer_auth_sends_authorization_header() {
         .mount(&server)
         .await;
 
-    let client = A2aClient::new(&server.uri())
+    let client = A2aClient::new(server.uri())
         .with_auth(ClientAuth::Bearer("my-jwt-token".into()));
     client.list_tasks(&ListTasksParams::default()).await.unwrap();
 }
@@ -234,7 +234,7 @@ async fn api_key_auth_sends_custom_header() {
         .mount(&server)
         .await;
 
-    let client = A2aClient::new(&server.uri()).with_auth(ClientAuth::ApiKey {
+    let client = A2aClient::new(server.uri()).with_auth(ClientAuth::ApiKey {
         header: "X-API-Key".into(),
         key: "secret-key".into(),
     });
@@ -258,7 +258,7 @@ async fn tenant_prefix_applied_to_routes() {
         .mount(&server)
         .await;
 
-    let client = A2aClient::new(&server.uri()).with_tenant("acme");
+    let client = A2aClient::new(server.uri()).with_tenant("acme");
     client.list_tasks(&ListTasksParams::default()).await.unwrap();
 }
 
@@ -274,7 +274,7 @@ async fn tenant_prefix_on_send_message() {
         .mount(&server)
         .await;
 
-    let client = A2aClient::new(&server.uri()).with_tenant("my-tenant");
+    let client = A2aClient::new(server.uri()).with_tenant("my-tenant");
     let request = turul_a2a_proto::SendMessageRequest {
         tenant: String::new(),
         message: Some(turul_a2a_proto::Message {
@@ -311,7 +311,7 @@ async fn a2a_version_header_sent_on_all_requests() {
         .mount(&server)
         .await;
 
-    let client = A2aClient::new(&server.uri());
+    let client = A2aClient::new(server.uri());
     client.get_task("check-version", None).await.unwrap();
 }
 

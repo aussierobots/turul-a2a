@@ -187,7 +187,7 @@ async fn get_task_returns_task_after_send() {
 
     // Then: get the task
     let router = build_router(state);
-    let req = Request::get(&format!("/tasks/{task_id}"))
+    let req = Request::get(format!("/tasks/{task_id}"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
@@ -235,7 +235,7 @@ async fn get_task_history_length_zero_omits_history() {
 
     // Get with historyLength=0
     let router = build_router(state);
-    let req = Request::get(&format!("/tasks/{task_id}?historyLength=0"))
+    let req = Request::get(format!("/tasks/{task_id}?historyLength=0"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
@@ -244,7 +244,7 @@ async fn get_task_history_length_zero_omits_history() {
     // History should be empty or absent (proto3 omits empty repeated)
     let history = body.get("history");
     assert!(
-        history.is_none() || history.unwrap().as_array().map_or(true, |a| a.is_empty()),
+        history.is_none() || history.unwrap().as_array().is_none_or(|a| a.is_empty()),
         "historyLength=0 should omit history"
     );
 }
@@ -269,7 +269,7 @@ async fn cancel_completed_task_returns_409_with_error_info() {
 
     // Cancel the completed task
     let router = build_router(state);
-    let req = Request::post(&format!("/tasks/{task_id}:cancel"))
+    let req = Request::post(format!("/tasks/{task_id}:cancel"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
@@ -355,7 +355,7 @@ async fn push_config_crud_through_http() {
         "url": "https://example.com/webhook"
     })
     .to_string();
-    let req = Request::post(&format!("/tasks/{task_id}/pushNotificationConfigs"))
+    let req = Request::post(format!("/tasks/{task_id}/pushNotificationConfigs"))
         .header("content-type", "application/json")
         .header("a2a-version", "1.0")
         .body(Body::from(config_body))
@@ -367,7 +367,7 @@ async fn push_config_crud_through_http() {
 
     // Get push config
     let router = build_router(state.clone());
-    let req = Request::get(&format!(
+    let req = Request::get(format!(
         "/tasks/{task_id}/pushNotificationConfigs/{config_id}"
     ))
     .header("a2a-version", "1.0")
@@ -379,7 +379,7 @@ async fn push_config_crud_through_http() {
 
     // List push configs
     let router = build_router(state.clone());
-    let req = Request::get(&format!("/tasks/{task_id}/pushNotificationConfigs"))
+    let req = Request::get(format!("/tasks/{task_id}/pushNotificationConfigs"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
@@ -391,7 +391,7 @@ async fn push_config_crud_through_http() {
     let router = build_router(state.clone());
     let req = Request::builder()
         .method("DELETE")
-        .uri(&format!(
+        .uri(format!(
             "/tasks/{task_id}/pushNotificationConfigs/{config_id}"
         ))
         .header("a2a-version", "1.0")
@@ -402,7 +402,7 @@ async fn push_config_crud_through_http() {
 
     // Get after delete returns 404
     let router = build_router(state);
-    let req = Request::get(&format!(
+    let req = Request::get(format!(
         "/tasks/{task_id}/pushNotificationConfigs/{config_id}"
     ))
     .header("a2a-version", "1.0")
@@ -455,7 +455,7 @@ async fn tenant_prefixed_send_scopes_to_tenant() {
 
     // Get the task under tenant "acme" — should find it
     let router = build_router(state.clone());
-    let req = Request::get(&format!("/acme/tasks/{task_id}"))
+    let req = Request::get(format!("/acme/tasks/{task_id}"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
@@ -464,7 +464,7 @@ async fn tenant_prefixed_send_scopes_to_tenant() {
 
     // Get the same task under default (no tenant) — should NOT find it
     let router = build_router(state.clone());
-    let req = Request::get(&format!("/tasks/{task_id}"))
+    let req = Request::get(format!("/tasks/{task_id}"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
@@ -473,7 +473,7 @@ async fn tenant_prefixed_send_scopes_to_tenant() {
 
     // Get the same task under tenant "other" — should NOT find it
     let router = build_router(state.clone());
-    let req = Request::get(&format!("/other/tasks/{task_id}"))
+    let req = Request::get(format!("/other/tasks/{task_id}"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
@@ -517,7 +517,7 @@ async fn tenant_prefixed_cancel_scopes_to_tenant() {
 
     // Cancel under wrong tenant — should fail (404)
     let router = build_router(state.clone());
-    let req = Request::post(&format!("/other/tasks/{task_id}:cancel"))
+    let req = Request::post(format!("/other/tasks/{task_id}:cancel"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
@@ -616,7 +616,7 @@ async fn push_config_list_pagination_through_http() {
             "url": format!("https://example.com/hook-{i}")
         })
         .to_string();
-        let req = Request::post(&format!("/tasks/{task_id}/pushNotificationConfigs"))
+        let req = Request::post(format!("/tasks/{task_id}/pushNotificationConfigs"))
             .header("content-type", "application/json")
             .header("a2a-version", "1.0")
         .body(Body::from(config_body))
@@ -627,7 +627,7 @@ async fn push_config_list_pagination_through_http() {
 
     // List with pageSize=2 — should paginate
     let router = build_router(state.clone());
-    let req = Request::get(&format!(
+    let req = Request::get(format!(
         "/tasks/{task_id}/pushNotificationConfigs?pageSize=2"
     ))
     .header("a2a-version", "1.0")

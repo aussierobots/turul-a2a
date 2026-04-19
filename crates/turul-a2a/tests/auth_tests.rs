@@ -325,7 +325,7 @@ async fn authenticated_owner_flows_to_storage() {
 
     // Same user can see the task
     let router = build_router(state.clone());
-    let req = Request::get(&format!("/tasks/{task_id}"))
+    let req = Request::get(format!("/tasks/{task_id}"))
         .header("x-test-auth", "user-123")
         .header("a2a-version", "1.0")
         .body(Body::empty())
@@ -335,7 +335,7 @@ async fn authenticated_owner_flows_to_storage() {
 
     // Different user cannot see it
     let router = build_router(state);
-    let req = Request::get(&format!("/tasks/{task_id}"))
+    let req = Request::get(format!("/tasks/{task_id}"))
         .header("x-test-auth", "user-456")
         .header("a2a-version", "1.0")
         .body(Body::empty())
@@ -378,7 +378,7 @@ async fn tenant_plus_auth_scoped_together() {
 
     // user-a under acme can see it
     let router = build_router(state.clone());
-    let req = Request::get(&format!("/acme/tasks/{task_id}"))
+    let req = Request::get(format!("/acme/tasks/{task_id}"))
         .header("x-test-auth", "user-a")
         .header("a2a-version", "1.0")
         .body(Body::empty())
@@ -388,7 +388,7 @@ async fn tenant_plus_auth_scoped_together() {
 
     // user-b under acme cannot see it (wrong owner)
     let router = build_router(state.clone());
-    let req = Request::get(&format!("/acme/tasks/{task_id}"))
+    let req = Request::get(format!("/acme/tasks/{task_id}"))
         .header("x-test-auth", "user-b")
         .header("a2a-version", "1.0")
         .body(Body::empty())
@@ -398,7 +398,7 @@ async fn tenant_plus_auth_scoped_together() {
 
     // user-a under different tenant cannot see it (wrong tenant)
     let router = build_router(state);
-    let req = Request::get(&format!("/other/tasks/{task_id}"))
+    let req = Request::get(format!("/other/tasks/{task_id}"))
         .header("x-test-auth", "user-a")
         .header("a2a-version", "1.0")
         .body(Body::empty())
@@ -433,7 +433,7 @@ async fn push_config_owner_isolation() {
         "url": "https://example.com/hook"
     })
     .to_string();
-    let req = Request::post(&format!("/tasks/{task_id}/pushNotificationConfigs"))
+    let req = Request::post(format!("/tasks/{task_id}/pushNotificationConfigs"))
         .header("content-type", "application/json")
         .header("x-test-auth", "user-a")
         .header("a2a-version", "1.0")
@@ -449,7 +449,7 @@ async fn push_config_owner_isolation() {
         "url": "https://evil.com/hook"
     })
     .to_string();
-    let req = Request::post(&format!("/tasks/{task_id}/pushNotificationConfigs"))
+    let req = Request::post(format!("/tasks/{task_id}/pushNotificationConfigs"))
         .header("content-type", "application/json")
         .header("x-test-auth", "user-b")
         .header("a2a-version", "1.0")

@@ -33,11 +33,11 @@
 //!    dispatches + deliveries tables and `Get` on the tasks table.
 //! 4. Tune `LambdaScheduledRecoveryConfig` to match your workload:
 //!    - `stale_cutoff` should exceed the request Lambda's worst-case
-//!       fresh-dispatch latency (recommended: equal to
-//!       `push_claim_expiry`).
+//!      fresh-dispatch latency (recommended: equal to
+//!      `push_claim_expiry`).
 //!    - `stale_markers_limit` / `reclaimable_claims_limit` cap the
-//!       batch size so a post-outage backlog recovers over several
-//!       ticks rather than overwhelming the Lambda.
+//!      batch size so a post-outage backlog recovers over several
+//!      ticks rather than overwhelming the Lambda.
 
 use std::sync::Arc;
 

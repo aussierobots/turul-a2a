@@ -780,7 +780,7 @@ async fn reclaim_sweep_redispatches_after_persistent_terminal_failure() {
         status_update: turul_a2a::streaming::StatusUpdatePayload {
             task_id: task_id.clone(),
             context_id: "ctx-reclaim".into(),
-            status: serde_json::to_value(&turul_a2a_types::TaskStatus::new(
+            status: serde_json::to_value(turul_a2a_types::TaskStatus::new(
                 turul_a2a_types::TaskState::Submitted,
             ))
             .unwrap(),
@@ -1223,7 +1223,7 @@ async fn redispatch_read_error_leaves_row_reclaimable() {
         status_update: turul_a2a::streaming::StatusUpdatePayload {
             task_id: task_id.into(),
             context_id: "ctx-rd".into(),
-            status: serde_json::to_value(&turul_a2a_types::TaskStatus::new(
+            status: serde_json::to_value(turul_a2a_types::TaskStatus::new(
                 turul_a2a_types::TaskState::Submitted,
             ))
             .unwrap(),
@@ -1479,7 +1479,7 @@ async fn initial_dispatch_retries_list_configs_on_transient_failure() {
         status_update: turul_a2a::streaming::StatusUpdatePayload {
             task_id: task_id.into(),
             context_id: "ctx-ld".into(),
-            status: serde_json::to_value(&turul_a2a_types::TaskStatus::new(
+            status: serde_json::to_value(turul_a2a_types::TaskStatus::new(
                 turul_a2a_types::TaskState::Completed,
             ))
             .unwrap(),

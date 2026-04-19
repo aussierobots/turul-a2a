@@ -86,7 +86,7 @@ async fn seed_working_task(storage: &InMemoryA2aStorage, task_id: &str) {
         status_update: turul_a2a::streaming::StatusUpdatePayload {
             task_id: task_id.into(),
             context_id: "ctx-server-push-dispatch".into(),
-            status: serde_json::to_value(&TaskStatus::new(TaskState::Submitted)).unwrap(),
+            status: serde_json::to_value(TaskStatus::new(TaskState::Submitted)).unwrap(),
         },
     };
     let working_task = storage
@@ -99,7 +99,7 @@ async fn seed_working_task(storage: &InMemoryA2aStorage, task_id: &str) {
         status_update: turul_a2a::streaming::StatusUpdatePayload {
             task_id: task_id.into(),
             context_id: "ctx-server-push-dispatch".into(),
-            status: serde_json::to_value(&TaskStatus::new(TaskState::Working)).unwrap(),
+            status: serde_json::to_value(TaskStatus::new(TaskState::Working)).unwrap(),
         },
     };
     storage

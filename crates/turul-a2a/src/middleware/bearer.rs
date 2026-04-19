@@ -7,7 +7,7 @@
 /// Hardened: case-insensitive scheme, rejects whitespace and control characters.
 pub fn extract_bearer_token(auth_header: &str) -> Option<String> {
     let trimmed = auth_header.trim();
-    let (scheme, rest) = trimmed.split_once(|c: char| c == ' ' || c == '\t')?;
+    let (scheme, rest) = trimmed.split_once([' ', '\t'])?;
 
     if !scheme.eq_ignore_ascii_case("bearer") {
         return None;

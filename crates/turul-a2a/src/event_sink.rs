@@ -341,7 +341,7 @@ impl EventSinkInner {
                             task_id: self.task_id.clone(),
                             context_id: self.context_id.clone(),
                             status: serde_json::to_value(
-                                &turul_a2a_types::TaskStatus::new(state),
+                                turul_a2a_types::TaskStatus::new(state),
                             )
                             .unwrap_or_default(),
                         },

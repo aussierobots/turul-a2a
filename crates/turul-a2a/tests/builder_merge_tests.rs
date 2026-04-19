@@ -206,7 +206,7 @@ async fn no_middleware_agent_card_has_no_security() {
     // No security schemes or requirements
     let schemes = card.get("securitySchemes");
     assert!(
-        schemes.is_none() || schemes.unwrap().as_object().map_or(true, |m| m.is_empty()),
+        schemes.is_none() || schemes.unwrap().as_object().is_none_or(|m| m.is_empty()),
         "No middleware should mean no security schemes"
     );
 }

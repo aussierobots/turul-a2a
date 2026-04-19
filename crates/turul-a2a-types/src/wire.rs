@@ -1,7 +1,7 @@
-/// Centralized wire-format constants from the A2A v1.0 specification.
-///
-/// All values derived from `a2a.proto` google.api.http annotations and
-/// the spec's error code mapping table (Section 5.4).
+//! Centralized wire-format constants from the A2A v1.0 specification.
+//!
+//! All values derived from `a2a.proto` google.api.http annotations and
+//! the spec's error code mapping table (Section 5.4).
 
 /// JSON-RPC method names (PascalCase, from proto service definition)
 pub mod jsonrpc {

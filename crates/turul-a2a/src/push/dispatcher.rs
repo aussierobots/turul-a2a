@@ -183,7 +183,7 @@ impl PushDispatcher {
             let mut page_token: Option<String> = None;
             let fetch_outcome: Result<(), crate::storage::A2aStorageError> = loop {
                 let mut last_err: Option<crate::storage::A2aStorageError> = None;
-                let page = 'retry: loop {
+                let page = 'retry: {
                     for attempt in 0..LIST_MAX_ATTEMPTS {
                         if attempt > 0 {
                             tokio::time::sleep(
@@ -206,7 +206,7 @@ impl PushDispatcher {
                             Err(e) => last_err = Some(e),
                         }
                     }
-                    break 'retry None;
+                    None
                 };
                 match page {
                     Some(p) => {

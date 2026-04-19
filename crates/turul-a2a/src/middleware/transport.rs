@@ -18,7 +18,7 @@ const SUPPORTED_VERSION: &str = "1.0";
 const VERSION_EXEMPT_PATHS: &[&str] = &["/.well-known/agent-card.json"];
 
 fn is_version_exempt(path: &str) -> bool {
-    VERSION_EXEMPT_PATHS.iter().any(|p| path == *p)
+    VERSION_EXEMPT_PATHS.contains(&path)
 }
 
 /// Tower Layer for A2A transport compliance.
@@ -111,6 +111,7 @@ where
 
 impl A2aError {
     /// Convert to an HTTP response body for transport-level errors.
+    #[allow(clippy::wrong_self_convention)] // `into_*` on &self is intentional: we never consume the error, we render it
     fn into_response_body(&self) -> Response<Body> {
         let status = axum::http::StatusCode::from_u16(self.http_status())
             .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);

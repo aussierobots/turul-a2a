@@ -468,17 +468,19 @@ impl A2aServerBuilder {
                 // we've validated the horizon. Runtime config carries
                 // the full worker tuning; the dispatcher closes the
                 // commit-to-POST loop (ADR-011 §2 + §13.13).
-                let mut delivery_cfg = crate::push::delivery::PushDeliveryConfig::default();
-                delivery_cfg.max_attempts = self.runtime_config.push_max_attempts as u32;
-                delivery_cfg.backoff_base = self.runtime_config.push_backoff_base;
-                delivery_cfg.backoff_cap = self.runtime_config.push_backoff_cap;
-                delivery_cfg.backoff_jitter = self.runtime_config.push_backoff_jitter;
-                delivery_cfg.request_timeout = self.runtime_config.push_request_timeout;
-                delivery_cfg.connect_timeout = self.runtime_config.push_connect_timeout;
-                delivery_cfg.read_timeout = self.runtime_config.push_read_timeout;
-                delivery_cfg.claim_expiry = self.runtime_config.push_claim_expiry;
-                delivery_cfg.max_payload_bytes = self.runtime_config.push_max_payload_bytes;
-                delivery_cfg.allow_insecure_urls = self.runtime_config.allow_insecure_push_urls;
+                let delivery_cfg = crate::push::delivery::PushDeliveryConfig {
+                    max_attempts: self.runtime_config.push_max_attempts as u32,
+                    backoff_base: self.runtime_config.push_backoff_base,
+                    backoff_cap: self.runtime_config.push_backoff_cap,
+                    backoff_jitter: self.runtime_config.push_backoff_jitter,
+                    request_timeout: self.runtime_config.push_request_timeout,
+                    connect_timeout: self.runtime_config.push_connect_timeout,
+                    read_timeout: self.runtime_config.push_read_timeout,
+                    claim_expiry: self.runtime_config.push_claim_expiry,
+                    max_payload_bytes: self.runtime_config.push_max_payload_bytes,
+                    allow_insecure_urls: self.runtime_config.allow_insecure_push_urls,
+                    ..crate::push::delivery::PushDeliveryConfig::default()
+                };
 
                 let instance_id = format!("a2a-server-{}", uuid::Uuid::now_v7());
                 let worker = crate::push::delivery::PushDeliveryWorker::new(

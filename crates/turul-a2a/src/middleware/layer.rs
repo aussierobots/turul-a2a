@@ -19,7 +19,7 @@ use super::stack::MiddlewareStack;
 const PUBLIC_PATHS: &[&str] = &["/.well-known/agent-card.json"];
 
 fn is_public_path(path: &str) -> bool {
-    PUBLIC_PATHS.iter().any(|p| path == *p)
+    PUBLIC_PATHS.contains(&path)
 }
 
 /// Tower Layer that wraps a service with auth middleware.

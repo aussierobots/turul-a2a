@@ -18,7 +18,6 @@ pub use lf::a2a::v1::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json;
 
     // =========================================================
     // Proto generation verification tests

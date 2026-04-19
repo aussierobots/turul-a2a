@@ -425,7 +425,7 @@ pub(crate) async fn core_send_streaming_message(
         status_update: crate::streaming::StatusUpdatePayload {
             task_id: task_id.clone(),
             context_id: context_id.clone(),
-            status: serde_json::to_value(&TaskStatus::new(TaskState::Submitted))
+            status: serde_json::to_value(TaskStatus::new(TaskState::Submitted))
                 .unwrap_or_default(),
         },
     };
@@ -445,7 +445,7 @@ pub(crate) async fn core_send_streaming_message(
         status_update: crate::streaming::StatusUpdatePayload {
             task_id: task_id.clone(),
             context_id: context_id.clone(),
-            status: serde_json::to_value(&TaskStatus::new(TaskState::Working))
+            status: serde_json::to_value(TaskStatus::new(TaskState::Working))
                 .unwrap_or_default(),
         },
     };
@@ -525,7 +525,7 @@ pub(crate) async fn core_subscribe_to_task(
 
     // Parse Last-Event-ID for replay
     let after_sequence = last_event_id_header
-        .and_then(|header| replay::parse_last_event_id(header))
+        .and_then(replay::parse_last_event_id)
         .filter(|parsed| parsed.task_id == task_id)
         .map(|parsed| parsed.sequence)
         .unwrap_or(0);
@@ -798,7 +798,7 @@ pub async fn core_send_message(
             status_update: crate::streaming::StatusUpdatePayload {
                 task_id: task_id.clone(),
                 context_id: context_id.clone(),
-                status: serde_json::to_value(&TaskStatus::new(TaskState::Working))
+                status: serde_json::to_value(TaskStatus::new(TaskState::Working))
                     .unwrap_or_default(),
             },
         };
@@ -823,7 +823,7 @@ pub async fn core_send_message(
             status_update: crate::streaming::StatusUpdatePayload {
                 task_id: task_id.clone(),
                 context_id: context_id.clone(),
-                status: serde_json::to_value(&TaskStatus::new(TaskState::Submitted))
+                status: serde_json::to_value(TaskStatus::new(TaskState::Submitted))
                     .unwrap_or_default(),
             },
         };
@@ -838,7 +838,7 @@ pub async fn core_send_message(
             status_update: crate::streaming::StatusUpdatePayload {
                 task_id: task_id.clone(),
                 context_id: context_id.clone(),
-                status: serde_json::to_value(&TaskStatus::new(TaskState::Working))
+                status: serde_json::to_value(TaskStatus::new(TaskState::Working))
                     .unwrap_or_default(),
             },
         };
@@ -927,6 +927,7 @@ pub async fn core_send_message(
 ///    abort the spawned JoinHandle as best-effort cleanup.
 ///
 /// Returns the Task the caller should hand back to the client.
+#[allow(clippy::too_many_arguments)] // router glue: all args are request-derived
 async fn await_yielded_with_two_deadlines(
     mut yielded_rx: tokio::sync::oneshot::Receiver<Task>,
     cancellation: tokio_util::sync::CancellationToken,
@@ -1050,6 +1051,7 @@ async fn await_yielded_with_two_deadlines(
     }
 }
 
+#[allow(clippy::large_enum_variant)] // Option<Task> is ~hundreds of bytes; the enum is short-lived on the stack of one function
 enum YieldedOutcome {
     Yielded(Option<Task>),
     SoftTimeout,
@@ -1241,7 +1243,7 @@ pub async fn core_cancel_task(
         status_update: crate::streaming::StatusUpdatePayload {
             task_id: task_id.to_string(),
             context_id,
-            status: serde_json::to_value(&TaskStatus::new(TaskState::Canceled))
+            status: serde_json::to_value(TaskStatus::new(TaskState::Canceled))
                 .unwrap_or_default(),
         },
     };
