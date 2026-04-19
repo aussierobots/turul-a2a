@@ -92,7 +92,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auth-agent"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -940,7 +940,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "echo-agent"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "tokio",
@@ -1783,7 +1783,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-agent"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "lambda_http",
@@ -1797,7 +1797,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-scheduled-worker"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "aws_lambda_events 0.15.1",
@@ -1815,7 +1815,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-stream-worker"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "aws_lambda_events 0.15.1",
@@ -3784,7 +3784,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "turul-a2a"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3819,7 +3819,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-auth"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "jsonwebtoken",
@@ -3834,7 +3834,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-aws-lambda"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "aws_lambda_events 0.15.1",
@@ -3861,7 +3861,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-client"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "futures",
  "reqwest",
@@ -3877,7 +3877,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-proto"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "pbjson",
  "pbjson-build",
@@ -3891,7 +3891,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-types"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "pbjson-types",
@@ -3904,7 +3904,7 @@ dependencies = [
 
 [[package]]
 name = "turul-jwt-validator"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64 0.22.1",
  "jsonwebtoken",

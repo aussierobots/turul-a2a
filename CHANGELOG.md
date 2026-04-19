@@ -4,6 +4,36 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.5] — 2026-04-20
+
+### Fixed
+- **`.storage()` no longer auto-wires push delivery (ADR-013 §4.3
+  errata).** 0.1.4 required the backend passed to `.storage()` to
+  implement `A2aPushDeliveryStore` and automatically assigned it as
+  the push delivery store. Because all four first-party backends
+  implement every storage trait on the same struct (ADR-009
+  same-backend requirement), **any non-push adopter calling
+  `.storage(storage)` was silently enrolled into push delivery** and
+  forced to call `with_push_dispatch_enabled(true)` to pass the
+  §4.3 consistency check — even when they never registered a push
+  config.
+
+  This was a conflation of "implements the trait" with "is wired for
+  use". Fixed in both `turul_a2a::server::A2aServerBuilder::storage`
+  and `turul_a2a_aws_lambda::LambdaA2aServerBuilder::storage`: the
+  `A2aPushDeliveryStore` bound is removed, and no auto-assignment
+  occurs. Push delivery is now strict opt-in via the existing
+  `.push_delivery_store(storage.clone())` setter, which must be
+  paired with `with_push_dispatch_enabled(true)` on the storage
+  instance (unchanged consistency check).
+
+  **Migration:**
+  - Non-push deployments: no changes required. `.storage(storage)`
+    works unchanged.
+  - Push-using deployments: add `.push_delivery_store(storage.clone())`
+    explicitly before `.build()`. This was already the documented
+    path; it is now the only path.
+
 ## [0.1.4] — 2026-04-20
 
 ### Added
@@ -132,5 +162,6 @@ Pre-crates.io development. Highlights from the 0.1.x series (not published):
   `proto/a2a.proto`, wrapped in ergonomic Rust types with state-machine
   enforcement (ADR-002).
 
+[0.1.5]: https://github.com/aussierobots/turul-a2a/releases/tag/v0.1.5
 [0.1.4]: https://github.com/aussierobots/turul-a2a/releases/tag/v0.1.4
 [0.1.3]: https://github.com/aussierobots/turul-a2a/releases/tag/v0.1.3
