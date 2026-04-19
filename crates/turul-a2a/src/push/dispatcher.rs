@@ -119,7 +119,7 @@ impl PushDispatcher {
 
         let self_clone = self.clone();
         tokio::spawn(async move {
-            self_clone
+            let _ = self_clone
                 .run_fanout(tenant, owner, task_id, task, terminal_seqs)
                 .await;
         });
@@ -139,7 +139,7 @@ impl PushDispatcher {
         task_id: String,
         task: Task,
         terminal_seqs: Vec<u64>,
-    ) {
+    ) -> Result<(), crate::storage::A2aStorageError> {
         // ADR-013 §4.3: fresh-dispatch markers are written atomically
         // with the task + event commit when the backend opts in to
         // `push_dispatch_enabled`. The redispatch path refreshes
@@ -152,7 +152,11 @@ impl PushDispatcher {
         // the same JSON body (ADR-011 §3).
         let payload = match serde_json::to_vec(&task) {
             Ok(p) => p,
-            Err(_) => return,
+            Err(e) => {
+                return Err(crate::storage::A2aStorageError::SerializationError(
+                    format!("task payload serialise failed: {e}"),
+                ));
+            }
         };
 
         // ADR-013 §4.5 / §5.5: fan out per-seq using the eligibility
@@ -167,6 +171,12 @@ impl PushDispatcher {
             std::time::Duration::from_millis(150),
             std::time::Duration::from_millis(500),
         ];
+
+        // Retain the first persistent config-list error for the
+        // recovery-path caller (stream/scheduler workers). We still
+        // attempt every `seq` in the batch so a single bad seq does
+        // not prevent others from progressing.
+        let mut first_err: Option<crate::storage::A2aStorageError> = None;
 
         for seq in &terminal_seqs {
             let mut configs: Vec<turul_a2a_proto::TaskPushNotificationConfig> = Vec::new();
@@ -230,6 +240,9 @@ impl PushDispatcher {
                     "push dispatch aborted: list_configs_eligible_at_event failed after \
                      bounded retry; pending-dispatch marker retained for reclaim sweep"
                 );
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
                 continue;
             }
 
@@ -282,6 +295,10 @@ impl PushDispatcher {
                 .push_delivery_store_handle()
                 .delete_pending_dispatch(&tenant, &task_id, *seq)
                 .await;
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 
@@ -367,8 +384,82 @@ impl PushDispatcher {
 
         // Re-run the fan-out for this event. run_fanout deletes the
         // marker after completion.
-        self.run_fanout(tenant, owner, task_id, task, vec![event_sequence])
+        let _ = self
+            .run_fanout(tenant, owner, task_id, task, vec![event_sequence])
             .await;
+    }
+
+    /// Recovery-path variant of [`Self::redispatch_pending`] (ADR-013
+    /// §5.2 / §5.3). Returns `Ok(())` when the marker has been
+    /// consumed — either fan-out completed or the task was deleted
+    /// — so the caller (Lambda stream worker or scheduled worker)
+    /// can acknowledge the work. Returns `Err(_)` on a transient
+    /// storage error; the marker is retained for the next tick and
+    /// the caller should surface a retryable signal (e.g.
+    /// BatchItemFailure on the stream handler).
+    ///
+    /// Semantics match ADR-013 §4.6:
+    ///
+    /// - `get_task → Ok(Some(task))` → refresh recorded_at, run
+    ///   fan-out, delete marker → `Ok(())`.
+    /// - `get_task → Ok(None)` (task deleted) → delete marker,
+    ///   return `Ok(())`. A deleted task is a permanent signal, not
+    ///   transient.
+    /// - `get_task → Err(_)` → `Err(_)` — marker retained.
+    /// - fan-out path `list_configs_eligible_at_event` exhausts
+    ///   retry budget → `Err(_)` — marker retained.
+    /// - per-config delivery failures → logged + left for claim-row
+    ///   reclaim; do NOT bubble up here.
+    pub async fn try_redispatch_pending(
+        &self,
+        pending: crate::push::claim::PendingDispatch,
+    ) -> Result<(), crate::storage::A2aStorageError> {
+        let crate::push::claim::PendingDispatch {
+            tenant,
+            owner,
+            task_id,
+            event_sequence,
+            ..
+        } = pending;
+
+        let task = match self
+            .task_storage
+            .get_task(&tenant, &task_id, &owner, None)
+            .await
+        {
+            Ok(Some(task)) => task,
+            Ok(None) => {
+                // ADR-013 §4.6: deleted task is a permanent signal —
+                // delete the marker, return Ok so the caller
+                // acknowledges (no BatchItemFailure).
+                self.push_delivery_store_handle()
+                    .delete_pending_dispatch(&tenant, &task_id, event_sequence)
+                    .await?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Refresh recorded_at so the scheduler doesn't double-pick this
+        // marker mid-run. Failure is non-fatal — the sweeper can pick
+        // it up again and claim fencing prevents double-delivery.
+        if let Err(e) = self
+            .push_delivery_store_handle()
+            .record_pending_dispatch(&tenant, &owner, &task_id, event_sequence)
+            .await
+        {
+            tracing::warn!(
+                target: "turul_a2a::push_pending_dispatch_refresh_failed",
+                tenant = %tenant,
+                task_id = %task_id,
+                event_sequence = event_sequence,
+                error = %e,
+                "recovery redispatch marker refresh failed; fan-out continues"
+            );
+        }
+
+        self.run_fanout(tenant, owner, task_id, task, vec![event_sequence])
+            .await
     }
 
     /// Redispatch one previously-stuck claim row.

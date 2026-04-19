@@ -660,3 +660,25 @@ pub struct PendingDispatch {
     pub event_sequence: u64,
     pub recorded_at: SystemTime,
 }
+
+impl PendingDispatch {
+    /// Construct a pending-dispatch handle. External callers (Lambda
+    /// stream worker, reclaim-sweep adapters) use this to reconstruct
+    /// the struct from a stream record or backend row without
+    /// tripping the `#[non_exhaustive]` guard.
+    pub fn new(
+        tenant: String,
+        owner: String,
+        task_id: String,
+        event_sequence: u64,
+        recorded_at: SystemTime,
+    ) -> Self {
+        Self {
+            tenant,
+            owner,
+            task_id,
+            event_sequence,
+            recorded_at,
+        }
+    }
+}

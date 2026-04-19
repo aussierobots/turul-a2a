@@ -45,13 +45,17 @@
 mod adapter;
 mod auth;
 mod no_streaming;
+mod stream_recovery;
 
 #[cfg(test)]
 mod builder_tests;
+#[cfg(test)]
+mod stream_recovery_tests;
 
 pub use adapter::{lambda_to_axum_request, axum_to_lambda_response};
 pub use auth::{AuthorizerMapping, LambdaAuthorizerMiddleware};
 pub use no_streaming::NoStreamingLayer;
+pub use stream_recovery::LambdaStreamRecoveryHandler;
 
 use std::sync::Arc;
 

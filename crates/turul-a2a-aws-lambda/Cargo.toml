@@ -21,6 +21,9 @@ turul-a2a-types = { workspace = true }
 turul-a2a-proto = { workspace = true }
 lambda_http = { workspace = true }
 lambda_runtime = { workspace = true }
+aws_lambda_events = { workspace = true }
+serde_dynamo = { version = "4" }
+thiserror = { workspace = true }
 axum = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
@@ -35,3 +38,5 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+wiremock = { workspace = true }
+chrono = { workspace = true }
