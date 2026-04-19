@@ -7,6 +7,10 @@ publish = false
 [[bin]]
 name = "bootstrap"
 path = "src/main.rs"
+# cargo-lambda requires the binary to be named `bootstrap`; all three
+# Lambda example crates declare the same name. Exclude from rustdoc so
+# `cargo doc --workspace` does not collide on the output filename.
+doc = false
 
 [dependencies]
 turul-a2a = { path = "../../crates/turul-a2a" }

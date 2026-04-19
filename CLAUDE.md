@@ -178,9 +178,14 @@ Our vendored `proto/a2a.proto` is byte-identical to upstream `a2aproject/A2A/spe
 - Query params: camelCase (historyLength, pageSize, pageToken, contextId)
 - contextId/taskId mismatch rejection on continuation (spec §3.4.3)
 
-**No known spec compliance gaps remaining.** ListTasks sorts by `updated_at DESC` across all four backends. Pagination cursor encodes `updated_at|task_id` for stable iteration.
+**Release scope.** turul-a2a is tested against the current upstream A2A v1.0 proto (`proto/a2a.proto`) and implements the core HTTP+JSON and JSON-RPC server surfaces covered by that vendored contract. Within those covered surfaces there are no known compliance gaps: ListTasks sorts by `updated_at DESC` across all four backends; pagination cursor encodes `updated_at|task_id` for stable iteration; the spec-compliance suite (`crates/turul-a2a/tests/spec_compliance.rs`) walks every core RPC on both transports.
 
-**Deployment responsibilities:** TLS 1.2+ (§7.1) and gzip (§11.4) are met at the deployment layer (reverse proxy, load balancer), not framework-enforced.
+**Out of scope for the framework release:**
+- gRPC transport (the proto is generated but the gRPC service surface is not wired — see "Deferred" below).
+- Deployment-layer transport requirements: TLS 1.2+ (spec §7.1) and gzip (§11.4) are met at the reverse proxy / load balancer, not framework-enforced.
+- Deeper per-skill security-scheme semantics (agent-level only; see "Deferred").
+
+Before describing a release as "A2A v1.0 compliant", re-verify the vendored `proto/a2a.proto` SHA256 still matches `a2aproject/A2A:main/specification/a2a.proto` (AGENTS.md §55+§173).
 
 ### Completed
 
