@@ -42,15 +42,12 @@
 use std::sync::Arc;
 
 use aws_lambda_events::event::eventbridge::EventBridgeEvent;
-use lambda_runtime::{service_fn, Error, LambdaEvent};
+use lambda_runtime::{Error, LambdaEvent, service_fn};
 use turul_a2a::push::delivery::{PushDeliveryConfig, PushDeliveryWorker};
 use turul_a2a::push::{A2aPushDeliveryStore, PushDispatcher};
-use turul_a2a::storage::{
-    A2aPushNotificationStorage, A2aTaskStorage, InMemoryA2aStorage,
-};
+use turul_a2a::storage::{A2aPushNotificationStorage, A2aTaskStorage, InMemoryA2aStorage};
 use turul_a2a_aws_lambda::{
-    LambdaScheduledRecoveryConfig, LambdaScheduledRecoveryHandler,
-    LambdaScheduledRecoveryResponse,
+    LambdaScheduledRecoveryConfig, LambdaScheduledRecoveryHandler, LambdaScheduledRecoveryResponse,
 };
 
 /// Replace this with the shared backend the request Lambda uses
@@ -65,8 +62,7 @@ fn build_storage() -> Arc<InMemoryA2aStorage> {
 async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_target(false)
         .without_time()
@@ -89,33 +85,32 @@ async fn main() -> Result<(), Error> {
     );
     let dispatcher = Arc::new(PushDispatcher::new(worker, push_storage, task_storage));
 
-    let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery)
-        .with_config(LambdaScheduledRecoveryConfig {
+    let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery).with_config(
+        LambdaScheduledRecoveryConfig {
             stale_cutoff: std::time::Duration::from_secs(10 * 60),
             stale_markers_limit: 128,
             reclaimable_claims_limit: 128,
-        });
-
-    lambda_runtime::run(service_fn(
-        move |event: LambdaEvent<EventBridgeEvent>| {
-            let handler = handler.clone();
-            async move {
-                let response: LambdaScheduledRecoveryResponse =
-                    handler.handle_scheduled_event(event.payload).await;
-                tracing::info!(
-                    target: "turul_a2a::scheduled_worker_tick",
-                    stale_markers_found = response.stale_markers_found,
-                    stale_markers_recovered = response.stale_markers_recovered,
-                    stale_markers_transient_errors = response.stale_markers_transient_errors,
-                    reclaimable_claims_found = response.reclaimable_claims_found,
-                    reclaimable_claims_processed = response.reclaimable_claims_processed,
-                    error_sample = ?response.errors,
-                    "scheduled recovery tick complete"
-                );
-                Ok::<_, Error>(response)
-            }
         },
-    ))
+    );
+
+    lambda_runtime::run(service_fn(move |event: LambdaEvent<EventBridgeEvent>| {
+        let handler = handler.clone();
+        async move {
+            let response: LambdaScheduledRecoveryResponse =
+                handler.handle_scheduled_event(event.payload).await;
+            tracing::info!(
+                target: "turul_a2a::scheduled_worker_tick",
+                stale_markers_found = response.stale_markers_found,
+                stale_markers_recovered = response.stale_markers_recovered,
+                stale_markers_transient_errors = response.stale_markers_transient_errors,
+                reclaimable_claims_found = response.reclaimable_claims_found,
+                reclaimable_claims_processed = response.reclaimable_claims_processed,
+                error_sample = ?response.errors,
+                "scheduled recovery tick complete"
+            );
+            Ok::<_, Error>(response)
+        }
+    }))
     .await
 }
 

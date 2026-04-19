@@ -11,8 +11,10 @@ use std::time::Duration;
 use crate::error::A2aError;
 use crate::executor::AgentExecutor;
 use crate::middleware::{A2aMiddleware, MiddlewareStack, SecurityContribution};
-use crate::router::{build_router, AppState};
-use crate::storage::{A2aAtomicStore, A2aPushNotificationStorage, A2aTaskStorage, InMemoryA2aStorage};
+use crate::router::{AppState, build_router};
+use crate::storage::{
+    A2aAtomicStore, A2aPushNotificationStorage, A2aTaskStorage, InMemoryA2aStorage,
+};
 use crate::streaming::TaskEventBroker;
 
 // ---------------------------------------------------------------------------
@@ -137,28 +139,28 @@ impl A2aServerBuilder {
 
     /// Soft timeout for blocking `SendMessage` requests. On expiry the
     /// framework trips the executor's cancellation token and waits up to
-    /// [`Self::timeout_abort_grace`] for cooperative exit. 
+    /// [`Self::timeout_abort_grace`] for cooperative exit.
     pub fn blocking_task_timeout(mut self, d: Duration) -> Self {
         self.runtime_config.blocking_task_timeout = d;
         self
     }
 
     /// Grace window between soft cancellation and hard `JoinHandle::abort()`.
-    /// 
+    ///
     pub fn timeout_abort_grace(mut self, d: Duration) -> Self {
         self.runtime_config.timeout_abort_grace = d;
         self
     }
 
     /// How long the `CancelTask` handler waits for cancellation to resolve
-    /// before force-committing CANCELED itself. 
+    /// before force-committing CANCELED itself.
     pub fn cancel_handler_grace(mut self, d: Duration) -> Self {
         self.runtime_config.cancel_handler_grace = d;
         self
     }
 
     /// Poll interval used inside the `CancelTask` handler's grace window to
-    /// re-read task state from storage. 
+    /// re-read task state from storage.
     pub fn cancel_handler_poll_interval(mut self, d: Duration) -> Self {
         self.runtime_config.cancel_handler_poll_interval = d;
         self
@@ -166,51 +168,51 @@ impl A2aServerBuilder {
 
     /// How often the in-flight supervisor batch-polls the cancel marker
     /// across in-flight tasks for cross-instance cancel propagation.
-    /// 
+    ///
     pub fn cross_instance_cancel_poll_interval(mut self, d: Duration) -> Self {
         self.runtime_config.cross_instance_cancel_poll_interval = d;
         self
     }
 
     /// Maximum retry attempts (including first) per push delivery.
-    /// 
+    ///
     pub fn push_max_attempts(mut self, n: usize) -> Self {
         self.runtime_config.push_max_attempts = n;
         self
     }
 
     /// Base delay before the second push attempt; doubles up to
-    /// [`Self::push_backoff_cap`]. 
+    /// [`Self::push_backoff_cap`].
     pub fn push_backoff_base(mut self, d: Duration) -> Self {
         self.runtime_config.push_backoff_base = d;
         self
     }
 
-    /// Maximum single-wait in the push retry schedule. 
+    /// Maximum single-wait in the push retry schedule.
     pub fn push_backoff_cap(mut self, d: Duration) -> Self {
         self.runtime_config.push_backoff_cap = d;
         self
     }
 
-    /// Jitter fraction applied to push retry waits. 
+    /// Jitter fraction applied to push retry waits.
     pub fn push_backoff_jitter(mut self, j: f32) -> Self {
         self.runtime_config.push_backoff_jitter = j;
         self
     }
 
-    /// Total per-request timeout for a push POST. 
+    /// Total per-request timeout for a push POST.
     pub fn push_request_timeout(mut self, d: Duration) -> Self {
         self.runtime_config.push_request_timeout = d;
         self
     }
 
-    /// Connect-phase timeout for a push POST. 
+    /// Connect-phase timeout for a push POST.
     pub fn push_connect_timeout(mut self, d: Duration) -> Self {
         self.runtime_config.push_connect_timeout = d;
         self
     }
 
-    /// Read-phase timeout for a push POST. 
+    /// Read-phase timeout for a push POST.
     pub fn push_read_timeout(mut self, d: Duration) -> Self {
         self.runtime_config.push_read_timeout = d;
         self
@@ -224,20 +226,20 @@ impl A2aServerBuilder {
         self
     }
 
-    /// Push-config cache TTL inside the delivery worker. 
+    /// Push-config cache TTL inside the delivery worker.
     pub fn push_config_cache_ttl(mut self, d: Duration) -> Self {
         self.runtime_config.push_config_cache_ttl = d;
         self
     }
 
     /// Retention for failed push delivery records (operator inspection).
-    /// 
+    ///
     pub fn push_failed_delivery_retention(mut self, d: Duration) -> Self {
         self.runtime_config.push_failed_delivery_retention = d;
         self
     }
 
-    /// Maximum serialized Task body size for a push POST. 
+    /// Maximum serialized Task body size for a push POST.
     pub fn push_max_payload_bytes(mut self, bytes: usize) -> Self {
         self.runtime_config.push_max_payload_bytes = bytes;
         self
@@ -581,8 +583,7 @@ fn merge_stacked_contributions(
         return Ok(merged);
     }
 
-    let mut combined: Vec<turul_a2a_proto::SecurityRequirement> =
-        requirement_sets[0].to_vec();
+    let mut combined: Vec<turul_a2a_proto::SecurityRequirement> = requirement_sets[0].to_vec();
 
     for alternatives in &requirement_sets[1..] {
         let mut new_combined = Vec::new();
@@ -706,15 +707,15 @@ impl A2aServer {
         // observed here within one `cross_instance_cancel_poll_interval`.
         let poller_registry = std::sync::Arc::clone(&self.state.in_flight);
         let poller_supervisor = std::sync::Arc::clone(&self.state.cancellation_supervisor);
-        let poller_interval = self.state.runtime_config.cross_instance_cancel_poll_interval;
+        let poller_interval = self
+            .state
+            .runtime_config
+            .cross_instance_cancel_poll_interval;
         let push_delivery_store_for_sweep = self.state.push_delivery_store.clone();
         let self_push_dispatcher_for_sweep = self.state.push_dispatcher.clone();
-        let sweep_interval_for_task =
-            self.state.runtime_config.push_reclaim_sweep_interval;
-        let sweep_batch_for_task =
-            self.state.runtime_config.push_reclaim_sweep_batch;
-        let push_claim_expiry_for_sweep =
-            self.state.runtime_config.push_claim_expiry;
+        let sweep_interval_for_task = self.state.runtime_config.push_reclaim_sweep_interval;
+        let sweep_batch_for_task = self.state.runtime_config.push_reclaim_sweep_batch;
+        let push_claim_expiry_for_sweep = self.state.runtime_config.push_claim_expiry;
 
         let app = self.into_router();
         let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -729,12 +730,13 @@ impl A2aServer {
         // shutdown signal.
         let shutdown = tokio_util::sync::CancellationToken::new();
         let poller_shutdown = shutdown.clone();
-        let poller_handle = tokio::spawn(crate::server::in_flight::run_cross_instance_cancel_poller(
-            poller_registry,
-            poller_supervisor,
-            poller_interval,
-            poller_shutdown,
-        ));
+        let poller_handle =
+            tokio::spawn(crate::server::in_flight::run_cross_instance_cancel_poller(
+                poller_registry,
+                poller_supervisor,
+                poller_interval,
+                poller_shutdown,
+            ));
 
         // Push-delivery reclaim loop (ADR-011 §10.5). Two
         // enumerations run per tick:
@@ -766,9 +768,7 @@ impl A2aServer {
                 let pending_stale_threshold = push_claim_expiry_for_sweep;
                 Some(tokio::spawn(async move {
                     let mut ticker = tokio::time::interval(interval);
-                    ticker.set_missed_tick_behavior(
-                        tokio::time::MissedTickBehavior::Delay,
-                    );
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         tokio::select! {
                             _ = shutdown.cancelled() => break,
@@ -838,8 +838,7 @@ impl A2aServer {
             let _ = h.await;
         }
 
-        serve_result
-            .map_err(|e| A2aError::Internal(format!("Server error: {e}")))?;
+        serve_result.map_err(|e| A2aError::Internal(format!("Server error: {e}")))?;
         Ok(())
     }
 }
@@ -904,7 +903,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AgentExecutor for DummyExecutor {
-        async fn execute(&self, _task: &mut Task, _msg: &Message, _ctx: &crate::executor::ExecutionContext) -> Result<(), A2aError> {
+        async fn execute(
+            &self,
+            _task: &mut Task,
+            _msg: &Message,
+            _ctx: &crate::executor::ExecutionContext,
+        ) -> Result<(), A2aError> {
             Ok(())
         }
         fn agent_card(&self) -> turul_a2a_proto::AgentCard {
@@ -944,11 +948,36 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::storage::A2aEventStore for FakeEventStore {
-        fn backend_name(&self) -> &'static str { "fake-backend" }
-        async fn append_event(&self, _t: &str, _tid: &str, _e: crate::streaming::StreamEvent) -> Result<u64, crate::storage::A2aStorageError> { Ok(0) }
-        async fn get_events_after(&self, _t: &str, _tid: &str, _s: u64) -> Result<Vec<(u64, crate::streaming::StreamEvent)>, crate::storage::A2aStorageError> { Ok(vec![]) }
-        async fn latest_sequence(&self, _t: &str, _tid: &str) -> Result<u64, crate::storage::A2aStorageError> { Ok(0) }
-        async fn cleanup_expired(&self) -> Result<u64, crate::storage::A2aStorageError> { Ok(0) }
+        fn backend_name(&self) -> &'static str {
+            "fake-backend"
+        }
+        async fn append_event(
+            &self,
+            _t: &str,
+            _tid: &str,
+            _e: crate::streaming::StreamEvent,
+        ) -> Result<u64, crate::storage::A2aStorageError> {
+            Ok(0)
+        }
+        async fn get_events_after(
+            &self,
+            _t: &str,
+            _tid: &str,
+            _s: u64,
+        ) -> Result<Vec<(u64, crate::streaming::StreamEvent)>, crate::storage::A2aStorageError>
+        {
+            Ok(vec![])
+        }
+        async fn latest_sequence(
+            &self,
+            _t: &str,
+            _tid: &str,
+        ) -> Result<u64, crate::storage::A2aStorageError> {
+            Ok(0)
+        }
+        async fn cleanup_expired(&self) -> Result<u64, crate::storage::A2aStorageError> {
+            Ok(0)
+        }
     }
 
     #[test]
@@ -976,10 +1005,37 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::storage::A2aAtomicStore for FakeAtomicStore {
-        fn backend_name(&self) -> &'static str { "fake-atomic" }
-        async fn create_task_with_events(&self, _t: &str, _o: &str, task: turul_a2a_types::Task, _e: Vec<crate::streaming::StreamEvent>) -> Result<(turul_a2a_types::Task, Vec<u64>), crate::storage::A2aStorageError> { Ok((task, vec![])) }
-        async fn update_task_status_with_events(&self, _t: &str, _tid: &str, _o: &str, _s: turul_a2a_types::TaskStatus, _e: Vec<crate::streaming::StreamEvent>) -> Result<(turul_a2a_types::Task, Vec<u64>), crate::storage::A2aStorageError> { unimplemented!() }
-        async fn update_task_with_events(&self, _t: &str, _o: &str, _task: turul_a2a_types::Task, _e: Vec<crate::streaming::StreamEvent>) -> Result<Vec<u64>, crate::storage::A2aStorageError> { Ok(vec![]) }
+        fn backend_name(&self) -> &'static str {
+            "fake-atomic"
+        }
+        async fn create_task_with_events(
+            &self,
+            _t: &str,
+            _o: &str,
+            task: turul_a2a_types::Task,
+            _e: Vec<crate::streaming::StreamEvent>,
+        ) -> Result<(turul_a2a_types::Task, Vec<u64>), crate::storage::A2aStorageError> {
+            Ok((task, vec![]))
+        }
+        async fn update_task_status_with_events(
+            &self,
+            _t: &str,
+            _tid: &str,
+            _o: &str,
+            _s: turul_a2a_types::TaskStatus,
+            _e: Vec<crate::streaming::StreamEvent>,
+        ) -> Result<(turul_a2a_types::Task, Vec<u64>), crate::storage::A2aStorageError> {
+            unimplemented!()
+        }
+        async fn update_task_with_events(
+            &self,
+            _t: &str,
+            _o: &str,
+            _task: turul_a2a_types::Task,
+            _e: Vec<crate::streaming::StreamEvent>,
+        ) -> Result<Vec<u64>, crate::storage::A2aStorageError> {
+            Ok(vec![])
+        }
     }
 
     #[test]
@@ -1037,23 +1093,23 @@ mod tests {
         let server = A2aServer::builder()
             .executor(DummyExecutor)
             // One representative setter per consumer group.
-            .blocking_task_timeout(Duration::from_secs(42))          
-            .timeout_abort_grace(Duration::from_secs(7))              
-            .cancel_handler_grace(Duration::from_secs(3))             
-            .cancel_handler_poll_interval(Duration::from_millis(50))  
+            .blocking_task_timeout(Duration::from_secs(42))
+            .timeout_abort_grace(Duration::from_secs(7))
+            .cancel_handler_grace(Duration::from_secs(3))
+            .cancel_handler_poll_interval(Duration::from_millis(50))
             .cross_instance_cancel_poll_interval(Duration::from_secs(2))
-            .push_max_attempts(17)                                    
-            .push_backoff_base(Duration::from_millis(500))            
-            .push_backoff_cap(Duration::from_secs(90))                
-            .push_backoff_jitter(0.5)                                 
-            .push_request_timeout(Duration::from_secs(20))            
-            .push_connect_timeout(Duration::from_secs(3))             
-            .push_read_timeout(Duration::from_secs(15))               
-            .push_claim_expiry(Duration::from_secs(20 * 60))          
-            .push_config_cache_ttl(Duration::from_secs(10))           
+            .push_max_attempts(17)
+            .push_backoff_base(Duration::from_millis(500))
+            .push_backoff_cap(Duration::from_secs(90))
+            .push_backoff_jitter(0.5)
+            .push_request_timeout(Duration::from_secs(20))
+            .push_connect_timeout(Duration::from_secs(3))
+            .push_read_timeout(Duration::from_secs(15))
+            .push_claim_expiry(Duration::from_secs(20 * 60))
+            .push_config_cache_ttl(Duration::from_secs(10))
             .push_failed_delivery_retention(Duration::from_secs(48 * 60 * 60))
-            .push_max_payload_bytes(2 * 1024 * 1024)                  
-            .allow_insecure_push_urls(true)                           
+            .push_max_payload_bytes(2 * 1024 * 1024)
+            .allow_insecure_push_urls(true)
             .build()
             .expect("build must succeed");
 
@@ -1062,7 +1118,10 @@ mod tests {
         assert_eq!(cfg.timeout_abort_grace, Duration::from_secs(7));
         assert_eq!(cfg.cancel_handler_grace, Duration::from_secs(3));
         assert_eq!(cfg.cancel_handler_poll_interval, Duration::from_millis(50));
-        assert_eq!(cfg.cross_instance_cancel_poll_interval, Duration::from_secs(2));
+        assert_eq!(
+            cfg.cross_instance_cancel_poll_interval,
+            Duration::from_secs(2)
+        );
         assert_eq!(cfg.push_max_attempts, 17);
         assert_eq!(cfg.push_backoff_base, Duration::from_millis(500));
         assert_eq!(cfg.push_backoff_cap, Duration::from_secs(90));
@@ -1072,7 +1131,10 @@ mod tests {
         assert_eq!(cfg.push_read_timeout, Duration::from_secs(15));
         assert_eq!(cfg.push_claim_expiry, Duration::from_secs(20 * 60));
         assert_eq!(cfg.push_config_cache_ttl, Duration::from_secs(10));
-        assert_eq!(cfg.push_failed_delivery_retention, Duration::from_secs(48 * 60 * 60));
+        assert_eq!(
+            cfg.push_failed_delivery_retention,
+            Duration::from_secs(48 * 60 * 60)
+        );
         assert_eq!(cfg.push_max_payload_bytes, 2 * 1024 * 1024);
         assert!(cfg.allow_insecure_push_urls);
     }
@@ -1090,7 +1152,10 @@ mod tests {
         let defaults = RuntimeConfig::default();
         assert_eq!(cfg.blocking_task_timeout, defaults.blocking_task_timeout);
         assert_eq!(cfg.push_max_attempts, defaults.push_max_attempts);
-        assert_eq!(cfg.allow_insecure_push_urls, defaults.allow_insecure_push_urls);
+        assert_eq!(
+            cfg.allow_insecure_push_urls,
+            defaults.allow_insecure_push_urls
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1193,8 +1258,7 @@ mod tests {
             Ok(_) => panic!("orphan dispatch flag must be rejected"),
         };
         assert!(
-            err.contains("push_dispatch_enabled() is true")
-                && err.contains("no consumer"),
+            err.contains("push_dispatch_enabled() is true") && err.contains("no consumer"),
             "error should cite the orphaned-marker rationale: {err}"
         );
     }
@@ -1270,13 +1334,15 @@ mod tests {
             SecurityContribution::new().with_scheme(
                 "TestApiKey",
                 turul_a2a_proto::SecurityScheme {
-                    scheme: Some(turul_a2a_proto::security_scheme::Scheme::ApiKeySecurityScheme(
-                        turul_a2a_proto::ApiKeySecurityScheme {
-                            description: "test".into(),
-                            location: "header".into(),
-                            name: "X-Test-Key".into(),
-                        },
-                    )),
+                    scheme: Some(
+                        turul_a2a_proto::security_scheme::Scheme::ApiKeySecurityScheme(
+                            turul_a2a_proto::ApiKeySecurityScheme {
+                                description: "test".into(),
+                                location: "header".into(),
+                                name: "X-Test-Key".into(),
+                            },
+                        ),
+                    ),
                 },
                 vec![],
             )

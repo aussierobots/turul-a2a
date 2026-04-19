@@ -48,7 +48,9 @@ use crate::push::claim::{
     GaveUpReason,
 };
 use crate::push::secret::Secret;
-use crate::push::ssrf::{decide as ssrf_decide, OutboundUrlValidator, SsrfBlockReason, SsrfDecision};
+use crate::push::ssrf::{
+    OutboundUrlValidator, SsrfBlockReason, SsrfDecision, decide as ssrf_decide,
+};
 use crate::storage::A2aStorageError;
 
 /// Runtime-configurable delivery parameters (ADR-011 §5, §R3).
@@ -289,11 +291,9 @@ impl PushDeliveryWorker {
 
             // Classify.
             let outcome = match &result {
-                Ok(status) if (200..400).contains(&status.as_u16()) => {
-                    DeliveryOutcome::Succeeded {
-                        http_status: status.as_u16(),
-                    }
-                }
+                Ok(status) if (200..400).contains(&status.as_u16()) => DeliveryOutcome::Succeeded {
+                    http_status: status.as_u16(),
+                },
                 Ok(status) if status.as_u16() == 429 => DeliveryOutcome::Retry {
                     next_attempt_at: SystemTime::now() + self.backoff_for(new_count),
                     http_status: Some(status.as_u16()),
@@ -363,8 +363,7 @@ impl PushDeliveryWorker {
                             &claim.claimant,
                             claim.generation,
                             DeliveryOutcome::Retry {
-                                next_attempt_at: SystemTime::now()
-                                    + self.backoff_for(new_count),
+                                next_attempt_at: SystemTime::now() + self.backoff_for(new_count),
                                 http_status,
                                 error_class,
                             },
@@ -427,9 +426,7 @@ impl PushDeliveryWorker {
         outcome: DeliveryOutcome,
     ) -> DeliveryReport {
         let success_report = match &outcome {
-            DeliveryOutcome::Succeeded { http_status } => {
-                DeliveryReport::Succeeded(*http_status)
-            }
+            DeliveryOutcome::Succeeded { http_status } => DeliveryReport::Succeeded(*http_status),
             DeliveryOutcome::GaveUp { reason, .. } => DeliveryReport::GaveUp(*reason),
             DeliveryOutcome::Abandoned { reason } => DeliveryReport::Abandoned(*reason),
             // Should not happen — caller is responsible for filtering
@@ -525,7 +522,9 @@ impl PushDeliveryWorker {
     }
 
     async fn resolve(&self, url: &Url) -> Result<Vec<IpAddr>, String> {
-        let host = url.host_str().ok_or_else(|| "url has no host".to_string())?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| "url has no host".to_string())?;
         let port = url.port_or_known_default().unwrap_or(443);
         self.dns_resolver.resolve(host, port).await
     }
@@ -572,10 +571,7 @@ impl PushDeliveryWorker {
                 "User-Agent",
                 format!("turul-a2a/{}", env!("CARGO_PKG_VERSION")),
             )
-            .header(
-                "X-Turul-Event-Sequence",
-                target.event_sequence.to_string(),
-            );
+            .header("X-Turul-Event-Sequence", target.event_sequence.to_string());
         // ADR-011 §4: omit the `Authorization` header entirely when
         // the config has no authentication. Emitting an empty
         // `"{scheme} {creds}"` value — as the earlier implementation
@@ -585,7 +581,11 @@ impl PushDeliveryWorker {
         if !target.auth_scheme.is_empty() {
             req = req.header(
                 "Authorization",
-                format!("{} {}", target.auth_scheme, target.auth_credentials.expose()),
+                format!(
+                    "{} {}",
+                    target.auth_scheme,
+                    target.auth_credentials.expose()
+                ),
             );
         }
         if let Some(tok) = &target.token {
@@ -656,9 +656,7 @@ pub enum DeliveryReport {
     TransientStoreError,
 }
 
-fn ssrf_block_to_diagnostics(
-    reason: SsrfBlockReason,
-) -> (GaveUpReason, DeliveryErrorClass) {
+fn ssrf_block_to_diagnostics(reason: SsrfBlockReason) -> (GaveUpReason, DeliveryErrorClass) {
     match reason {
         SsrfBlockReason::PrivateIp
         | SsrfBlockReason::InvalidUrl
@@ -666,10 +664,9 @@ fn ssrf_block_to_diagnostics(
         | SsrfBlockReason::ValidatorDenied => {
             (GaveUpReason::SsrfBlocked, DeliveryErrorClass::SSRFBlocked)
         }
-        SsrfBlockReason::InsecureScheme => (
-            GaveUpReason::TlsRejected,
-            DeliveryErrorClass::TlsRejected,
-        ),
+        SsrfBlockReason::InsecureScheme => {
+            (GaveUpReason::TlsRejected, DeliveryErrorClass::TlsRejected)
+        }
     }
 }
 
@@ -682,13 +679,8 @@ mod tests {
         store: Arc<InMemoryA2aStorage>,
         cfg: PushDeliveryConfig,
     ) -> PushDeliveryWorker {
-        PushDeliveryWorker::new(
-            store,
-            cfg,
-            None,
-            format!("worker-{}", uuid::Uuid::now_v7()),
-        )
-        .expect("build")
+        PushDeliveryWorker::new(store, cfg, None, format!("worker-{}", uuid::Uuid::now_v7()))
+            .expect("build")
     }
 
     fn target(url: &str) -> PushTarget {
@@ -737,7 +729,10 @@ mod tests {
         let t = target("https://example.com/");
         let payload = vec![0u8; 1024];
         let report = w.deliver(&t, &payload).await;
-        assert_eq!(report, DeliveryReport::GaveUp(GaveUpReason::PayloadTooLarge));
+        assert_eq!(
+            report,
+            DeliveryReport::GaveUp(GaveUpReason::PayloadTooLarge)
+        );
 
         let failed = store
             .list_failed_deliveries(&t.tenant, SystemTime::UNIX_EPOCH, 10)

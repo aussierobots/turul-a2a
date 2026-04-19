@@ -28,5 +28,5 @@ pub use claim::{
     DeliveryOutcome, FailedDelivery, GaveUpReason, PendingDispatch, ReclaimableClaim,
 };
 pub use dispatcher::PushDispatcher;
-pub use secret::{redact_in_str, Secret};
-pub use ssrf::{decide as ssrf_decide, is_blocked_ip, SsrfBlockReason, SsrfDecision};
+pub use secret::{Secret, redact_in_str};
+pub use ssrf::{SsrfBlockReason, SsrfDecision, decide as ssrf_decide, is_blocked_ip};

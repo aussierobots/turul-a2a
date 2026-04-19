@@ -4,16 +4,16 @@ use async_trait::async_trait;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use turul_a2a_types::{Artifact, Message, Task, TaskState, TaskStatus};
 
-use crate::push::{
-    A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
-    DeliveryOutcome, FailedDelivery, GaveUpReason,
-};
-use crate::streaming::StreamEvent;
 use super::atomic::A2aAtomicStore;
 use super::error::A2aStorageError;
 use super::event_store::A2aEventStore;
 use super::filter::{PushConfigListPage, TaskFilter, TaskListPage};
 use super::traits::{A2aPushNotificationStorage, A2aTaskStorage};
+use crate::push::{
+    A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
+    DeliveryOutcome, FailedDelivery, GaveUpReason,
+};
+use crate::streaming::StreamEvent;
 
 /// SQLite storage configuration.
 #[derive(Debug, Clone)]
@@ -85,10 +85,11 @@ impl SqliteA2aStorage {
         // SQLite has no conditional ADD COLUMN, so we attempt the ALTER
         // and ignore the duplicate-column error. This is the standard
         // idempotent migration pattern for SQLite.
-        let alter_result =
-            sqlx::query("ALTER TABLE a2a_tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
-                .execute(&self.pool)
-                .await;
+        let alter_result = sqlx::query(
+            "ALTER TABLE a2a_tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
         match alter_result {
             Ok(_) => {}
             Err(e) if e.to_string().contains("duplicate column") => {
@@ -100,10 +101,11 @@ impl SqliteA2aStorage {
         // ADR-013 §6.3: unconditional latest_event_sequence column.
         // Legacy rows default to 0; the first post-migration commit
         // extends it monotonically via MAX(existing, new).
-        let alter_latest =
-            sqlx::query("ALTER TABLE a2a_tasks ADD COLUMN latest_event_sequence INTEGER NOT NULL DEFAULT 0")
-                .execute(&self.pool)
-                .await;
+        let alter_latest = sqlx::query(
+            "ALTER TABLE a2a_tasks ADD COLUMN latest_event_sequence INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
         match alter_latest {
             Ok(_) => {}
             Err(e) if e.to_string().contains("duplicate column") => {}
@@ -214,8 +216,8 @@ impl SqliteA2aStorage {
     }
 
     fn task_from_json(json: &str) -> Result<Task, A2aStorageError> {
-        let proto: turul_a2a_proto::Task =
-            serde_json::from_str(json).map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
+        let proto: turul_a2a_proto::Task = serde_json::from_str(json)
+            .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
         Task::try_from(proto).map_err(A2aStorageError::TypeError)
     }
 
@@ -241,7 +243,8 @@ impl SqliteA2aStorage {
         if !include_artifacts {
             proto.artifacts.clear();
         }
-        Task::try_from(proto).unwrap_or_else(|_| Task::new("err", TaskStatus::new(TaskState::Failed)))
+        Task::try_from(proto)
+            .unwrap_or_else(|_| Task::new("err", TaskStatus::new(TaskState::Failed)))
     }
 }
 
@@ -335,15 +338,14 @@ impl A2aTaskStorage for SqliteA2aStorage {
         task_id: &str,
         owner: &str,
     ) -> Result<bool, A2aStorageError> {
-        let result = sqlx::query(
-            "DELETE FROM a2a_tasks WHERE tenant = ? AND task_id = ? AND owner = ?",
-        )
-        .bind(tenant)
-        .bind(task_id)
-        .bind(owner)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        let result =
+            sqlx::query("DELETE FROM a2a_tasks WHERE tenant = ? AND task_id = ? AND owner = ?")
+                .bind(tenant)
+                .bind(task_id)
+                .bind(owner)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -431,18 +433,22 @@ impl A2aTaskStorage for SqliteA2aStorage {
         let tasks_with_times: Vec<(Task, String)> = rows
             .iter()
             .filter_map(|(json, updated_at)| {
-                Self::task_from_json(json)
-                    .ok()
-                    .map(|t| (Self::trim_task(t, filter.history_length, include_artifacts), updated_at.clone()))
+                Self::task_from_json(json).ok().map(|t| {
+                    (
+                        Self::trim_task(t, filter.history_length, include_artifacts),
+                        updated_at.clone(),
+                    )
+                })
             })
             .collect();
 
         let tasks: Vec<Task> = tasks_with_times.iter().map(|(t, _)| t.clone()).collect();
 
         let next_page_token = if tasks.len() as i32 >= page_size {
-            tasks_with_times.last().map(|(t, updated_at)| {
-                format!("{}|{}", updated_at, t.id())
-            }).unwrap_or_default()
+            tasks_with_times
+                .last()
+                .map(|(t, updated_at)| format!("{}|{}", updated_at, t.id()))
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -480,7 +486,9 @@ impl A2aTaskStorage for SqliteA2aStorage {
                 turul_a2a_types::A2aTypeError::InvalidTransition { current, requested } => {
                     A2aStorageError::InvalidTransition { current, requested }
                 }
-                turul_a2a_types::A2aTypeError::TerminalState(s) => A2aStorageError::TerminalState(s),
+                turul_a2a_types::A2aTypeError::TerminalState(s) => {
+                    A2aStorageError::TerminalState(s)
+                }
                 other => A2aStorageError::TypeError(other),
             },
         )?;
@@ -610,9 +618,11 @@ impl A2aTaskStorage for SqliteA2aStorage {
                     // the UPDATE sets = 1 regardless of prior value, so
                     // rows_affected is 1 as long as WHERE matches. Falling
                     // here implies something odd; return generic error.
-                    other => return Err(A2aStorageError::DatabaseError(format!(
-                        "unexpected status_state on set_cancel_requested classify: {other}"
-                    ))),
+                    other => {
+                        return Err(A2aStorageError::DatabaseError(format!(
+                            "unexpected status_state on set_cancel_requested classify: {other}"
+                        )));
+                    }
                 };
                 Err(A2aStorageError::TerminalState(state))
             }
@@ -705,7 +715,10 @@ impl A2aPushNotificationStorage for SqliteA2aStorage {
         const MAX_ATTEMPTS: u32 = 5;
         let backoffs_ms: [u64; 4] = [10, 50, 250, 1000];
         for attempt in 0..MAX_ATTEMPTS {
-            let mut tx = self.pool.begin().await
+            let mut tx = self
+                .pool
+                .begin()
+                .await
                 .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
             let latest: Option<(i64,)> = sqlx::query_as(
@@ -774,7 +787,8 @@ impl A2aPushNotificationStorage for SqliteA2aStorage {
                 continue;
             }
 
-            tx.commit().await
+            tx.commit()
+                .await
                 .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
             return Ok(config);
         }
@@ -962,7 +976,10 @@ impl A2aEventStore for SqliteA2aStorage {
 
         // Single transaction: allocate sequence + insert event.
         // SQLite single-writer model makes MAX+1 safe.
-        let mut tx = self.pool.begin().await
+        let mut tx = self
+            .pool
+            .begin()
+            .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         let seq: (i64,) = sqlx::query_as(
@@ -987,7 +1004,8 @@ impl A2aEventStore for SqliteA2aStorage {
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        tx.commit().await
+        tx.commit()
+            .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         Ok(seq.0 as u64)
@@ -1020,11 +1038,7 @@ impl A2aEventStore for SqliteA2aStorage {
         Ok(events)
     }
 
-    async fn latest_sequence(
-        &self,
-        tenant: &str,
-        task_id: &str,
-    ) -> Result<u64, A2aStorageError> {
+    async fn latest_sequence(&self, tenant: &str, task_id: &str) -> Result<u64, A2aStorageError> {
         let row: (i64,) = sqlx::query_as(
             "SELECT COALESCE(MAX(event_sequence), 0) FROM a2a_task_events
              WHERE tenant = ? AND task_id = ?",
@@ -1063,7 +1077,10 @@ impl A2aAtomicStore for SqliteA2aStorage {
         let task_json = Self::task_to_json(&task)?;
         let state_str = Self::status_state_str(&task);
 
-        let mut tx = self.pool.begin().await
+        let mut tx = self
+            .pool
+            .begin()
+            .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         // Insert task
@@ -1127,7 +1144,8 @@ impl A2aAtomicStore for SqliteA2aStorage {
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         }
 
-        tx.commit().await
+        tx.commit()
+            .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         Ok((task, sequences))
@@ -1141,7 +1159,10 @@ impl A2aAtomicStore for SqliteA2aStorage {
         new_status: TaskStatus,
         events: Vec<StreamEvent>,
     ) -> Result<(Task, Vec<u64>), A2aStorageError> {
-        let mut tx = self.pool.begin().await
+        let mut tx = self
+            .pool
+            .begin()
+            .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         // Read current task within transaction
@@ -1306,7 +1327,8 @@ impl A2aAtomicStore for SqliteA2aStorage {
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         }
 
-        tx.commit().await
+        tx.commit()
+            .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         Ok((updated_task, sequences))
@@ -1322,7 +1344,10 @@ impl A2aAtomicStore for SqliteA2aStorage {
         let task_json = Self::task_to_json(&task)?;
         let state_str = Self::status_state_str(&task);
 
-        let mut tx = self.pool.begin().await
+        let mut tx = self
+            .pool
+            .begin()
+            .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         // Terminal-preservation CAS (ADR-010 §7.1 extension): the UPDATE's
@@ -1361,8 +1386,7 @@ impl A2aAtomicStore for SqliteA2aStorage {
             return match current {
                 Some((state,)) => Err(A2aStorageError::TerminalStateAlreadySet {
                     task_id: task.id().to_string(),
-                    current_state:
-                        crate::storage::terminal_cas::debug_state_to_wire_name(&state),
+                    current_state: crate::storage::terminal_cas::debug_state_to_wire_name(&state),
                 }),
                 None => Err(A2aStorageError::TaskNotFound(task.id().to_string())),
             };
@@ -1414,7 +1438,8 @@ impl A2aAtomicStore for SqliteA2aStorage {
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         }
 
-        tx.commit().await
+        tx.commit()
+            .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         Ok(sequences)
@@ -1466,7 +1491,9 @@ fn error_class_to_json(c: DeliveryErrorClass) -> String {
 }
 
 fn error_class_from_json(s: &str) -> Option<DeliveryErrorClass> {
-    serde_json::from_str::<ErrorClassWire>(s).ok().map(Into::into)
+    serde_json::from_str::<ErrorClassWire>(s)
+        .ok()
+        .map(Into::into)
 }
 
 /// Wire shape for persisting `DeliveryErrorClass` without coupling
@@ -1560,26 +1587,50 @@ impl A2aPushDeliveryStore for SqliteA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        let existing: Option<(String, String, i64, i64, i64, i64, String, Option<i64>, Option<i64>, Option<i64>, Option<String>)> =
-            sqlx::query_as(
-                "SELECT claimant, owner, generation, claimed_at_micros, expires_at_micros, \
+        let existing: Option<(
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT claimant, owner, generation, claimed_at_micros, expires_at_micros, \
                     delivery_attempt_count, status, first_attempted_at_micros, \
                     last_attempted_at_micros, last_http_status, last_error_class \
                  FROM a2a_push_deliveries \
                  WHERE tenant = ?1 AND task_id = ?2 AND event_sequence = ?3 AND config_id = ?4",
-            )
-            .bind(tenant)
-            .bind(task_id)
-            .bind(event_sequence as i64)
-            .bind(config_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        )
+        .bind(tenant)
+        .bind(task_id)
+        .bind(event_sequence as i64)
+        .bind(config_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         let now_micros = systime_to_micros(now);
         let expires_micros = systime_to_micros(expires_at);
 
-        if let Some((_prev_claimant, prev_owner, prev_gen, _prev_claimed, prev_expires, prev_count, prev_status_s, prev_first, prev_last, prev_http, prev_err)) = existing {
+        if let Some((
+            _prev_claimant,
+            prev_owner,
+            prev_gen,
+            _prev_claimed,
+            prev_expires,
+            prev_count,
+            prev_status_s,
+            prev_first,
+            prev_last,
+            prev_http,
+            prev_err,
+        )) = existing
+        {
             let prev_status = claim_status_from_str(&prev_status_s)?;
             let is_terminal = matches!(
                 prev_status,
@@ -1797,7 +1848,7 @@ impl A2aPushDeliveryStore for SqliteA2aStorage {
                     task_id: task_id.to_string(),
                     event_sequence,
                     config_id: config_id.to_string(),
-                })
+                });
             }
         };
         if cur_claimant != claimant || cur_gen as u64 != claim_generation {
@@ -1943,17 +1994,15 @@ impl A2aPushDeliveryStore for SqliteA2aStorage {
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         Ok(rows
             .into_iter()
-            .map(
-                |(tenant, owner, task_id, event_sequence, config_id)| {
-                    crate::push::claim::ReclaimableClaim {
-                        tenant,
-                        owner,
-                        task_id,
-                        event_sequence: event_sequence.max(0) as u64,
-                        config_id,
-                    }
-                },
-            )
+            .map(|(tenant, owner, task_id, event_sequence, config_id)| {
+                crate::push::claim::ReclaimableClaim {
+                    tenant,
+                    owner,
+                    task_id,
+                    event_sequence: event_sequence.max(0) as u64,
+                    config_id,
+                }
+            })
             .collect())
     }
 
@@ -2026,15 +2075,17 @@ impl A2aPushDeliveryStore for SqliteA2aStorage {
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         Ok(rows
             .into_iter()
-            .map(|(tenant, owner, task_id, event_sequence, recorded_at_micros)| {
-                crate::push::claim::PendingDispatch {
-                    tenant,
-                    owner,
-                    task_id,
-                    event_sequence: event_sequence.max(0) as u64,
-                    recorded_at: micros_to_systime(recorded_at_micros),
-                }
-            })
+            .map(
+                |(tenant, owner, task_id, event_sequence, recorded_at_micros)| {
+                    crate::push::claim::PendingDispatch {
+                        tenant,
+                        owner,
+                        task_id,
+                        event_sequence: event_sequence.max(0) as u64,
+                        recorded_at: micros_to_systime(recorded_at_micros),
+                    }
+                },
+            )
             .collect())
     }
 

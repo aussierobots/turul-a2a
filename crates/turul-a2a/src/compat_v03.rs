@@ -120,10 +120,18 @@ fn normalize_jsonrpc_method(method: &str) -> String {
         "tasks/list" => methods::LIST_TASKS.to_string(),
         "tasks/cancel" => methods::CANCEL_TASK.to_string(),
         "tasks/subscribe" => methods::SUBSCRIBE_TO_TASK.to_string(),
-        "tasks/pushNotificationConfig/set" => methods::CREATE_TASK_PUSH_NOTIFICATION_CONFIG.to_string(),
-        "tasks/pushNotificationConfig/get" => methods::GET_TASK_PUSH_NOTIFICATION_CONFIG.to_string(),
-        "tasks/pushNotificationConfig/list" => methods::LIST_TASK_PUSH_NOTIFICATION_CONFIGS.to_string(),
-        "tasks/pushNotificationConfig/delete" => methods::DELETE_TASK_PUSH_NOTIFICATION_CONFIG.to_string(),
+        "tasks/pushNotificationConfig/set" => {
+            methods::CREATE_TASK_PUSH_NOTIFICATION_CONFIG.to_string()
+        }
+        "tasks/pushNotificationConfig/get" => {
+            methods::GET_TASK_PUSH_NOTIFICATION_CONFIG.to_string()
+        }
+        "tasks/pushNotificationConfig/list" => {
+            methods::LIST_TASK_PUSH_NOTIFICATION_CONFIGS.to_string()
+        }
+        "tasks/pushNotificationConfig/delete" => {
+            methods::DELETE_TASK_PUSH_NOTIFICATION_CONFIG.to_string()
+        }
         other => other.to_string(),
     }
 }
@@ -287,27 +295,34 @@ pub fn inject_agent_card_compat(mut card: serde_json::Value) -> serde_json::Valu
                 }
             }
 
-            let additional: Vec<serde_json::Value> = interfaces.iter().map(|iface| {
-                let mut ai = serde_json::Map::new();
-                if let Some(url) = iface.get("url") {
-                    ai.insert("url".to_string(), url.clone());
-                }
-                // v0.3 renames protocolBinding → transport
-                if let Some(binding) = iface.get("protocolBinding") {
-                    ai.insert("transport".to_string(), binding.clone());
-                }
-                serde_json::Value::Object(ai)
-            }).collect();
+            let additional: Vec<serde_json::Value> = interfaces
+                .iter()
+                .map(|iface| {
+                    let mut ai = serde_json::Map::new();
+                    if let Some(url) = iface.get("url") {
+                        ai.insert("url".to_string(), url.clone());
+                    }
+                    // v0.3 renames protocolBinding → transport
+                    if let Some(binding) = iface.get("protocolBinding") {
+                        ai.insert("transport".to_string(), binding.clone());
+                    }
+                    serde_json::Value::Object(ai)
+                })
+                .collect();
 
             if !obj.contains_key("additionalInterfaces") {
-                obj.insert("additionalInterfaces".to_string(),
-                    serde_json::Value::Array(additional));
+                obj.insert(
+                    "additionalInterfaces".to_string(),
+                    serde_json::Value::Array(additional),
+                );
             }
         }
 
         if !obj.contains_key("protocolVersion") {
-            obj.insert("protocolVersion".to_string(),
-                serde_json::Value::String("0.3.0".to_string()));
+            obj.insert(
+                "protocolVersion".to_string(),
+                serde_json::Value::String("0.3.0".to_string()),
+            );
         }
     }
     card
@@ -328,14 +343,20 @@ mod tests {
     fn v03_compat_detect_v10_with_header() {
         let mut headers = HeaderMap::new();
         headers.insert("a2a-version", "1.0".parse().unwrap());
-        assert_eq!(detect_compat_mode("message/send", &headers), CompatMode::V10,
-            "Explicit A2A-Version: 1.0 forces V10 even with slash method");
+        assert_eq!(
+            detect_compat_mode("message/send", &headers),
+            CompatMode::V10,
+            "Explicit A2A-Version: 1.0 forces V10 even with slash method"
+        );
     }
 
     #[test]
     fn v03_compat_detect_v03_by_method() {
         let headers = HeaderMap::new();
-        assert_eq!(detect_compat_mode("message/send", &headers), CompatMode::V03);
+        assert_eq!(
+            detect_compat_mode("message/send", &headers),
+            CompatMode::V03
+        );
         assert_eq!(detect_compat_mode("tasks/get", &headers), CompatMode::V03);
     }
 
@@ -349,23 +370,38 @@ mod tests {
     #[test]
     fn v03_compat_detect_v10_for_unknown_method() {
         let headers = HeaderMap::new();
-        assert_eq!(detect_compat_mode("SomethingNew", &headers), CompatMode::V10,
-            "Unknown methods default to V10 — let dispatcher reject clearly");
+        assert_eq!(
+            detect_compat_mode("SomethingNew", &headers),
+            CompatMode::V10,
+            "Unknown methods default to V10 — let dispatcher reject clearly"
+        );
     }
 
     // -- Conditional method normalization -----------------------------------
 
     #[test]
     fn v03_compat_normalize_only_in_v03_mode() {
-        assert_eq!(maybe_normalize_method("message/send", CompatMode::V03), "SendMessage");
-        assert_eq!(maybe_normalize_method("message/send", CompatMode::V10), "message/send",
-            "V10 mode must NOT normalize — dispatcher rejects unknown methods");
+        assert_eq!(
+            maybe_normalize_method("message/send", CompatMode::V03),
+            "SendMessage"
+        );
+        assert_eq!(
+            maybe_normalize_method("message/send", CompatMode::V10),
+            "message/send",
+            "V10 mode must NOT normalize — dispatcher rejects unknown methods"
+        );
     }
 
     #[test]
     fn v03_compat_v10_methods_pass_through_in_both_modes() {
-        assert_eq!(maybe_normalize_method("SendMessage", CompatMode::V10), "SendMessage");
-        assert_eq!(maybe_normalize_method("SendMessage", CompatMode::V03), "SendMessage");
+        assert_eq!(
+            maybe_normalize_method("SendMessage", CompatMode::V10),
+            "SendMessage"
+        );
+        assert_eq!(
+            maybe_normalize_method("SendMessage", CompatMode::V03),
+            "SendMessage"
+        );
     }
 
     // -- Agent card (unconditionally additive) ------------------------------
@@ -430,7 +466,9 @@ mod tests {
             }
         });
         maybe_normalize_params(&mut params, CompatMode::V10);
-        assert_eq!(params["message"]["role"], "user",
-            "V10 mode must NOT normalize — let proto reject invalid enums");
+        assert_eq!(
+            params["message"]["role"], "user",
+            "V10 mode must NOT normalize — let proto reject invalid enums"
+        );
     }
 }

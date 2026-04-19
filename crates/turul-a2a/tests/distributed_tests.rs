@@ -15,7 +15,7 @@ use turul_a2a::card_builder::AgentCardBuilder;
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
 use turul_a2a::middleware::MiddlewareStack;
-use turul_a2a::router::{build_router, AppState};
+use turul_a2a::router::{AppState, build_router};
 use turul_a2a::storage::InMemoryA2aStorage;
 use turul_a2a::streaming::TaskEventBroker;
 use turul_a2a_types::{Message, Task};
@@ -24,7 +24,12 @@ struct TestExecutor;
 
 #[async_trait::async_trait]
 impl AgentExecutor for TestExecutor {
-    async fn execute(&self, task: &mut Task, _msg: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
+    async fn execute(
+        &self,
+        task: &mut Task,
+        _msg: &Message,
+        _ctx: &turul_a2a::executor::ExecutionContext,
+    ) -> Result<(), A2aError> {
         task.push_text_artifact("dist-art", "Result", "distributed result");
         task.complete();
         Ok(())
@@ -58,7 +63,7 @@ fn two_instances() -> (axum::Router, axum::Router) {
         in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
-            push_dispatcher: None,
+        push_dispatcher: None,
     };
 
     let state_b = AppState {
@@ -73,7 +78,7 @@ fn two_instances() -> (axum::Router, axum::Router) {
         in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
-            push_dispatcher: None,
+        push_dispatcher: None,
     };
 
     (build_router(state_a), build_router(state_b))
@@ -115,7 +120,10 @@ async fn create_on_a_fetch_on_b() {
         .body(Body::empty())
         .unwrap();
     let (status, body) = json_response(router_b, req).await;
-    assert_eq!(status, 200, "Instance B should see task created by instance A");
+    assert_eq!(
+        status, 200,
+        "Instance B should see task created by instance A"
+    );
     assert_eq!(body["id"].as_str().unwrap(), task_id);
 }
 
@@ -144,7 +152,10 @@ async fn create_on_a_list_on_b() {
         .unwrap();
     let (status, body) = json_response(router_b, req).await;
     assert_eq!(status, 200);
-    assert_eq!(body["totalSize"], 3, "Instance B should see all 3 tasks from instance A");
+    assert_eq!(
+        body["totalSize"], 3,
+        "Instance B should see all 3 tasks from instance A"
+    );
 }
 
 // =========================================================
@@ -213,7 +224,10 @@ async fn tenant_isolation_across_instances() {
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(router_b, req).await;
-    assert_eq!(status, 404, "Default tenant on B should not see acme's task");
+    assert_eq!(
+        status, 404,
+        "Default tenant on B should not see acme's task"
+    );
 }
 
 // =========================================================
@@ -249,12 +263,17 @@ async fn push_config_across_instances() {
     let config_id = body["id"].as_str().unwrap();
 
     // Get push config on B
-    let req = Request::get(format!("/tasks/{task_id}/pushNotificationConfigs/{config_id}"))
-        .header("a2a-version", "1.0")
-        .body(Body::empty())
-        .unwrap();
+    let req = Request::get(format!(
+        "/tasks/{task_id}/pushNotificationConfigs/{config_id}"
+    ))
+    .header("a2a-version", "1.0")
+    .body(Body::empty())
+    .unwrap();
     let (status, body) = json_response(router_b, req).await;
-    assert_eq!(status, 200, "Instance B should see push config created by A");
+    assert_eq!(
+        status, 200,
+        "Instance B should see push config created by A"
+    );
     assert_eq!(body["id"].as_str().unwrap(), config_id);
 }
 

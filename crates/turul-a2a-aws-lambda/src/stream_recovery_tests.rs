@@ -23,8 +23,7 @@ use serde::Serialize;
 use turul_a2a::push::delivery::{PushDeliveryConfig, PushDeliveryWorker};
 use turul_a2a::push::{A2aPushDeliveryStore, PushDispatcher};
 use turul_a2a::storage::{
-    A2aAtomicStore, A2aPushNotificationStorage, A2aStorageError, A2aTaskStorage,
-    InMemoryA2aStorage,
+    A2aAtomicStore, A2aPushNotificationStorage, A2aStorageError, A2aTaskStorage, InMemoryA2aStorage,
 };
 use turul_a2a::streaming::{StatusUpdatePayload, StreamEvent};
 use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
@@ -77,8 +76,7 @@ async fn seed_task_with_marker(
     let owner = "owner-1";
     let ctx = "ctx-stream";
 
-    let working =
-        Task::new(task_id, TaskStatus::new(TaskState::Working)).with_context_id(ctx);
+    let working = Task::new(task_id, TaskStatus::new(TaskState::Working)).with_context_id(ctx);
     A2aTaskStorage::create_task(storage.as_ref(), tenant, owner, working)
         .await
         .expect("seed");
@@ -107,13 +105,7 @@ async fn seed_task_with_marker(
         },
     };
     let (_t, seqs) = storage
-        .update_task_status_with_events(
-            tenant,
-            task_id,
-            owner,
-            completed,
-            vec![terminal_evt],
-        )
+        .update_task_status_with_events(tenant, task_id, owner, completed, vec![terminal_evt])
         .await
         .expect("terminal commit");
 
@@ -312,12 +304,7 @@ async fn stream_transient_storage_error_surfaces_batch_item_failure() {
         async fn update_task(&self, t: &str, o: &str, task: Task) -> Result<(), A2aStorageError> {
             self.inner.update_task(t, o, task).await
         }
-        async fn delete_task(
-            &self,
-            t: &str,
-            id: &str,
-            o: &str,
-        ) -> Result<bool, A2aStorageError> {
+        async fn delete_task(&self, t: &str, id: &str, o: &str) -> Result<bool, A2aStorageError> {
             self.inner.delete_task(t, id, o).await
         }
         async fn list_tasks(
@@ -353,9 +340,7 @@ async fn stream_transient_storage_error_surfaces_batch_item_failure() {
             append: bool,
             last: bool,
         ) -> Result<(), A2aStorageError> {
-            self.inner
-                .append_artifact(t, id, o, a, append, last)
-                .await
+            self.inner.append_artifact(t, id, o, a, append, last).await
         }
         async fn task_count(&self) -> Result<usize, A2aStorageError> {
             self.inner.task_count().await
@@ -395,8 +380,7 @@ async fn stream_transient_storage_error_surfaces_batch_item_failure() {
     cfg.allow_insecure_urls = true;
     let delivery2: Arc<dyn A2aPushDeliveryStore> = storage.clone();
     let worker = Arc::new(
-        PushDeliveryWorker::new(delivery2, cfg, None, "flaky-test".into())
-            .expect("worker"),
+        PushDeliveryWorker::new(delivery2, cfg, None, "flaky-test".into()).expect("worker"),
     );
     let push_storage: Arc<dyn A2aPushNotificationStorage> = storage.clone();
     let dispatcher = Arc::new(PushDispatcher::new(worker, push_storage, flaky));

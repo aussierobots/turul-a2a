@@ -100,7 +100,9 @@ mod tests {
         };
 
         let url_part = Part {
-            content: Some(part::Content::Url("https://example.com/doc.pdf".to_string())),
+            content: Some(part::Content::Url(
+                "https://example.com/doc.pdf".to_string(),
+            )),
             metadata: None,
             filename: "doc.pdf".to_string(),
             media_type: "application/pdf".to_string(),
@@ -147,24 +149,38 @@ mod tests {
             oauth2_metadata_url: String::new(),
         });
 
-        let oidc = security_scheme::Scheme::OpenIdConnectSecurityScheme(
-            OpenIdConnectSecurityScheme {
+        let oidc =
+            security_scheme::Scheme::OpenIdConnectSecurityScheme(OpenIdConnectSecurityScheme {
                 description: String::new(),
                 open_id_connect_url: "https://example.com/.well-known/openid-configuration"
                     .to_string(),
-            },
-        );
+            });
 
         let mtls = security_scheme::Scheme::MtlsSecurityScheme(MutualTlsSecurityScheme {
             description: String::new(),
         });
 
         // All five constructable
-        assert!(matches!(api_key, security_scheme::Scheme::ApiKeySecurityScheme(_)));
-        assert!(matches!(http_auth, security_scheme::Scheme::HttpAuthSecurityScheme(_)));
-        assert!(matches!(oauth2, security_scheme::Scheme::Oauth2SecurityScheme(_)));
-        assert!(matches!(oidc, security_scheme::Scheme::OpenIdConnectSecurityScheme(_)));
-        assert!(matches!(mtls, security_scheme::Scheme::MtlsSecurityScheme(_)));
+        assert!(matches!(
+            api_key,
+            security_scheme::Scheme::ApiKeySecurityScheme(_)
+        ));
+        assert!(matches!(
+            http_auth,
+            security_scheme::Scheme::HttpAuthSecurityScheme(_)
+        ));
+        assert!(matches!(
+            oauth2,
+            security_scheme::Scheme::Oauth2SecurityScheme(_)
+        ));
+        assert!(matches!(
+            oidc,
+            security_scheme::Scheme::OpenIdConnectSecurityScheme(_)
+        ));
+        assert!(matches!(
+            mtls,
+            security_scheme::Scheme::MtlsSecurityScheme(_)
+        ));
     }
 
     #[test]
@@ -340,9 +356,11 @@ mod tests {
 
     #[test]
     fn proto_required_annotations_present() {
-        let proto_source =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../proto/a2a.proto"))
-                .expect("should read a2a.proto");
+        let proto_source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../proto/a2a.proto"
+        ))
+        .expect("should read a2a.proto");
 
         // Each tuple: (message context, field pattern that must have REQUIRED)
         let required_fields = [
@@ -364,16 +382,40 @@ mod tests {
             ("TaskStatusUpdateEvent", "TaskStatus status = 3", "REQUIRED"),
             // TaskArtifactUpdateEvent (proto lines 310-314)
             ("TaskArtifactUpdateEvent", "string task_id = 1", "REQUIRED"),
-            ("TaskArtifactUpdateEvent", "string context_id = 2", "REQUIRED"),
-            ("TaskArtifactUpdateEvent", "Artifact artifact = 3", "REQUIRED"),
+            (
+                "TaskArtifactUpdateEvent",
+                "string context_id = 2",
+                "REQUIRED",
+            ),
+            (
+                "TaskArtifactUpdateEvent",
+                "Artifact artifact = 3",
+                "REQUIRED",
+            ),
             // AgentCard (proto lines 359-388)
             ("AgentCard", "string name = 1", "REQUIRED"),
             ("AgentCard", "string description = 2", "REQUIRED"),
-            ("AgentCard", "repeated AgentInterface supported_interfaces = 3", "REQUIRED"),
+            (
+                "AgentCard",
+                "repeated AgentInterface supported_interfaces = 3",
+                "REQUIRED",
+            ),
             ("AgentCard", "string version = 5", "REQUIRED"),
-            ("AgentCard", "AgentCapabilities capabilities = 7", "REQUIRED"),
-            ("AgentCard", "repeated string default_input_modes = 10", "REQUIRED"),
-            ("AgentCard", "repeated string default_output_modes = 11", "REQUIRED"),
+            (
+                "AgentCard",
+                "AgentCapabilities capabilities = 7",
+                "REQUIRED",
+            ),
+            (
+                "AgentCard",
+                "repeated string default_input_modes = 10",
+                "REQUIRED",
+            ),
+            (
+                "AgentCard",
+                "repeated string default_output_modes = 11",
+                "REQUIRED",
+            ),
             ("AgentCard", "repeated AgentSkill skills = 12", "REQUIRED"),
             // AgentInterface (proto lines 339-349)
             ("AgentInterface", "string url = 1", "REQUIRED"),
@@ -386,7 +428,11 @@ mod tests {
             ("AgentSkill", "repeated string tags = 4", "REQUIRED"),
             // ListTasksResponse (proto lines 696-702)
             ("ListTasksResponse", "repeated Task tasks = 1", "REQUIRED"),
-            ("ListTasksResponse", "string next_page_token = 2", "REQUIRED"),
+            (
+                "ListTasksResponse",
+                "string next_page_token = 2",
+                "REQUIRED",
+            ),
             ("ListTasksResponse", "int32 page_size = 3", "REQUIRED"),
             ("ListTasksResponse", "int32 total_size = 4", "REQUIRED"),
             // SendMessageRequest (proto line 646)
@@ -429,10 +475,16 @@ mod tests {
         };
         let json = serde_json::to_value(&task).unwrap();
         // Verify camelCase: contextId (not context_id)
-        assert!(json.get("contextId").is_some(), "expected camelCase 'contextId'");
+        assert!(
+            json.get("contextId").is_some(),
+            "expected camelCase 'contextId'"
+        );
         // Proto3 JSON: empty repeated fields are omitted, but field name is "history" not "messages"
         // When history is populated, the field should appear as "history"
-        assert!(json.get("messages").is_none(), "'messages' field should NOT exist");
+        assert!(
+            json.get("messages").is_none(),
+            "'messages' field should NOT exist"
+        );
 
         // Verify history appears when populated
         let task_with_history = Task {
@@ -453,7 +505,10 @@ mod tests {
             metadata: None,
         };
         let json2 = serde_json::to_value(&task_with_history).unwrap();
-        assert!(json2.get("history").is_some(), "expected 'history' field when populated");
+        assert!(
+            json2.get("history").is_some(),
+            "expected 'history' field when populated"
+        );
     }
 
     #[test]
@@ -649,7 +704,10 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         let message_val = json.get("message").unwrap();
         // Must be an object, not a string
-        assert!(message_val.is_object(), "TaskStatus.message must be a Message object, not a string");
+        assert!(
+            message_val.is_object(),
+            "TaskStatus.message must be a Message object, not a string"
+        );
         assert!(message_val.get("messageId").is_some());
         assert!(message_val.get("role").is_some());
         assert!(message_val.get("parts").is_some());

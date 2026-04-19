@@ -14,7 +14,7 @@ use tower::ServiceExt;
 
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
-use turul_a2a::router::{build_router, AppState};
+use turul_a2a::router::{AppState, build_router};
 use turul_a2a::storage::InMemoryA2aStorage;
 use turul_a2a_types::{Message, Task};
 
@@ -23,7 +23,12 @@ struct CompletingExecutor;
 
 #[async_trait::async_trait]
 impl AgentExecutor for CompletingExecutor {
-    async fn execute(&self, task: &mut Task, _message: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
+    async fn execute(
+        &self,
+        task: &mut Task,
+        _message: &Message,
+        _ctx: &turul_a2a::executor::ExecutionContext,
+    ) -> Result<(), A2aError> {
         let mut proto = task.as_proto().clone();
         proto.status = Some(turul_a2a_proto::TaskStatus {
             state: turul_a2a_proto::TaskState::Completed.into(),
@@ -35,7 +40,9 @@ impl AgentExecutor for CompletingExecutor {
             name: "SSE Result".into(),
             description: String::new(),
             parts: vec![turul_a2a_proto::Part {
-                content: Some(turul_a2a_proto::part::Content::Text("streamed result".into())),
+                content: Some(turul_a2a_proto::part::Content::Text(
+                    "streamed result".into(),
+                )),
                 metadata: None,
                 filename: String::new(),
                 media_type: String::new(),
@@ -91,7 +98,7 @@ fn test_state() -> AppState {
         in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
-            push_dispatcher: None,
+        push_dispatcher: None,
     }
 }
 
@@ -108,10 +115,7 @@ fn send_message_body(id: &str, text: &str) -> String {
 
 /// Collect SSE events from a response body with a timeout.
 /// Returns the raw `data:` payloads as parsed JSON values.
-async fn collect_sse_events(
-    body: Body,
-    timeout: Duration,
-) -> Vec<serde_json::Value> {
+async fn collect_sse_events(body: Body, timeout: Duration) -> Vec<serde_json::Value> {
     let collected = tokio::time::timeout(timeout, async {
         let bytes = body.collect().await.unwrap().to_bytes();
         let text = String::from_utf8_lossy(&bytes);
@@ -349,9 +353,10 @@ async fn message_stream_events_have_durable_ids() {
 
     // Every event must have an id in {task_id}:{sequence} format
     for (i, event) in events.iter().enumerate() {
-        let id = event.id.as_ref().unwrap_or_else(|| {
-            panic!("Event {i} missing id: field")
-        });
+        let id = event
+            .id
+            .as_ref()
+            .unwrap_or_else(|| panic!("Event {i} missing id: field"));
         // Parse with the replay module's format
         assert!(
             id.contains(':'),
@@ -483,7 +488,11 @@ async fn subscribe_tenant_scoped_missing_returns_404() {
         .body(Body::empty())
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), 404, "Subscribe under wrong tenant should 404");
+    assert_eq!(
+        resp.status(),
+        404,
+        "Subscribe under wrong tenant should 404"
+    );
 }
 
 // =========================================================
@@ -527,7 +536,9 @@ async fn subscribe_non_terminal_task_returns_sse_with_stored_events() {
     state
         .atomic_store
         .update_task_status_with_events(
-            "", "sub-happy-1", "anonymous",
+            "",
+            "sub-happy-1",
+            "anonymous",
             turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Working),
             vec![working_event],
         )
@@ -542,7 +553,11 @@ async fn subscribe_non_terminal_task_returns_sse_with_stored_events() {
         .unwrap();
 
     let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), 200, "Subscribe to non-terminal task should return 200");
+    assert_eq!(
+        resp.status(),
+        200,
+        "Subscribe to non-terminal task should return 200"
+    );
 
     let content_type = resp
         .headers()

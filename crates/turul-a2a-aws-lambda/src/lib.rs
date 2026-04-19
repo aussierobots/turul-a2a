@@ -83,12 +83,11 @@ mod scheduled_recovery_tests;
 #[cfg(test)]
 mod stream_recovery_tests;
 
-pub use adapter::{lambda_to_axum_request, axum_to_lambda_response};
+pub use adapter::{axum_to_lambda_response, lambda_to_axum_request};
 pub use auth::{AuthorizerMapping, LambdaAuthorizerMiddleware};
 pub use no_streaming::NoStreamingLayer;
 pub use scheduled_recovery::{
-    LambdaScheduledRecoveryConfig, LambdaScheduledRecoveryHandler,
-    LambdaScheduledRecoveryResponse,
+    LambdaScheduledRecoveryConfig, LambdaScheduledRecoveryHandler, LambdaScheduledRecoveryResponse,
 };
 pub use stream_recovery::LambdaStreamRecoveryHandler;
 
@@ -98,7 +97,7 @@ use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
 use turul_a2a::middleware::{A2aMiddleware, MiddlewareStack};
 use turul_a2a::push::A2aPushDeliveryStore;
-use turul_a2a::router::{build_router, AppState};
+use turul_a2a::router::{AppState, build_router};
 use turul_a2a::server::RuntimeConfig;
 use turul_a2a::storage::{
     A2aAtomicStore, A2aCancellationSupervisor, A2aEventStore, A2aPushNotificationStorage,
@@ -212,10 +211,7 @@ impl LambdaA2aServerBuilder {
     /// one backend and the supervisor reads from another, silently
     /// breaking cross-instance cancellation. Prefer `.storage()` for
     /// unified wiring. Consumed by `core_cancel_task` (ADR-012).
-    pub fn cancellation_supervisor(
-        mut self,
-        s: impl A2aCancellationSupervisor + 'static,
-    ) -> Self {
+    pub fn cancellation_supervisor(mut self, s: impl A2aCancellationSupervisor + 'static) -> Self {
         self.cancellation_supervisor = Some(Arc::new(s));
         self
     }
@@ -227,10 +223,7 @@ impl LambdaA2aServerBuilder {
     /// rejects mismatches. Passing a delivery store also requires the
     /// atomic store to have opted in via `with_push_dispatch_enabled(true)`
     /// (ADR-013 §4.3).
-    pub fn push_delivery_store(
-        mut self,
-        store: impl A2aPushDeliveryStore + 'static,
-    ) -> Self {
+    pub fn push_delivery_store(mut self, store: impl A2aPushDeliveryStore + 'static) -> Self {
         self.push_delivery_store = Some(Arc::new(store));
         self
     }
@@ -250,9 +243,9 @@ impl LambdaA2aServerBuilder {
     }
 
     pub fn build(self) -> Result<LambdaA2aHandler, A2aError> {
-        let executor = self.executor.ok_or(A2aError::Internal(
-            "executor is required".into(),
-        ))?;
+        let executor = self
+            .executor
+            .ok_or(A2aError::Internal("executor is required".into()))?;
         let task_storage = self.task_storage.ok_or(A2aError::Internal(
             "task_storage is required for Lambda".into(),
         ))?;

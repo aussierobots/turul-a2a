@@ -32,7 +32,10 @@ pub fn lambda_to_axum_request(
     // The exact structure depends on the API Gateway type (v1, v2, ALB).
     // We use a generic approach: look for the RequestContext extension and
     // extract authorizer fields from it.
-    if let Some(ctx) = parts.extensions.get::<lambda_http::request::RequestContext>() {
+    if let Some(ctx) = parts
+        .extensions
+        .get::<lambda_http::request::RequestContext>()
+    {
         match ctx {
             lambda_http::request::RequestContext::ApiGatewayV2(apigw) => {
                 if let Some(ref authorizer) = apigw.authorizer {
@@ -85,7 +88,9 @@ pub async fn axum_to_lambda_response(
     resp: http::Response<Body>,
 ) -> Result<lambda_http::Response<lambda_http::Body>, lambda_http::Error> {
     let (parts, body) = resp.into_parts();
-    let body_bytes = body.collect().await
+    let body_bytes = body
+        .collect()
+        .await
         .map_err(|e| lambda_http::Error::from(format!("Body collect error: {e}")))?
         .to_bytes();
 
@@ -143,9 +148,6 @@ mod tests {
     fn inject_authorizer_header_works() {
         let mut headers = http::HeaderMap::new();
         inject_authorizer_header(&mut headers, "userId", "user-123");
-        assert_eq!(
-            headers.get("x-authorizer-userid").unwrap(),
-            "user-123"
-        );
+        assert_eq!(headers.get("x-authorizer-userid").unwrap(), "user-123");
     }
 }

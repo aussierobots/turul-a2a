@@ -137,7 +137,10 @@ impl InFlightHandle {
     /// `JoinHandle` separately (typically done by the supervisor
     /// task).
     pub fn abort(&self) {
-        let guard = self.abort_handle.lock().expect("abort_handle Mutex poisoned");
+        let guard = self
+            .abort_handle
+            .lock()
+            .expect("abort_handle Mutex poisoned");
         guard.abort();
     }
 
@@ -153,12 +156,10 @@ impl InFlightHandle {
     pub fn fire_yielded(&self, task: Task) -> bool {
         // AcqRel on the CAS: Acq of the prior Release makes the sender's
         // state visible; Rel publishes the flag transition to later loads.
-        match self.yielded_fired.compare_exchange(
-            false,
-            true,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match self
+            .yielded_fired
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        {
             Ok(_) => {
                 // We won — take the sender and send.
                 let sender = self
@@ -198,7 +199,10 @@ impl InFlightHandle {
     pub fn set_spawned(&self, spawned: JoinHandle<()>) {
         let new_abort = spawned.abort_handle();
         *self.spawned.lock().expect("spawned Mutex poisoned") = Some(spawned);
-        *self.abort_handle.lock().expect("abort_handle Mutex poisoned") = new_abort;
+        *self
+            .abort_handle
+            .lock()
+            .expect("abort_handle Mutex poisoned") = new_abort;
     }
 
     /// Take the spawned JoinHandle out of the handle.
@@ -307,10 +311,7 @@ impl InFlightRegistry {
     /// supervisor's cross-instance cancel-marker poll. Copies the keys
     /// out of the lock so the poll body runs without holding the lock.
     pub(crate) fn snapshot_by_tenant(&self) -> std::collections::HashMap<String, Vec<String>> {
-        let map = self
-            .map
-            .read()
-            .expect("InFlightRegistry RwLock poisoned");
+        let map = self.map.read().expect("InFlightRegistry RwLock poisoned");
         let mut out: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for (tenant, task_id) in map.keys() {
@@ -398,7 +399,11 @@ impl SupervisorSentinel {
         key: InFlightKey,
         handle: Arc<InFlightHandle>,
     ) -> Self {
-        Self { registry, key, handle }
+        Self {
+            registry,
+            key,
+            handle,
+        }
     }
 }
 

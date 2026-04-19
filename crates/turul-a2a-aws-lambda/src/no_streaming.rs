@@ -52,7 +52,9 @@ where
 
         if is_streaming_path(&path) {
             let err = A2aError::UnsupportedOperation {
-                message: "Streaming is not supported on Lambda. Use request/response endpoints instead.".into(),
+                message:
+                    "Streaming is not supported on Lambda. Use request/response endpoints instead."
+                        .into(),
             };
             let body = err.to_http_error_body();
             let status = axum::http::StatusCode::from_u16(err.http_status())

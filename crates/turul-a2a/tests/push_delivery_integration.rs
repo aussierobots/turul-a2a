@@ -53,10 +53,7 @@ const SENTINEL_TOKEN: &str = "SECRET-TOKEN-DO-NOT-LEAK";
 
 /// Build a worker with a fast retry schedule suitable for integration
 /// tests. Jitter is zeroed so backoff is deterministic.
-fn fast_worker(
-    store: Arc<InMemoryA2aStorage>,
-    max_attempts: u32,
-) -> PushDeliveryWorker {
+fn fast_worker(store: Arc<InMemoryA2aStorage>, max_attempts: u32) -> PushDeliveryWorker {
     // `PushDeliveryConfig` is `#[non_exhaustive]` — can't be built via
     // struct literal from an external test crate, so mutate a default.
     let mut cfg = PushDeliveryConfig::default();
@@ -70,8 +67,13 @@ fn fast_worker(
     cfg.claim_expiry = Duration::from_secs(60);
     cfg.max_payload_bytes = 64 * 1024;
     cfg.allow_insecure_urls = true; // wiremock lives on 127.0.0.1
-    PushDeliveryWorker::new(store, cfg, None, format!("instance-{}", uuid::Uuid::now_v7()))
-        .expect("worker build must succeed")
+    PushDeliveryWorker::new(
+        store,
+        cfg,
+        None,
+        format!("instance-{}", uuid::Uuid::now_v7()),
+    )
+    .expect("worker build must succeed")
 }
 
 fn sentinel_target(base_url: &str) -> PushTarget {
@@ -302,7 +304,10 @@ async fn secret_sentinel_never_leaks_on_giveup() {
     // worker actually sends on the wire (via `expose()` at header
     // build time). If this assertion ever fires, the test is
     // mis-configured and the whole redaction check is meaningless.
-    assert_eq!(target.auth_credentials.expose().as_str(), SENTINEL_CREDENTIAL);
+    assert_eq!(
+        target.auth_credentials.expose().as_str(),
+        SENTINEL_CREDENTIAL
+    );
     assert_eq!(
         target.token.as_ref().map(|t| t.expose().as_str()),
         Some(SENTINEL_TOKEN)
@@ -368,11 +373,7 @@ struct PinResolver {
 }
 
 impl PushDnsResolver for PinResolver {
-    fn resolve(
-        &self,
-        _host: &str,
-        _port: u16,
-    ) -> BoxFuture<'_, Result<Vec<IpAddr>, String>> {
+    fn resolve(&self, _host: &str, _port: u16) -> BoxFuture<'_, Result<Vec<IpAddr>, String>> {
         *self.call_count.lock().unwrap() += 1;
         let ip = self.ip;
         Box::pin(async move { Ok(vec![ip]) })
@@ -520,7 +521,15 @@ impl A2aPushDeliveryStore for FailingTerminalStore {
         claim_expiry: Duration,
     ) -> Result<DeliveryClaim, A2aStorageError> {
         self.inner
-            .claim_delivery(tenant, task_id, event_sequence, config_id, claimant, owner, claim_expiry)
+            .claim_delivery(
+                tenant,
+                task_id,
+                event_sequence,
+                config_id,
+                claimant,
+                owner,
+                claim_expiry,
+            )
             .await
     }
 
@@ -632,7 +641,9 @@ impl A2aPushDeliveryStore for FailingTerminalStore {
         since: SystemTime,
         limit: usize,
     ) -> Result<Vec<FailedDelivery>, A2aStorageError> {
-        self.inner.list_failed_deliveries(tenant, since, limit).await
+        self.inner
+            .list_failed_deliveries(tenant, since, limit)
+            .await
     }
 }
 
@@ -668,8 +679,8 @@ async fn terminal_persist_failure_becomes_transient_not_succeeded() {
     cfg.claim_expiry = Duration::from_secs(60);
     cfg.max_payload_bytes = 64 * 1024;
     cfg.allow_insecure_urls = true;
-    let worker = PushDeliveryWorker::new(store, cfg, None, "instance-fail".into())
-        .expect("worker build");
+    let worker =
+        PushDeliveryWorker::new(store, cfg, None, "instance-fail".into()).expect("worker build");
 
     let target = sentinel_target(&server.uri());
 
@@ -763,7 +774,8 @@ async fn reclaim_sweep_redispatches_after_persistent_terminal_failure() {
 
     let push_storage: Arc<dyn turul_a2a::storage::A2aPushNotificationStorage> = inner.clone();
     let task_storage: Arc<dyn turul_a2a::storage::A2aTaskStorage> = inner.clone();
-    let dispatcher = PushDispatcher::new(worker.clone(), push_storage.clone(), task_storage.clone());
+    let dispatcher =
+        PushDispatcher::new(worker.clone(), push_storage.clone(), task_storage.clone());
 
     // Seed a task in storage so the redispatch path's get_task
     // succeeds. Use the owner-scoped atomic store since that's what
@@ -810,10 +822,9 @@ async fn reclaim_sweep_redispatches_after_persistent_terminal_failure() {
         .expect("create_config");
 
     // --- Step 1: first deliver exhausts persist_terminal retries.
-    let target = turul_a2a::push::delivery::PushTarget::from_config(
-        tenant, owner, &task_id, 1, &cfg_proto,
-    )
-    .expect("valid target");
+    let target =
+        turul_a2a::push::delivery::PushTarget::from_config(tenant, owner, &task_id, 1, &cfg_proto)
+            .expect("valid target");
     let payload = b"{}".to_vec();
     let first = worker.deliver(&target, &payload).await;
     assert_eq!(
@@ -897,8 +908,8 @@ async fn terminal_persist_recovers_after_transient_blip() {
     cfg.claim_expiry = Duration::from_secs(60);
     cfg.max_payload_bytes = 64 * 1024;
     cfg.allow_insecure_urls = true;
-    let worker = PushDeliveryWorker::new(store, cfg, None, "instance-blip".into())
-        .expect("worker build");
+    let worker =
+        PushDeliveryWorker::new(store, cfg, None, "instance-blip".into()).expect("worker build");
     let target = sentinel_target(&server.uri());
 
     let report = worker.deliver(&target, b"{}").await;
@@ -946,8 +957,8 @@ async fn stale_claim_on_terminal_write_becomes_claim_lost() {
     cfg.claim_expiry = Duration::from_secs(60);
     cfg.max_payload_bytes = 64 * 1024;
     cfg.allow_insecure_urls = true;
-    let worker = PushDeliveryWorker::new(store, cfg, None, "instance-stale".into())
-        .expect("worker build");
+    let worker =
+        PushDeliveryWorker::new(store, cfg, None, "instance-stale".into()).expect("worker build");
     let target = sentinel_target(&server.uri());
 
     let report = worker.deliver(&target, b"{}").await;
@@ -1251,7 +1262,15 @@ async fn redispatch_read_error_leaves_row_reclaimable() {
 
     // Seed a claim row, then let it expire.
     delivery_store
-        .claim_delivery(tenant, task_id, 1, "cfg-rd", "instance-rd", owner, Duration::from_millis(50))
+        .claim_delivery(
+            tenant,
+            task_id,
+            1,
+            "cfg-rd",
+            "instance-rd",
+            owner,
+            Duration::from_millis(50),
+        )
         .await
         .expect("seed claim");
     tokio::time::sleep(Duration::from_millis(70)).await;
@@ -1412,7 +1431,9 @@ async fn pending_dispatch_marker_recovers_persistent_list_configs_outage() {
     // Simulate the reclaim sweep tick: drive redispatch. The
     // FailingPushStorage has one retry budget left, but the
     // redispatch's own retry will cycle past it.
-    dispatcher.redispatch_pending(pending.into_iter().next().unwrap()).await;
+    dispatcher
+        .redispatch_pending(pending.into_iter().next().unwrap())
+        .await;
 
     // After recovery, the marker is gone and wiremock saw one POST.
     let pending_after = delivery_store
@@ -1519,4 +1540,3 @@ async fn initial_dispatch_retries_list_configs_on_transient_failure() {
 
     drop(server);
 }
-

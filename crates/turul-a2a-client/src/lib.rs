@@ -16,15 +16,16 @@ pub use error::A2aClientError;
 pub use sse::{SseEvent, SseStream, StreamEvent, TypedSseEvent, TypedSseStream};
 
 /// Auth configuration for the client.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum ClientAuth {
     #[default]
     None,
     Bearer(String),
-    ApiKey { header: String, key: String },
+    ApiKey {
+        header: String,
+        key: String,
+    },
 }
-
 
 /// A2A client for communicating with A2A agents.
 #[derive(Debug, Clone)]
@@ -90,12 +91,16 @@ impl A2aClient {
     fn url(&self, path: &str) -> String {
         match &self.tenant {
             Some(tenant) => {
-                let encoded_tenant =
-                    reqwest::Url::parse("http://x")
-                        .unwrap()
-                        .join(&format!("{}/", tenant))
-                        .map(|u| u.path().trim_end_matches('/').trim_start_matches('/').to_string())
-                        .unwrap_or_else(|_| tenant.clone());
+                let encoded_tenant = reqwest::Url::parse("http://x")
+                    .unwrap()
+                    .join(&format!("{}/", tenant))
+                    .map(|u| {
+                        u.path()
+                            .trim_end_matches('/')
+                            .trim_start_matches('/')
+                            .to_string()
+                    })
+                    .unwrap_or_else(|_| tenant.clone());
                 format!("{}/{}{}", self.base_url, encoded_tenant, path)
             }
             None => format!("{}{}", self.base_url, path),
@@ -207,10 +212,7 @@ impl A2aClient {
     }
 
     /// Cancel a task, returning the raw proto Task.
-    pub async fn cancel_task_proto(
-        &self,
-        task_id: &str,
-    ) -> Result<pb::Task, A2aClientError> {
+    pub async fn cancel_task_proto(&self, task_id: &str) -> Result<pb::Task, A2aClientError> {
         let url = self.url(&format!("/tasks/{task_id}:cancel"));
         let resp = self
             .request(reqwest::Method::POST, &url)
@@ -400,10 +402,7 @@ impl A2aClient {
         let url = self.url(&format!(
             "/tasks/{task_id}/pushNotificationConfigs/{config_id}"
         ));
-        let resp = self
-            .request(reqwest::Method::DELETE, &url)
-            .send()
-            .await?;
+        let resp = self.request(reqwest::Method::DELETE, &url).send().await?;
 
         if !resp.status().is_success() {
             return Err(self.parse_error_from_status(resp).await);
@@ -416,9 +415,7 @@ impl A2aClient {
     // =========================================================
 
     /// Fetch the extended agent card (requires authentication).
-    pub async fn fetch_extended_agent_card(
-        &self,
-    ) -> Result<pb::AgentCard, A2aClientError> {
+    pub async fn fetch_extended_agent_card(&self) -> Result<pb::AgentCard, A2aClientError> {
         let url = self.url("/extendedAgentCard");
         let resp = self.request(reqwest::Method::GET, &url).send().await?;
 

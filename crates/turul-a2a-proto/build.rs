@@ -11,8 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Rebuild if any proto changes.
     println!("cargo:rerun-if-changed=proto");
 
-    let descriptor_path =
-        PathBuf::from(env::var("OUT_DIR")?).join("a2a_descriptor.bin");
+    let descriptor_path = PathBuf::from(env::var("OUT_DIR")?).join("a2a_descriptor.bin");
 
     // Step 1: Generate prost types + file descriptor set
     // compile_well_known_types + extern_path maps google.protobuf to pbjson_types

@@ -6,11 +6,11 @@
 
 use turul_a2a_types::{Artifact, Message, Part, Role, Task, TaskState, TaskStatus};
 
-use crate::streaming::StreamEvent;
 use super::atomic::A2aAtomicStore;
 use super::event_store::A2aEventStore;
 use super::filter::TaskFilter;
 use super::traits::{A2aPushNotificationStorage, A2aTaskStorage};
+use crate::streaming::StreamEvent;
 
 fn make_task(task_id: &str, context_id: &str) -> Task {
     Task::new(task_id, TaskStatus::new(TaskState::Submitted)).with_context_id(context_id)
@@ -29,7 +29,10 @@ fn make_artifact(id: &str, text: &str) -> Artifact {
 // =========================================================
 pub async fn test_create_and_retrieve(storage: &dyn A2aTaskStorage) {
     let task = make_task("parity-crud-1", "ctx-1");
-    let created = storage.create_task("default", "owner-a", task).await.unwrap();
+    let created = storage
+        .create_task("default", "owner-a", task)
+        .await
+        .unwrap();
     assert_eq!(created.id(), "parity-crud-1");
     assert_eq!(created.context_id(), "ctx-1");
 
@@ -50,9 +53,19 @@ pub async fn test_create_and_retrieve(storage: &dyn A2aTaskStorage) {
     assert!(missing.is_none());
 
     // Delete
-    assert!(storage.delete_task("default", "parity-crud-1", "owner-a").await.unwrap());
+    assert!(
+        storage
+            .delete_task("default", "parity-crud-1", "owner-a")
+            .await
+            .unwrap()
+    );
     // Second delete returns false
-    assert!(!storage.delete_task("default", "parity-crud-1", "owner-a").await.unwrap());
+    assert!(
+        !storage
+            .delete_task("default", "parity-crud-1", "owner-a")
+            .await
+            .unwrap()
+    );
 }
 
 // =========================================================
@@ -60,30 +73,56 @@ pub async fn test_create_and_retrieve(storage: &dyn A2aTaskStorage) {
 // =========================================================
 pub async fn test_state_machine_enforcement(storage: &dyn A2aTaskStorage) {
     let task = make_task("sm-1", "ctx-sm");
-    storage.create_task("default", "owner-a", task).await.unwrap();
+    storage
+        .create_task("default", "owner-a", task)
+        .await
+        .unwrap();
 
     // Valid: Submitted -> Working
     let updated = storage
-        .update_task_status("default", "sm-1", "owner-a", TaskStatus::new(TaskState::Working))
+        .update_task_status(
+            "default",
+            "sm-1",
+            "owner-a",
+            TaskStatus::new(TaskState::Working),
+        )
         .await
         .unwrap();
-    assert_eq!(updated.status().unwrap().state().unwrap(), TaskState::Working);
+    assert_eq!(
+        updated.status().unwrap().state().unwrap(),
+        TaskState::Working
+    );
 
     // Valid: Working -> InputRequired
     storage
-        .update_task_status("default", "sm-1", "owner-a", TaskStatus::new(TaskState::InputRequired))
+        .update_task_status(
+            "default",
+            "sm-1",
+            "owner-a",
+            TaskStatus::new(TaskState::InputRequired),
+        )
         .await
         .unwrap();
 
     // Valid: InputRequired -> Working
     storage
-        .update_task_status("default", "sm-1", "owner-a", TaskStatus::new(TaskState::Working))
+        .update_task_status(
+            "default",
+            "sm-1",
+            "owner-a",
+            TaskStatus::new(TaskState::Working),
+        )
         .await
         .unwrap();
 
     // Valid: Working -> Completed
     storage
-        .update_task_status("default", "sm-1", "owner-a", TaskStatus::new(TaskState::Completed))
+        .update_task_status(
+            "default",
+            "sm-1",
+            "owner-a",
+            TaskStatus::new(TaskState::Completed),
+        )
         .await
         .unwrap();
 }
@@ -103,11 +142,19 @@ pub async fn test_terminal_state_rejection(storage: &dyn A2aTaskStorage) {
     {
         let id = format!("term-{i}");
         let task = make_task(&id, "ctx-term");
-        storage.create_task("default", "owner-a", task).await.unwrap();
+        storage
+            .create_task("default", "owner-a", task)
+            .await
+            .unwrap();
 
         // Move to Working first (Submitted -> Working is valid)
         storage
-            .update_task_status("default", &id, "owner-a", TaskStatus::new(TaskState::Working))
+            .update_task_status(
+                "default",
+                &id,
+                "owner-a",
+                TaskStatus::new(TaskState::Working),
+            )
             .await
             .unwrap();
 
@@ -115,16 +162,32 @@ pub async fn test_terminal_state_rejection(storage: &dyn A2aTaskStorage) {
         if *terminal == TaskState::Rejected {
             // Rejected is only valid from Submitted, so create a new task
             let id2 = format!("term-rej-{i}");
-            storage.create_task("default", "owner-a", make_task(&id2, "ctx-term")).await.unwrap();
             storage
-                .update_task_status("default", &id2, "owner-a", TaskStatus::new(TaskState::Rejected))
+                .create_task("default", "owner-a", make_task(&id2, "ctx-term"))
+                .await
+                .unwrap();
+            storage
+                .update_task_status(
+                    "default",
+                    &id2,
+                    "owner-a",
+                    TaskStatus::new(TaskState::Rejected),
+                )
                 .await
                 .unwrap();
             // Now try to transition away from Rejected
             let result = storage
-                .update_task_status("default", &id2, "owner-a", TaskStatus::new(TaskState::Working))
+                .update_task_status(
+                    "default",
+                    &id2,
+                    "owner-a",
+                    TaskStatus::new(TaskState::Working),
+                )
                 .await;
-            assert!(result.is_err(), "Terminal {terminal:?} should reject transitions");
+            assert!(
+                result.is_err(),
+                "Terminal {terminal:?} should reject transitions"
+            );
         } else {
             storage
                 .update_task_status("default", &id, "owner-a", TaskStatus::new(*terminal))
@@ -132,9 +195,17 @@ pub async fn test_terminal_state_rejection(storage: &dyn A2aTaskStorage) {
                 .unwrap();
             // Try to transition away
             let result = storage
-                .update_task_status("default", &id, "owner-a", TaskStatus::new(TaskState::Working))
+                .update_task_status(
+                    "default",
+                    &id,
+                    "owner-a",
+                    TaskStatus::new(TaskState::Working),
+                )
                 .await;
-            assert!(result.is_err(), "Terminal {terminal:?} should reject transitions");
+            assert!(
+                result.is_err(),
+                "Terminal {terminal:?} should reject transitions"
+            );
         }
     }
 }
@@ -143,15 +214,27 @@ pub async fn test_terminal_state_rejection(storage: &dyn A2aTaskStorage) {
 // P2-014: Tenant isolation
 // =========================================================
 pub async fn test_tenant_isolation(storage: &dyn A2aTaskStorage) {
-    storage.create_task("tenant-a", "owner", make_task("ti-1", "ctx")).await.unwrap();
-    storage.create_task("tenant-b", "owner", make_task("ti-2", "ctx")).await.unwrap();
+    storage
+        .create_task("tenant-a", "owner", make_task("ti-1", "ctx"))
+        .await
+        .unwrap();
+    storage
+        .create_task("tenant-b", "owner", make_task("ti-2", "ctx"))
+        .await
+        .unwrap();
 
     // Tenant A can't see Tenant B's task
-    let result = storage.get_task("tenant-a", "ti-2", "owner", None).await.unwrap();
+    let result = storage
+        .get_task("tenant-a", "ti-2", "owner", None)
+        .await
+        .unwrap();
     assert!(result.is_none(), "Tenant A should not see Tenant B's task");
 
     // Tenant B can't see Tenant A's task
-    let result = storage.get_task("tenant-b", "ti-1", "owner", None).await.unwrap();
+    let result = storage
+        .get_task("tenant-b", "ti-1", "owner", None)
+        .await
+        .unwrap();
     assert!(result.is_none(), "Tenant B should not see Tenant A's task");
 
     // List scoped by tenant
@@ -167,26 +250,50 @@ pub async fn test_tenant_isolation(storage: &dyn A2aTaskStorage) {
     assert_eq!(page_a.tasks[0].id(), "ti-1");
 
     // Tenant A can't delete Tenant B's task
-    assert!(!storage.delete_task("tenant-a", "ti-2", "owner").await.unwrap());
+    assert!(
+        !storage
+            .delete_task("tenant-a", "ti-2", "owner")
+            .await
+            .unwrap()
+    );
 }
 
 // =========================================================
 // P2-005: Owner isolation
 // =========================================================
 pub async fn test_owner_isolation(storage: &dyn A2aTaskStorage) {
-    storage.create_task("default", "alice", make_task("oi-1", "ctx")).await.unwrap();
-    storage.create_task("default", "bob", make_task("oi-2", "ctx")).await.unwrap();
+    storage
+        .create_task("default", "alice", make_task("oi-1", "ctx"))
+        .await
+        .unwrap();
+    storage
+        .create_task("default", "bob", make_task("oi-2", "ctx"))
+        .await
+        .unwrap();
 
     // Alice can't see Bob's task
-    let result = storage.get_task("default", "oi-2", "alice", None).await.unwrap();
+    let result = storage
+        .get_task("default", "oi-2", "alice", None)
+        .await
+        .unwrap();
     assert!(result.is_none());
 
     // Alice can't delete Bob's task
-    assert!(!storage.delete_task("default", "oi-2", "alice").await.unwrap());
+    assert!(
+        !storage
+            .delete_task("default", "oi-2", "alice")
+            .await
+            .unwrap()
+    );
 
     // Alice can't update status on Bob's task
     let result = storage
-        .update_task_status("default", "oi-2", "alice", TaskStatus::new(TaskState::Working))
+        .update_task_status(
+            "default",
+            "oi-2",
+            "alice",
+            TaskStatus::new(TaskState::Working),
+        )
         .await;
     assert!(result.is_err());
 }
@@ -195,26 +302,53 @@ pub async fn test_owner_isolation(storage: &dyn A2aTaskStorage) {
 // P2-005: History length semantics
 // =========================================================
 pub async fn test_history_length(storage: &dyn A2aTaskStorage) {
-    storage.create_task("default", "owner", make_task("hl-1", "ctx")).await.unwrap();
+    storage
+        .create_task("default", "owner", make_task("hl-1", "ctx"))
+        .await
+        .unwrap();
 
     // Append 5 messages
     for i in 0..5 {
         storage
-            .append_message("default", "hl-1", "owner", make_message(&format!("m-{i}"), &format!("msg {i}")))
+            .append_message(
+                "default",
+                "hl-1",
+                "owner",
+                make_message(&format!("m-{i}"), &format!("msg {i}")),
+            )
             .await
             .unwrap();
     }
 
     // history_length=0 -> empty history
-    let task = storage.get_task("default", "hl-1", "owner", Some(0)).await.unwrap().unwrap();
-    assert!(task.history().is_empty(), "history_length=0 should return empty history");
+    let task = storage
+        .get_task("default", "hl-1", "owner", Some(0))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        task.history().is_empty(),
+        "history_length=0 should return empty history"
+    );
 
     // history_length=None -> all messages
-    let task = storage.get_task("default", "hl-1", "owner", None).await.unwrap().unwrap();
-    assert_eq!(task.history().len(), 5, "history_length=None should return all");
+    let task = storage
+        .get_task("default", "hl-1", "owner", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        task.history().len(),
+        5,
+        "history_length=None should return all"
+    );
 
     // history_length=2 -> last 2
-    let task = storage.get_task("default", "hl-1", "owner", Some(2)).await.unwrap().unwrap();
+    let task = storage
+        .get_task("default", "hl-1", "owner", Some(2))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(task.history().len(), 2, "history_length=2 should return 2");
     // Should be the LAST 2 messages
     assert_eq!(task.history()[0].message_id, "m-3");
@@ -276,8 +410,24 @@ pub async fn test_list_filter_by_status(storage: &dyn A2aTaskStorage) {
             .unwrap();
     }
     // Move task 0 and 2 to Working
-    storage.update_task_status("default", "fs-0", "owner", TaskStatus::new(TaskState::Working)).await.unwrap();
-    storage.update_task_status("default", "fs-2", "owner", TaskStatus::new(TaskState::Working)).await.unwrap();
+    storage
+        .update_task_status(
+            "default",
+            "fs-0",
+            "owner",
+            TaskStatus::new(TaskState::Working),
+        )
+        .await
+        .unwrap();
+    storage
+        .update_task_status(
+            "default",
+            "fs-2",
+            "owner",
+            TaskStatus::new(TaskState::Working),
+        )
+        .await
+        .unwrap();
 
     let page = storage
         .list_tasks(TaskFilter {
@@ -295,9 +445,18 @@ pub async fn test_list_filter_by_status(storage: &dyn A2aTaskStorage) {
 // P2-008: List filter by context_id
 // =========================================================
 pub async fn test_list_filter_by_context_id(storage: &dyn A2aTaskStorage) {
-    storage.create_task("default", "owner", make_task("fc-1", "ctx-alpha")).await.unwrap();
-    storage.create_task("default", "owner", make_task("fc-2", "ctx-beta")).await.unwrap();
-    storage.create_task("default", "owner", make_task("fc-3", "ctx-alpha")).await.unwrap();
+    storage
+        .create_task("default", "owner", make_task("fc-1", "ctx-alpha"))
+        .await
+        .unwrap();
+    storage
+        .create_task("default", "owner", make_task("fc-2", "ctx-beta"))
+        .await
+        .unwrap();
+    storage
+        .create_task("default", "owner", make_task("fc-3", "ctx-alpha"))
+        .await
+        .unwrap();
 
     let page = storage
         .list_tasks(TaskFilter {
@@ -315,12 +474,25 @@ pub async fn test_list_filter_by_context_id(storage: &dyn A2aTaskStorage) {
 // P2-006: Append message
 // =========================================================
 pub async fn test_append_message(storage: &dyn A2aTaskStorage) {
-    storage.create_task("default", "owner", make_task("am-1", "ctx")).await.unwrap();
+    storage
+        .create_task("default", "owner", make_task("am-1", "ctx"))
+        .await
+        .unwrap();
 
-    storage.append_message("default", "am-1", "owner", make_message("m-1", "first")).await.unwrap();
-    storage.append_message("default", "am-1", "owner", make_message("m-2", "second")).await.unwrap();
+    storage
+        .append_message("default", "am-1", "owner", make_message("m-1", "first"))
+        .await
+        .unwrap();
+    storage
+        .append_message("default", "am-1", "owner", make_message("m-2", "second"))
+        .await
+        .unwrap();
 
-    let task = storage.get_task("default", "am-1", "owner", None).await.unwrap().unwrap();
+    let task = storage
+        .get_task("default", "am-1", "owner", None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(task.history().len(), 2);
     assert_eq!(task.history()[0].message_id, "m-1");
     assert_eq!(task.history()[1].message_id, "m-2");
@@ -330,14 +502,28 @@ pub async fn test_append_message(storage: &dyn A2aTaskStorage) {
 // P2-007: Append artifact
 // =========================================================
 pub async fn test_append_artifact(storage: &dyn A2aTaskStorage) {
-    storage.create_task("default", "owner", make_task("aa-1", "ctx")).await.unwrap();
-
     storage
-        .append_artifact("default", "aa-1", "owner", make_artifact("art-1", "chunk1"), false, false)
+        .create_task("default", "owner", make_task("aa-1", "ctx"))
         .await
         .unwrap();
 
-    let task = storage.get_task("default", "aa-1", "owner", None).await.unwrap().unwrap();
+    storage
+        .append_artifact(
+            "default",
+            "aa-1",
+            "owner",
+            make_artifact("art-1", "chunk1"),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let task = storage
+        .get_task("default", "aa-1", "owner", None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(task.artifacts().len(), 1);
     assert_eq!(task.artifacts()[0].artifact_id, "art-1");
 }
@@ -346,19 +532,35 @@ pub async fn test_append_artifact(storage: &dyn A2aTaskStorage) {
 // Owner isolation for mutation APIs
 // =========================================================
 pub async fn test_owner_isolation_mutations(storage: &dyn A2aTaskStorage) {
-    storage.create_task("default", "alice", make_task("oim-1", "ctx")).await.unwrap();
+    storage
+        .create_task("default", "alice", make_task("oim-1", "ctx"))
+        .await
+        .unwrap();
 
     // Bob can't append message to Alice's task
     let result = storage
         .append_message("default", "oim-1", "bob", make_message("m-bad", "nope"))
         .await;
-    assert!(result.is_err(), "Bob should not append message to Alice's task");
+    assert!(
+        result.is_err(),
+        "Bob should not append message to Alice's task"
+    );
 
     // Bob can't append artifact to Alice's task
     let result = storage
-        .append_artifact("default", "oim-1", "bob", make_artifact("a-bad", "nope"), false, false)
+        .append_artifact(
+            "default",
+            "oim-1",
+            "bob",
+            make_artifact("a-bad", "nope"),
+            false,
+            false,
+        )
         .await;
-    assert!(result.is_err(), "Bob should not append artifact to Alice's task");
+    assert!(
+        result.is_err(),
+        "Bob should not append artifact to Alice's task"
+    );
 
     // Alice CAN append
     storage
@@ -366,7 +568,14 @@ pub async fn test_owner_isolation_mutations(storage: &dyn A2aTaskStorage) {
         .await
         .unwrap();
     storage
-        .append_artifact("default", "oim-1", "alice", make_artifact("a-ok", "yes"), false, false)
+        .append_artifact(
+            "default",
+            "oim-1",
+            "alice",
+            make_artifact("a-ok", "yes"),
+            false,
+            false,
+        )
         .await
         .unwrap();
 }
@@ -375,45 +584,104 @@ pub async fn test_owner_isolation_mutations(storage: &dyn A2aTaskStorage) {
 // P2-008: Artifact chunk semantics (append + last_chunk)
 // =========================================================
 pub async fn test_artifact_chunk_semantics(storage: &dyn A2aTaskStorage) {
-    storage.create_task("default", "owner", make_task("acs-1", "ctx")).await.unwrap();
-
-    // First chunk: append=false (new artifact)
     storage
-        .append_artifact("default", "acs-1", "owner", make_artifact("art-1", "chunk-1"), false, false)
+        .create_task("default", "owner", make_task("acs-1", "ctx"))
         .await
         .unwrap();
 
-    let task = storage.get_task("default", "acs-1", "owner", None).await.unwrap().unwrap();
+    // First chunk: append=false (new artifact)
+    storage
+        .append_artifact(
+            "default",
+            "acs-1",
+            "owner",
+            make_artifact("art-1", "chunk-1"),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let task = storage
+        .get_task("default", "acs-1", "owner", None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(task.artifacts().len(), 1);
     assert_eq!(task.artifacts()[0].parts.len(), 1);
 
     // Second chunk: append=true, same artifact_id -> should append parts
     storage
-        .append_artifact("default", "acs-1", "owner", make_artifact("art-1", "chunk-2"), true, false)
+        .append_artifact(
+            "default",
+            "acs-1",
+            "owner",
+            make_artifact("art-1", "chunk-2"),
+            true,
+            false,
+        )
         .await
         .unwrap();
 
-    let task = storage.get_task("default", "acs-1", "owner", None).await.unwrap().unwrap();
+    let task = storage
+        .get_task("default", "acs-1", "owner", None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(task.artifacts().len(), 1, "should still be 1 artifact");
-    assert_eq!(task.artifacts()[0].parts.len(), 2, "should have 2 parts after append");
+    assert_eq!(
+        task.artifacts()[0].parts.len(),
+        2,
+        "should have 2 parts after append"
+    );
 
     // Third chunk: append=true, last_chunk=true -> append parts, mark complete
     storage
-        .append_artifact("default", "acs-1", "owner", make_artifact("art-1", "chunk-3"), true, true)
+        .append_artifact(
+            "default",
+            "acs-1",
+            "owner",
+            make_artifact("art-1", "chunk-3"),
+            true,
+            true,
+        )
         .await
         .unwrap();
 
-    let task = storage.get_task("default", "acs-1", "owner", None).await.unwrap().unwrap();
-    assert_eq!(task.artifacts()[0].parts.len(), 3, "should have 3 parts total");
+    let task = storage
+        .get_task("default", "acs-1", "owner", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        task.artifacts()[0].parts.len(),
+        3,
+        "should have 3 parts total"
+    );
 
     // New artifact with different ID: append=false
     storage
-        .append_artifact("default", "acs-1", "owner", make_artifact("art-2", "separate"), false, true)
+        .append_artifact(
+            "default",
+            "acs-1",
+            "owner",
+            make_artifact("art-2", "separate"),
+            false,
+            true,
+        )
         .await
         .unwrap();
 
-    let task = storage.get_task("default", "acs-1", "owner", None).await.unwrap().unwrap();
-    assert_eq!(task.artifacts().len(), 2, "should have 2 distinct artifacts");
+    let task = storage
+        .get_task("default", "acs-1", "owner", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        task.artifacts().len(),
+        2,
+        "should have 2 distinct artifacts"
+    );
 }
 
 // =========================================================
@@ -421,11 +689,20 @@ pub async fn test_artifact_chunk_semantics(storage: &dyn A2aTaskStorage) {
 // =========================================================
 pub async fn test_task_count(storage: &dyn A2aTaskStorage) {
     let initial = storage.task_count().await.unwrap();
-    storage.create_task("default", "owner", make_task("tc-1", "ctx")).await.unwrap();
-    storage.create_task("default", "owner", make_task("tc-2", "ctx")).await.unwrap();
+    storage
+        .create_task("default", "owner", make_task("tc-1", "ctx"))
+        .await
+        .unwrap();
+    storage
+        .create_task("default", "owner", make_task("tc-2", "ctx"))
+        .await
+        .unwrap();
     assert_eq!(storage.task_count().await.unwrap(), initial + 2);
 
-    storage.delete_task("default", "tc-1", "owner").await.unwrap();
+    storage
+        .delete_task("default", "tc-1", "owner")
+        .await
+        .unwrap();
     assert_eq!(storage.task_count().await.unwrap(), initial + 1);
 }
 
@@ -454,7 +731,10 @@ pub async fn test_push_config_crud(storage: &dyn A2aPushNotificationStorage) {
     assert!(fetched.is_some());
 
     // Get nonexistent
-    let missing = storage.get_config("default", "task-1", "nope").await.unwrap();
+    let missing = storage
+        .get_config("default", "task-1", "nope")
+        .await
+        .unwrap();
     assert!(missing.is_none());
 }
 
@@ -474,11 +754,23 @@ pub async fn test_push_config_idempotent_delete(storage: &dyn A2aPushNotificatio
     let created = storage.create_config("default", config).await.unwrap();
 
     // Delete succeeds
-    storage.delete_config("default", "task-del", &created.id).await.unwrap();
+    storage
+        .delete_config("default", "task-del", &created.id)
+        .await
+        .unwrap();
     // Second delete also succeeds (idempotent)
-    storage.delete_config("default", "task-del", &created.id).await.unwrap();
+    storage
+        .delete_config("default", "task-del", &created.id)
+        .await
+        .unwrap();
     // Get returns None
-    assert!(storage.get_config("default", "task-del", &created.id).await.unwrap().is_none());
+    assert!(
+        storage
+            .get_config("default", "task-del", &created.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 // =========================================================
@@ -516,7 +808,11 @@ pub async fn test_push_config_list_pagination(storage: &dyn A2aPushNotificationS
         page_token = Some(page.next_page_token);
     }
 
-    assert_eq!(all_ids.len(), 5, "should collect all 5 configs across pages");
+    assert_eq!(
+        all_ids.len(),
+        5,
+        "should collect all 5 configs across pages"
+    );
     let unique: std::collections::HashSet<_> = all_ids.iter().collect();
     assert_eq!(unique.len(), 5, "no duplicate configs");
 }
@@ -617,18 +913,33 @@ pub async fn test_event_monotonic_ordering(storage: &dyn A2aEventStore) {
 
 pub async fn test_event_per_task_isolation(storage: &dyn A2aEventStore) {
     // Events for task A
-    storage.append_event("default", "iso-a", make_status_event("A1")).await.unwrap();
-    storage.append_event("default", "iso-a", make_status_event("A2")).await.unwrap();
+    storage
+        .append_event("default", "iso-a", make_status_event("A1"))
+        .await
+        .unwrap();
+    storage
+        .append_event("default", "iso-a", make_status_event("A2"))
+        .await
+        .unwrap();
 
     // Events for task B
-    storage.append_event("default", "iso-b", make_status_event("B1")).await.unwrap();
+    storage
+        .append_event("default", "iso-b", make_status_event("B1"))
+        .await
+        .unwrap();
 
     // Task A has 2 events
-    let a_events = storage.get_events_after("default", "iso-a", 0).await.unwrap();
+    let a_events = storage
+        .get_events_after("default", "iso-a", 0)
+        .await
+        .unwrap();
     assert_eq!(a_events.len(), 2);
 
     // Task B has 1 event
-    let b_events = storage.get_events_after("default", "iso-b", 0).await.unwrap();
+    let b_events = storage
+        .get_events_after("default", "iso-b", 0)
+        .await
+        .unwrap();
     assert_eq!(b_events.len(), 1);
 
     // Sequences are per-task
@@ -637,32 +948,71 @@ pub async fn test_event_per_task_isolation(storage: &dyn A2aEventStore) {
 }
 
 pub async fn test_event_tenant_isolation(storage: &dyn A2aEventStore) {
-    storage.append_event("tenant-x", "iso-t", make_status_event("X")).await.unwrap();
-    storage.append_event("tenant-y", "iso-t", make_status_event("Y")).await.unwrap();
+    storage
+        .append_event("tenant-x", "iso-t", make_status_event("X"))
+        .await
+        .unwrap();
+    storage
+        .append_event("tenant-y", "iso-t", make_status_event("Y"))
+        .await
+        .unwrap();
 
     // Same task_id, different tenants — isolated
-    let x_events = storage.get_events_after("tenant-x", "iso-t", 0).await.unwrap();
+    let x_events = storage
+        .get_events_after("tenant-x", "iso-t", 0)
+        .await
+        .unwrap();
     assert_eq!(x_events.len(), 1);
 
-    let y_events = storage.get_events_after("tenant-y", "iso-t", 0).await.unwrap();
+    let y_events = storage
+        .get_events_after("tenant-y", "iso-t", 0)
+        .await
+        .unwrap();
     assert_eq!(y_events.len(), 1);
 }
 
 pub async fn test_event_latest_sequence(storage: &dyn A2aEventStore) {
-    assert_eq!(storage.latest_sequence("default", "seq-t").await.unwrap(), 0);
+    assert_eq!(
+        storage.latest_sequence("default", "seq-t").await.unwrap(),
+        0
+    );
 
-    storage.append_event("default", "seq-t", make_status_event("S1")).await.unwrap();
-    assert_eq!(storage.latest_sequence("default", "seq-t").await.unwrap(), 1);
+    storage
+        .append_event("default", "seq-t", make_status_event("S1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.latest_sequence("default", "seq-t").await.unwrap(),
+        1
+    );
 
-    storage.append_event("default", "seq-t", make_status_event("S2")).await.unwrap();
-    storage.append_event("default", "seq-t", make_status_event("S3")).await.unwrap();
-    assert_eq!(storage.latest_sequence("default", "seq-t").await.unwrap(), 3);
+    storage
+        .append_event("default", "seq-t", make_status_event("S2"))
+        .await
+        .unwrap();
+    storage
+        .append_event("default", "seq-t", make_status_event("S3"))
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.latest_sequence("default", "seq-t").await.unwrap(),
+        3
+    );
 }
 
 pub async fn test_event_empty_task(storage: &dyn A2aEventStore) {
-    let events = storage.get_events_after("default", "nonexistent", 0).await.unwrap();
+    let events = storage
+        .get_events_after("default", "nonexistent", 0)
+        .await
+        .unwrap();
     assert!(events.is_empty());
-    assert_eq!(storage.latest_sequence("default", "nonexistent").await.unwrap(), 0);
+    assert_eq!(
+        storage
+            .latest_sequence("default", "nonexistent")
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 // =========================================================
@@ -688,9 +1038,11 @@ pub async fn test_atomic_create_task_with_events(
     events: &dyn A2aEventStore,
 ) {
     let task = make_task("at-create-1", "ctx-1");
-    let evts = vec![
-        make_status_event_for("at-create-1", "ctx-1", "TASK_STATE_SUBMITTED"),
-    ];
+    let evts = vec![make_status_event_for(
+        "at-create-1",
+        "ctx-1",
+        "TASK_STATE_SUBMITTED",
+    )];
 
     let (created, seqs) = atomic
         .create_task_with_events("default", "owner-1", task, evts)
@@ -729,19 +1081,27 @@ pub async fn test_atomic_update_status_with_events(
     tasks.create_task("default", "owner-1", task).await.unwrap();
 
     // Atomic status update with event
-    let evts = vec![
-        make_status_event_for("at-status-1", "ctx-1", "TASK_STATE_WORKING"),
-    ];
+    let evts = vec![make_status_event_for(
+        "at-status-1",
+        "ctx-1",
+        "TASK_STATE_WORKING",
+    )];
     let (updated, seqs) = atomic
         .update_task_status_with_events(
-            "default", "at-status-1", "owner-1",
-            TaskStatus::new(TaskState::Working), evts,
+            "default",
+            "at-status-1",
+            "owner-1",
+            TaskStatus::new(TaskState::Working),
+            evts,
         )
         .await
         .unwrap();
 
     assert_eq!(seqs.len(), 1);
-    assert_eq!(updated.status().unwrap().state().unwrap(), TaskState::Working);
+    assert_eq!(
+        updated.status().unwrap().state().unwrap(),
+        TaskState::Working
+    );
 
     // Verify via reads
     let fetched = tasks
@@ -749,7 +1109,10 @@ pub async fn test_atomic_update_status_with_events(
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(fetched.status().unwrap().state().unwrap(), TaskState::Working);
+    assert_eq!(
+        fetched.status().unwrap().state().unwrap(),
+        TaskState::Working
+    );
 
     let stored_events = events
         .get_events_after("default", "at-status-1", 0)
@@ -769,22 +1132,37 @@ pub async fn test_atomic_status_rejects_invalid_transition(
     let task = make_task("at-invalid-1", "ctx-1");
     tasks.create_task("default", "owner-1", task).await.unwrap();
     tasks
-        .update_task_status("default", "at-invalid-1", "owner-1", TaskStatus::new(TaskState::Working))
+        .update_task_status(
+            "default",
+            "at-invalid-1",
+            "owner-1",
+            TaskStatus::new(TaskState::Working),
+        )
         .await
         .unwrap();
     tasks
-        .update_task_status("default", "at-invalid-1", "owner-1", TaskStatus::new(TaskState::Completed))
+        .update_task_status(
+            "default",
+            "at-invalid-1",
+            "owner-1",
+            TaskStatus::new(TaskState::Completed),
+        )
         .await
         .unwrap();
 
     // Attempt invalid transition (Completed → Working) with event
-    let evts = vec![
-        make_status_event_for("at-invalid-1", "ctx-1", "TASK_STATE_WORKING"),
-    ];
+    let evts = vec![make_status_event_for(
+        "at-invalid-1",
+        "ctx-1",
+        "TASK_STATE_WORKING",
+    )];
     let result = atomic
         .update_task_status_with_events(
-            "default", "at-invalid-1", "owner-1",
-            TaskStatus::new(TaskState::Working), evts,
+            "default",
+            "at-invalid-1",
+            "owner-1",
+            TaskStatus::new(TaskState::Working),
+            evts,
         )
         .await;
 
@@ -796,14 +1174,20 @@ pub async fn test_atomic_status_rejects_invalid_transition(
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(fetched.status().unwrap().state().unwrap(), TaskState::Completed);
+    assert_eq!(
+        fetched.status().unwrap().state().unwrap(),
+        TaskState::Completed
+    );
 
     // Verify no events were written
     let stored_events = events
         .get_events_after("default", "at-invalid-1", 0)
         .await
         .unwrap();
-    assert!(stored_events.is_empty(), "No events should be written on failed atomic op");
+    assert!(
+        stored_events.is_empty(),
+        "No events should be written on failed atomic op"
+    );
 }
 
 /// AT-004: update_task_with_events replaces task and appends events atomically.
@@ -845,7 +1229,10 @@ pub async fn test_atomic_update_task_with_events(
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(fetched.status().unwrap().state().unwrap(), TaskState::Completed);
+    assert_eq!(
+        fetched.status().unwrap().state().unwrap(),
+        TaskState::Completed
+    );
     assert!(!fetched.artifacts().is_empty());
 
     // Verify events
@@ -857,22 +1244,24 @@ pub async fn test_atomic_update_task_with_events(
 }
 
 /// AT-005: Atomic operations enforce owner isolation.
-pub async fn test_atomic_owner_isolation(
-    atomic: &dyn A2aAtomicStore,
-    tasks: &dyn A2aTaskStorage,
-) {
+pub async fn test_atomic_owner_isolation(atomic: &dyn A2aAtomicStore, tasks: &dyn A2aTaskStorage) {
     // Create task owned by "alice"
     let task = make_task("at-owner-1", "ctx-1");
     tasks.create_task("default", "alice", task).await.unwrap();
 
     // "bob" cannot update status with events
-    let evts = vec![
-        make_status_event_for("at-owner-1", "ctx-1", "TASK_STATE_WORKING"),
-    ];
+    let evts = vec![make_status_event_for(
+        "at-owner-1",
+        "ctx-1",
+        "TASK_STATE_WORKING",
+    )];
     let result = atomic
         .update_task_status_with_events(
-            "default", "at-owner-1", "bob",
-            TaskStatus::new(TaskState::Working), evts,
+            "default",
+            "at-owner-1",
+            "bob",
+            TaskStatus::new(TaskState::Working),
+            evts,
         )
         .await;
     assert!(result.is_err(), "Wrong owner should fail");
@@ -880,13 +1269,18 @@ pub async fn test_atomic_owner_isolation(
     // "bob" cannot full-update with events
     let mut fake_task = make_task("at-owner-1", "ctx-1");
     fake_task.set_status(TaskStatus::new(TaskState::Working));
-    let evts = vec![
-        make_status_event_for("at-owner-1", "ctx-1", "TASK_STATE_WORKING"),
-    ];
+    let evts = vec![make_status_event_for(
+        "at-owner-1",
+        "ctx-1",
+        "TASK_STATE_WORKING",
+    )];
     let result = atomic
         .update_task_with_events("default", "bob", fake_task, evts)
         .await;
-    assert!(result.is_err(), "Wrong owner should fail for update_task_with_events");
+    assert!(
+        result.is_err(),
+        "Wrong owner should fail for update_task_with_events"
+    );
 }
 
 /// AT-006: Tenant isolation for atomic operations.
@@ -901,7 +1295,9 @@ pub async fn test_atomic_tenant_isolation(
 
     atomic
         .create_task_with_events(
-            "tenant-a", "owner-1", task_a,
+            "tenant-a",
+            "owner-1",
+            task_a,
             vec![make_status_event_for("at-tenant-1", "ctx-1", "SUBMITTED_A")],
         )
         .await
@@ -909,28 +1305,48 @@ pub async fn test_atomic_tenant_isolation(
 
     atomic
         .create_task_with_events(
-            "tenant-b", "owner-1", task_b,
+            "tenant-b",
+            "owner-1",
+            task_b,
             vec![make_status_event_for("at-tenant-1", "ctx-1", "SUBMITTED_B")],
         )
         .await
         .unwrap();
 
     // Events are isolated by tenant
-    let a_events = events.get_events_after("tenant-a", "at-tenant-1", 0).await.unwrap();
-    let b_events = events.get_events_after("tenant-b", "at-tenant-1", 0).await.unwrap();
+    let a_events = events
+        .get_events_after("tenant-a", "at-tenant-1", 0)
+        .await
+        .unwrap();
+    let b_events = events
+        .get_events_after("tenant-b", "at-tenant-1", 0)
+        .await
+        .unwrap();
     assert_eq!(a_events.len(), 1);
     assert_eq!(b_events.len(), 1);
 
     // Tasks are isolated by tenant
-    let a_task = tasks.get_task("tenant-a", "at-tenant-1", "owner-1", None).await.unwrap();
-    let b_task = tasks.get_task("tenant-b", "at-tenant-1", "owner-1", None).await.unwrap();
+    let a_task = tasks
+        .get_task("tenant-a", "at-tenant-1", "owner-1", None)
+        .await
+        .unwrap();
+    let b_task = tasks
+        .get_task("tenant-b", "at-tenant-1", "owner-1", None)
+        .await
+        .unwrap();
     assert!(a_task.is_some());
     assert!(b_task.is_some());
 
     // Cross-tenant invisible
-    let cross = tasks.get_task("tenant-a", "at-tenant-1", "owner-1", None).await.unwrap();
+    let cross = tasks
+        .get_task("tenant-a", "at-tenant-1", "owner-1", None)
+        .await
+        .unwrap();
     assert!(cross.is_some()); // Own tenant visible
-    let wrong_tenant_events = events.get_events_after("tenant-c", "at-tenant-1", 0).await.unwrap();
+    let wrong_tenant_events = events
+        .get_events_after("tenant-c", "at-tenant-1", 0)
+        .await
+        .unwrap();
     assert!(wrong_tenant_events.is_empty()); // Non-existent tenant has no events
 }
 
@@ -950,11 +1366,17 @@ pub async fn test_atomic_create_with_empty_events(
     assert!(seqs.is_empty());
 
     // Task exists
-    let fetched = tasks.get_task("default", "at-empty-1", "owner-1", None).await.unwrap();
+    let fetched = tasks
+        .get_task("default", "at-empty-1", "owner-1", None)
+        .await
+        .unwrap();
     assert!(fetched.is_some());
 
     // No events
-    let stored = events.get_events_after("default", "at-empty-1", 0).await.unwrap();
+    let stored = events
+        .get_events_after("default", "at-empty-1", 0)
+        .await
+        .unwrap();
     assert!(stored.is_empty());
 }
 
@@ -968,7 +1390,9 @@ pub async fn test_atomic_sequence_continuity(
     let task = make_task("at-seq-1", "ctx-1");
     let (_, seqs) = atomic
         .create_task_with_events(
-            "default", "owner-1", task,
+            "default",
+            "owner-1",
+            task,
             vec![make_status_event_for("at-seq-1", "ctx-1", "SUBMITTED")],
         )
         .await
@@ -988,7 +1412,9 @@ pub async fn test_atomic_sequence_continuity(
     task2.complete();
     let seqs2 = atomic
         .update_task_with_events(
-            "default", "owner-1", task2,
+            "default",
+            "owner-1",
+            task2,
             vec![make_status_event_for("at-seq-1", "ctx-1", "COMPLETED")],
         )
         .await
@@ -996,7 +1422,10 @@ pub async fn test_atomic_sequence_continuity(
     assert_eq!(seqs2, vec![3]);
 
     // Verify all 3 events in order
-    let all = events.get_events_after("default", "at-seq-1", 0).await.unwrap();
+    let all = events
+        .get_events_after("default", "at-seq-1", 0)
+        .await
+        .unwrap();
     assert_eq!(all.len(), 3);
     assert_eq!(all[0].0, 1);
     assert_eq!(all[1].0, 2);
@@ -1155,11 +1584,7 @@ pub async fn test_terminal_cas_single_winner_on_concurrent_terminals(
     // REJECTED is only reachable from Submitted (refuse-at-intake). With
     // all three candidates being spec-valid Working-exits, the winner is
     // decided solely by the atomic store's CAS.
-    let terminals = [
-        TaskState::Completed,
-        TaskState::Failed,
-        TaskState::Canceled,
-    ];
+    let terminals = [TaskState::Completed, TaskState::Failed, TaskState::Canceled];
     let mut handles = Vec::with_capacity(terminals.len());
     let barrier = Arc::new(tokio::sync::Barrier::new(terminals.len() + 1));
     for (i, terminal) in terminals.into_iter().enumerate() {
@@ -1199,9 +1624,9 @@ pub async fn test_terminal_cas_single_winner_on_concurrent_terminals(
             }) => {
                 losers.push((terminal, task_id, current_state));
             }
-            Err(other) => panic!(
-                "unexpected error from terminal-CAS attempt ({terminal:?}): {other:?}"
-            ),
+            Err(other) => {
+                panic!("unexpected error from terminal-CAS attempt ({terminal:?}): {other:?}")
+            }
         }
     }
 
@@ -1289,11 +1714,7 @@ pub async fn test_terminal_cas_single_winner_from_submitted_includes_rejected(
 
     // All three are valid terminal exits from SUBMITTED per the state
     // machine (SUBMITTED → { Working, Rejected, Failed, Canceled }).
-    let terminals = [
-        TaskState::Rejected,
-        TaskState::Failed,
-        TaskState::Canceled,
-    ];
+    let terminals = [TaskState::Rejected, TaskState::Failed, TaskState::Canceled];
     let mut handles = Vec::with_capacity(terminals.len());
     let barrier = Arc::new(tokio::sync::Barrier::new(terminals.len() + 1));
     for (i, terminal) in terminals.into_iter().enumerate() {
@@ -1336,7 +1757,11 @@ pub async fn test_terminal_cas_single_winner_from_submitted_includes_rejected(
         }
     }
 
-    assert_eq!(winners.len(), 1, "exactly one terminal write must win from SUBMITTED");
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly one terminal write must win from SUBMITTED"
+    );
     assert_eq!(
         losers.len(),
         terminals.len() - 1,
@@ -1434,8 +1859,11 @@ pub async fn test_terminal_cas_rejects_sequential_second_terminal(
         .await
         .unwrap();
 
-    let event_count_after_first_terminal =
-        events.get_events_after("default", "cas-seq-1", 0).await.unwrap().len();
+    let event_count_after_first_terminal = events
+        .get_events_after("default", "cas-seq-1", 0)
+        .await
+        .unwrap()
+        .len();
 
     // Second terminal — must fail.
     let second = atomic
@@ -1459,9 +1887,7 @@ pub async fn test_terminal_cas_rejects_sequential_second_terminal(
             assert_eq!(task_id, "cas-seq-1");
             assert_eq!(current_state, "TASK_STATE_COMPLETED");
         }
-        other => panic!(
-            "expected TerminalStateAlreadySet on second terminal write, got {other:?}"
-        ),
+        other => panic!("expected TerminalStateAlreadySet on second terminal write, got {other:?}"),
     }
 
     // No new event appended.
@@ -1536,8 +1962,8 @@ pub async fn test_update_task_with_events_rejects_terminal_already_set(
     // WORKING — the exact shape of the EventSink::emit_artifact
     // read-mutate-write race. The argument task carries WORKING;
     // the persisted task is COMPLETED.
-    let stale = Task::new("upd-tpc-1", TaskStatus::new(TaskState::Working))
-        .with_context_id("ctx-upd-tpc");
+    let stale =
+        Task::new("upd-tpc-1", TaskStatus::new(TaskState::Working)).with_context_id("ctx-upd-tpc");
     let result = atomic
         .update_task_with_events(
             "default",
@@ -1586,11 +2012,7 @@ pub async fn test_update_task_with_events_rejects_terminal_already_set(
         .unwrap()
         .unwrap();
     assert_eq!(
-        persisted
-            .status()
-            .unwrap()
-            .state()
-            .unwrap(),
+        persisted.status().unwrap().state().unwrap(),
         TaskState::Completed,
         "rejected update_task_with_events must not mutate task state"
     );
@@ -1608,18 +2030,28 @@ pub async fn test_cancel_marker_roundtrip(
     supervisor: &dyn crate::storage::A2aCancellationSupervisor,
 ) {
     let task = make_task("cm-rt-1", "ctx");
-    tasks.create_task("default", "owner-cm", task).await.unwrap();
+    tasks
+        .create_task("default", "owner-cm", task)
+        .await
+        .unwrap();
     // Advance to Working so the marker write is eligible.
     tasks
-        .update_task_status("default", "cm-rt-1", "owner-cm", TaskStatus::new(TaskState::Working))
+        .update_task_status(
+            "default",
+            "cm-rt-1",
+            "owner-cm",
+            TaskStatus::new(TaskState::Working),
+        )
         .await
         .unwrap();
 
     // Before: marker is false.
-    assert!(!supervisor
-        .supervisor_get_cancel_requested("default", "cm-rt-1")
-        .await
-        .unwrap());
+    assert!(
+        !supervisor
+            .supervisor_get_cancel_requested("default", "cm-rt-1")
+            .await
+            .unwrap()
+    );
 
     // Set the marker (owner-scoped).
     tasks
@@ -1628,20 +2060,24 @@ pub async fn test_cancel_marker_roundtrip(
         .unwrap();
 
     // After: marker is true.
-    assert!(supervisor
-        .supervisor_get_cancel_requested("default", "cm-rt-1")
-        .await
-        .unwrap());
+    assert!(
+        supervisor
+            .supervisor_get_cancel_requested("default", "cm-rt-1")
+            .await
+            .unwrap()
+    );
 
     // Idempotent: setting again is a successful no-op.
     tasks
         .set_cancel_requested("default", "cm-rt-1", "owner-cm")
         .await
         .unwrap();
-    assert!(supervisor
-        .supervisor_get_cancel_requested("default", "cm-rt-1")
-        .await
-        .unwrap());
+    assert!(
+        supervisor
+            .supervisor_get_cancel_requested("default", "cm-rt-1")
+            .await
+            .unwrap()
+    );
 }
 
 /// CS-002: `supervisor_list_cancel_requested` returns only the marked
@@ -1655,7 +2091,10 @@ pub async fn test_supervisor_list_cancel_requested_parity(
     // t3 marked+Completed (terminal → excluded), t4 nonexistent.
     for id in ["cm-list-1", "cm-list-2", "cm-list-3"] {
         let task = make_task(id, "ctx-list");
-        tasks.create_task("default", "owner-list", task).await.unwrap();
+        tasks
+            .create_task("default", "owner-list", task)
+            .await
+            .unwrap();
         // Advance each into Working so we can mark and set terminal later.
         atomic
             .update_task_status_with_events(
@@ -1745,8 +2184,10 @@ pub async fn test_invalid_transition_distinct_from_terminal_already_set(
             assert_eq!(requested, TaskState::InputRequired);
         }
         Err(crate::storage::A2aStorageError::TerminalStateAlreadySet { .. }) => {
-            panic!("illegal non-terminal transition must surface InvalidTransition, \
-                    not TerminalStateAlreadySet");
+            panic!(
+                "illegal non-terminal transition must surface InvalidTransition, \
+                    not TerminalStateAlreadySet"
+            );
         }
         Err(other) => panic!("unexpected error: {other:?}"),
         Ok(_) => panic!("illegal transition must fail"),
@@ -2096,9 +2537,7 @@ pub async fn test_push_claim_terminal_abandoned_blocks_reclaim_and_not_listed(
 /// count. Repeated calls (two pre-flight starts without an
 /// intervening outcome) each advance by 1 — the method is the sole
 /// budget-consumer and every call is billed.
-pub async fn test_push_attempt_started_advances_count_and_status(
-    store: &dyn A2aPushDeliveryStore,
-) {
+pub async fn test_push_attempt_started_advances_count_and_status(store: &dyn A2aPushDeliveryStore) {
     let (tenant, task_id, seq, config_id) = push_tuple("att-001");
     let long = Duration::from_secs(60);
 
@@ -2318,7 +2757,14 @@ pub async fn test_push_sweep_counts_expired_nonterminal_and_preserves_status(
         .await
         .expect("C claim");
     store
-        .record_attempt_started(&tenant_c, &task_c, seq_c, &config_c, "w", claim_c.generation)
+        .record_attempt_started(
+            &tenant_c,
+            &task_c,
+            seq_c,
+            &config_c,
+            "w",
+            claim_c.generation,
+        )
         .await
         .expect("C start");
     store
@@ -2347,7 +2793,9 @@ pub async fn test_push_sweep_counts_expired_nonterminal_and_preserves_status(
     // rewritten to something sweep-invented.
     assert!(matches!(
         store
-            .claim_delivery(&tenant_a, &task_a, seq_a, &config_a, "probe", "owner-x", long)
+            .claim_delivery(
+                &tenant_a, &task_a, seq_a, &config_a, "probe", "owner-x", long
+            )
             .await,
         Err(A2aStorageError::ClaimAlreadyHeld { .. })
     ));
@@ -2358,7 +2806,9 @@ pub async fn test_push_sweep_counts_expired_nonterminal_and_preserves_status(
     assert_eq!(re_b.generation, 2);
     assert!(matches!(
         store
-            .claim_delivery(&tenant_c, &task_c, seq_c, &config_c, "probe", "owner-x", long)
+            .claim_delivery(
+                &tenant_c, &task_c, seq_c, &config_c, "probe", "owner-x", long
+            )
             .await,
         Err(A2aStorageError::ClaimAlreadyHeld { .. })
     ));
@@ -2387,18 +2837,41 @@ pub async fn test_push_list_reclaimable_filters_and_returns_identity(
 
     // B: expired + Pending — MUST appear with owner = "owner-rcl".
     let _ = store
-        .claim_delivery(&tenant_b, &task_b, seq_b, &config_b, "w", "owner-rcl", short)
+        .claim_delivery(
+            &tenant_b,
+            &task_b,
+            seq_b,
+            &config_b,
+            "w",
+            "owner-rcl",
+            short,
+        )
         .await
         .expect("B claim");
 
     // C: expired but terminal Succeeded — must NOT appear (terminal
     // rows never reclaim regardless of age).
     let claim_c = store
-        .claim_delivery(&tenant_c, &task_c, seq_c, &config_c, "w", "owner-rcl", short)
+        .claim_delivery(
+            &tenant_c,
+            &task_c,
+            seq_c,
+            &config_c,
+            "w",
+            "owner-rcl",
+            short,
+        )
         .await
         .expect("C claim");
     store
-        .record_attempt_started(&tenant_c, &task_c, seq_c, &config_c, "w", claim_c.generation)
+        .record_attempt_started(
+            &tenant_c,
+            &task_c,
+            seq_c,
+            &config_c,
+            "w",
+            claim_c.generation,
+        )
         .await
         .expect("C start");
     store
@@ -2422,15 +2895,15 @@ pub async fn test_push_list_reclaimable_filters_and_returns_identity(
         .expect("list_reclaimable_claims");
 
     // B must be in the result; A and C must not.
-    let has_a = rows.iter().any(|r| {
-        r.tenant == tenant_a && r.task_id == task_a && r.config_id == config_a
-    });
-    let has_b = rows.iter().any(|r| {
-        r.tenant == tenant_b && r.task_id == task_b && r.config_id == config_b
-    });
-    let has_c = rows.iter().any(|r| {
-        r.tenant == tenant_c && r.task_id == task_c && r.config_id == config_c
-    });
+    let has_a = rows
+        .iter()
+        .any(|r| r.tenant == tenant_a && r.task_id == task_a && r.config_id == config_a);
+    let has_b = rows
+        .iter()
+        .any(|r| r.tenant == tenant_b && r.task_id == task_b && r.config_id == config_b);
+    let has_c = rows
+        .iter()
+        .any(|r| r.tenant == tenant_c && r.task_id == task_c && r.config_id == config_c);
     assert!(!has_a, "fresh non-expired row must not be reclaimable");
     assert!(has_b, "expired non-terminal row must be reclaimable");
     assert!(!has_c, "terminal row must not be reclaimable");
@@ -2706,9 +3179,7 @@ pub async fn test_push_failed_delivery_diagnostics_roundtrip(store: &dyn A2aPush
 /// (same claimant, same generation — the fencing identity still
 /// matches) returns `StaleDeliveryClaim` and does NOT mutate the
 /// row. Exercised for each of the three terminal variants.
-pub async fn test_push_attempt_started_rejected_after_terminal(
-    store: &dyn A2aPushDeliveryStore,
-) {
+pub async fn test_push_attempt_started_rejected_after_terminal(store: &dyn A2aPushDeliveryStore) {
     let long = Duration::from_secs(60);
 
     async fn seed_and_commit_terminal(
@@ -2718,7 +3189,15 @@ pub async fn test_push_attempt_started_rejected_after_terminal(
     ) -> (String, String, u64, String, String, u64, u32) {
         let (tenant, task_id, seq, config_id) = push_tuple(suffix);
         let claim = store
-            .claim_delivery(&tenant, &task_id, seq, &config_id, "w", "owner-x", Duration::from_secs(60))
+            .claim_delivery(
+                &tenant,
+                &task_id,
+                seq,
+                &config_id,
+                "w",
+                "owner-x",
+                Duration::from_secs(60),
+            )
             .await
             .expect("claim");
         // At least one attempt start (so count > 0 for checking).
@@ -2774,7 +3253,10 @@ pub async fn test_push_attempt_started_rejected_after_terminal(
     let reclaim = store
         .claim_delivery(&t, &tid, seq, &cid, "other", "owner-x", long)
         .await;
-    assert!(matches!(reclaim, Err(A2aStorageError::ClaimAlreadyHeld { .. })));
+    assert!(matches!(
+        reclaim,
+        Err(A2aStorageError::ClaimAlreadyHeld { .. })
+    ));
     let _ = count_at_terminal;
 
     // GaveUp terminal.
@@ -2832,9 +3314,7 @@ pub async fn test_push_attempt_started_rejected_after_terminal(
 /// - Succeeded -> GaveUp: row stays Succeeded (NOT listed as failed).
 /// - GaveUp -> Succeeded: row stays GaveUp (listed as failed).
 /// - Abandoned -> Succeeded: row stays Abandoned (NOT listed).
-pub async fn test_push_outcome_does_not_overwrite_terminal(
-    store: &dyn A2aPushDeliveryStore,
-) {
+pub async fn test_push_outcome_does_not_overwrite_terminal(store: &dyn A2aPushDeliveryStore) {
     let long = Duration::from_secs(60);
 
     async fn seed_terminal(
@@ -2844,7 +3324,15 @@ pub async fn test_push_outcome_does_not_overwrite_terminal(
     ) -> (String, String, u64, String, u64) {
         let (tenant, task_id, seq, config_id) = push_tuple(suffix);
         let claim = store
-            .claim_delivery(&tenant, &task_id, seq, &config_id, "w", "owner-x", Duration::from_secs(60))
+            .claim_delivery(
+                &tenant,
+                &task_id,
+                seq,
+                &config_id,
+                "w",
+                "owner-x",
+                Duration::from_secs(60),
+            )
             .await
             .expect("claim");
         store
@@ -2889,7 +3377,9 @@ pub async fn test_push_outcome_does_not_overwrite_terminal(
         )
         .await
         .expect("Succeeded->Retry must be Ok no-op");
-    let rc = store.claim_delivery(&t, &tid, seq, &cid, "x", "owner-x", long).await;
+    let rc = store
+        .claim_delivery(&t, &tid, seq, &cid, "x", "owner-x", long)
+        .await;
     assert!(
         matches!(rc, Err(A2aStorageError::ClaimAlreadyHeld { .. })),
         "row must still be Succeeded; got {rc:?}"
@@ -2899,7 +3389,10 @@ pub async fn test_push_outcome_does_not_overwrite_terminal(
         .list_failed_deliveries(&t, SystemTime::UNIX_EPOCH, 10)
         .await
         .expect("list");
-    assert!(!f.iter().any(|row| row.task_id == tid && row.config_id == cid));
+    assert!(
+        !f.iter()
+            .any(|row| row.task_id == tid && row.config_id == cid)
+    );
 
     // (2) Succeeded -> GaveUp: no-op, row still Succeeded, NOT in failed list.
     let (t, tid, seq, cid, gen_n) = seed_terminal(
@@ -2929,7 +3422,8 @@ pub async fn test_push_outcome_does_not_overwrite_terminal(
         .await
         .expect("list");
     assert!(
-        !f.iter().any(|row| row.task_id == tid && row.config_id == cid),
+        !f.iter()
+            .any(|row| row.task_id == tid && row.config_id == cid),
         "Succeeded row must not appear in failed-delivery list"
     );
 
@@ -2961,7 +3455,8 @@ pub async fn test_push_outcome_does_not_overwrite_terminal(
         .await
         .expect("list");
     assert!(
-        f.iter().any(|row| row.task_id == tid && row.config_id == cid),
+        f.iter()
+            .any(|row| row.task_id == tid && row.config_id == cid),
         "GaveUp row must remain in failed-delivery list after cross-over attempt"
     );
 
@@ -2986,7 +3481,9 @@ pub async fn test_push_outcome_does_not_overwrite_terminal(
         )
         .await
         .expect("Abandoned->Succeeded must be Ok no-op");
-    let rc = store.claim_delivery(&t, &tid, seq, &cid, "x", "owner-x", long).await;
+    let rc = store
+        .claim_delivery(&t, &tid, seq, &cid, "x", "owner-x", long)
+        .await;
     assert!(
         matches!(rc, Err(A2aStorageError::ClaimAlreadyHeld { .. })),
         "row must remain Abandoned (non-re-claimable)"
@@ -2996,7 +3493,8 @@ pub async fn test_push_outcome_does_not_overwrite_terminal(
         .await
         .expect("list");
     assert!(
-        !f.iter().any(|row| row.task_id == tid && row.config_id == cid),
+        !f.iter()
+            .any(|row| row.task_id == tid && row.config_id == cid),
         "Abandoned row must not appear in failed-delivery list"
     );
 }
@@ -3024,7 +3522,9 @@ where
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
             store
-                .claim_delivery(&tenant, &task_id, seq, &config_id, claimant, "owner-x", long)
+                .claim_delivery(
+                    &tenant, &task_id, seq, &config_id, claimant, "owner-x", long,
+                )
                 .await
         }));
     }
@@ -3069,8 +3569,8 @@ pub async fn test_atomic_marker_written_for_terminal_status(
     );
 
     // Seed Working so the terminal transition is valid.
-    let task = Task::new("pdm-001", TaskStatus::new(TaskState::Working))
-        .with_context_id("ctx-pdm-001");
+    let task =
+        Task::new("pdm-001", TaskStatus::new(TaskState::Working)).with_context_id("ctx-pdm-001");
     tasks
         .create_task("default", "owner-1", task)
         .await
@@ -3111,8 +3611,8 @@ pub async fn test_atomic_marker_skipped_for_non_terminal_status(
 ) {
     assert!(atomic.push_dispatch_enabled());
 
-    let task = Task::new("pdm-002", TaskStatus::new(TaskState::Submitted))
-        .with_context_id("ctx-pdm-002");
+    let task =
+        Task::new("pdm-002", TaskStatus::new(TaskState::Submitted)).with_context_id("ctx-pdm-002");
     tasks
         .create_task("default", "owner-1", task)
         .await
@@ -3151,8 +3651,8 @@ pub async fn test_atomic_marker_skipped_for_artifact_event(
 ) {
     assert!(atomic.push_dispatch_enabled());
 
-    let task = Task::new("pdm-003", TaskStatus::new(TaskState::Working))
-        .with_context_id("ctx-pdm-003");
+    let task =
+        Task::new("pdm-003", TaskStatus::new(TaskState::Working)).with_context_id("ctx-pdm-003");
     tasks
         .create_task("default", "owner-1", task.clone())
         .await
@@ -3206,8 +3706,8 @@ pub async fn test_atomic_marker_absent_when_opt_in_off(
         "PDM-004 expects an atomic store with push_dispatch_enabled() == false"
     );
 
-    let task = Task::new("pdm-004", TaskStatus::new(TaskState::Working))
-        .with_context_id("ctx-pdm-004");
+    let task =
+        Task::new("pdm-004", TaskStatus::new(TaskState::Working)).with_context_id("ctx-pdm-004");
     tasks
         .create_task("default", "owner-1", task)
         .await
@@ -3256,8 +3756,8 @@ pub async fn test_config_registered_at_or_after_event_not_eligible(
     let owner = "owner-1";
 
     // Seed Working so the terminal transition is valid.
-    let task = Task::new(task_id, TaskStatus::new(TaskState::Working))
-        .with_context_id("ctx-pef-001");
+    let task =
+        Task::new(task_id, TaskStatus::new(TaskState::Working)).with_context_id("ctx-pef-001");
     tasks
         .create_task(tenant, owner, task.clone())
         .await
@@ -3305,17 +3805,14 @@ pub async fn test_config_registered_at_or_after_event_not_eligible(
     let completed_status = TaskStatus::new(TaskState::Completed);
     let terminal = make_status_event_for(task_id, "ctx-pef-001", "TASK_STATE_COMPLETED");
     let (_t, seqs) = atomic
-        .update_task_status_with_events(
-            tenant,
-            task_id,
-            owner,
-            completed_status,
-            vec![terminal],
-        )
+        .update_task_status_with_events(tenant, task_id, owner, completed_status, vec![terminal])
         .await
         .expect("terminal commit");
     let terminal_seq = seqs[0];
-    assert_eq!(terminal_seq, 3, "expected seq 3 after two working + one terminal");
+    assert_eq!(
+        terminal_seq, 3,
+        "expected seq 3 after two working + one terminal"
+    );
 
     // Register C2 AFTER the terminal commit. CAS reads
     // latest_event_sequence = 3, stamps C2 with seq=3.
@@ -3355,8 +3852,7 @@ pub async fn test_config_registered_at_or_after_event_not_eligible(
         .expect("list all");
     let all_ids: Vec<_> = all.configs.iter().map(|c| c.id.clone()).collect();
     assert!(
-        all_ids.contains(&"cfg-pef-c1".to_string())
-            && all_ids.contains(&"cfg-pef-c2".to_string()),
+        all_ids.contains(&"cfg-pef-c1".to_string()) && all_ids.contains(&"cfg-pef-c2".to_string()),
         "list_configs must still return both configs; got {all_ids:?}"
     );
 }
@@ -3387,8 +3883,8 @@ pub async fn test_late_create_config_stamps_advanced_sequence(
     let task_id = "task-pef-002";
     let owner = "owner-1";
 
-    let task = Task::new(task_id, TaskStatus::new(TaskState::Working))
-        .with_context_id("ctx-pef-002");
+    let task =
+        Task::new(task_id, TaskStatus::new(TaskState::Working)).with_context_id("ctx-pef-002");
     tasks
         .create_task(tenant, owner, task.clone())
         .await

@@ -163,7 +163,9 @@ async fn http_call(
     if body.is_some() {
         req = req.header("content-type", "application/json");
     }
-    let req = req.body(body.map(Body::from).unwrap_or_else(Body::empty)).unwrap();
+    let req = req
+        .body(body.map(Body::from).unwrap_or_else(Body::empty))
+        .unwrap();
     let resp = router.oneshot(req).await.unwrap();
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
@@ -209,7 +211,9 @@ async fn jsonrpc_call(
 /// compliance check accepts either shape.
 fn assert_has_error_info(json: &serde_json::Value, expected_reason: &str) {
     let error = json.get("error").expect("error envelope present");
-    let info: &serde_json::Value = if let Some(details) = error.get("details").and_then(|d| d.as_array()) {
+    let info: &serde_json::Value = if let Some(details) =
+        error.get("details").and_then(|d| d.as_array())
+    {
         details
             .iter()
             .find(|entry| {
@@ -225,7 +229,9 @@ fn assert_has_error_info(json: &serde_json::Value, expected_reason: &str) {
         );
         data
     } else {
-        panic!("error must carry ErrorInfo via either `details` (HTTP) or `data` (JSON-RPC); got {json}")
+        panic!(
+            "error must carry ErrorInfo via either `details` (HTTP) or `data` (JSON-RPC); got {json}"
+        )
     };
     assert_eq!(
         info.get("reason").and_then(|v| v.as_str()),
@@ -246,13 +252,8 @@ fn assert_has_error_info(json: &serde_json::Value, expected_reason: &str) {
 #[tokio::test]
 async fn public_agent_card_is_served_unauthenticated() {
     let router = compliance_router();
-    let (status, _, card) = http_call(
-        router,
-        Method::GET,
-        "/.well-known/agent-card.json",
-        None,
-    )
-    .await;
+    let (status, _, card) =
+        http_call(router, Method::GET, "/.well-known/agent-card.json", None).await;
     assert_eq!(status, 200);
     // Required fields per proto AgentCard.
     assert!(card.get("name").and_then(|v| v.as_str()).is_some());
@@ -268,8 +269,7 @@ async fn public_agent_card_is_served_unauthenticated() {
 #[tokio::test]
 async fn extended_agent_card_returns_executor_supplied_card() {
     let router = compliance_router();
-    let (status, _, card) =
-        http_call(router, Method::GET, "/extendedAgentCard", None).await;
+    let (status, _, card) = http_call(router, Method::GET, "/extendedAgentCard", None).await;
     assert_eq!(status, 200);
     // Our ComplianceAgent differentiates the extended card via the
     // description field; any shape change is a spec-compliance
@@ -366,8 +366,13 @@ async fn get_task_http_and_jsonrpc_both_return_the_same_task() {
         .to_string();
 
     // HTTP GET.
-    let (status, _, http_task) =
-        http_call(router.clone(), Method::GET, &format!("/tasks/{task_id}"), None).await;
+    let (status, _, http_task) = http_call(
+        router.clone(),
+        Method::GET,
+        &format!("/tasks/{task_id}"),
+        None,
+    )
+    .await;
     assert_eq!(status, 200);
     assert_eq!(
         http_task.get("id").and_then(|v| v.as_str()),
@@ -375,13 +380,7 @@ async fn get_task_http_and_jsonrpc_both_return_the_same_task() {
     );
 
     // JSON-RPC.
-    let jrpc = jsonrpc_call(
-        router,
-        "GetTask",
-        serde_json::json!({"id": task_id}),
-        42,
-    )
-    .await;
+    let jrpc = jsonrpc_call(router, "GetTask", serde_json::json!({"id": task_id}), 42).await;
     let jrpc_task = jrpc.get("result").expect("result present");
     assert_eq!(
         jrpc_task.get("id").and_then(|v| v.as_str()),
@@ -395,13 +394,8 @@ async fn get_task_not_found_maps_to_404_and_minus_32001() {
     let router = compliance_router();
 
     // HTTP.
-    let (status, _, http_err) = http_call(
-        router.clone(),
-        Method::GET,
-        "/tasks/does-not-exist",
-        None,
-    )
-    .await;
+    let (status, _, http_err) =
+        http_call(router.clone(), Method::GET, "/tasks/does-not-exist", None).await;
     assert_eq!(status, 404, "TaskNotFoundError HTTP status per ADR-004");
     assert_has_error_info(&http_err, "TASK_NOT_FOUND");
 
@@ -418,7 +412,10 @@ async fn get_task_not_found_maps_to_404_and_minus_32001() {
         .and_then(|e| e.get("code"))
         .and_then(|v| v.as_i64())
         .expect("error.code");
-    assert_eq!(code, -32001, "TaskNotFoundError JSON-RPC code per spec §5.4");
+    assert_eq!(
+        code, -32001,
+        "TaskNotFoundError JSON-RPC code per spec §5.4"
+    );
     assert_has_error_info(&jrpc, "TASK_NOT_FOUND");
 }
 
@@ -479,18 +476,18 @@ async fn cancel_terminal_task_returns_409_and_task_not_cancelable_error() {
         None,
     )
     .await;
-    assert_eq!(status, 409, "TaskNotCancelableError HTTP status per ADR-004");
+    assert_eq!(
+        status, 409,
+        "TaskNotCancelableError HTTP status per ADR-004"
+    );
     assert_has_error_info(&http_err, "TASK_NOT_CANCELABLE");
 
     // JSON-RPC.
-    let jrpc = jsonrpc_call(
-        router,
-        "CancelTask",
-        serde_json::json!({"id": task_id}),
-        11,
-    )
-    .await;
-    let code = jrpc.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_i64());
+    let jrpc = jsonrpc_call(router, "CancelTask", serde_json::json!({"id": task_id}), 11).await;
+    let code = jrpc
+        .get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(|v| v.as_i64());
     assert_eq!(
         code,
         Some(-32002),
@@ -502,13 +499,7 @@ async fn cancel_terminal_task_returns_409_and_task_not_cancelable_error() {
 #[tokio::test]
 async fn cancel_nonexistent_task_returns_404_not_cancel_error() {
     let router = compliance_router();
-    let (status, _, err) = http_call(
-        router,
-        Method::POST,
-        "/tasks/ghost:cancel",
-        None,
-    )
-    .await;
+    let (status, _, err) = http_call(router, Method::POST, "/tasks/ghost:cancel", None).await;
     assert_eq!(status, 404);
     assert_has_error_info(&err, "TASK_NOT_FOUND");
 }
@@ -843,7 +834,10 @@ async fn a2a_version_unsupported_value_always_rejected() {
 async fn jsonrpc_unknown_method_returns_method_not_found() {
     let router = compliance_router();
     let resp = jsonrpc_call(router, "NonExistentMethod", serde_json::json!({}), 1).await;
-    let code = resp.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_i64());
+    let code = resp
+        .get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(|v| v.as_i64());
     assert_eq!(code, Some(-32601), "JSON-RPC Method Not Found per spec");
 }
 

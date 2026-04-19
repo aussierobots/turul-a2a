@@ -128,11 +128,7 @@ impl AgentCardBuilder {
         self
     }
 
-    pub fn provider(
-        mut self,
-        organization: impl Into<String>,
-        url: impl Into<String>,
-    ) -> Self {
+    pub fn provider(mut self, organization: impl Into<String>, url: impl Into<String>) -> Self {
         self.provider = Some(turul_a2a_proto::AgentProvider {
             organization: organization.into(),
             url: url.into(),
@@ -354,7 +350,10 @@ mod tests {
         assert_eq!(card.supported_interfaces.len(), 2);
         assert!(card.provider.is_some());
         assert_eq!(card.capabilities.as_ref().unwrap().streaming, Some(true));
-        assert_eq!(card.icon_url.as_deref(), Some("https://example.com/icon.png"));
+        assert_eq!(
+            card.icon_url.as_deref(),
+            Some("https://example.com/icon.png")
+        );
     }
 
     #[test]

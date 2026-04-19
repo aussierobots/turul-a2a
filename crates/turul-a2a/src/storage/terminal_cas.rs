@@ -20,12 +20,7 @@ use turul_a2a_types::TaskState;
 /// Terminal-state values in the storage column format (Rust `Debug`).
 /// This matches what `status_state_str` writes in each SQL/DynamoDB
 /// backend. Used to construct the conditional-UPDATE / ConditionExpression.
-pub const DEBUG_TERMINAL_STATES: &[&str] = &[
-    "Completed",
-    "Failed",
-    "Canceled",
-    "Rejected",
-];
+pub const DEBUG_TERMINAL_STATES: &[&str] = &["Completed", "Failed", "Canceled", "Rejected"];
 
 /// Map a [`TaskState`] to its proto wire name.
 ///
@@ -93,8 +88,16 @@ mod tests {
             (TaskState::Completed, "Completed", "TASK_STATE_COMPLETED"),
             (TaskState::Failed, "Failed", "TASK_STATE_FAILED"),
             (TaskState::Canceled, "Canceled", "TASK_STATE_CANCELED"),
-            (TaskState::InputRequired, "InputRequired", "TASK_STATE_INPUT_REQUIRED"),
-            (TaskState::AuthRequired, "AuthRequired", "TASK_STATE_AUTH_REQUIRED"),
+            (
+                TaskState::InputRequired,
+                "InputRequired",
+                "TASK_STATE_INPUT_REQUIRED",
+            ),
+            (
+                TaskState::AuthRequired,
+                "AuthRequired",
+                "TASK_STATE_AUTH_REQUIRED",
+            ),
             (TaskState::Rejected, "Rejected", "TASK_STATE_REJECTED"),
         ];
         for (state, debug, wire) in cases {

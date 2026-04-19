@@ -16,7 +16,7 @@ use turul_a2a::executor::AgentExecutor;
 use turul_a2a::middleware::{
     A2aMiddleware, AuthIdentity, MiddlewareError, MiddlewareStack, RequestContext,
 };
-use turul_a2a::router::{build_router, AppState};
+use turul_a2a::router::{AppState, build_router};
 use turul_a2a::storage::InMemoryA2aStorage;
 use turul_a2a::streaming::TaskEventBroker;
 use turul_a2a_types::{Message, Task};
@@ -29,7 +29,12 @@ struct TestExecutor;
 
 #[async_trait]
 impl AgentExecutor for TestExecutor {
-    async fn execute(&self, task: &mut Task, _msg: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
+    async fn execute(
+        &self,
+        task: &mut Task,
+        _msg: &Message,
+        _ctx: &turul_a2a::executor::ExecutionContext,
+    ) -> Result<(), A2aError> {
         let mut p = task.as_proto().clone();
         p.status = Some(turul_a2a_proto::TaskStatus {
             state: turul_a2a_proto::TaskState::Completed.into(),
@@ -141,7 +146,7 @@ fn state_no_auth() -> AppState {
         event_store: Arc::new(s.clone()),
         atomic_store: Arc::new(s),
         push_delivery_store: None,
-            push_dispatcher: None,
+        push_dispatcher: None,
     }
 }
 
@@ -154,14 +159,12 @@ fn state_with_auth() -> AppState {
         event_store: Arc::new(s.clone()),
         atomic_store: Arc::new(s),
         event_broker: TaskEventBroker::new(),
-        middleware_stack: Arc::new(MiddlewareStack::new(vec![
-            Arc::new(TestAuthMiddleware),
-        ])),
+        middleware_stack: Arc::new(MiddlewareStack::new(vec![Arc::new(TestAuthMiddleware)])),
         runtime_config: turul_a2a::server::RuntimeConfig::default(),
         in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
-            push_dispatcher: None,
+        push_dispatcher: None,
     }
 }
 
@@ -177,7 +180,13 @@ fn jrpc_body(method: &str, id: i64) -> String {
 async fn response(router: axum::Router, req: Request<Body>) -> (u16, Vec<u8>) {
     let resp = router.oneshot(req).await.unwrap();
     let status = resp.status().as_u16();
-    let body = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
     (status, body)
 }
 
@@ -250,7 +259,10 @@ async fn auth_middleware_rejects_unauthenticated_http() {
         .unwrap();
     let (status, _headers, body) = response_with_headers(router, req).await;
     assert_eq!(status, 401, "Unauthenticated should return 401");
-    assert!(body["error"]["code"].as_u64().is_some(), "Should have AIP-193 error body");
+    assert!(
+        body["error"]["code"].as_u64().is_some(),
+        "Should have AIP-193 error body"
+    );
 }
 
 #[tokio::test]
@@ -268,7 +280,10 @@ async fn auth_middleware_rejects_unauthenticated_jsonrpc() {
         body.get("jsonrpc").is_none(),
         "Auth failure on /jsonrpc must be HTTP 401, not JSON-RPC error: {body}"
     );
-    assert!(body["error"]["code"].as_u64().is_some(), "Should be AIP-193 format");
+    assert!(
+        body["error"]["code"].as_u64().is_some(),
+        "Should be AIP-193 format"
+    );
 }
 
 #[tokio::test]
@@ -279,7 +294,10 @@ async fn well_known_agent_card_excluded_from_auth() {
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(router, req).await;
-    assert_eq!(status, 200, "Agent card should be public even with auth configured");
+    assert_eq!(
+        status, 200,
+        "Agent card should be public even with auth configured"
+    );
 }
 
 #[tokio::test]
@@ -355,7 +373,10 @@ async fn jsonrpc_unauthenticated_is_http_401_not_jsonrpc_error() {
     let (status, _, body) = response_with_headers(router, req).await;
     assert_eq!(status, 401);
     // NOT a JSON-RPC error
-    assert!(body.get("jsonrpc").is_none(), "Must be HTTP error, not JSON-RPC");
+    assert!(
+        body.get("jsonrpc").is_none(),
+        "Must be HTTP error, not JSON-RPC"
+    );
     // IS AIP-193
     assert_eq!(body["error"]["code"], 401);
 }

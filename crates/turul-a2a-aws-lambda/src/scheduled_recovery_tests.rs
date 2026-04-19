@@ -11,21 +11,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use turul_a2a::push::delivery::{PushDeliveryConfig, PushDeliveryWorker};
-use turul_a2a::push::{
-    A2aPushDeliveryStore, PendingDispatch, PushDispatcher, ReclaimableClaim,
-};
+use turul_a2a::push::{A2aPushDeliveryStore, PendingDispatch, PushDispatcher, ReclaimableClaim};
 use turul_a2a::storage::{
-    A2aAtomicStore, A2aPushNotificationStorage, A2aStorageError, A2aTaskStorage,
-    InMemoryA2aStorage,
+    A2aAtomicStore, A2aPushNotificationStorage, A2aStorageError, A2aTaskStorage, InMemoryA2aStorage,
 };
 use turul_a2a::streaming::{StatusUpdatePayload, StreamEvent};
 use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::scheduled_recovery::{
-    LambdaScheduledRecoveryConfig, LambdaScheduledRecoveryHandler,
-};
+use crate::scheduled_recovery::{LambdaScheduledRecoveryConfig, LambdaScheduledRecoveryHandler};
 
 async fn build_stack() -> (
     Arc<InMemoryA2aStorage>,
@@ -68,8 +63,7 @@ async fn seed_task_with_marker(
     let tenant = "t-sched";
     let owner = "owner-1";
     let ctx = "ctx-sched";
-    let working =
-        Task::new(task_id, TaskStatus::new(TaskState::Working)).with_context_id(ctx);
+    let working = Task::new(task_id, TaskStatus::new(TaskState::Working)).with_context_id(ctx);
     A2aTaskStorage::create_task(storage.as_ref(), tenant, owner, working)
         .await
         .expect("seed task");
@@ -125,18 +119,23 @@ async fn scheduled_sweep_recovers_stale_marker_and_fires_post() {
     // qualifies immediately. This matches the ADR's contract — the
     // cutoff is operator-tuned, not hard-coded; tests set it to the
     // shortest value that admits the seeded marker.
-    let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery.clone())
-        .with_config(LambdaScheduledRecoveryConfig {
+    let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery.clone()).with_config(
+        LambdaScheduledRecoveryConfig {
             stale_cutoff: std::time::Duration::ZERO,
             stale_markers_limit: 16,
             reclaimable_claims_limit: 16,
-        });
+        },
+    );
     let response = handler.run_sweep().await;
 
     assert_eq!(response.stale_markers_found, 1);
     assert_eq!(response.stale_markers_recovered, 1);
     assert_eq!(response.stale_markers_transient_errors, 0);
-    assert!(response.errors.is_empty(), "no errors expected: {:?}", response.errors);
+    assert!(
+        response.errors.is_empty(),
+        "no errors expected: {:?}",
+        response.errors
+    );
 
     // Marker must have been deleted by the redispatch path.
     let remaining = delivery
@@ -147,7 +146,9 @@ async fn scheduled_sweep_recovers_stale_marker_and_fires_post() {
         .await
         .expect("list");
     assert!(
-        remaining.iter().all(|p| !(p.tenant == tenant && p.task_id == task_id && p.event_sequence == seq)),
+        remaining
+            .iter()
+            .all(|p| !(p.tenant == tenant && p.task_id == task_id && p.event_sequence == seq)),
         "marker must be deleted after successful sweep; remaining: {remaining:?}"
     );
 }
@@ -183,28 +184,13 @@ async fn scheduled_sweep_counts_transient_error_and_retains_marker() {
             }
             self.inner.get_task(t, id, o, h).await
         }
-        async fn create_task(
-            &self,
-            t: &str,
-            o: &str,
-            task: Task,
-        ) -> Result<Task, A2aStorageError> {
+        async fn create_task(&self, t: &str, o: &str, task: Task) -> Result<Task, A2aStorageError> {
             self.inner.create_task(t, o, task).await
         }
-        async fn update_task(
-            &self,
-            t: &str,
-            o: &str,
-            task: Task,
-        ) -> Result<(), A2aStorageError> {
+        async fn update_task(&self, t: &str, o: &str, task: Task) -> Result<(), A2aStorageError> {
             self.inner.update_task(t, o, task).await
         }
-        async fn delete_task(
-            &self,
-            t: &str,
-            id: &str,
-            o: &str,
-        ) -> Result<bool, A2aStorageError> {
+        async fn delete_task(&self, t: &str, id: &str, o: &str) -> Result<bool, A2aStorageError> {
             self.inner.delete_task(t, id, o).await
         }
         async fn list_tasks(
@@ -240,9 +226,7 @@ async fn scheduled_sweep_counts_transient_error_and_retains_marker() {
             append: bool,
             last: bool,
         ) -> Result<(), A2aStorageError> {
-            self.inner
-                .append_artifact(t, id, o, a, append, last)
-                .await
+            self.inner.append_artifact(t, id, o, a, append, last).await
         }
         async fn task_count(&self) -> Result<usize, A2aStorageError> {
             self.inner.task_count().await
@@ -286,12 +270,13 @@ async fn scheduled_sweep_counts_transient_error_and_retains_marker() {
     let push_storage: Arc<dyn A2aPushNotificationStorage> = storage.clone();
     let dispatcher = Arc::new(PushDispatcher::new(worker, push_storage, flaky));
 
-    let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery.clone())
-        .with_config(LambdaScheduledRecoveryConfig {
+    let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery.clone()).with_config(
+        LambdaScheduledRecoveryConfig {
             stale_cutoff: std::time::Duration::ZERO,
             stale_markers_limit: 16,
             reclaimable_claims_limit: 16,
-        });
+        },
+    );
     let response = handler.run_sweep().await;
 
     assert_eq!(response.stale_markers_found, 1);
@@ -352,12 +337,13 @@ async fn scheduled_sweep_processes_reclaimable_claims() {
     // Wait out the tiny expiry.
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-    let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery.clone())
-        .with_config(LambdaScheduledRecoveryConfig {
+    let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery.clone()).with_config(
+        LambdaScheduledRecoveryConfig {
             stale_cutoff: std::time::Duration::from_secs(60 * 60),
             stale_markers_limit: 16,
             reclaimable_claims_limit: 16,
-        });
+        },
+    );
     let response = handler.run_sweep().await;
 
     assert_eq!(
@@ -408,12 +394,13 @@ async fn scheduled_sweep_respects_stale_markers_limit() {
         webhook_urls.push(url);
     }
 
-    let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery)
-        .with_config(LambdaScheduledRecoveryConfig {
+    let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery).with_config(
+        LambdaScheduledRecoveryConfig {
             stale_cutoff: std::time::Duration::ZERO,
             stale_markers_limit: 2, // cap
             reclaimable_claims_limit: 16,
-        });
+        },
+    );
     let response = handler.run_sweep().await;
 
     assert_eq!(

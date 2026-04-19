@@ -12,11 +12,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -50,14 +50,26 @@ pub async fn jsonrpc_dispatch_handler(
     let jsonrpc = value.get("jsonrpc").and_then(|v| v.as_str());
     if jsonrpc != Some("2.0") {
         let id = value.get("id").cloned().unwrap_or(Value::Null);
-        return Json(jsonrpc_error(id, -32600, "Invalid Request: missing or wrong jsonrpc version", None)).into_response();
+        return Json(jsonrpc_error(
+            id,
+            -32600,
+            "Invalid Request: missing or wrong jsonrpc version",
+            None,
+        ))
+        .into_response();
     }
 
     let raw_method = match value.get("method").and_then(|v| v.as_str()) {
         Some(m) => m,
         None => {
             let id = value.get("id").cloned().unwrap_or(Value::Null);
-            return Json(jsonrpc_error(id, -32600, "Invalid Request: missing method", None)).into_response();
+            return Json(jsonrpc_error(
+                id,
+                -32600,
+                "Invalid Request: missing method",
+                None,
+            ))
+            .into_response();
         }
     };
 
@@ -94,7 +106,13 @@ pub async fn jsonrpc_dispatch_handler(
             if is_notification {
                 return axum::http::StatusCode::NO_CONTENT.into_response();
             }
-            return Json(jsonrpc_error(id, -32602, "Invalid params: params must be an object", None)).into_response();
+            return Json(jsonrpc_error(
+                id,
+                -32602,
+                "Invalid params: params must be an object",
+                None,
+            ))
+            .into_response();
         }
     };
 
@@ -127,7 +145,17 @@ pub async fn jsonrpc_dispatch_handler(
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
-        return match dispatch_streaming(state, &method, &tenant, &owner, params, id.clone(), last_event_id.as_deref()).await {
+        return match dispatch_streaming(
+            state,
+            &method,
+            &tenant,
+            &owner,
+            params,
+            id.clone(),
+            last_event_id.as_deref(),
+        )
+        .await
+        {
             Ok(response) => response,
             Err(e) => Json(e.to_jsonrpc_error(Some(&id))).into_response(),
         };
@@ -187,9 +215,9 @@ async fn dispatch(
             dispatch_delete_push_config(state, tenant, owner, params).await
         }
         // Streaming methods handled before dispatch() is called
-        methods::SEND_STREAMING_MESSAGE | methods::SUBSCRIBE_TO_TASK => {
-            Err(A2aError::Internal("Streaming methods should not reach dispatch()".into()))
-        }
+        methods::SEND_STREAMING_MESSAGE | methods::SUBSCRIBE_TO_TASK => Err(A2aError::Internal(
+            "Streaming methods should not reach dispatch()".into(),
+        )),
         _ => Err(method_not_found(method)),
     }
 }
@@ -212,7 +240,8 @@ async fn dispatch_streaming(
             dispatch_send_streaming_message(state, tenant, owner, params, request_id).await
         }
         methods::SUBSCRIBE_TO_TASK => {
-            dispatch_subscribe_to_task(state, tenant, owner, params, request_id, last_event_id).await
+            dispatch_subscribe_to_task(state, tenant, owner, params, request_id, last_event_id)
+                .await
         }
         _ => Err(A2aError::Internal("Unknown streaming method".into())),
     }
@@ -226,8 +255,8 @@ async fn dispatch_send_streaming_message(
     request_id: Value,
 ) -> Result<axum::response::Response, A2aError> {
     // Parse the SendMessageRequest from params
-    let request: turul_a2a_proto::SendMessageRequest = serde_json::from_value(params)
-        .map_err(|e| A2aError::InvalidRequest {
+    let request: turul_a2a_proto::SendMessageRequest =
+        serde_json::from_value(params).map_err(|e| A2aError::InvalidRequest {
             message: format!("Invalid params: {e}"),
         })?;
 
@@ -250,8 +279,8 @@ async fn dispatch_send_streaming_message(
     let wake_rx = state.event_broker.subscribe(&task_id).await;
 
     // Atomic: create task + SUBMITTED event
-    let mut task = Task::new(&task_id, TaskStatus::new(TaskState::Submitted))
-        .with_context_id(&context_id);
+    let mut task =
+        Task::new(&task_id, TaskStatus::new(TaskState::Submitted)).with_context_id(&context_id);
     task.append_message(message.clone());
 
     let submitted_event = StreamEvent::StatusUpdate {
@@ -275,8 +304,7 @@ async fn dispatch_send_streaming_message(
         status_update: streaming::StatusUpdatePayload {
             task_id: task_id.clone(),
             context_id: context_id.clone(),
-            status: serde_json::to_value(TaskStatus::new(TaskState::Working))
-                .unwrap_or_default(),
+            status: serde_json::to_value(TaskStatus::new(TaskState::Working)).unwrap_or_default(),
         },
     };
     state
@@ -367,7 +395,11 @@ async fn dispatch_subscribe_to_task(
         .unwrap_or(0);
 
     // Spec §3.1.6: first event is Task snapshot (when not reconnecting)
-    let initial_task = if after_sequence == 0 { Some(task) } else { None };
+    let initial_task = if after_sequence == 0 {
+        Some(task)
+    } else {
+        None
+    };
 
     let wake_rx = state.event_broker.subscribe(&task_id).await;
 
@@ -424,7 +456,10 @@ fn make_jsonrpc_sse_response(
         let mut wake_rx = wake_rx;
 
         loop {
-            let events = match event_store.get_events_after(&tenant, &task_id, last_seq).await {
+            let events = match event_store
+                .get_events_after(&tenant, &task_id, last_seq)
+                .await
+            {
                 Ok(e) => e,
                 Err(_) => break,
             };
@@ -517,7 +552,8 @@ async fn dispatch_get_task(
         .and_then(|v| v.as_i64())
         .map(|v| v as i32);
 
-    let Json(response) = crate::router::core_get_task(state, tenant, owner, &id, history_length).await?;
+    let Json(response) =
+        crate::router::core_get_task(state, tenant, owner, &id, history_length).await?;
     Ok(response)
 }
 
@@ -528,11 +564,26 @@ async fn dispatch_list_tasks(
     params: Value,
 ) -> Result<Value, A2aError> {
     let query = crate::router::ListTasksQuery {
-        context_id: params.get("contextId").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        status: params.get("status").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        page_size: params.get("pageSize").and_then(|v| v.as_i64()).map(|v| v as i32),
-        page_token: params.get("pageToken").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        history_length: params.get("historyLength").and_then(|v| v.as_i64()).map(|v| v as i32),
+        context_id: params
+            .get("contextId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        status: params
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        page_size: params
+            .get("pageSize")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32),
+        page_token: params
+            .get("pageToken")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        history_length: params
+            .get("historyLength")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32),
         include_artifacts: params.get("includeArtifacts").and_then(|v| v.as_bool()),
     };
 
@@ -583,7 +634,8 @@ async fn dispatch_create_push_config(
         message: format!("Invalid params: {e}"),
     })?;
 
-    let Json(response) = crate::router::core_create_push_config(state, tenant, owner, &task_id, body).await?;
+    let Json(response) =
+        crate::router::core_create_push_config(state, tenant, owner, &task_id, body).await?;
     Ok(response)
 }
 
@@ -593,14 +645,23 @@ async fn dispatch_get_push_config(
     owner: &str,
     params: Value,
 ) -> Result<Value, A2aError> {
-    let task_id = params.get("taskId").and_then(|v| v.as_str()).ok_or(A2aError::InvalidRequest {
-        message: "Missing required field: taskId".into(),
-    })?.to_string();
-    let id = params.get("id").and_then(|v| v.as_str()).ok_or(A2aError::InvalidRequest {
-        message: "Missing required field: id".into(),
-    })?.to_string();
+    let task_id = params
+        .get("taskId")
+        .and_then(|v| v.as_str())
+        .ok_or(A2aError::InvalidRequest {
+            message: "Missing required field: taskId".into(),
+        })?
+        .to_string();
+    let id = params
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or(A2aError::InvalidRequest {
+            message: "Missing required field: id".into(),
+        })?
+        .to_string();
 
-    let Json(response) = crate::router::core_get_push_config(state, tenant, owner, &task_id, &id).await?;
+    let Json(response) =
+        crate::router::core_get_push_config(state, tenant, owner, &task_id, &id).await?;
     Ok(response)
 }
 
@@ -610,16 +671,27 @@ async fn dispatch_list_push_configs(
     owner: &str,
     params: Value,
 ) -> Result<Value, A2aError> {
-    let task_id = params.get("taskId").and_then(|v| v.as_str()).ok_or(A2aError::InvalidRequest {
-        message: "Missing required field: taskId".into(),
-    })?.to_string();
+    let task_id = params
+        .get("taskId")
+        .and_then(|v| v.as_str())
+        .ok_or(A2aError::InvalidRequest {
+            message: "Missing required field: taskId".into(),
+        })?
+        .to_string();
 
     let query = crate::router::PushConfigQuery {
-        page_size: params.get("pageSize").and_then(|v| v.as_i64()).map(|v| v as i32),
-        page_token: params.get("pageToken").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        page_size: params
+            .get("pageSize")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32),
+        page_token: params
+            .get("pageToken")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     };
 
-    let Json(response) = crate::router::core_list_push_configs(state, tenant, owner, &task_id, &query).await?;
+    let Json(response) =
+        crate::router::core_list_push_configs(state, tenant, owner, &task_id, &query).await?;
     Ok(response)
 }
 
@@ -629,14 +701,23 @@ async fn dispatch_delete_push_config(
     owner: &str,
     params: Value,
 ) -> Result<Value, A2aError> {
-    let task_id = params.get("taskId").and_then(|v| v.as_str()).ok_or(A2aError::InvalidRequest {
-        message: "Missing required field: taskId".into(),
-    })?.to_string();
-    let id = params.get("id").and_then(|v| v.as_str()).ok_or(A2aError::InvalidRequest {
-        message: "Missing required field: id".into(),
-    })?.to_string();
+    let task_id = params
+        .get("taskId")
+        .and_then(|v| v.as_str())
+        .ok_or(A2aError::InvalidRequest {
+            message: "Missing required field: taskId".into(),
+        })?
+        .to_string();
+    let id = params
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or(A2aError::InvalidRequest {
+            message: "Missing required field: id".into(),
+        })?
+        .to_string();
 
-    let Json(response) = crate::router::core_delete_push_config(state, tenant, owner, &task_id, &id).await?;
+    let Json(response) =
+        crate::router::core_delete_push_config(state, tenant, owner, &task_id, &id).await?;
     Ok(response)
 }
 

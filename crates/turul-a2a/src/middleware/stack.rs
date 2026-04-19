@@ -217,8 +217,7 @@ mod tests {
     #[async_trait]
     impl A2aMiddleware for CallTracker {
         async fn before_request(&self, ctx: &mut RequestContext) -> Result<(), MiddlewareError> {
-            self.called
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
             self.inner.before_request(ctx).await
         }
     }

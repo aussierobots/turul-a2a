@@ -9,7 +9,7 @@ use tower::ServiceExt;
 
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
-use turul_a2a::router::{build_router, AppState};
+use turul_a2a::router::{AppState, build_router};
 use turul_a2a::storage::InMemoryA2aStorage;
 use turul_a2a::streaming::TaskEventBroker;
 use turul_a2a_types::{Message, Task};
@@ -18,7 +18,12 @@ struct DummyExecutor;
 
 #[async_trait::async_trait]
 impl AgentExecutor for DummyExecutor {
-    async fn execute(&self, task: &mut Task, _msg: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
+    async fn execute(
+        &self,
+        task: &mut Task,
+        _msg: &Message,
+        _ctx: &turul_a2a::executor::ExecutionContext,
+    ) -> Result<(), A2aError> {
         let mut p = task.as_proto().clone();
         p.status = Some(turul_a2a_proto::TaskStatus {
             state: turul_a2a_proto::TaskState::Completed.into(),
@@ -54,7 +59,7 @@ fn test_state() -> AppState {
         in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
-            push_dispatcher: None,
+        push_dispatcher: None,
     }
 }
 
@@ -97,7 +102,10 @@ async fn request_without_a2a_version_accepted_with_compat() {
         .body(Body::from(send_body()))
         .unwrap();
     let (status, _body) = json_response(router, req).await;
-    assert_ne!(status, 400, "Missing A2A-Version must not be rejected (v0.3 compat)");
+    assert_ne!(
+        status, 400,
+        "Missing A2A-Version must not be rejected (v0.3 compat)"
+    );
 }
 
 #[tokio::test]
@@ -110,7 +118,10 @@ async fn request_without_a2a_version_rejects_strict() {
         .body(Body::from(send_body()))
         .unwrap();
     let (status, body) = json_response(router, req).await;
-    assert_eq!(status, 400, "Missing A2A-Version header → VersionNotSupportedError");
+    assert_eq!(
+        status, 400,
+        "Missing A2A-Version header → VersionNotSupportedError"
+    );
     if let Some(details) = body["error"]["details"].as_array() {
         if !details.is_empty() {
             assert_eq!(details[0]["reason"], "VERSION_NOT_SUPPORTED");
@@ -173,7 +184,10 @@ async fn post_without_content_type_allowed_for_empty_body_actions() {
         .unwrap();
     let (status, _) = json_response(router, req).await;
     // Should get 404 (task not found), not 415
-    assert_ne!(status, 415, "POST without Content-Type + empty body should not be 415");
+    assert_ne!(
+        status, 415,
+        "POST without Content-Type + empty body should not be 415"
+    );
 }
 
 #[tokio::test]

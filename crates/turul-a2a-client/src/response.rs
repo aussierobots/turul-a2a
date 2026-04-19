@@ -91,11 +91,7 @@ impl TryFrom<pb::ListTasksResponse> for ListResponse {
     type Error = A2aClientError;
 
     fn try_from(resp: pb::ListTasksResponse) -> Result<Self, Self::Error> {
-        let tasks: Result<Vec<Task>, _> = resp
-            .tasks
-            .into_iter()
-            .map(Task::try_from)
-            .collect();
+        let tasks: Result<Vec<Task>, _> = resp.tasks.into_iter().map(Task::try_from).collect();
         let tasks = tasks.map_err(|e| A2aClientError::Conversion(e.to_string()))?;
 
         Ok(Self {

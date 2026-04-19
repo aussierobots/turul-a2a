@@ -12,13 +12,13 @@ use http::Request;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+use turul_a2a::A2aServer;
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
 use turul_a2a::middleware::{
     A2aMiddleware, AnyOfMiddleware, AuthIdentity, MiddlewareError, RequestContext,
     SecurityContribution,
 };
-use turul_a2a::A2aServer;
 use turul_a2a_types::{Message, Task};
 
 // =========================================================
@@ -29,7 +29,12 @@ struct DummyExecutor;
 
 #[async_trait]
 impl AgentExecutor for DummyExecutor {
-    async fn execute(&self, _task: &mut Task, _msg: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
+    async fn execute(
+        &self,
+        _task: &mut Task,
+        _msg: &Message,
+        _ctx: &turul_a2a::executor::ExecutionContext,
+    ) -> Result<(), A2aError> {
         Ok(())
     }
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
@@ -265,8 +270,14 @@ async fn stacked_middleware_produces_and_requirements() {
     let reqs = card["securityRequirements"].as_array().unwrap();
     assert_eq!(reqs.len(), 1, "Stacked should produce 1 requirement (AND)");
     let req = &reqs[0]["schemes"];
-    assert!(req.get("apiKey").is_some(), "AND requirement should include apiKey");
-    assert!(req.get("bearer").is_some(), "AND requirement should include bearer");
+    assert!(
+        req.get("apiKey").is_some(),
+        "AND requirement should include apiKey"
+    );
+    assert!(
+        req.get("bearer").is_some(),
+        "AND requirement should include bearer"
+    );
 }
 
 #[tokio::test]
@@ -315,5 +326,8 @@ async fn bearer_scopes_appear_in_requirements() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert!(scopes.contains(&"a2a:read"), "Scopes should be in requirements");
+    assert!(
+        scopes.contains(&"a2a:read"),
+        "Scopes should be in requirements"
+    );
 }

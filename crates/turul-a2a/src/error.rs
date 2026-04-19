@@ -4,7 +4,7 @@
 //! and google.rpc.ErrorInfo reason string using wire constants from
 //! `turul_a2a_types::wire::errors`.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use turul_a2a_types::wire::errors;
 
 /// Server-level error for A2A operations.
@@ -82,7 +82,7 @@ impl A2aError {
             Self::ExtensionSupportRequired { .. } => errors::JSONRPC_EXTENSION_SUPPORT_REQUIRED,
             Self::VersionNotSupported { .. } => errors::JSONRPC_VERSION_NOT_SUPPORTED,
             Self::InvalidRequest { .. } => -32602, // Invalid params
-            Self::Internal(_) => -32603,            // Internal error
+            Self::Internal(_) => -32603,           // Internal error
         }
     }
 
@@ -96,9 +96,7 @@ impl A2aError {
                 Some(errors::REASON_PUSH_NOTIFICATION_NOT_SUPPORTED)
             }
             Self::UnsupportedOperation { .. } => Some(errors::REASON_UNSUPPORTED_OPERATION),
-            Self::ContentTypeNotSupported { .. } => {
-                Some(errors::REASON_CONTENT_TYPE_NOT_SUPPORTED)
-            }
+            Self::ContentTypeNotSupported { .. } => Some(errors::REASON_CONTENT_TYPE_NOT_SUPPORTED),
             Self::InvalidAgentResponse { .. } => Some(errors::REASON_INVALID_AGENT_RESPONSE),
             Self::ExtendedAgentCardNotConfigured => {
                 Some(errors::REASON_EXTENDED_AGENT_CARD_NOT_CONFIGURED)
@@ -206,10 +204,7 @@ mod tests {
         };
         assert_eq!(err.http_status(), 409);
         assert_eq!(err.jsonrpc_code(), errors::JSONRPC_TASK_NOT_CANCELABLE);
-        assert_eq!(
-            err.error_reason(),
-            Some(errors::REASON_TASK_NOT_CANCELABLE)
-        );
+        assert_eq!(err.error_reason(), Some(errors::REASON_TASK_NOT_CANCELABLE));
     }
 
     #[test]
@@ -241,15 +236,29 @@ mod tests {
     #[test]
     fn all_a2a_errors_have_error_info() {
         let a2a_errors: Vec<A2aError> = vec![
-            A2aError::TaskNotFound { task_id: "t".into() },
-            A2aError::TaskNotCancelable { task_id: "t".into() },
+            A2aError::TaskNotFound {
+                task_id: "t".into(),
+            },
+            A2aError::TaskNotCancelable {
+                task_id: "t".into(),
+            },
             A2aError::PushNotificationNotSupported,
-            A2aError::UnsupportedOperation { message: "x".into() },
-            A2aError::ContentTypeNotSupported { content_type: "x".into() },
-            A2aError::InvalidAgentResponse { message: "x".into() },
+            A2aError::UnsupportedOperation {
+                message: "x".into(),
+            },
+            A2aError::ContentTypeNotSupported {
+                content_type: "x".into(),
+            },
+            A2aError::InvalidAgentResponse {
+                message: "x".into(),
+            },
             A2aError::ExtendedAgentCardNotConfigured,
-            A2aError::ExtensionSupportRequired { extension: "x".into() },
-            A2aError::VersionNotSupported { version: "x".into() },
+            A2aError::ExtensionSupportRequired {
+                extension: "x".into(),
+            },
+            A2aError::VersionNotSupported {
+                version: "x".into(),
+            },
         ];
 
         for err in &a2a_errors {
@@ -257,11 +266,13 @@ mod tests {
             assert!(info.is_some(), "{err} should have ErrorInfo");
             let info = info.unwrap();
             assert_eq!(
-                info["@type"], errors::ERROR_INFO_TYPE,
+                info["@type"],
+                errors::ERROR_INFO_TYPE,
                 "{err} ErrorInfo @type"
             );
             assert_eq!(
-                info["domain"], errors::ERROR_DOMAIN,
+                info["domain"],
+                errors::ERROR_DOMAIN,
                 "{err} ErrorInfo domain"
             );
             assert!(
@@ -273,7 +284,13 @@ mod tests {
 
     #[test]
     fn non_a2a_errors_have_no_error_info() {
-        assert!(A2aError::InvalidRequest { message: "x".into() }.error_info().is_none());
+        assert!(
+            A2aError::InvalidRequest {
+                message: "x".into()
+            }
+            .error_info()
+            .is_none()
+        );
         assert!(A2aError::Internal("x".into()).error_info().is_none());
     }
 
@@ -323,15 +340,29 @@ mod tests {
     #[test]
     fn all_nine_a2a_jsonrpc_codes_in_range() {
         let a2a_errors: Vec<A2aError> = vec![
-            A2aError::TaskNotFound { task_id: "t".into() },
-            A2aError::TaskNotCancelable { task_id: "t".into() },
+            A2aError::TaskNotFound {
+                task_id: "t".into(),
+            },
+            A2aError::TaskNotCancelable {
+                task_id: "t".into(),
+            },
             A2aError::PushNotificationNotSupported,
-            A2aError::UnsupportedOperation { message: "x".into() },
-            A2aError::ContentTypeNotSupported { content_type: "x".into() },
-            A2aError::InvalidAgentResponse { message: "x".into() },
+            A2aError::UnsupportedOperation {
+                message: "x".into(),
+            },
+            A2aError::ContentTypeNotSupported {
+                content_type: "x".into(),
+            },
+            A2aError::InvalidAgentResponse {
+                message: "x".into(),
+            },
             A2aError::ExtendedAgentCardNotConfigured,
-            A2aError::ExtensionSupportRequired { extension: "x".into() },
-            A2aError::VersionNotSupported { version: "x".into() },
+            A2aError::ExtensionSupportRequired {
+                extension: "x".into(),
+            },
+            A2aError::VersionNotSupported {
+                version: "x".into(),
+            },
         ];
 
         let codes: Vec<i32> = a2a_errors.iter().map(|e| e.jsonrpc_code()).collect();

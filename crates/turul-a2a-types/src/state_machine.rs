@@ -1,3 +1,4 @@
+use crate::TaskState;
 /// A2A TaskState transition validation.
 ///
 /// Validates transitions per the A2A v1.0 task lifecycle. `REJECTED`
@@ -16,7 +17,6 @@
 /// Unspecified -> ERROR (not a valid application state)
 /// ```
 use crate::error::A2aTypeError;
-use crate::TaskState;
 
 /// Validate a task state transition per A2A v1.0 lifecycle rules.
 pub fn validate_transition(from: TaskState, to: TaskState) -> Result<(), A2aTypeError> {
@@ -54,19 +54,17 @@ pub fn validate_transition(from: TaskState, to: TaskState) -> Result<(), A2aType
             }),
         },
         TaskState::AuthRequired => match to {
-            TaskState::Working
-            | TaskState::Failed
-            | TaskState::Canceled
-            | TaskState::Rejected => Ok(()),
+            TaskState::Working | TaskState::Failed | TaskState::Canceled | TaskState::Rejected => {
+                Ok(())
+            }
             _ => Err(A2aTypeError::InvalidTransition {
                 current: from,
                 requested: to,
             }),
         },
-        TaskState::Completed
-        | TaskState::Failed
-        | TaskState::Canceled
-        | TaskState::Rejected => Err(A2aTypeError::TerminalState(from)),
+        TaskState::Completed | TaskState::Failed | TaskState::Canceled | TaskState::Rejected => {
+            Err(A2aTypeError::TerminalState(from))
+        }
     }
 }
 
@@ -133,9 +131,7 @@ mod tests {
 
     #[test]
     fn invalid_input_required_transitions() {
-        assert!(
-            validate_transition(TaskState::InputRequired, TaskState::InputRequired).is_err()
-        );
+        assert!(validate_transition(TaskState::InputRequired, TaskState::InputRequired).is_err());
         assert!(validate_transition(TaskState::InputRequired, TaskState::AuthRequired).is_err());
         assert!(validate_transition(TaskState::InputRequired, TaskState::Submitted).is_err());
     }

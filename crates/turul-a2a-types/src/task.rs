@@ -70,8 +70,7 @@ impl TryFrom<i32> for TaskState {
     type Error = A2aTypeError;
 
     fn try_from(value: i32) -> Result<Self, Self::Error> {
-        let proto_state = pb::TaskState::try_from(value)
-            .map_err(|_| A2aTypeError::InvalidState)?;
+        let proto_state = pb::TaskState::try_from(value).map_err(|_| A2aTypeError::InvalidState)?;
         Self::try_from(proto_state)
     }
 }
@@ -100,8 +99,8 @@ impl TaskStatus {
     }
 
     pub fn state(&self) -> Result<TaskState, A2aTypeError> {
-        let proto_state = pb::TaskState::try_from(self.inner.state)
-            .map_err(|_| A2aTypeError::InvalidState)?;
+        let proto_state =
+            pb::TaskState::try_from(self.inner.state).map_err(|_| A2aTypeError::InvalidState)?;
         TaskState::try_from(proto_state)
     }
 
@@ -119,8 +118,8 @@ impl TryFrom<pb::TaskStatus> for TaskStatus {
 
     fn try_from(inner: pb::TaskStatus) -> Result<Self, Self::Error> {
         // Validate state is not UNSPECIFIED
-        let proto_state = pb::TaskState::try_from(inner.state)
-            .map_err(|_| A2aTypeError::InvalidState)?;
+        let proto_state =
+            pb::TaskState::try_from(inner.state).map_err(|_| A2aTypeError::InvalidState)?;
         if proto_state == pb::TaskState::Unspecified {
             return Err(A2aTypeError::InvalidState);
         }
@@ -182,7 +181,10 @@ impl Task {
     }
 
     pub fn status(&self) -> Option<TaskStatus> {
-        self.inner.status.clone().and_then(|s| TaskStatus::try_from(s).ok())
+        self.inner
+            .status
+            .clone()
+            .and_then(|s| TaskStatus::try_from(s).ok())
     }
 
     pub fn history(&self) -> &[pb::Message] {
@@ -263,8 +265,7 @@ impl Task {
         name: impl Into<String>,
         text: impl Into<String>,
     ) {
-        let artifact = Artifact::new(artifact_id, vec![crate::Part::text(text)])
-            .with_name(name);
+        let artifact = Artifact::new(artifact_id, vec![crate::Part::text(text)]).with_name(name);
         self.append_artifact(artifact);
     }
 
@@ -293,8 +294,8 @@ impl TryFrom<pb::Task> for Task {
             .status
             .as_ref()
             .ok_or(A2aTypeError::MissingField("status"))?;
-        let proto_state = pb::TaskState::try_from(status.state)
-            .map_err(|_| A2aTypeError::InvalidState)?;
+        let proto_state =
+            pb::TaskState::try_from(status.state).map_err(|_| A2aTypeError::InvalidState)?;
         if proto_state == pb::TaskState::Unspecified {
             return Err(A2aTypeError::InvalidState);
         }
@@ -328,14 +329,38 @@ mod tests {
 
     #[test]
     fn try_from_proto_all_valid_states() {
-        assert_eq!(TaskState::try_from(pb::TaskState::Submitted).unwrap(), TaskState::Submitted);
-        assert_eq!(TaskState::try_from(pb::TaskState::Working).unwrap(), TaskState::Working);
-        assert_eq!(TaskState::try_from(pb::TaskState::Completed).unwrap(), TaskState::Completed);
-        assert_eq!(TaskState::try_from(pb::TaskState::Failed).unwrap(), TaskState::Failed);
-        assert_eq!(TaskState::try_from(pb::TaskState::Canceled).unwrap(), TaskState::Canceled);
-        assert_eq!(TaskState::try_from(pb::TaskState::InputRequired).unwrap(), TaskState::InputRequired);
-        assert_eq!(TaskState::try_from(pb::TaskState::Rejected).unwrap(), TaskState::Rejected);
-        assert_eq!(TaskState::try_from(pb::TaskState::AuthRequired).unwrap(), TaskState::AuthRequired);
+        assert_eq!(
+            TaskState::try_from(pb::TaskState::Submitted).unwrap(),
+            TaskState::Submitted
+        );
+        assert_eq!(
+            TaskState::try_from(pb::TaskState::Working).unwrap(),
+            TaskState::Working
+        );
+        assert_eq!(
+            TaskState::try_from(pb::TaskState::Completed).unwrap(),
+            TaskState::Completed
+        );
+        assert_eq!(
+            TaskState::try_from(pb::TaskState::Failed).unwrap(),
+            TaskState::Failed
+        );
+        assert_eq!(
+            TaskState::try_from(pb::TaskState::Canceled).unwrap(),
+            TaskState::Canceled
+        );
+        assert_eq!(
+            TaskState::try_from(pb::TaskState::InputRequired).unwrap(),
+            TaskState::InputRequired
+        );
+        assert_eq!(
+            TaskState::try_from(pb::TaskState::Rejected).unwrap(),
+            TaskState::Rejected
+        );
+        assert_eq!(
+            TaskState::try_from(pb::TaskState::AuthRequired).unwrap(),
+            TaskState::AuthRequired
+        );
     }
 
     #[test]
@@ -419,17 +444,23 @@ mod tests {
 
     #[test]
     fn task_constructor() {
-        let task = Task::new("t-1", TaskStatus::new(TaskState::Submitted))
-            .with_context_id("ctx-1");
+        let task = Task::new("t-1", TaskStatus::new(TaskState::Submitted)).with_context_id("ctx-1");
         assert_eq!(task.id(), "t-1");
         assert_eq!(task.context_id(), "ctx-1");
-        assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Submitted);
+        assert_eq!(
+            task.status().unwrap().state().unwrap(),
+            TaskState::Submitted
+        );
     }
 
     #[test]
     fn task_append_history_and_artifacts() {
         let mut task = Task::new("t-2", TaskStatus::new(TaskState::Working));
-        task.append_message(crate::Message::new("m-1", Role::User, vec![Part::text("hi")]));
+        task.append_message(crate::Message::new(
+            "m-1",
+            Role::User,
+            vec![Part::text("hi")],
+        ));
         task.append_artifact(crate::Artifact::new("a-1", vec![Part::text("result")]));
         assert_eq!(task.history().len(), 1);
         assert_eq!(task.artifacts().len(), 1);
@@ -446,7 +477,11 @@ mod tests {
             false,
         );
 
-        assert_eq!(task.artifacts().len(), 1, "same-id append must not duplicate");
+        assert_eq!(
+            task.artifacts().len(),
+            1,
+            "same-id append must not duplicate"
+        );
         assert_eq!(task.artifacts()[0].parts.len(), 2);
     }
 
@@ -532,8 +567,7 @@ mod tests {
 
     #[test]
     fn task_serde_round_trip() {
-        let task = Task::new("t-rt", TaskStatus::new(TaskState::Working))
-            .with_context_id("ctx-rt");
+        let task = Task::new("t-rt", TaskStatus::new(TaskState::Working)).with_context_id("ctx-rt");
         let json = serde_json::to_string(&task).unwrap();
         let back: Task = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id(), "t-rt");
@@ -546,7 +580,10 @@ mod tests {
     fn task_complete_sets_completed_status() {
         let mut task = Task::new("h-1", TaskStatus::new(TaskState::Submitted));
         task.complete();
-        assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Completed);
+        assert_eq!(
+            task.status().unwrap().state().unwrap(),
+            TaskState::Completed
+        );
     }
 
     #[test]

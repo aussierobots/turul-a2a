@@ -193,7 +193,10 @@ async fn list_tasks_with_pagination() {
         .await;
 
     let client = A2aClient::new(server.uri());
-    let response = client.list_tasks(&ListTasksParams::default()).await.unwrap();
+    let response = client
+        .list_tasks(&ListTasksParams::default())
+        .await
+        .unwrap();
     assert_eq!(response.tasks.len(), 1);
     assert_eq!(response.next_page_token, "token-2");
     assert_eq!(response.total_size, 25);
@@ -216,9 +219,11 @@ async fn bearer_auth_sends_authorization_header() {
         .mount(&server)
         .await;
 
-    let client = A2aClient::new(server.uri())
-        .with_auth(ClientAuth::Bearer("my-jwt-token".into()));
-    client.list_tasks(&ListTasksParams::default()).await.unwrap();
+    let client = A2aClient::new(server.uri()).with_auth(ClientAuth::Bearer("my-jwt-token".into()));
+    client
+        .list_tasks(&ListTasksParams::default())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -238,7 +243,10 @@ async fn api_key_auth_sends_custom_header() {
         header: "X-API-Key".into(),
         key: "secret-key".into(),
     });
-    client.list_tasks(&ListTasksParams::default()).await.unwrap();
+    client
+        .list_tasks(&ListTasksParams::default())
+        .await
+        .unwrap();
 }
 
 // =========================================================
@@ -259,7 +267,10 @@ async fn tenant_prefix_applied_to_routes() {
         .await;
 
     let client = A2aClient::new(server.uri()).with_tenant("acme");
-    client.list_tasks(&ListTasksParams::default()).await.unwrap();
+    client
+        .list_tasks(&ListTasksParams::default())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -323,9 +334,7 @@ async fn a2a_version_header_sent_on_all_requests() {
 fn message_builder_data_produces_valid_request() {
     use turul_a2a_client::MessageBuilder;
 
-    let request = MessageBuilder::new()
-        .data(json!({"key": "value"}))
-        .build();
+    let request = MessageBuilder::new().data(json!({"key": "value"})).build();
 
     let msg = request.message.unwrap();
     assert_eq!(msg.parts.len(), 1);
@@ -352,15 +361,9 @@ fn message_builder_parts_accepts_iterator() {
     use turul_a2a_client::MessageBuilder;
     use turul_a2a_types::Part;
 
-    let parts = vec![
-        Part::text("one"),
-        Part::text("two"),
-        Part::text("three"),
-    ];
+    let parts = vec![Part::text("one"), Part::text("two"), Part::text("three")];
 
-    let request = MessageBuilder::new()
-        .parts(parts)
-        .build();
+    let request = MessageBuilder::new().parts(parts).build();
 
     let msg = request.message.unwrap();
     assert_eq!(msg.parts.len(), 3);

@@ -6,12 +6,14 @@
 
 use std::sync::Arc;
 
+use futures::StreamExt;
 use turul_a2a::card_builder::AgentCardBuilder;
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
 use turul_a2a::storage::InMemoryA2aStorage;
-use futures::StreamExt;
-use turul_a2a_client::{A2aClient, A2aClientError, ClientAuth, ListTasksParams, MessageBuilder, StreamEvent};
+use turul_a2a_client::{
+    A2aClient, A2aClientError, ClientAuth, ListTasksParams, MessageBuilder, StreamEvent,
+};
 use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
 
 // =========================================================
@@ -22,7 +24,12 @@ struct CompletingExecutor;
 
 #[async_trait::async_trait]
 impl AgentExecutor for CompletingExecutor {
-    async fn execute(&self, task: &mut Task, _msg: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
+    async fn execute(
+        &self,
+        task: &mut Task,
+        _msg: &Message,
+        _ctx: &turul_a2a::executor::ExecutionContext,
+    ) -> Result<(), A2aError> {
         task.push_text_artifact("tcp-art", "Result", "tcp e2e result");
         task.complete();
         Ok(())
@@ -43,7 +50,12 @@ struct PausingExecutor;
 
 #[async_trait::async_trait]
 impl AgentExecutor for PausingExecutor {
-    async fn execute(&self, task: &mut Task, _msg: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
+    async fn execute(
+        &self,
+        task: &mut Task,
+        _msg: &Message,
+        _ctx: &turul_a2a::executor::ExecutionContext,
+    ) -> Result<(), A2aError> {
         // First call: pause at INPUT_REQUIRED
         // Second call (continuation): complete
         if task.history().len() <= 1 {
@@ -109,13 +121,19 @@ async fn start_server_with_api_key(
     #[async_trait::async_trait]
     impl turul_a2a_auth::ApiKeyLookup for StaticKeyLookup {
         async fn lookup(&self, key: &str) -> Option<String> {
-            if key == self.key { Some("test-owner".into()) } else { None }
+            if key == self.key {
+                Some("test-owner".into())
+            } else {
+                None
+            }
         }
     }
 
     let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
     let auth = ApiKeyMiddleware::new(
-        Arc::new(StaticKeyLookup { key: expected_key.to_string() }),
+        Arc::new(StaticKeyLookup {
+            key: expected_key.to_string(),
+        }),
         "X-API-Key",
     );
 
@@ -158,7 +176,11 @@ fn send_request(id: &str, text: &str) -> turul_a2a_proto::SendMessageRequest {
     }
 }
 
-fn send_request_with_task(id: &str, text: &str, task_id: &str) -> turul_a2a_proto::SendMessageRequest {
+fn send_request_with_task(
+    id: &str,
+    text: &str,
+    task_id: &str,
+) -> turul_a2a_proto::SendMessageRequest {
     let mut req = send_request(id, text);
     if let Some(ref mut msg) = req.message {
         msg.task_id = task_id.into();
@@ -184,12 +206,18 @@ async fn e2e_tcp_send_message_creates_task() {
     let url = start_server(CompletingExecutor).await;
     let client = A2aClient::new(&url);
 
-    let resp = client.send_message(send_request("tcp-send-1", "hello")).await.unwrap();
+    let resp = client
+        .send_message(send_request("tcp-send-1", "hello"))
+        .await
+        .unwrap();
 
     // Response should contain a task
     let task = resp.into_task().expect("Expected Task payload");
     assert!(!task.id().is_empty());
-    assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Completed);
+    assert_eq!(
+        task.status().unwrap().state().unwrap(),
+        TaskState::Completed
+    );
     assert!(!task.artifacts().is_empty());
 }
 
@@ -198,13 +226,19 @@ async fn e2e_tcp_get_task_after_send() {
     let url = start_server(CompletingExecutor).await;
     let client = A2aClient::new(&url);
 
-    let resp = client.send_message(send_request("tcp-get-1", "create")).await.unwrap();
+    let resp = client
+        .send_message(send_request("tcp-get-1", "create"))
+        .await
+        .unwrap();
     let task_id = resp.task().expect("Expected Task").id().to_string();
 
     // Get with no history limit
     let task = client.get_task(&task_id, None).await.unwrap();
     assert_eq!(task.id(), task_id);
-    assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Completed);
+    assert_eq!(
+        task.status().unwrap().state().unwrap(),
+        TaskState::Completed
+    );
 
     // Get with history_length=0 should omit history
     let task = client.get_task(&task_id, Some(0)).await.unwrap();
@@ -226,7 +260,10 @@ async fn e2e_tcp_cancel_completed_task() {
     let url = start_server(CompletingExecutor).await;
     let client = A2aClient::new(&url);
 
-    let resp = client.send_message(send_request("tcp-cancel-1", "complete")).await.unwrap();
+    let resp = client
+        .send_message(send_request("tcp-cancel-1", "complete"))
+        .await
+        .unwrap();
     let task_id = resp.task().expect("Expected Task").id().to_string();
 
     let err = client.cancel_task(&task_id).await.unwrap_err();
@@ -239,7 +276,10 @@ async fn e2e_tcp_list_tasks_empty() {
     let url = start_server(CompletingExecutor).await;
     let client = A2aClient::new(&url);
 
-    let resp = client.list_tasks(&ListTasksParams::default()).await.unwrap();
+    let resp = client
+        .list_tasks(&ListTasksParams::default())
+        .await
+        .unwrap();
     assert!(resp.tasks.is_empty());
     assert_eq!(resp.total_size, 0);
 }
@@ -251,7 +291,10 @@ async fn e2e_tcp_list_tasks_pagination() {
 
     // Create 5 tasks
     for i in 0..5 {
-        client.send_message(send_request(&format!("tcp-list-{i}"), "task")).await.unwrap();
+        client
+            .send_message(send_request(&format!("tcp-list-{i}"), "task"))
+            .await
+            .unwrap();
     }
 
     // Paginate with page_size=2
@@ -288,9 +331,15 @@ async fn e2e_tcp_multi_turn_continuation() {
     let client = A2aClient::new(&url);
 
     // First send: pauses at INPUT_REQUIRED
-    let resp = client.send_message(send_request("tcp-multi-1", "start")).await.unwrap();
+    let resp = client
+        .send_message(send_request("tcp-multi-1", "start"))
+        .await
+        .unwrap();
     let task = resp.task().expect("Expected Task");
-    assert_eq!(task.status().unwrap().state().unwrap(), TaskState::InputRequired);
+    assert_eq!(
+        task.status().unwrap().state().unwrap(),
+        TaskState::InputRequired
+    );
     let task_id = task.id().to_string();
 
     // Second send with same task_id: completes
@@ -301,7 +350,10 @@ async fn e2e_tcp_multi_turn_continuation() {
 
     let task = resp.task().expect("Expected Task");
     assert_eq!(task.id(), task_id);
-    assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Completed);
+    assert_eq!(
+        task.status().unwrap().state().unwrap(),
+        TaskState::Completed
+    );
 }
 
 #[tokio::test]
@@ -312,7 +364,10 @@ async fn e2e_tcp_tenant_isolation() {
     let client_default = A2aClient::new(&url);
 
     // Create task under alpha
-    let resp = client_alpha.send_message(send_request("tcp-tenant-1", "alpha task")).await.unwrap();
+    let resp = client_alpha
+        .send_message(send_request("tcp-tenant-1", "alpha task"))
+        .await
+        .unwrap();
     let task_id = resp.task().expect("Expected Task").id().to_string();
 
     // Alpha can see it
@@ -328,10 +383,16 @@ async fn e2e_tcp_tenant_isolation() {
     assert_eq!(err.status(), Some(404));
 
     // Alpha list has 1, default has 0
-    let alpha_list = client_alpha.list_tasks(&ListTasksParams::default()).await.unwrap();
+    let alpha_list = client_alpha
+        .list_tasks(&ListTasksParams::default())
+        .await
+        .unwrap();
     assert_eq!(alpha_list.total_size, 1);
 
-    let default_list = client_default.list_tasks(&ListTasksParams::default()).await.unwrap();
+    let default_list = client_default
+        .list_tasks(&ListTasksParams::default())
+        .await
+        .unwrap();
     assert_eq!(default_list.total_size, 0);
 }
 
@@ -343,9 +404,15 @@ async fn e2e_tcp_api_key_auth_accepted() {
         key: "test-secret".into(),
     });
 
-    let resp = client.send_message(send_request("tcp-auth-1", "authed")).await.unwrap();
+    let resp = client
+        .send_message(send_request("tcp-auth-1", "authed"))
+        .await
+        .unwrap();
     let task = resp.task().expect("Expected Task");
-    assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Completed);
+    assert_eq!(
+        task.status().unwrap().state().unwrap(),
+        TaskState::Completed
+    );
 }
 
 #[tokio::test]
@@ -353,7 +420,10 @@ async fn e2e_tcp_api_key_auth_rejected() {
     let url = start_server_with_api_key(CompletingExecutor, "test-secret").await;
     let client = A2aClient::new(&url); // No auth
 
-    let err = client.send_message(send_request("tcp-auth-2", "no auth")).await.unwrap_err();
+    let err = client
+        .send_message(send_request("tcp-auth-2", "no auth"))
+        .await
+        .unwrap_err();
     assert_eq!(err.status(), Some(401));
 }
 
@@ -365,7 +435,11 @@ async fn e2e_tcp_error_envelope_format() {
     // Any error — 404 from get_task
     let err = client.get_task("missing", None).await.unwrap_err();
     match err {
-        A2aClientError::A2aError { status, message, reason } => {
+        A2aClientError::A2aError {
+            status,
+            message,
+            reason,
+        } => {
             assert_eq!(status, 404);
             assert!(!message.is_empty());
             assert_eq!(reason.as_deref(), Some("TASK_NOT_FOUND"));
@@ -421,10 +495,7 @@ async fn e2e_tcp_subscribe_to_non_terminal_task() {
     let mut stream = client.subscribe_to_task(&task_id, None).await.unwrap();
 
     // Collect first event (Task snapshot)
-    let first = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        stream.next(),
-    ).await;
+    let first = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next()).await;
 
     match first {
         Ok(Some(Ok(event))) => {
@@ -453,7 +524,11 @@ async fn e2e_tcp_subscribe_terminal_task_returns_error() {
     // Subscribe to terminal task — should error
     match client.subscribe_to_task(&task_id, None).await {
         Err(err) => {
-            assert_eq!(err.status(), Some(400), "Terminal subscribe should return 400");
+            assert_eq!(
+                err.status(),
+                Some(400),
+                "Terminal subscribe should return 400"
+            );
         }
         Ok(_) => panic!("Subscribe to terminal task should return error"),
     }
@@ -465,9 +540,7 @@ async fn e2e_tcp_message_builder_ergonomics() {
     let client = A2aClient::new(&url);
 
     // MessageBuilder hides proto nesting
-    let request = MessageBuilder::new()
-        .text("hello from builder")
-        .build();
+    let request = MessageBuilder::new().text("hello from builder").build();
 
     let resp = client.send_message(request).await.unwrap();
     let task = resp.task().expect("Expected Task");

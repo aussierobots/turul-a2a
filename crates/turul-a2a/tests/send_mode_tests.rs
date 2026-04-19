@@ -30,9 +30,9 @@ use tokio::sync::Notify;
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
 use turul_a2a::middleware::MiddlewareStack;
-use turul_a2a::router::{core_send_message, AppState};
-use turul_a2a::server::in_flight::InFlightRegistry;
+use turul_a2a::router::{AppState, core_send_message};
 use turul_a2a::server::RuntimeConfig;
+use turul_a2a::server::in_flight::InFlightRegistry;
 use turul_a2a::storage::InMemoryA2aStorage;
 use turul_a2a::streaming::TaskEventBroker;
 use turul_a2a_types::{Artifact, Message, Part, Role, Task, TaskState};
@@ -55,7 +55,7 @@ fn make_state(executor: Arc<dyn AgentExecutor>) -> AppState {
         in_flight: Arc::new(InFlightRegistry::new()),
         cancellation_supervisor: storage,
         push_delivery_store: None,
-            push_dispatcher: None,
+        push_dispatcher: None,
     }
 }
 
@@ -154,11 +154,7 @@ async fn blocking_send_long_running_sink_driven_completes() {
         task.status().unwrap().state().unwrap(),
         TaskState::Completed
     );
-    assert_eq!(
-        task.artifacts().len(),
-        1,
-        "emitted artifact should persist"
-    );
+    assert_eq!(task.artifacts().len(), 1, "emitted artifact should persist");
 }
 
 // ---------------------------------------------------------------------------
@@ -254,9 +250,10 @@ async fn blocking_send_direct_task_mutation_extended_artifact_is_persisted() {
 #[tokio::test]
 async fn blocking_send_direct_task_mutation_still_terminates_via_cas() {
     let state = make_state(Arc::new(DirectMutationCompleter));
-    let axum::Json(v) = core_send_message(state.clone(), "", "owner-legacy", send_request_body("x"))
-        .await
-        .expect("blocking send on direct-task-mutation executor");
+    let axum::Json(v) =
+        core_send_message(state.clone(), "", "owner-legacy", send_request_body("x"))
+            .await
+            .expect("blocking send on direct-task-mutation executor");
     let task = task_from_response(v);
     assert_eq!(
         task.status().unwrap().state().unwrap(),
@@ -282,7 +279,9 @@ impl AgentExecutor for ErrReturner {
         _msg: &Message,
         _ctx: &ExecutionContext,
     ) -> Result<(), A2aError> {
-        Err(A2aError::Internal("boom — upstream service unavailable".into()))
+        Err(A2aError::Internal(
+            "boom — upstream service unavailable".into(),
+        ))
     }
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
         turul_a2a_proto::AgentCard::default()
@@ -296,14 +295,15 @@ async fn blocking_send_executor_err_commits_failed() {
         .await
         .expect("blocking send returns the FAILED task, not an Err");
     let task = task_from_response(v);
-    assert_eq!(
-        task.status().unwrap().state().unwrap(),
-        TaskState::Failed
-    );
+    assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Failed);
     // The framework's agent-authored failure message carries the
     // executor's error text.
     let pb_status = task.status().unwrap();
-    let msg = pb_status.as_proto().message.as_ref().expect("status message present");
+    let msg = pb_status
+        .as_proto()
+        .message
+        .as_ref()
+        .expect("status message present");
     let msg_text: String = msg
         .parts
         .iter()
@@ -334,7 +334,9 @@ impl AgentExecutor for PolicyRejecter {
         _msg: &Message,
         ctx: &ExecutionContext,
     ) -> Result<(), A2aError> {
-        ctx.events.reject(Some("policy: not permitted".into())).await?;
+        ctx.events
+            .reject(Some("policy: not permitted".into()))
+            .await?;
         Ok(())
     }
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
@@ -387,7 +389,9 @@ impl AgentExecutor for CooperativeCancelLoop {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        ctx.events.fail(Some("cancellation never arrived".into())).await?;
+        ctx.events
+            .fail(Some("cancellation never arrived".into()))
+            .await?;
         Ok(())
     }
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
@@ -490,7 +494,11 @@ async fn blocking_send_two_deadline_abort_fallback_returns_failed() {
         "hard-deadline must fire within soft + grace + slack, got {elapsed:?}"
     );
     let pb_status = task.status().unwrap();
-    let msg = pb_status.as_proto().message.as_ref().expect("timeout message present");
+    let msg = pb_status
+        .as_proto()
+        .message
+        .as_ref()
+        .expect("timeout message present");
     let msg_text: String = msg
         .parts
         .iter()
@@ -529,10 +537,9 @@ async fn blocking_send_hard_timeout_actually_aborts_executor() {
         Duration::from_millis(150),
     );
 
-    let axum::Json(_v) =
-        core_send_message(state, "", "owner-abort-probe", send_request_body("x"))
-            .await
-            .expect("blocking send force-commits FAILED");
+    let axum::Json(_v) = core_send_message(state, "", "owner-abort-probe", send_request_body("x"))
+        .await
+        .expect("blocking send force-commits FAILED");
 
     // The Sender lives inside the executor future. When the future
     // drops (via abort), the Sender drops, and `rx` resolves —

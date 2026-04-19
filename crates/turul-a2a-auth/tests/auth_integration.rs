@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use turul_a2a::middleware::{AnyOfMiddleware, A2aMiddleware, MiddlewareError, RequestContext};
+use turul_a2a::middleware::{A2aMiddleware, AnyOfMiddleware, MiddlewareError, RequestContext};
 use turul_a2a_auth::{ApiKeyMiddleware, StaticApiKeyLookup};
 
 fn api_key_middleware() -> ApiKeyMiddleware {
@@ -23,19 +23,14 @@ struct FakeBearerMiddleware;
 
 #[async_trait::async_trait]
 impl A2aMiddleware for FakeBearerMiddleware {
-    async fn before_request(
-        &self,
-        _ctx: &mut RequestContext,
-    ) -> Result<(), MiddlewareError> {
+    async fn before_request(&self, _ctx: &mut RequestContext) -> Result<(), MiddlewareError> {
         Err(MiddlewareError::HttpChallenge {
             status: 401,
             www_authenticate: "Bearer realm=\"a2a\"".into(),
         })
     }
 
-    fn security_contribution(
-        &self,
-    ) -> turul_a2a::middleware::SecurityContribution {
+    fn security_contribution(&self) -> turul_a2a::middleware::SecurityContribution {
         turul_a2a::middleware::SecurityContribution::new().with_scheme(
             "bearer",
             turul_a2a_proto::SecurityScheme {

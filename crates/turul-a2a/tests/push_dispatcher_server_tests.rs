@@ -14,10 +14,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use tokio::sync::Notify;
 use axum::body::Body;
 use http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
+use tokio::sync::Notify;
 use tower::ServiceExt;
 
 use turul_a2a::error::A2aError;
@@ -165,9 +165,7 @@ async fn framework_cancel_triggers_push_delivery_with_canceled_state() {
 
     let create_req = Request::builder()
         .method(Method::POST)
-        .uri(format!(
-            "/tasks/{task_id}/pushNotificationConfigs"
-        ))
+        .uri(format!("/tasks/{task_id}/pushNotificationConfigs"))
         .header("content-type", "application/json")
         .header("A2A-Version", "1.0")
         .body(Body::from(config_body.to_string()))
@@ -192,11 +190,7 @@ async fn framework_cancel_triggers_push_delivery_with_canceled_state() {
         .body(Body::empty())
         .unwrap();
     let cancel_resp = router.clone().oneshot(cancel_req).await.unwrap();
-    assert_eq!(
-        cancel_resp.status(),
-        StatusCode::OK,
-        "cancel must succeed"
-    );
+    assert_eq!(cancel_resp.status(), StatusCode::OK, "cancel must succeed");
     let cancel_body = cancel_resp.into_body().collect().await.unwrap().to_bytes();
     let cancel_json: serde_json::Value = serde_json::from_slice(&cancel_body).unwrap();
     assert_eq!(
@@ -282,8 +276,10 @@ impl turul_a2a::storage::A2aPushNotificationStorage for TinyPageStorage {
         tenant: &str,
         task_id: &str,
         config_id: &str,
-    ) -> Result<Option<turul_a2a_proto::TaskPushNotificationConfig>, turul_a2a::storage::A2aStorageError>
-    {
+    ) -> Result<
+        Option<turul_a2a_proto::TaskPushNotificationConfig>,
+        turul_a2a::storage::A2aStorageError,
+    > {
         self.inner.get_config(tenant, task_id, config_id).await
     }
     async fn list_configs(
@@ -295,7 +291,9 @@ impl turul_a2a::storage::A2aPushNotificationStorage for TinyPageStorage {
     ) -> Result<turul_a2a::storage::PushConfigListPage, turul_a2a::storage::A2aStorageError> {
         // Force page_size=1 so the dispatcher must traverse the full
         // chain to see every config.
-        self.inner.list_configs(tenant, task_id, page_token, Some(1)).await
+        self.inner
+            .list_configs(tenant, task_id, page_token, Some(1))
+            .await
     }
     async fn delete_config(
         &self,
@@ -546,9 +544,7 @@ async fn executor_completion_triggers_push_delivery_with_completed_state() {
     let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
     let gate = Arc::new(Notify::new());
     let server = A2aServer::builder()
-        .executor(GatedExecutor {
-            gate: gate.clone(),
-        })
+        .executor(GatedExecutor { gate: gate.clone() })
         .storage(storage.clone())
         .allow_insecure_push_urls(true)
         .push_max_attempts(1)

@@ -1,9 +1,7 @@
 //! Lambda authorizer middleware — reads trusted x-authorizer-* headers.
 
 use async_trait::async_trait;
-use turul_a2a::middleware::{
-    A2aMiddleware, AuthIdentity, MiddlewareError, RequestContext,
-};
+use turul_a2a::middleware::{A2aMiddleware, AuthIdentity, MiddlewareError, RequestContext};
 
 use crate::adapter::AUTHORIZER_HEADER_PREFIX;
 
@@ -73,7 +71,10 @@ fn collect_authorizer_claims(headers: &http::HeaderMap) -> serde_json::Value {
         let key_str = key.as_str();
         if let Some(field) = key_str.strip_prefix(AUTHORIZER_HEADER_PREFIX) {
             if let Ok(val) = value.to_str() {
-                claims.insert(field.to_string(), serde_json::Value::String(val.to_string()));
+                claims.insert(
+                    field.to_string(),
+                    serde_json::Value::String(val.to_string()),
+                );
             }
         }
     }

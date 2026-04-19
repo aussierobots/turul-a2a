@@ -56,10 +56,7 @@ impl SseStream {
                             buffer.push_str(&String::from_utf8_lossy(&chunk));
                         }
                         Some(Err(e)) => {
-                            return Some((
-                                Err(A2aClientError::Request(e)),
-                                (stream, buffer),
-                            ));
+                            return Some((Err(A2aClientError::Request(e)), (stream, buffer)));
                         }
                         None => {
                             // Stream ended — check if there's a final event in the buffer
@@ -171,33 +168,51 @@ fn parse_stream_event(raw: &SseEvent) -> Result<TypedSseEvent, A2aClientError> {
     let event = if let Some(task_json) = data.get("task") {
         let proto: turul_a2a_proto::Task = serde_json::from_value(task_json.clone())
             .map_err(|e| A2aClientError::Conversion(format!("Invalid Task: {e}")))?;
-        let task = Task::try_from(proto)
-            .map_err(|e| A2aClientError::Conversion(e.to_string()))?;
+        let task = Task::try_from(proto).map_err(|e| A2aClientError::Conversion(e.to_string()))?;
         StreamEvent::Task(task)
     } else if let Some(msg_json) = data.get("message") {
         let proto: turul_a2a_proto::Message = serde_json::from_value(msg_json.clone())
             .map_err(|e| A2aClientError::Conversion(format!("Invalid Message: {e}")))?;
-        let msg = Message::try_from(proto)
-            .map_err(|e| A2aClientError::Conversion(e.to_string()))?;
+        let msg =
+            Message::try_from(proto).map_err(|e| A2aClientError::Conversion(e.to_string()))?;
         StreamEvent::Message(msg)
     } else if let Some(su) = data.get("statusUpdate") {
         StreamEvent::StatusUpdate {
-            task_id: su.get("taskId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            context_id: su.get("contextId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            task_id: su
+                .get("taskId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            context_id: su
+                .get("contextId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             status: su.get("status").cloned().unwrap_or_default(),
         }
     } else if let Some(au) = data.get("artifactUpdate") {
         StreamEvent::ArtifactUpdate {
-            task_id: au.get("taskId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            context_id: au.get("contextId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            task_id: au
+                .get("taskId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            context_id: au
+                .get("contextId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             artifact: au.get("artifact").cloned().unwrap_or_default(),
             append: au.get("append").and_then(|v| v.as_bool()).unwrap_or(false),
-            last_chunk: au.get("lastChunk").and_then(|v| v.as_bool()).unwrap_or(false),
+            last_chunk: au
+                .get("lastChunk")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         }
     } else {
-        return Err(A2aClientError::Conversion(
-            format!("Unknown stream event shape: {data}")
-        ));
+        return Err(A2aClientError::Conversion(format!(
+            "Unknown stream event shape: {data}"
+        )));
     };
 
     Ok(TypedSseEvent {

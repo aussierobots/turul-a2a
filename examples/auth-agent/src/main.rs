@@ -21,10 +21,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use turul_a2a::A2aServer;
 use turul_a2a::card_builder::{AgentCardBuilder, AgentSkillBuilder};
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
-use turul_a2a::A2aServer;
 use turul_a2a_auth::{ApiKeyMiddleware, StaticApiKeyLookup};
 use turul_a2a_types::{Message, Task};
 
@@ -32,7 +32,12 @@ struct AuthEchoExecutor;
 
 #[async_trait::async_trait]
 impl AgentExecutor for AuthEchoExecutor {
-    async fn execute(&self, task: &mut Task, _message: &Message, ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
+    async fn execute(
+        &self,
+        task: &mut Task,
+        _message: &Message,
+        ctx: &turul_a2a::executor::ExecutionContext,
+    ) -> Result<(), A2aError> {
         // Use ExecutionContext to access caller identity
         let response = format!(
             "Authenticated as: {} (tenant: {})",
@@ -40,11 +45,7 @@ impl AgentExecutor for AuthEchoExecutor {
             ctx.tenant.as_deref().unwrap_or("default"),
         );
 
-        task.push_text_artifact(
-            uuid::Uuid::now_v7().to_string(),
-            "Auth Echo",
-            response,
-        );
+        task.push_text_artifact(uuid::Uuid::now_v7().to_string(), "Auth Echo", response);
         task.complete();
         Ok(())
     }
@@ -76,10 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     keys.insert("demo-key-alice".to_string(), "alice".to_string());
     keys.insert("demo-key-bob".to_string(), "bob".to_string());
 
-    let api_key_auth = ApiKeyMiddleware::new(
-        Arc::new(StaticApiKeyLookup::new(keys)),
-        "X-API-Key",
-    );
+    let api_key_auth = ApiKeyMiddleware::new(Arc::new(StaticApiKeyLookup::new(keys)), "X-API-Key");
 
     let server = A2aServer::builder()
         .executor(AuthEchoExecutor)
@@ -94,14 +92,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  curl -s http://localhost:3001/message:send \\");
     println!("    -H 'Content-Type: application/json' \\");
     println!("    -H 'a2a-version: 1.0' \\");
-    println!("    -d '{{\"message\":{{\"messageId\":\"1\",\"role\":\"ROLE_USER\",\"parts\":[{{\"text\":\"hello\"}}]}}}}'");
+    println!(
+        "    -d '{{\"message\":{{\"messageId\":\"1\",\"role\":\"ROLE_USER\",\"parts\":[{{\"text\":\"hello\"}}]}}}}'"
+    );
     println!();
     println!("With auth (should 200):");
     println!("  curl -s http://localhost:3001/message:send \\");
     println!("    -H 'Content-Type: application/json' \\");
     println!("    -H 'a2a-version: 1.0' \\");
     println!("    -H 'X-API-Key: demo-key-alice' \\");
-    println!("    -d '{{\"message\":{{\"messageId\":\"1\",\"role\":\"ROLE_USER\",\"parts\":[{{\"text\":\"hello\"}}]}}}}'");
+    println!(
+        "    -d '{{\"message\":{{\"messageId\":\"1\",\"role\":\"ROLE_USER\",\"parts\":[{{\"text\":\"hello\"}}]}}}}'"
+    );
 
     server.run().await?;
     Ok(())

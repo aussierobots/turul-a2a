@@ -11,7 +11,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use turul_a2a::executor::AgentExecutor;
-use turul_a2a::router::{build_router, AppState};
+use turul_a2a::router::{AppState, build_router};
 use turul_a2a::storage::InMemoryA2aStorage;
 use turul_a2a_types::{Message, Task};
 
@@ -73,7 +73,7 @@ fn test_state() -> AppState {
         in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
-            push_dispatcher: None,
+        push_dispatcher: None,
     }
 }
 
@@ -95,7 +95,10 @@ async fn assert_route_dispatches(router: axum::Router, req: Request<Body>) {
     let status = resp.status().as_u16();
     if status == 404 {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        assert!(!body.is_empty(), "Route returned 404 with empty body — not registered");
+        assert!(
+            !body.is_empty(),
+            "Route returned 404 with empty body — not registered"
+        );
     }
 }
 
@@ -127,10 +130,7 @@ async fn well_known_agent_card_has_required_fields() {
         body.get("description").is_some(),
         "AgentCard must have description"
     );
-    assert!(
-        body.get("version").is_some(),
-        "AgentCard must have version"
-    );
+    assert!(body.get("version").is_some(), "AgentCard must have version");
 }
 
 #[tokio::test]
@@ -193,8 +193,10 @@ async fn get_task_routes() {
 #[tokio::test]
 async fn list_tasks_routes() {
     let router = build_router(test_state());
-    let req = Request::get("/tasks").header("a2a-version", "1.0")
-        .body(Body::empty()).unwrap();
+    let req = Request::get("/tasks")
+        .header("a2a-version", "1.0")
+        .body(Body::empty())
+        .unwrap();
     let status = response_status(router, req).await;
     assert_ne!(status, 404, "GET /tasks must route");
 }

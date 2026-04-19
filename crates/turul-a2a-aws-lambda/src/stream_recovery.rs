@@ -30,11 +30,9 @@
 use std::sync::Arc;
 
 use aws_lambda_events::event::dynamodb::Event as DynamoDbEvent;
-use aws_lambda_events::event::streams::{
-    DynamoDbBatchItemFailure, DynamoDbEventResponse,
-};
-use turul_a2a::push::claim::PendingDispatch;
+use aws_lambda_events::event::streams::{DynamoDbBatchItemFailure, DynamoDbEventResponse};
 use turul_a2a::push::PushDispatcher;
+use turul_a2a::push::claim::PendingDispatch;
 
 /// Handler for DynamoDB Stream events on `a2a_push_pending_dispatches`.
 ///
@@ -59,10 +57,7 @@ impl LambdaStreamRecoveryHandler {
     /// `SequenceNumber` are skipped with a log warning — they cannot
     /// be surfaced in `BatchItemFailures` (the field is required by
     /// the Lambda service to identify the record to retry).
-    pub async fn handle_stream_event(
-        &self,
-        event: DynamoDbEvent,
-    ) -> DynamoDbEventResponse {
+    pub async fn handle_stream_event(&self, event: DynamoDbEvent) -> DynamoDbEventResponse {
         let mut failures: Vec<DynamoDbBatchItemFailure> = Vec::new();
 
         for record in event.records {
@@ -151,17 +146,15 @@ fn push_failure(failures: &mut Vec<DynamoDbBatchItemFailure>, seq: Option<String
 /// A missing or wrong-typed attribute surfaces as a parse error;
 /// the caller turns that into a `BatchItemFailure` so operators can
 /// investigate the malformed record out-of-band.
-fn parse_pending_from_new_image(
-    item: &serde_dynamo::Item,
-) -> Result<PendingDispatch, ParseError> {
+fn parse_pending_from_new_image(item: &serde_dynamo::Item) -> Result<PendingDispatch, ParseError> {
     let tenant = string_attr(item, "tenant")?;
     let task_id = string_attr(item, "taskId")?;
     let owner = string_attr(item, "owner")?;
     let event_sequence = number_attr::<u64>(item, "eventSequence")?;
     let recorded_at_micros = number_attr::<i64>(item, "recordedAtMicros")?;
 
-    let recorded_at = std::time::UNIX_EPOCH
-        + std::time::Duration::from_micros(recorded_at_micros.max(0) as u64);
+    let recorded_at =
+        std::time::UNIX_EPOCH + std::time::Duration::from_micros(recorded_at_micros.max(0) as u64);
 
     Ok(PendingDispatch::new(
         tenant,
@@ -198,7 +191,7 @@ fn number_attr<T: std::str::FromStr>(
             return Err(ParseError::WrongType {
                 key: key.to_string(),
                 expected: "N",
-            })
+            });
         }
     };
     n.parse::<T>().map_err(|_| ParseError::NumberParse {

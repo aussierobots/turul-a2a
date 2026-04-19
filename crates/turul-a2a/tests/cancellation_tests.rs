@@ -17,9 +17,9 @@ use tokio_util::sync::CancellationToken;
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
 use turul_a2a::middleware::MiddlewareStack;
-use turul_a2a::router::{core_cancel_task, AppState};
-use turul_a2a::server::in_flight::{InFlightHandle, InFlightRegistry};
+use turul_a2a::router::{AppState, core_cancel_task};
 use turul_a2a::server::RuntimeConfig;
+use turul_a2a::server::in_flight::{InFlightHandle, InFlightRegistry};
 use turul_a2a::storage::{A2aCancellationSupervisor, A2aTaskStorage, InMemoryA2aStorage};
 use turul_a2a::streaming::{StreamEvent, TaskEventBroker};
 use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
@@ -62,7 +62,7 @@ fn make_state() -> (AppState, InMemoryA2aStorage) {
         in_flight: Arc::new(InFlightRegistry::new()),
         cancellation_supervisor: Arc::new(storage.clone()),
         push_delivery_store: None,
-            push_dispatcher: None,
+        push_dispatcher: None,
     };
     (state, storage)
 }
@@ -79,8 +79,8 @@ fn with_fast_grace(mut state: AppState) -> AppState {
 /// Seed a task in Submitted state via the task storage (bypassing the
 /// atomic store so we don't add extra events during setup).
 async fn seed_task(storage: &InMemoryA2aStorage, tenant: &str, owner: &str, task_id: &str) {
-    let task = Task::new(task_id, TaskStatus::new(TaskState::Submitted))
-        .with_context_id("ctx-cancel");
+    let task =
+        Task::new(task_id, TaskStatus::new(TaskState::Submitted)).with_context_id("ctx-cancel");
     storage
         .create_task(tenant, owner, task)
         .await
@@ -89,7 +89,12 @@ async fn seed_task(storage: &InMemoryA2aStorage, tenant: &str, owner: &str, task
 
 /// Advance a seeded task to Working via the atomic store (so state is
 /// cancel-eligible and there is a WORKING event in the store).
-async fn advance_to_working(storage: &InMemoryA2aStorage, tenant: &str, owner: &str, task_id: &str) {
+async fn advance_to_working(
+    storage: &InMemoryA2aStorage,
+    tenant: &str,
+    owner: &str,
+    task_id: &str,
+) {
     use turul_a2a::storage::A2aAtomicStore;
     storage
         .update_task_status_with_events(
@@ -116,7 +121,11 @@ fn install_in_flight(
     state: &AppState,
     tenant: &str,
     task_id: &str,
-) -> (Arc<InFlightHandle>, CancellationToken, tokio::task::AbortHandle) {
+) -> (
+    Arc<InFlightHandle>,
+    CancellationToken,
+    tokio::task::AbortHandle,
+) {
     let token = CancellationToken::new();
     let exposed = token.clone();
     // spawned task: waits on cancellation — represents a live executor
@@ -127,7 +136,10 @@ fn install_in_flight(
     let handle = Arc::new(InFlightHandle::new(exposed.clone(), yielded_tx, spawned));
     state
         .in_flight
-        .try_insert((tenant.to_string(), task_id.to_string()), Arc::clone(&handle))
+        .try_insert(
+            (tenant.to_string(), task_id.to_string()),
+            Arc::clone(&handle),
+        )
         .expect("try_insert");
     (handle, exposed, abort)
 }
@@ -153,7 +165,9 @@ async fn same_instance_cancel_trips_executor_token() {
     // was tripped).
     let state_clone = with_fast_grace(state.clone());
     let cancel_handle =
-        tokio::spawn(async move { core_cancel_task(state_clone, "default", "owner-a", "t-1").await });
+        tokio::spawn(
+            async move { core_cancel_task(state_clone, "default", "owner-a", "t-1").await },
+        );
 
     // Poll for the token being tripped. Deterministic via yield_now; the
     // :cancel handler trips the token BEFORE entering its grace loop.
@@ -172,9 +186,19 @@ async fn same_instance_cancel_trips_executor_token() {
 
     // Let the cancel handler complete (grace expires, framework commits
     // CANCELED). Response is a terminal Task.
-    let result = cancel_handle.await.expect("cancel task").expect("cancel OK");
-    let state_str = result.get("status").and_then(|s| s.get("state")).and_then(|v| v.as_str());
-    assert_eq!(state_str, Some("TASK_STATE_CANCELED"), "terminal is CANCELED");
+    let result = cancel_handle
+        .await
+        .expect("cancel task")
+        .expect("cancel OK");
+    let state_str = result
+        .get("status")
+        .and_then(|s| s.get("state"))
+        .and_then(|v| v.as_str());
+    assert_eq!(
+        state_str,
+        Some("TASK_STATE_CANCELED"),
+        "terminal is CANCELED"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +222,7 @@ async fn cross_instance_cancel_via_storage_marker() {
         in_flight: Arc::new(InFlightRegistry::new()),
         cancellation_supervisor: Arc::new(storage),
         push_delivery_store: None,
-            push_dispatcher: None,
+        push_dispatcher: None,
     };
     let state_a = make_state_for_storage(storage.clone());
     let state_b = make_state_for_storage(storage.clone());
@@ -254,10 +278,18 @@ async fn cancel_on_orphaned_task_resolves_via_grace_fallback() {
     // response) and then force-commit CANCELED via the atomic store.
 
     let state_fast = with_fast_grace(state);
-    let result =
-        core_cancel_task(state_fast, "default", "owner-o", "t-orphan").await.expect("cancel OK");
-    let state_str = result.get("status").and_then(|s| s.get("state")).and_then(|v| v.as_str());
-    assert_eq!(state_str, Some("TASK_STATE_CANCELED"), "orphan resolved to CANCELED");
+    let result = core_cancel_task(state_fast, "default", "owner-o", "t-orphan")
+        .await
+        .expect("cancel OK");
+    let state_str = result
+        .get("status")
+        .and_then(|s| s.get("state"))
+        .and_then(|v| v.as_str());
+    assert_eq!(
+        state_str,
+        Some("TASK_STATE_CANCELED"),
+        "orphan resolved to CANCELED"
+    );
 
     // Framework-committed terminal has message = None per ADR-012 §8.
     let message = result.get("status").and_then(|s| s.get("message"));
@@ -290,20 +322,28 @@ async fn cancel_vs_cancel_idempotency() {
     let r1 = r1.expect("first cancel must succeed");
     let r2 = r2.expect("second cancel must succeed (idempotent)");
     for r in [&r1, &r2] {
-        let s = r.get("status").and_then(|s| s.get("state")).and_then(|v| v.as_str());
+        let s = r
+            .get("status")
+            .and_then(|s| s.get("state"))
+            .and_then(|v| v.as_str());
         assert_eq!(s, Some("TASK_STATE_CANCELED"), "both return CANCELED");
     }
 
     // Event store has exactly one CANCELED event (the single-terminal-writer
     // invariant from ADR-010 §7.1 enforces this at the atomic-store layer).
     use turul_a2a::storage::A2aEventStore;
-    let events = storage.get_events_after("default", "t-idem", 0).await.unwrap();
+    let events = storage
+        .get_events_after("default", "t-idem", 0)
+        .await
+        .unwrap();
     let canceled_count = events
         .iter()
-        .filter(|(_, e)| matches!(e, StreamEvent::StatusUpdate { status_update } if status_update
+        .filter(|(_, e)| {
+            matches!(e, StreamEvent::StatusUpdate { status_update } if status_update
                 .status
                 .get("state")
-                .and_then(|v| v.as_str()) == Some("TASK_STATE_CANCELED")))
+                .and_then(|v| v.as_str()) == Some("TASK_STATE_CANCELED"))
+        })
         .count();
     assert_eq!(
         canceled_count, 1,
@@ -413,7 +453,9 @@ async fn marker_write_conditional_on_non_terminal() {
         .unwrap();
 
     // Now marker write must reject.
-    let result = storage.set_cancel_requested("default", "t-cond", "owner-c").await;
+    let result = storage
+        .set_cancel_requested("default", "t-cond", "owner-c")
+        .await;
     match result {
         Err(turul_a2a::storage::A2aStorageError::TerminalState(s)) => {
             assert_eq!(s, TaskState::Completed);
@@ -444,11 +486,19 @@ async fn supervisor_panic_cleanup_via_sentinel_under_cancellation() {
 
     let cancellation = CancellationToken::new();
     let (_trap_tx, trap_rx) = oneshot::channel::<()>();
-    let spawned = tokio::spawn(async move { let _ = trap_rx.await; });
+    let spawned = tokio::spawn(async move {
+        let _ = trap_rx.await;
+    });
     let abort = spawned.abort_handle();
     let (yielded_tx, _yielded_rx) = oneshot::channel::<Task>();
-    let handle = Arc::new(InFlightHandle::new(cancellation.clone(), yielded_tx, spawned));
-    registry.try_insert(key.clone(), Arc::clone(&handle)).unwrap();
+    let handle = Arc::new(InFlightHandle::new(
+        cancellation.clone(),
+        yielded_tx,
+        spawned,
+    ));
+    registry
+        .try_insert(key.clone(), Arc::clone(&handle))
+        .unwrap();
 
     let reg_for_task = Arc::clone(&registry);
     let key_for_task = key.clone();
@@ -515,7 +565,11 @@ async fn streaming_subscriber_sees_terminal_canceled() {
         .oneshot(subscribe_req)
         .await
         .expect("subscribe oneshot");
-    assert_eq!(subscribe_resp.status(), 200, "subscribe must 200 on non-terminal");
+    assert_eq!(
+        subscribe_resp.status(),
+        200,
+        "subscribe must 200 on non-terminal"
+    );
 
     // Kick off a body-reader task that collects SSE frames until the
     // stream closes (terminal delivery closes it cleanly per ADR-009 §4).

@@ -12,20 +12,20 @@
 //! tenant, they must use distinct task IDs (guaranteed by UUID v7 generation).
 
 use async_trait::async_trait;
-use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client;
+use aws_sdk_dynamodb::types::AttributeValue;
 use turul_a2a_types::{Artifact, Message, Task, TaskState, TaskStatus};
 
-use crate::push::{
-    A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
-    DeliveryOutcome, FailedDelivery, GaveUpReason,
-};
-use crate::streaming::StreamEvent;
 use super::atomic::A2aAtomicStore;
 use super::error::A2aStorageError;
 use super::event_store::A2aEventStore;
 use super::filter::{PushConfigListPage, TaskFilter, TaskListPage};
 use super::traits::{A2aPushNotificationStorage, A2aTaskStorage};
+use crate::push::{
+    A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
+    DeliveryOutcome, FailedDelivery, GaveUpReason,
+};
+use crate::streaming::StreamEvent;
 
 /// DynamoDB storage configuration.
 #[derive(Debug, Clone)]
@@ -151,10 +151,7 @@ impl DynamoDbA2aStorage {
         let mut item = std::collections::HashMap::new();
         item.insert("pk".into(), AttributeValue::S(pk.to_string()));
         item.insert("sk".into(), AttributeValue::S(Self::event_sort_key(seq)));
-        item.insert(
-            "eventSequence".into(),
-            AttributeValue::N(seq.to_string()),
-        );
+        item.insert("eventSequence".into(), AttributeValue::N(seq.to_string()));
         item.insert(
             "eventData".into(),
             AttributeValue::S(event_data.to_string()),
@@ -184,7 +181,9 @@ impl DynamoDbA2aStorage {
         if ttl_seconds == 0 {
             return None;
         }
-        Some(AttributeValue::N((Self::now_epoch() + ttl_seconds).to_string()))
+        Some(AttributeValue::N(
+            (Self::now_epoch() + ttl_seconds).to_string(),
+        ))
     }
 
     fn task_to_json(task: &Task) -> Result<String, A2aStorageError> {
@@ -192,8 +191,8 @@ impl DynamoDbA2aStorage {
     }
 
     fn task_from_json(json: &str) -> Result<Task, A2aStorageError> {
-        let proto: turul_a2a_proto::Task =
-            serde_json::from_str(json).map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
+        let proto: turul_a2a_proto::Task = serde_json::from_str(json)
+            .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
         Task::try_from(proto).map_err(A2aStorageError::TypeError)
     }
 
@@ -218,7 +217,8 @@ impl DynamoDbA2aStorage {
         if !include_artifacts {
             proto.artifacts.clear();
         }
-        Task::try_from(proto).unwrap_or_else(|_| Task::new("err", TaskStatus::new(TaskState::Failed)))
+        Task::try_from(proto)
+            .unwrap_or_else(|_| Task::new("err", TaskStatus::new(TaskState::Failed)))
     }
 }
 
@@ -238,14 +238,18 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         let json = Self::task_to_json(&task)?;
         let state_str = Self::status_state_str(&task);
 
-        let mut req = self.client
+        let mut req = self
+            .client
             .put_item()
             .table_name(&self.config.tasks_table)
             .item("pk", AttributeValue::S(pk))
             .item("tenant", AttributeValue::S(tenant.to_string()))
             .item("taskId", AttributeValue::S(task.id().to_string()))
             .item("owner", AttributeValue::S(owner.to_string()))
-            .item("contextId", AttributeValue::S(task.context_id().to_string()))
+            .item(
+                "contextId",
+                AttributeValue::S(task.context_id().to_string()),
+            )
             .item("statusState", AttributeValue::S(state_str))
             .item("taskJson", AttributeValue::S(json))
             .item("updatedAt", AttributeValue::S(Self::now_iso()));
@@ -322,15 +326,15 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .item("tenant", AttributeValue::S(tenant.to_string()))
             .item("taskId", AttributeValue::S(task.id().to_string()))
             .item("owner", AttributeValue::S(owner.to_string()))
-            .item("contextId", AttributeValue::S(task.context_id().to_string()))
+            .item(
+                "contextId",
+                AttributeValue::S(task.context_id().to_string()),
+            )
             .item("statusState", AttributeValue::S(state_str))
             .item("taskJson", AttributeValue::S(json))
             .condition_expression("attribute_exists(pk) AND #o = :expected_owner")
             .expression_attribute_names("#o", "owner")
-            .expression_attribute_values(
-                ":expected_owner",
-                AttributeValue::S(owner.to_string()),
-            );
+            .expression_attribute_values(":expected_owner", AttributeValue::S(owner.to_string()));
         if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
             req = req.item("ttl", ttl);
         }
@@ -418,10 +422,12 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         let mut tasks_with_times: Vec<(Task, String)> = items
             .iter()
             .filter_map(|item| {
-                let task = item.get("taskJson")
+                let task = item
+                    .get("taskJson")
                     .and_then(|v| v.as_s().ok())
                     .and_then(|json| Self::task_from_json(json).ok())?;
-                let updated_at = item.get("updatedAt")
+                let updated_at = item
+                    .get("updatedAt")
                     .and_then(|v| v.as_s().ok())
                     .cloned()
                     .unwrap_or_default();
@@ -429,7 +435,8 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             })
             .collect();
         tasks_with_times.sort_by(|(a_task, a_time), (b_task, b_time)| {
-            b_time.cmp(a_time)
+            b_time
+                .cmp(a_time)
                 .then_with(|| b_task.id().cmp(a_task.id()))
         });
 
@@ -458,9 +465,10 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .collect();
 
         let next_page_token = if end_idx < tasks_with_times.len() {
-            tasks_with_times.get(end_idx - 1).map(|(t, updated_at)| {
-                format!("{}|{}", updated_at, t.id())
-            }).unwrap_or_default()
+            tasks_with_times
+                .get(end_idx - 1)
+                .map(|(t, updated_at)| format!("{}|{}", updated_at, t.id()))
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -498,7 +506,9 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
                 turul_a2a_types::A2aTypeError::InvalidTransition { current, requested } => {
                     A2aStorageError::InvalidTransition { current, requested }
                 }
-                turul_a2a_types::A2aTypeError::TerminalState(s) => A2aStorageError::TerminalState(s),
+                turul_a2a_types::A2aTypeError::TerminalState(s) => {
+                    A2aStorageError::TerminalState(s)
+                }
                 other => A2aStorageError::TypeError(other),
             },
         )?;
@@ -614,9 +624,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
                     // Probe to classify: missing, wrong owner, or terminal.
                     match self.get_task(tenant, task_id, owner, Some(0)).await {
                         Ok(Some(t)) => {
-                            let state = t
-                                .status()
-                                .and_then(|s| s.state().ok());
+                            let state = t.status().and_then(|s| s.state().ok());
                             if let Some(s) = state {
                                 if turul_a2a_types::state_machine::is_terminal(s) {
                                     return Err(A2aStorageError::TerminalState(s));
@@ -729,7 +737,10 @@ impl crate::storage::A2aCancellationSupervisor for DynamoDbA2aStorage {
                             .map(String::as_str);
                         let is_terminal = matches!(
                             state_str,
-                            Some("Completed") | Some("Failed") | Some("Canceled") | Some("Rejected")
+                            Some("Completed")
+                                | Some("Failed")
+                                | Some("Canceled")
+                                | Some("Rejected")
                         );
                         if is_terminal {
                             continue;
@@ -814,10 +825,7 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
                         "latestEventSequence = :seq OR \
                          (attribute_not_exists(latestEventSequence) AND :seq = :zero)",
                     )
-                    .expression_attribute_values(
-                        ":seq",
-                        AttributeValue::N(seq_read.to_string()),
-                    )
+                    .expression_attribute_values(":seq", AttributeValue::N(seq_read.to_string()))
                     .expression_attribute_values(":zero", AttributeValue::N("0".into()))
                     .build()
                     .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?
@@ -965,7 +973,10 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
         let page_configs = configs[start_idx..end_idx].to_vec();
 
         let next_page_token = if end_idx < configs.len() {
-            page_configs.last().map(|c| c.id.clone()).unwrap_or_default()
+            page_configs
+                .last()
+                .map(|c| c.id.clone())
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -1018,10 +1029,7 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
             )
             .expression_attribute_values(":t", AttributeValue::S(tenant.to_string()))
             .expression_attribute_values(":tid", AttributeValue::S(task_id.to_string()))
-            .expression_attribute_values(
-                ":seq",
-                AttributeValue::N(event_sequence.to_string()),
-            )
+            .expression_attribute_values(":seq", AttributeValue::N(event_sequence.to_string()))
             .send()
             .await
             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
@@ -1050,7 +1058,10 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
         let page_configs = configs[start_idx..end_idx].to_vec();
 
         let next_page_token = if end_idx < configs.len() {
-            page_configs.last().map(|c| c.id.clone()).unwrap_or_default()
+            page_configs
+                .last()
+                .map(|c| c.id.clone())
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -1111,7 +1122,9 @@ async fn query_max_sequence(
     if let Some(items) = result.items {
         if let Some(item) = items.first() {
             if let Some(AttributeValue::N(n)) = item.get("eventSequence") {
-                return n.parse::<u64>().map_err(|e| A2aStorageError::DatabaseError(e.to_string()));
+                return n
+                    .parse::<u64>()
+                    .map_err(|e| A2aStorageError::DatabaseError(e.to_string()));
             }
         }
     }
@@ -1176,7 +1189,8 @@ impl A2aEventStore for DynamoDbA2aStorage {
         // item for the logical sequence — `sk` is only the physical
         // key carrier.
         let after_sk = Self::event_sort_key(after_sequence);
-        let result = self.client
+        let result = self
+            .client
             .query()
             .table_name(&self.config.events_table)
             .key_condition_expression("pk = :pk AND sk > :sk")
@@ -1192,13 +1206,27 @@ impl A2aEventStore for DynamoDbA2aStorage {
             for item in items {
                 let seq = item
                     .get("eventSequence")
-                    .and_then(|v| if let AttributeValue::N(n) = v { Some(n) } else { None })
+                    .and_then(|v| {
+                        if let AttributeValue::N(n) = v {
+                            Some(n)
+                        } else {
+                            None
+                        }
+                    })
                     .and_then(|n| n.parse::<u64>().ok())
-                    .ok_or_else(|| A2aStorageError::DatabaseError("Missing eventSequence".into()))?;
+                    .ok_or_else(|| {
+                        A2aStorageError::DatabaseError("Missing eventSequence".into())
+                    })?;
 
                 let data = item
                     .get("eventData")
-                    .and_then(|v| if let AttributeValue::S(s) = v { Some(s) } else { None })
+                    .and_then(|v| {
+                        if let AttributeValue::S(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
                     .ok_or_else(|| A2aStorageError::DatabaseError("Missing eventData".into()))?;
 
                 let event: StreamEvent = serde_json::from_str(data)
@@ -1209,11 +1237,7 @@ impl A2aEventStore for DynamoDbA2aStorage {
         Ok(events)
     }
 
-    async fn latest_sequence(
-        &self,
-        tenant: &str,
-        task_id: &str,
-    ) -> Result<u64, A2aStorageError> {
+    async fn latest_sequence(&self, tenant: &str, task_id: &str) -> Result<u64, A2aStorageError> {
         let pk = Self::task_key(tenant, task_id);
         query_max_sequence(&self.client, &self.config.events_table, &pk).await
     }
@@ -1260,7 +1284,10 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             .item("taskId", AttributeValue::S(task.id().to_string()))
             .item("owner", AttributeValue::S(owner.to_string()))
             .item("taskJson", AttributeValue::S(task_json))
-            .item("contextId", AttributeValue::S(task.context_id().to_string()))
+            .item(
+                "contextId",
+                AttributeValue::S(task.context_id().to_string()),
+            )
             .item("statusState", AttributeValue::S(state_str))
             .item("updatedAt", AttributeValue::S(Self::now_iso()))
             .item(
@@ -1273,7 +1300,8 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let mut items = vec![
             aws_sdk_dynamodb::types::TransactWriteItem::builder()
                 .put(
-                    task_put.build()
+                    task_put
+                        .build()
                         .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
                 )
                 .build(),
@@ -1293,13 +1321,12 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             let event_put = aws_sdk_dynamodb::types::Put::builder()
                 .table_name(&self.config.events_table)
                 .set_item(Some(event_item))
-                .condition_expression(
-                    "attribute_not_exists(pk) AND attribute_not_exists(sk)",
-                );
+                .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)");
             items.push(
                 aws_sdk_dynamodb::types::TransactWriteItem::builder()
                     .put(
-                        event_put.build()
+                        event_put
+                            .build()
                             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
                     )
                     .build(),
@@ -1327,7 +1354,9 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let pk = Self::task_key(tenant, task_id);
 
         // Read current task for validation
-        let task = self.get_task(tenant, task_id, owner, None).await?
+        let task = self
+            .get_task(tenant, task_id, owner, None)
+            .await?
             .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?;
 
         let current_state = task
@@ -1386,7 +1415,10 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                         .item("pk", AttributeValue::S(pk.clone()))
                         .item("owner", AttributeValue::S(owner.to_string()))
                         .item("taskJson", AttributeValue::S(task_json))
-                        .item("contextId", AttributeValue::S(updated_task.context_id().to_string()))
+                        .item(
+                            "contextId",
+                            AttributeValue::S(updated_task.context_id().to_string()),
+                        )
                         .item("statusState", AttributeValue::S(state_str))
                         .item("updatedAt", AttributeValue::S(Self::now_iso()))
                         .item(
@@ -1399,10 +1431,22 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                         )
                         .expression_attribute_names("#owner", "owner")
                         .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()))
-                        .expression_attribute_values(":completed", AttributeValue::S("Completed".to_string()))
-                        .expression_attribute_values(":failed", AttributeValue::S("Failed".to_string()))
-                        .expression_attribute_values(":canceled", AttributeValue::S("Canceled".to_string()))
-                        .expression_attribute_values(":rejected", AttributeValue::S("Rejected".to_string()))
+                        .expression_attribute_values(
+                            ":completed",
+                            AttributeValue::S("Completed".to_string()),
+                        )
+                        .expression_attribute_values(
+                            ":failed",
+                            AttributeValue::S("Failed".to_string()),
+                        )
+                        .expression_attribute_values(
+                            ":canceled",
+                            AttributeValue::S("Canceled".to_string()),
+                        )
+                        .expression_attribute_values(
+                            ":rejected",
+                            AttributeValue::S("Rejected".to_string()),
+                        )
                         .build()
                         .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
                 )
@@ -1500,9 +1544,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                     // Probe current state to classify.
                     match self.get_task(tenant, task_id, owner, Some(0)).await {
                         Ok(Some(current_task)) => {
-                            let probe_state = current_task
-                                .status()
-                                .and_then(|s| s.state().ok());
+                            let probe_state = current_task.status().and_then(|s| s.state().ok());
                             if let Some(s) = probe_state {
                                 if turul_a2a_types::state_machine::is_terminal(s) {
                                     return Err(A2aStorageError::TerminalStateAlreadySet {
@@ -1560,7 +1602,10 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             .item("taskId", AttributeValue::S(task.id().to_string()))
             .item("owner", AttributeValue::S(owner.to_string()))
             .item("taskJson", AttributeValue::S(task_json))
-            .item("contextId", AttributeValue::S(task.context_id().to_string()))
+            .item(
+                "contextId",
+                AttributeValue::S(task.context_id().to_string()),
+            )
             .item("statusState", AttributeValue::S(state_str))
             .item("updatedAt", AttributeValue::S(Self::now_iso()))
             .item(
@@ -1583,7 +1628,8 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let mut items = vec![
             aws_sdk_dynamodb::types::TransactWriteItem::builder()
                 .put(
-                    task_put.build()
+                    task_put
+                        .build()
                         .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
                 )
                 .build(),
@@ -1605,13 +1651,12 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             let event_put = aws_sdk_dynamodb::types::Put::builder()
                 .table_name(&self.config.events_table)
                 .set_item(Some(event_item))
-                .condition_expression(
-                    "attribute_not_exists(pk) AND attribute_not_exists(sk)",
-                );
+                .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)");
             items.push(
                 aws_sdk_dynamodb::types::TransactWriteItem::builder()
                     .put(
-                        event_put.build()
+                        event_put
+                            .build()
                             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
                     )
                     .build(),
@@ -1619,7 +1664,8 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         }
 
         let task_id = task.id().to_string();
-        let tx_result = self.client
+        let tx_result = self
+            .client
             .transact_write_items()
             .set_transact_items(Some(items))
             .send()
@@ -1640,9 +1686,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 {
                     match self.get_task(tenant, &task_id, owner, Some(0)).await {
                         Ok(Some(current_task)) => {
-                            let probe_state = current_task
-                                .status()
-                                .and_then(|s| s.state().ok());
+                            let probe_state = current_task.status().and_then(|s| s.state().ok());
                             if let Some(s) = probe_state {
                                 if turul_a2a_types::state_machine::is_terminal(s) {
                                     return Err(A2aStorageError::TerminalStateAlreadySet {
@@ -1825,11 +1869,23 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
         if let Some(item) = existing.item {
             let prev_expires = item
                 .get("expiresAtMicros")
-                .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None })
+                .and_then(|v| {
+                    if let AttributeValue::N(n) = v {
+                        n.parse::<i64>().ok()
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or(0);
             let prev_status_s = item
                 .get("status")
-                .and_then(|v| if let AttributeValue::S(s) = v { Some(s.as_str()) } else { None })
+                .and_then(|v| {
+                    if let AttributeValue::S(s) = v {
+                        Some(s.as_str())
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or("Pending");
             let prev_status = ddb_claim_status_from_str(prev_status_s)?;
             let is_terminal = matches!(
@@ -1847,15 +1903,33 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
             }
             let prev_gen = item
                 .get("generation")
-                .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None })
+                .and_then(|v| {
+                    if let AttributeValue::N(n) = v {
+                        n.parse::<i64>().ok()
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or(0);
             let prev_count = item
                 .get("deliveryAttemptCount")
-                .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None })
+                .and_then(|v| {
+                    if let AttributeValue::N(n) = v {
+                        n.parse::<i64>().ok()
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or(0);
             let prev_owner = item
                 .get("owner")
-                .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                .and_then(|v| {
+                    if let AttributeValue::S(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or_default();
             let new_gen = prev_gen + 1;
 
@@ -1887,10 +1961,16 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
                 .expression_attribute_values(":newgen", AttributeValue::N(new_gen.to_string()))
                 .expression_attribute_values(":prevgen", AttributeValue::N(prev_gen.to_string()))
                 .expression_attribute_values(":claimed", AttributeValue::N(now_micros.to_string()))
-                .expression_attribute_values(":expires", AttributeValue::N(expires_micros.to_string()))
+                .expression_attribute_values(
+                    ":expires",
+                    AttributeValue::N(expires_micros.to_string()),
+                )
                 .expression_attribute_values(":pending", AttributeValue::S("Pending".into()))
                 .expression_attribute_values(":attempting", AttributeValue::S("Attempting".into()))
-                .expression_attribute_values(":nowguard", AttributeValue::N(now_micros.to_string()));
+                .expression_attribute_values(
+                    ":nowguard",
+                    AttributeValue::N(now_micros.to_string()),
+                );
             let update = if let Some(ttl) = Self::ttl_epoch(self.config.push_delivery_ttl_seconds) {
                 update
                     .update_expression(
@@ -1940,13 +2020,19 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
             .item("sk", AttributeValue::S(sk))
             .item("tenant", AttributeValue::S(tenant.to_string()))
             .item("taskId", AttributeValue::S(task_id.to_string()))
-            .item("eventSequence", AttributeValue::N(event_sequence.to_string()))
+            .item(
+                "eventSequence",
+                AttributeValue::N(event_sequence.to_string()),
+            )
             .item("configId", AttributeValue::S(config_id.to_string()))
             .item("claimant", AttributeValue::S(claimant.to_string()))
             .item("owner", AttributeValue::S(owner.to_string()))
             .item("generation", AttributeValue::N("1".into()))
             .item("claimedAtMicros", AttributeValue::N(now_micros.to_string()))
-            .item("expiresAtMicros", AttributeValue::N(expires_micros.to_string()))
+            .item(
+                "expiresAtMicros",
+                AttributeValue::N(expires_micros.to_string()),
+            )
             .item("deliveryAttemptCount", AttributeValue::N("0".into()))
             .item("status", AttributeValue::S("Pending".into()))
             .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)");
@@ -2083,7 +2169,13 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
             .item
             .as_ref()
             .and_then(|m| m.get("status"))
-            .and_then(|v| if let AttributeValue::S(s) = v { Some(s.as_str()) } else { None })
+            .and_then(|v| {
+                if let AttributeValue::S(s) = v {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
             .and_then(|s| ddb_claim_status_from_str(s).ok());
 
         // Terminal-frozen gate: once Succeeded/GaveUp/Abandoned,
@@ -2313,23 +2405,53 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
                     }
                     let tenant = item
                         .get("tenant")
-                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .and_then(|v| {
+                            if let AttributeValue::S(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or_default();
                     let owner = item
                         .get("owner")
-                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .and_then(|v| {
+                            if let AttributeValue::S(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or_default();
                     let task_id = item
                         .get("taskId")
-                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .and_then(|v| {
+                            if let AttributeValue::S(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or_default();
                     let event_sequence = item
                         .get("eventSequence")
-                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<u64>().ok() } else { None })
+                        .and_then(|v| {
+                            if let AttributeValue::N(n) = v {
+                                n.parse::<u64>().ok()
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(0);
                     let config_id = item
                         .get("configId")
-                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .and_then(|v| {
+                            if let AttributeValue::S(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or_default();
                     out.push(crate::push::claim::ReclaimableClaim {
                         tenant,
@@ -2369,9 +2491,15 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
             .item("sk", AttributeValue::S(sk))
             .item("tenant", AttributeValue::S(tenant.to_string()))
             .item("taskId", AttributeValue::S(task_id.to_string()))
-            .item("eventSequence", AttributeValue::N(event_sequence.to_string()))
+            .item(
+                "eventSequence",
+                AttributeValue::N(event_sequence.to_string()),
+            )
             .item("owner", AttributeValue::S(owner.to_string()))
-            .item("recordedAtMicros", AttributeValue::N(now_micros.to_string()));
+            .item(
+                "recordedAtMicros",
+                AttributeValue::N(now_micros.to_string()),
+            );
         if let Some(ttl) = Self::ttl_epoch(self.config.push_delivery_ttl_seconds) {
             put = put.item("ttl", ttl);
         }
@@ -2432,23 +2560,53 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
                     }
                     let tenant = item
                         .get("tenant")
-                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .and_then(|v| {
+                            if let AttributeValue::S(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or_default();
                     let owner = item
                         .get("owner")
-                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .and_then(|v| {
+                            if let AttributeValue::S(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or_default();
                     let task_id = item
                         .get("taskId")
-                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .and_then(|v| {
+                            if let AttributeValue::S(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or_default();
                     let event_sequence = item
                         .get("eventSequence")
-                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<u64>().ok() } else { None })
+                        .and_then(|v| {
+                            if let AttributeValue::N(n) = v {
+                                n.parse::<u64>().ok()
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(0);
                     let recorded_at_micros = item
                         .get("recordedAtMicros")
-                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None })
+                        .and_then(|v| {
+                            if let AttributeValue::N(n) = v {
+                                n.parse::<i64>().ok()
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(0);
                     out.push(crate::push::claim::PendingDispatch {
                         tenant,
@@ -2483,9 +2641,7 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
                 .client
                 .scan()
                 .table_name(&self.config.push_deliveries_table)
-                .filter_expression(
-                    "tenant = :t AND #status = :st AND gaveUpAtMicros >= :since",
-                )
+                .filter_expression("tenant = :t AND #status = :st AND gaveUpAtMicros >= :since")
                 .expression_attribute_names("#status", "status")
                 .expression_attribute_values(":t", AttributeValue::S(tenant.to_string()))
                 .expression_attribute_values(":st", AttributeValue::S("GaveUp".into()))
@@ -2501,40 +2657,92 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
                 for item in items {
                     let task_id = item
                         .get("taskId")
-                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .and_then(|v| {
+                            if let AttributeValue::S(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or_default();
                     let config_id = item
                         .get("configId")
-                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.clone()) } else { None })
+                        .and_then(|v| {
+                            if let AttributeValue::S(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or_default();
                     let event_sequence = item
                         .get("eventSequence")
-                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<u64>().ok() } else { None })
+                        .and_then(|v| {
+                            if let AttributeValue::N(n) = v {
+                                n.parse::<u64>().ok()
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(0);
                     let claimed = item
                         .get("claimedAtMicros")
-                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None })
+                        .and_then(|v| {
+                            if let AttributeValue::N(n) = v {
+                                n.parse::<i64>().ok()
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(0);
-                    let first = item
-                        .get("firstAttemptedAtMicros")
-                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None });
-                    let last = item
-                        .get("lastAttemptedAtMicros")
-                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None });
+                    let first = item.get("firstAttemptedAtMicros").and_then(|v| {
+                        if let AttributeValue::N(n) = v {
+                            n.parse::<i64>().ok()
+                        } else {
+                            None
+                        }
+                    });
+                    let last = item.get("lastAttemptedAtMicros").and_then(|v| {
+                        if let AttributeValue::N(n) = v {
+                            n.parse::<i64>().ok()
+                        } else {
+                            None
+                        }
+                    });
                     let gave_up = item
                         .get("gaveUpAtMicros")
-                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None })
+                        .and_then(|v| {
+                            if let AttributeValue::N(n) = v {
+                                n.parse::<i64>().ok()
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(claimed);
                     let attempt_count = item
                         .get("deliveryAttemptCount")
-                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<i64>().ok() } else { None })
+                        .and_then(|v| {
+                            if let AttributeValue::N(n) = v {
+                                n.parse::<i64>().ok()
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or(0);
-                    let http_status = item
-                        .get("lastHttpStatus")
-                        .and_then(|v| if let AttributeValue::N(n) = v { n.parse::<u16>().ok() } else { None });
-                    let err_class_s = item
-                        .get("lastErrorClass")
-                        .and_then(|v| if let AttributeValue::S(s) = v { Some(s.as_str()) } else { None });
+                    let http_status = item.get("lastHttpStatus").and_then(|v| {
+                        if let AttributeValue::N(n) = v {
+                            n.parse::<u16>().ok()
+                        } else {
+                            None
+                        }
+                    });
+                    let err_class_s = item.get("lastErrorClass").and_then(|v| {
+                        if let AttributeValue::S(s) = v {
+                            Some(s.as_str())
+                        } else {
+                            None
+                        }
+                    });
                     let last_error_class = err_class_s
                         .and_then(ddb_error_class_from_json)
                         .unwrap_or(DeliveryErrorClass::NetworkError);
@@ -2607,11 +2815,7 @@ mod tests {
 
         // Wait for table to become ACTIVE
         for _ in 0..30 {
-            let desc = client
-                .describe_table()
-                .table_name(table_name)
-                .send()
-                .await;
+            let desc = client.describe_table().table_name(table_name).send().await;
             if let Ok(resp) = desc {
                 if let Some(table) = resp.table {
                     if table.table_status == Some(aws_sdk_dynamodb::types::TableStatus::Active) {
@@ -2738,11 +2942,7 @@ mod tests {
 
         // Wait for table to become ACTIVE
         for _ in 0..30 {
-            let desc = client
-                .describe_table()
-                .table_name(table_name)
-                .send()
-                .await;
+            let desc = client.describe_table().table_name(table_name).send().await;
             if let Ok(resp) = desc {
                 if let Some(table) = resp.table {
                     if table.table_status == Some(aws_sdk_dynamodb::types::TableStatus::Active) {
@@ -2854,51 +3054,113 @@ mod tests {
 
     #[async_trait]
     impl A2aTaskStorage for TestStorage {
-        fn backend_name(&self) -> &'static str { "dynamodb-test" }
-
-        async fn create_task(&self, tenant: &str, owner: &str, task: Task)
-            -> Result<Task, A2aStorageError> {
-            self.inner.create_task(&self.scoped_tenant(tenant), owner, task).await
+        fn backend_name(&self) -> &'static str {
+            "dynamodb-test"
         }
 
-        async fn get_task(&self, tenant: &str, task_id: &str, owner: &str, history_length: Option<i32>)
-            -> Result<Option<Task>, A2aStorageError> {
-            self.inner.get_task(&self.scoped_tenant(tenant), task_id, owner, history_length).await
+        async fn create_task(
+            &self,
+            tenant: &str,
+            owner: &str,
+            task: Task,
+        ) -> Result<Task, A2aStorageError> {
+            self.inner
+                .create_task(&self.scoped_tenant(tenant), owner, task)
+                .await
         }
 
-        async fn update_task(&self, tenant: &str, owner: &str, task: Task)
-            -> Result<(), A2aStorageError> {
-            self.inner.update_task(&self.scoped_tenant(tenant), owner, task).await
+        async fn get_task(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            owner: &str,
+            history_length: Option<i32>,
+        ) -> Result<Option<Task>, A2aStorageError> {
+            self.inner
+                .get_task(&self.scoped_tenant(tenant), task_id, owner, history_length)
+                .await
         }
 
-        async fn delete_task(&self, tenant: &str, task_id: &str, owner: &str)
-            -> Result<bool, A2aStorageError> {
-            self.inner.delete_task(&self.scoped_tenant(tenant), task_id, owner).await
+        async fn update_task(
+            &self,
+            tenant: &str,
+            owner: &str,
+            task: Task,
+        ) -> Result<(), A2aStorageError> {
+            self.inner
+                .update_task(&self.scoped_tenant(tenant), owner, task)
+                .await
         }
 
-        async fn list_tasks(&self, mut filter: TaskFilter) -> Result<TaskListPage, A2aStorageError> {
+        async fn delete_task(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            owner: &str,
+        ) -> Result<bool, A2aStorageError> {
+            self.inner
+                .delete_task(&self.scoped_tenant(tenant), task_id, owner)
+                .await
+        }
+
+        async fn list_tasks(
+            &self,
+            mut filter: TaskFilter,
+        ) -> Result<TaskListPage, A2aStorageError> {
             filter.tenant = filter.tenant.map(|t| self.scoped_tenant(&t));
             self.inner.list_tasks(filter).await
         }
 
-        async fn update_task_status(&self, tenant: &str, task_id: &str, owner: &str, new_status: TaskStatus)
-            -> Result<Task, A2aStorageError> {
-            self.inner.update_task_status(&self.scoped_tenant(tenant), task_id, owner, new_status).await
+        async fn update_task_status(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            owner: &str,
+            new_status: TaskStatus,
+        ) -> Result<Task, A2aStorageError> {
+            self.inner
+                .update_task_status(&self.scoped_tenant(tenant), task_id, owner, new_status)
+                .await
         }
 
-        async fn append_message(&self, tenant: &str, task_id: &str, owner: &str, message: Message)
-            -> Result<(), A2aStorageError> {
-            self.inner.append_message(&self.scoped_tenant(tenant), task_id, owner, message).await
+        async fn append_message(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            owner: &str,
+            message: Message,
+        ) -> Result<(), A2aStorageError> {
+            self.inner
+                .append_message(&self.scoped_tenant(tenant), task_id, owner, message)
+                .await
         }
 
-        async fn append_artifact(&self, tenant: &str, task_id: &str, owner: &str, artifact: Artifact, append: bool, last_chunk: bool)
-            -> Result<(), A2aStorageError> {
-            self.inner.append_artifact(&self.scoped_tenant(tenant), task_id, owner, artifact, append, last_chunk).await
+        async fn append_artifact(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            owner: &str,
+            artifact: Artifact,
+            append: bool,
+            last_chunk: bool,
+        ) -> Result<(), A2aStorageError> {
+            self.inner
+                .append_artifact(
+                    &self.scoped_tenant(tenant),
+                    task_id,
+                    owner,
+                    artifact,
+                    append,
+                    last_chunk,
+                )
+                .await
         }
 
         async fn task_count(&self) -> Result<usize, A2aStorageError> {
             // Count only this test's tasks by filtering on tenant prefix
-            let result = self.inner.client
+            let result = self
+                .inner
+                .client
                 .scan()
                 .table_name(&self.inner.config.tasks_table)
                 .filter_expression("begins_with(pk, :prefix)")
@@ -2917,25 +3179,39 @@ mod tests {
             self.inner.maintenance().await
         }
 
-        async fn set_cancel_requested(&self, tenant: &str, task_id: &str, owner: &str)
-            -> Result<(), A2aStorageError> {
-            self.inner.set_cancel_requested(&self.scoped_tenant(tenant), task_id, owner).await
+        async fn set_cancel_requested(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            owner: &str,
+        ) -> Result<(), A2aStorageError> {
+            self.inner
+                .set_cancel_requested(&self.scoped_tenant(tenant), task_id, owner)
+                .await
         }
     }
 
     #[async_trait]
     impl crate::storage::A2aCancellationSupervisor for TestStorage {
-        fn backend_name(&self) -> &'static str { "dynamodb-test" }
+        fn backend_name(&self) -> &'static str {
+            "dynamodb-test"
+        }
 
-        async fn supervisor_get_cancel_requested(&self, tenant: &str, task_id: &str)
-            -> Result<bool, A2aStorageError> {
+        async fn supervisor_get_cancel_requested(
+            &self,
+            tenant: &str,
+            task_id: &str,
+        ) -> Result<bool, A2aStorageError> {
             <DynamoDbA2aStorage as crate::storage::A2aCancellationSupervisor>::supervisor_get_cancel_requested(
                 &self.inner, &self.scoped_tenant(tenant), task_id,
             ).await
         }
 
-        async fn supervisor_list_cancel_requested(&self, tenant: &str, task_ids: &[String])
-            -> Result<Vec<String>, A2aStorageError> {
+        async fn supervisor_list_cancel_requested(
+            &self,
+            tenant: &str,
+            task_ids: &[String],
+        ) -> Result<Vec<String>, A2aStorageError> {
             <DynamoDbA2aStorage as crate::storage::A2aCancellationSupervisor>::supervisor_list_cancel_requested(
                 &self.inner, &self.scoped_tenant(tenant), task_ids,
             ).await
@@ -2944,31 +3220,61 @@ mod tests {
 
     #[async_trait]
     impl A2aPushNotificationStorage for TestStorage {
-        fn backend_name(&self) -> &'static str { "dynamodb-test" }
-
-        async fn create_config(&self, tenant: &str, config: turul_a2a_proto::TaskPushNotificationConfig)
-            -> Result<turul_a2a_proto::TaskPushNotificationConfig, A2aStorageError> {
-            self.inner.create_config(&self.scoped_tenant(tenant), config).await
+        fn backend_name(&self) -> &'static str {
+            "dynamodb-test"
         }
 
-        async fn get_config(&self, tenant: &str, task_id: &str, config_id: &str)
-            -> Result<Option<turul_a2a_proto::TaskPushNotificationConfig>, A2aStorageError> {
-            self.inner.get_config(&self.scoped_tenant(tenant), task_id, config_id).await
+        async fn create_config(
+            &self,
+            tenant: &str,
+            config: turul_a2a_proto::TaskPushNotificationConfig,
+        ) -> Result<turul_a2a_proto::TaskPushNotificationConfig, A2aStorageError> {
+            self.inner
+                .create_config(&self.scoped_tenant(tenant), config)
+                .await
         }
 
-        async fn list_configs(&self, tenant: &str, task_id: &str, page_token: Option<&str>, page_size: Option<i32>)
-            -> Result<PushConfigListPage, A2aStorageError> {
-            self.inner.list_configs(&self.scoped_tenant(tenant), task_id, page_token, page_size).await
+        async fn get_config(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            config_id: &str,
+        ) -> Result<Option<turul_a2a_proto::TaskPushNotificationConfig>, A2aStorageError> {
+            self.inner
+                .get_config(&self.scoped_tenant(tenant), task_id, config_id)
+                .await
         }
 
-        async fn delete_config(&self, tenant: &str, task_id: &str, config_id: &str)
-            -> Result<(), A2aStorageError> {
-            self.inner.delete_config(&self.scoped_tenant(tenant), task_id, config_id).await
+        async fn list_configs(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            page_token: Option<&str>,
+            page_size: Option<i32>,
+        ) -> Result<PushConfigListPage, A2aStorageError> {
+            self.inner
+                .list_configs(&self.scoped_tenant(tenant), task_id, page_token, page_size)
+                .await
+        }
+
+        async fn delete_config(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            config_id: &str,
+        ) -> Result<(), A2aStorageError> {
+            self.inner
+                .delete_config(&self.scoped_tenant(tenant), task_id, config_id)
+                .await
         }
 
         async fn list_configs_eligible_at_event(
-            &self, tenant: &str, task_id: &str, event_sequence: u64,
-            page_token: Option<&str>, page_size: Option<i32>,
+            &self,
+            tenant: &str,
+            task_id: &str,
+            event_sequence: u64,
+            page_token: Option<&str>,
+            page_size: Option<i32>,
         ) -> Result<PushConfigListPage, A2aStorageError> {
             self.inner
                 .list_configs_eligible_at_event(
@@ -2984,21 +3290,40 @@ mod tests {
 
     #[async_trait]
     impl A2aEventStore for TestStorage {
-        fn backend_name(&self) -> &'static str { "dynamodb-test" }
-
-        async fn append_event(&self, tenant: &str, task_id: &str, event: StreamEvent)
-            -> Result<u64, A2aStorageError> {
-            self.inner.append_event(&self.scoped_tenant(tenant), task_id, event).await
+        fn backend_name(&self) -> &'static str {
+            "dynamodb-test"
         }
 
-        async fn get_events_after(&self, tenant: &str, task_id: &str, after_sequence: u64)
-            -> Result<Vec<(u64, StreamEvent)>, A2aStorageError> {
-            self.inner.get_events_after(&self.scoped_tenant(tenant), task_id, after_sequence).await
+        async fn append_event(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            event: StreamEvent,
+        ) -> Result<u64, A2aStorageError> {
+            self.inner
+                .append_event(&self.scoped_tenant(tenant), task_id, event)
+                .await
         }
 
-        async fn latest_sequence(&self, tenant: &str, task_id: &str)
-            -> Result<u64, A2aStorageError> {
-            self.inner.latest_sequence(&self.scoped_tenant(tenant), task_id).await
+        async fn get_events_after(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            after_sequence: u64,
+        ) -> Result<Vec<(u64, StreamEvent)>, A2aStorageError> {
+            self.inner
+                .get_events_after(&self.scoped_tenant(tenant), task_id, after_sequence)
+                .await
+        }
+
+        async fn latest_sequence(
+            &self,
+            tenant: &str,
+            task_id: &str,
+        ) -> Result<u64, A2aStorageError> {
+            self.inner
+                .latest_sequence(&self.scoped_tenant(tenant), task_id)
+                .await
         }
 
         async fn cleanup_expired(&self) -> Result<u64, A2aStorageError> {
@@ -3008,31 +3333,63 @@ mod tests {
 
     #[async_trait]
     impl A2aAtomicStore for TestStorage {
-        fn backend_name(&self) -> &'static str { "dynamodb-test" }
+        fn backend_name(&self) -> &'static str {
+            "dynamodb-test"
+        }
 
         fn push_dispatch_enabled(&self) -> bool {
             self.inner.push_dispatch_enabled()
         }
 
-        async fn create_task_with_events(&self, tenant: &str, owner: &str, task: Task, events: Vec<StreamEvent>)
-            -> Result<(Task, Vec<u64>), A2aStorageError> {
-            self.inner.create_task_with_events(&self.scoped_tenant(tenant), owner, task, events).await
+        async fn create_task_with_events(
+            &self,
+            tenant: &str,
+            owner: &str,
+            task: Task,
+            events: Vec<StreamEvent>,
+        ) -> Result<(Task, Vec<u64>), A2aStorageError> {
+            self.inner
+                .create_task_with_events(&self.scoped_tenant(tenant), owner, task, events)
+                .await
         }
 
-        async fn update_task_status_with_events(&self, tenant: &str, task_id: &str, owner: &str, new_status: TaskStatus, events: Vec<StreamEvent>)
-            -> Result<(Task, Vec<u64>), A2aStorageError> {
-            self.inner.update_task_status_with_events(&self.scoped_tenant(tenant), task_id, owner, new_status, events).await
+        async fn update_task_status_with_events(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            owner: &str,
+            new_status: TaskStatus,
+            events: Vec<StreamEvent>,
+        ) -> Result<(Task, Vec<u64>), A2aStorageError> {
+            self.inner
+                .update_task_status_with_events(
+                    &self.scoped_tenant(tenant),
+                    task_id,
+                    owner,
+                    new_status,
+                    events,
+                )
+                .await
         }
 
-        async fn update_task_with_events(&self, tenant: &str, owner: &str, task: Task, events: Vec<StreamEvent>)
-            -> Result<Vec<u64>, A2aStorageError> {
-            self.inner.update_task_with_events(&self.scoped_tenant(tenant), owner, task, events).await
+        async fn update_task_with_events(
+            &self,
+            tenant: &str,
+            owner: &str,
+            task: Task,
+            events: Vec<StreamEvent>,
+        ) -> Result<Vec<u64>, A2aStorageError> {
+            self.inner
+                .update_task_with_events(&self.scoped_tenant(tenant), owner, task, events)
+                .await
         }
     }
 
     #[async_trait]
     impl A2aPushDeliveryStore for TestStorage {
-        fn backend_name(&self) -> &'static str { "dynamodb-test" }
+        fn backend_name(&self) -> &'static str {
+            "dynamodb-test"
+        }
 
         async fn claim_delivery(
             &self,
@@ -3045,7 +3402,15 @@ mod tests {
             claim_expiry: std::time::Duration,
         ) -> Result<DeliveryClaim, A2aStorageError> {
             self.inner
-                .claim_delivery(&self.scoped_tenant(tenant), task_id, event_sequence, config_id, claimant, owner, claim_expiry)
+                .claim_delivery(
+                    &self.scoped_tenant(tenant),
+                    task_id,
+                    event_sequence,
+                    config_id,
+                    claimant,
+                    owner,
+                    claim_expiry,
+                )
                 .await
         }
 
@@ -3059,7 +3424,14 @@ mod tests {
             claim_generation: u64,
         ) -> Result<u32, A2aStorageError> {
             self.inner
-                .record_attempt_started(&self.scoped_tenant(tenant), task_id, event_sequence, config_id, claimant, claim_generation)
+                .record_attempt_started(
+                    &self.scoped_tenant(tenant),
+                    task_id,
+                    event_sequence,
+                    config_id,
+                    claimant,
+                    claim_generation,
+                )
                 .await
         }
 
@@ -3074,7 +3446,15 @@ mod tests {
             outcome: DeliveryOutcome,
         ) -> Result<(), A2aStorageError> {
             self.inner
-                .record_delivery_outcome(&self.scoped_tenant(tenant), task_id, event_sequence, config_id, claimant, claim_generation, outcome)
+                .record_delivery_outcome(
+                    &self.scoped_tenant(tenant),
+                    task_id,
+                    event_sequence,
+                    config_id,
+                    claimant,
+                    claim_generation,
+                    outcome,
+                )
                 .await
         }
 
@@ -3097,7 +3477,12 @@ mod tests {
             event_sequence: u64,
         ) -> Result<(), A2aStorageError> {
             self.inner
-                .record_pending_dispatch(&self.scoped_tenant(tenant), owner, task_id, event_sequence)
+                .record_pending_dispatch(
+                    &self.scoped_tenant(tenant),
+                    owner,
+                    task_id,
+                    event_sequence,
+                )
                 .await
         }
 
@@ -3424,17 +3809,11 @@ mod tests {
 
     #[test]
     fn event_sort_key_lex_order_matches_numeric_order() {
-        assert!(
-            DynamoDbA2aStorage::event_sort_key(1) < DynamoDbA2aStorage::event_sort_key(2)
-        );
+        assert!(DynamoDbA2aStorage::event_sort_key(1) < DynamoDbA2aStorage::event_sort_key(2));
         // Digit-boundary checks: plain itoa mis-orders these
         // lexicographically ("9" > "10"). Zero-padding prevents that.
-        assert!(
-            DynamoDbA2aStorage::event_sort_key(9) < DynamoDbA2aStorage::event_sort_key(10)
-        );
-        assert!(
-            DynamoDbA2aStorage::event_sort_key(99) < DynamoDbA2aStorage::event_sort_key(100)
-        );
+        assert!(DynamoDbA2aStorage::event_sort_key(9) < DynamoDbA2aStorage::event_sort_key(10));
+        assert!(DynamoDbA2aStorage::event_sort_key(99) < DynamoDbA2aStorage::event_sort_key(100));
         assert!(
             DynamoDbA2aStorage::event_sort_key(999_999)
                 < DynamoDbA2aStorage::event_sort_key(1_000_000)
@@ -3566,12 +3945,7 @@ mod tests {
     #[test]
     fn build_event_item_includes_ttl_when_provided() {
         let ttl_attr = AttributeValue::N("1234567890".into());
-        let item = DynamoDbA2aStorage::build_event_item(
-            "t#x",
-            1,
-            "{}",
-            Some(ttl_attr.clone()),
-        );
+        let item = DynamoDbA2aStorage::build_event_item("t#x", 1, "{}", Some(ttl_attr.clone()));
         assert_required_event_attributes(&item, "t#x", 1, "{}");
         match item.get("ttl") {
             Some(got) => assert_eq!(got, &ttl_attr),

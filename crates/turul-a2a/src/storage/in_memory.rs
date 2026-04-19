@@ -5,16 +5,16 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 use turul_a2a_types::{Artifact, Message, Task, TaskStatus};
 
-use crate::push::{
-    A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
-    DeliveryOutcome, FailedDelivery, GaveUpReason,
-};
-use crate::streaming::StreamEvent;
 use super::atomic::A2aAtomicStore;
 use super::error::A2aStorageError;
 use super::event_store::A2aEventStore;
 use super::filter::{PushConfigListPage, TaskFilter, TaskListPage};
 use super::traits::{A2aPushNotificationStorage, A2aTaskStorage};
+use crate::push::{
+    A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
+    DeliveryOutcome, FailedDelivery, GaveUpReason,
+};
+use crate::streaming::StreamEvent;
 
 /// Stored task with tenant/owner metadata not present in the proto Task.
 #[derive(Debug, Clone)]
@@ -358,15 +358,13 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         // Sort by last update time descending (spec §3.1.4 MUST).
         // Tiebreak by task_id descending for determinism.
         filtered.sort_by(|a, b| {
-            b.updated_at.cmp(&a.updated_at)
+            b.updated_at
+                .cmp(&a.updated_at)
                 .then_with(|| b.task.id().cmp(a.task.id()))
         });
 
         let total_size = filtered.len() as i32;
-        let page_size = filter
-            .page_size
-            .map(|ps| ps.clamp(1, 100))
-            .unwrap_or(50);
+        let page_size = filter.page_size.map(|ps| ps.clamp(1, 100)).unwrap_or(50);
 
         // Cursor-based pagination: token is "updated_at|task_id" of last item.
         // Next page starts after items that sort before this cursor.
@@ -374,9 +372,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
             if let Some((cursor_time, cursor_id)) = token.split_once('|') {
                 filtered
                     .iter()
-                    .position(|s| {
-                        (s.updated_at.as_str(), s.task.id()) < (cursor_time, cursor_id)
-                    })
+                    .position(|s| (s.updated_at.as_str(), s.task.id()) < (cursor_time, cursor_id))
                     .unwrap_or(filtered.len())
             } else {
                 // Legacy token format (task_id only) — skip past it
@@ -400,9 +396,10 @@ impl A2aTaskStorage for InMemoryA2aStorage {
 
         // Encode cursor as "updated_at|task_id"
         let next_page_token = if end_idx < filtered.len() {
-            filtered.get(end_idx - 1).map(|s| {
-                format!("{}|{}", s.updated_at, s.task.id())
-            }).unwrap_or_default()
+            filtered
+                .get(end_idx - 1)
+                .map(|s| format!("{}|{}", s.updated_at, s.task.id()))
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -448,10 +445,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         turul_a2a_types::state_machine::validate_transition(current_state, new_state).map_err(
             |e| match e {
                 turul_a2a_types::A2aTypeError::InvalidTransition { current, requested } => {
-                    A2aStorageError::InvalidTransition {
-                        current,
-                        requested,
-                    }
+                    A2aStorageError::InvalidTransition { current, requested }
                 }
                 turul_a2a_types::A2aTypeError::TerminalState(s) => {
                     A2aStorageError::TerminalState(s)
@@ -463,8 +457,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         // Update status on proto
         let mut proto = stored.task.as_proto().clone();
         proto.status = Some(new_status.into_proto());
-        let updated_task =
-            Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+        let updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
 
         // Preserve cancel_requested (monotonic) and latest_event_sequence
         // (ADR-013 §6.3 — monotonic, maintained by atomic commits only).
@@ -604,10 +597,7 @@ impl crate::storage::A2aCancellationSupervisor for InMemoryA2aStorage {
         };
         // Ignore the marker if the task is already terminal — supervisor
         // treats "already terminal" and "no cancel needed" identically.
-        let state = stored
-            .task
-            .status()
-            .and_then(|s| s.state().ok());
+        let state = stored.task.status().and_then(|s| s.state().ok());
         let terminal = state
             .map(turul_a2a_types::state_machine::is_terminal)
             .unwrap_or(false);
@@ -624,10 +614,7 @@ impl crate::storage::A2aCancellationSupervisor for InMemoryA2aStorage {
         for task_id in task_ids {
             let key = (tenant.to_string(), task_id.clone());
             if let Some(stored) = tasks.get(&key) {
-                let state = stored
-                    .task
-                    .status()
-                    .and_then(|s| s.state().ok());
+                let state = stored.task.status().and_then(|s| s.state().ok());
                 let terminal = state
                     .map(turul_a2a_types::state_machine::is_terminal)
                     .unwrap_or(false);
@@ -784,7 +771,10 @@ impl A2aPushNotificationStorage for InMemoryA2aStorage {
         let page_configs = matching[start_idx..end_idx].to_vec();
 
         let next_page_token = if end_idx < matching.len() {
-            page_configs.last().map(|c| c.id.clone()).unwrap_or_default()
+            page_configs
+                .last()
+                .map(|c| c.id.clone())
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -843,7 +833,10 @@ impl A2aPushNotificationStorage for InMemoryA2aStorage {
         let end_idx = (start_idx + page_size).min(matching.len());
         let page_configs = matching[start_idx..end_idx].to_vec();
         let next_page_token = if end_idx < matching.len() {
-            page_configs.last().map(|c| c.id.clone()).unwrap_or_default()
+            page_configs
+                .last()
+                .map(|c| c.id.clone())
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -906,11 +899,7 @@ impl A2aEventStore for InMemoryA2aStorage {
         }
     }
 
-    async fn latest_sequence(
-        &self,
-        tenant: &str,
-        task_id: &str,
-    ) -> Result<u64, A2aStorageError> {
+    async fn latest_sequence(&self, tenant: &str, task_id: &str) -> Result<u64, A2aStorageError> {
         let key = (tenant.to_string(), task_id.to_string());
         let counters = self.event_counters.read().await;
         Ok(*counters.get(&key).unwrap_or(&0))
@@ -1040,7 +1029,8 @@ impl A2aAtomicStore for InMemoryA2aStorage {
                 turul_a2a_types::A2aTypeError::TerminalState(s) => {
                     A2aStorageError::TerminalStateAlreadySet {
                         task_id: task_id.to_string(),
-                        current_state: crate::storage::terminal_cas::task_state_wire_name(s).to_string(),
+                        current_state: crate::storage::terminal_cas::task_state_wire_name(s)
+                            .to_string(),
                     }
                 }
                 other => A2aStorageError::TypeError(other),
@@ -1146,9 +1136,10 @@ impl A2aAtomicStore for InMemoryA2aStorage {
                     if turul_a2a_types::state_machine::is_terminal(state) {
                         return Err(A2aStorageError::TerminalStateAlreadySet {
                             task_id: task.id().to_string(),
-                            current_state:
-                                crate::storage::terminal_cas::task_state_wire_name(state)
-                                    .to_string(),
+                            current_state: crate::storage::terminal_cas::task_state_wire_name(
+                                state,
+                            )
+                            .to_string(),
                         });
                     }
                 }
@@ -2011,8 +2002,8 @@ mod tests {
         let owner = "owner-1";
 
         // Seed Working, bump latest_event_sequence to 3.
-        let task = Task::new(task_id, TaskStatus::new(TaskState::Working))
-            .with_context_id("ctx-race");
+        let task =
+            Task::new(task_id, TaskStatus::new(TaskState::Working)).with_context_id("ctx-race");
         A2aTaskStorage::create_task(&s, tenant, owner, task.clone())
             .await
             .expect("seed");
@@ -2073,8 +2064,7 @@ mod tests {
             status_update: crate::streaming::StatusUpdatePayload {
                 task_id: task_id.into(),
                 context_id: "ctx-race".into(),
-                status: serde_json::to_value(TaskStatus::new(TaskState::Completed))
-                    .unwrap(),
+                status: serde_json::to_value(TaskStatus::new(TaskState::Completed)).unwrap(),
             },
         };
         let (_t, seqs) = s

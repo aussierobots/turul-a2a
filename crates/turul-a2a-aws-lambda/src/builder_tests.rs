@@ -53,12 +53,7 @@ impl A2aTaskStorage for FakeBackend {
     fn backend_name(&self) -> &'static str {
         "fake-backend"
     }
-    async fn create_task(
-        &self,
-        _t: &str,
-        _o: &str,
-        task: Task,
-    ) -> Result<Task, A2aStorageError> {
+    async fn create_task(&self, _t: &str, _o: &str, task: Task) -> Result<Task, A2aStorageError> {
         Ok(task)
     }
     async fn get_task(
@@ -70,20 +65,10 @@ impl A2aTaskStorage for FakeBackend {
     ) -> Result<Option<Task>, A2aStorageError> {
         Ok(None)
     }
-    async fn update_task(
-        &self,
-        _t: &str,
-        _o: &str,
-        _task: Task,
-    ) -> Result<(), A2aStorageError> {
+    async fn update_task(&self, _t: &str, _o: &str, _task: Task) -> Result<(), A2aStorageError> {
         Ok(())
     }
-    async fn delete_task(
-        &self,
-        _t: &str,
-        _tid: &str,
-        _o: &str,
-    ) -> Result<bool, A2aStorageError> {
+    async fn delete_task(&self, _t: &str, _tid: &str, _o: &str) -> Result<bool, A2aStorageError> {
         Ok(false)
     }
     async fn list_tasks(
@@ -174,12 +159,7 @@ impl A2aPushNotificationStorage for FakeBackend {
             next_page_token: String::new(),
         })
     }
-    async fn delete_config(
-        &self,
-        _t: &str,
-        _tid: &str,
-        _c: &str,
-    ) -> Result<(), A2aStorageError> {
+    async fn delete_config(&self, _t: &str, _tid: &str, _c: &str) -> Result<(), A2aStorageError> {
         Ok(())
     }
     async fn list_configs_eligible_at_event(
@@ -322,7 +302,9 @@ fn build_rejects_missing_cancellation_supervisor() {
                 "error message should mention cancellation_supervisor: {msg}"
             );
         }
-        Ok(_) => panic!("expected Internal error about missing cancellation_supervisor, got Ok(handler)"),
+        Ok(_) => {
+            panic!("expected Internal error about missing cancellation_supervisor, got Ok(handler)")
+        }
         Err(other) => panic!("expected Internal error, got different error: {other}"),
     }
 }
@@ -503,4 +485,3 @@ fn lambda_builder_rejects_retry_horizon_violation() {
         "lambda error must cite the retry horizon: {err}"
     );
 }
-

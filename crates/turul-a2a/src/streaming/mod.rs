@@ -12,7 +12,7 @@ pub mod replay;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 
 /// A single streaming event (persisted in the durable event store).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -34,14 +34,19 @@ impl StreamEvent {
     /// Check if this event represents a terminal task state.
     pub fn is_terminal(&self) -> bool {
         match self {
-            StreamEvent::StatusUpdate { status_update } => {
-                status_update.status.get("state")
-                    .and_then(|s| s.as_str())
-                    .is_some_and(|s| matches!(s,
-                        "TASK_STATE_COMPLETED" | "TASK_STATE_FAILED" |
-                        "TASK_STATE_CANCELED" | "TASK_STATE_REJECTED"
-                    ))
-            }
+            StreamEvent::StatusUpdate { status_update } => status_update
+                .status
+                .get("state")
+                .and_then(|s| s.as_str())
+                .is_some_and(|s| {
+                    matches!(
+                        s,
+                        "TASK_STATE_COMPLETED"
+                            | "TASK_STATE_FAILED"
+                            | "TASK_STATE_CANCELED"
+                            | "TASK_STATE_REJECTED"
+                    )
+                }),
             StreamEvent::ArtifactUpdate { .. } => false,
         }
     }
@@ -92,10 +97,7 @@ impl TaskEventBroker {
     }
 
     /// Get or create a wake-up sender for a task.
-    async fn get_or_create_sender(
-        &self,
-        task_id: &str,
-    ) -> broadcast::Sender<()> {
+    async fn get_or_create_sender(&self, task_id: &str) -> broadcast::Sender<()> {
         let mut channels = self.channels.write().await;
         channels
             .entry(task_id.to_string())
@@ -105,10 +107,7 @@ impl TaskEventBroker {
 
     /// Subscribe to wake-up notifications for a task.
     /// Returns a receiver that yields `()` when new events are available in the store.
-    pub async fn subscribe(
-        &self,
-        task_id: &str,
-    ) -> broadcast::Receiver<()> {
+    pub async fn subscribe(&self, task_id: &str) -> broadcast::Receiver<()> {
         let sender = self.get_or_create_sender(task_id).await;
         sender.subscribe()
     }
@@ -209,14 +208,14 @@ mod tests {
         // Notify only task-a
         broker.notify("task-a").await;
 
-        assert!(rx_a.recv().await.is_ok(), "task-a subscriber should be notified");
+        assert!(
+            rx_a.recv().await.is_ok(),
+            "task-a subscriber should be notified"
+        );
 
         // task-b should have nothing — use try_recv to avoid blocking
         // (broadcast recv would block, so we check via a timeout)
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            rx_b.recv(),
-        ).await;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx_b.recv()).await;
         assert!(result.is_err(), "task-b should NOT be notified");
     }
 
@@ -255,10 +254,16 @@ mod tests {
 
     #[test]
     fn is_terminal_detects_terminal_states() {
-        for state in ["TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"] {
+        for state in [
+            "TASK_STATE_COMPLETED",
+            "TASK_STATE_FAILED",
+            "TASK_STATE_CANCELED",
+            "TASK_STATE_REJECTED",
+        ] {
             let event = StreamEvent::StatusUpdate {
                 status_update: StatusUpdatePayload {
-                    task_id: "t".into(), context_id: "c".into(),
+                    task_id: "t".into(),
+                    context_id: "c".into(),
                     status: serde_json::json!({"state": state}),
                 },
             };
@@ -268,10 +273,15 @@ mod tests {
 
     #[test]
     fn is_terminal_rejects_non_terminal_states() {
-        for state in ["TASK_STATE_SUBMITTED", "TASK_STATE_WORKING", "TASK_STATE_INPUT_REQUIRED"] {
+        for state in [
+            "TASK_STATE_SUBMITTED",
+            "TASK_STATE_WORKING",
+            "TASK_STATE_INPUT_REQUIRED",
+        ] {
             let event = StreamEvent::StatusUpdate {
                 status_update: StatusUpdatePayload {
-                    task_id: "t".into(), context_id: "c".into(),
+                    task_id: "t".into(),
+                    context_id: "c".into(),
                     status: serde_json::json!({"state": state}),
                 },
             };
@@ -283,9 +293,11 @@ mod tests {
     fn artifact_update_is_never_terminal() {
         let event = StreamEvent::ArtifactUpdate {
             artifact_update: ArtifactUpdatePayload {
-                task_id: "t".into(), context_id: "c".into(),
+                task_id: "t".into(),
+                context_id: "c".into(),
                 artifact: serde_json::json!({}),
-                append: false, last_chunk: true,
+                append: false,
+                last_chunk: true,
             },
         };
         assert!(!event.is_terminal());

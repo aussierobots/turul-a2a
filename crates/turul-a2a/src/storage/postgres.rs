@@ -4,16 +4,16 @@ use async_trait::async_trait;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use turul_a2a_types::{Artifact, Message, Task, TaskState, TaskStatus};
 
-use crate::push::{
-    A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
-    DeliveryOutcome, FailedDelivery, GaveUpReason,
-};
-use crate::streaming::StreamEvent;
 use super::atomic::A2aAtomicStore;
 use super::error::A2aStorageError;
 use super::event_store::A2aEventStore;
 use super::filter::{PushConfigListPage, TaskFilter, TaskListPage};
 use super::traits::{A2aPushNotificationStorage, A2aTaskStorage};
+use crate::push::{
+    A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
+    DeliveryOutcome, FailedDelivery, GaveUpReason,
+};
+use crate::streaming::StreamEvent;
 
 /// PostgreSQL storage configuration.
 #[derive(Debug, Clone)]
@@ -197,8 +197,8 @@ impl PostgresA2aStorage {
     }
 
     fn task_from_json(json: &serde_json::Value) -> Result<Task, A2aStorageError> {
-        let proto: turul_a2a_proto::Task =
-            serde_json::from_value(json.clone()).map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
+        let proto: turul_a2a_proto::Task = serde_json::from_value(json.clone())
+            .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
         Task::try_from(proto).map_err(A2aStorageError::TypeError)
     }
 
@@ -223,7 +223,8 @@ impl PostgresA2aStorage {
         if !include_artifacts {
             proto.artifacts.clear();
         }
-        Task::try_from(proto).unwrap_or_else(|_| Task::new("err", TaskStatus::new(TaskState::Failed)))
+        Task::try_from(proto)
+            .unwrap_or_else(|_| Task::new("err", TaskStatus::new(TaskState::Failed)))
     }
 }
 
@@ -317,15 +318,14 @@ impl A2aTaskStorage for PostgresA2aStorage {
         task_id: &str,
         owner: &str,
     ) -> Result<bool, A2aStorageError> {
-        let result = sqlx::query(
-            "DELETE FROM a2a_tasks WHERE tenant = $1 AND task_id = $2 AND owner = $3",
-        )
-        .bind(tenant)
-        .bind(task_id)
-        .bind(owner)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        let result =
+            sqlx::query("DELETE FROM a2a_tasks WHERE tenant = $1 AND task_id = $2 AND owner = $3")
+                .bind(tenant)
+                .bind(task_id)
+                .bind(owner)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -380,7 +380,8 @@ impl A2aTaskStorage for PostgresA2aStorage {
 
         // Cursor: "updated_at|task_id" — fetch items that sort after cursor in DESC order
         let cursor_parts = filter.page_token.as_ref().and_then(|t| {
-            t.split_once('|').map(|(time, id)| (time.to_string(), id.to_string()))
+            t.split_once('|')
+                .map(|(time, id)| (time.to_string(), id.to_string()))
         });
         if let Some((ref cursor_time, ref cursor_id)) = cursor_parts {
             extra_where.push_str(&format!(
@@ -414,18 +415,22 @@ impl A2aTaskStorage for PostgresA2aStorage {
         let tasks_with_times: Vec<(Task, String)> = rows
             .iter()
             .filter_map(|(json, updated_at)| {
-                Self::task_from_json(json)
-                    .ok()
-                    .map(|t| (Self::trim_task(t, filter.history_length, include_artifacts), updated_at.clone()))
+                Self::task_from_json(json).ok().map(|t| {
+                    (
+                        Self::trim_task(t, filter.history_length, include_artifacts),
+                        updated_at.clone(),
+                    )
+                })
             })
             .collect();
 
         let tasks: Vec<Task> = tasks_with_times.iter().map(|(t, _)| t.clone()).collect();
 
         let next_page_token = if tasks.len() as i32 >= page_size {
-            tasks_with_times.last().map(|(t, updated_at)| {
-                format!("{}|{}", updated_at, t.id())
-            }).unwrap_or_default()
+            tasks_with_times
+                .last()
+                .map(|(t, updated_at)| format!("{}|{}", updated_at, t.id()))
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -463,7 +468,9 @@ impl A2aTaskStorage for PostgresA2aStorage {
                 turul_a2a_types::A2aTypeError::InvalidTransition { current, requested } => {
                     A2aStorageError::InvalidTransition { current, requested }
                 }
-                turul_a2a_types::A2aTypeError::TerminalState(s) => A2aStorageError::TerminalState(s),
+                turul_a2a_types::A2aTypeError::TerminalState(s) => {
+                    A2aStorageError::TerminalState(s)
+                }
                 other => A2aStorageError::TypeError(other),
             },
         )?;
@@ -667,7 +674,10 @@ impl A2aPushNotificationStorage for PostgresA2aStorage {
         const MAX_ATTEMPTS: u32 = 5;
         let backoffs_ms: [u64; 4] = [10, 50, 250, 1000];
         for attempt in 0..MAX_ATTEMPTS {
-            let mut conn = self.pool.acquire().await
+            let mut conn = self
+                .pool
+                .acquire()
+                .await
                 .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
             sqlx::query("BEGIN ISOLATION LEVEL SERIALIZABLE")
                 .execute(&mut *conn)
@@ -914,7 +924,10 @@ impl A2aEventStore for PostgresA2aStorage {
         let event_data = serde_json::to_value(&event)
             .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
 
-        let mut tx = self.pool.begin().await
+        let mut tx = self
+            .pool
+            .begin()
+            .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         // Allocate per-task sequence via MAX+1 within transaction
@@ -942,7 +955,8 @@ impl A2aEventStore for PostgresA2aStorage {
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        tx.commit().await
+        tx.commit()
+            .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         Ok(seq as u64)
@@ -975,11 +989,7 @@ impl A2aEventStore for PostgresA2aStorage {
         Ok(events)
     }
 
-    async fn latest_sequence(
-        &self,
-        tenant: &str,
-        task_id: &str,
-    ) -> Result<u64, A2aStorageError> {
+    async fn latest_sequence(&self, tenant: &str, task_id: &str) -> Result<u64, A2aStorageError> {
         let row: Option<i64> = sqlx::query_scalar(
             "SELECT COALESCE(MAX(event_sequence), 0) FROM a2a_task_events
              WHERE tenant = $1 AND task_id = $2",
@@ -1017,7 +1027,10 @@ impl A2aAtomicStore for PostgresA2aStorage {
         let task_json = Self::task_to_json(&task)?;
         let state_str = Self::status_state_str(&task);
 
-        let mut tx = self.pool.begin().await
+        let mut tx = self
+            .pool
+            .begin()
+            .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         sqlx::query(
@@ -1079,7 +1092,8 @@ impl A2aAtomicStore for PostgresA2aStorage {
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         }
 
-        tx.commit().await
+        tx.commit()
+            .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         Ok((task, sequences))
@@ -1093,7 +1107,10 @@ impl A2aAtomicStore for PostgresA2aStorage {
         new_status: TaskStatus,
         events: Vec<StreamEvent>,
     ) -> Result<(Task, Vec<u64>), A2aStorageError> {
-        let mut tx = self.pool.begin().await
+        let mut tx = self
+            .pool
+            .begin()
+            .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         let row: Option<(serde_json::Value,)> = sqlx::query_as(
@@ -1257,7 +1274,8 @@ impl A2aAtomicStore for PostgresA2aStorage {
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         }
 
-        tx.commit().await
+        tx.commit()
+            .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         Ok((updated_task, sequences))
@@ -1273,7 +1291,10 @@ impl A2aAtomicStore for PostgresA2aStorage {
         let task_json = Self::task_to_json(&task)?;
         let state_str = Self::status_state_str(&task);
 
-        let mut tx = self.pool.begin().await
+        let mut tx = self
+            .pool
+            .begin()
+            .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         // Terminal-preservation CAS (ADR-010 §7.1 extension): exclude
@@ -1311,8 +1332,7 @@ impl A2aAtomicStore for PostgresA2aStorage {
             return match current {
                 Some((state,)) => Err(A2aStorageError::TerminalStateAlreadySet {
                     task_id: task.id().to_string(),
-                    current_state:
-                        crate::storage::terminal_cas::debug_state_to_wire_name(&state),
+                    current_state: crate::storage::terminal_cas::debug_state_to_wire_name(&state),
                 }),
                 None => Err(A2aStorageError::TaskNotFound(task.id().to_string())),
             };
@@ -1363,7 +1383,8 @@ impl A2aAtomicStore for PostgresA2aStorage {
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         }
 
-        tx.commit().await
+        tx.commit()
+            .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         Ok(sequences)
@@ -1945,15 +1966,17 @@ impl A2aPushDeliveryStore for PostgresA2aStorage {
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         Ok(rows
             .into_iter()
-            .map(|(tenant, owner, task_id, event_sequence, recorded_at_micros)| {
-                crate::push::claim::PendingDispatch {
-                    tenant,
-                    owner,
-                    task_id,
-                    event_sequence: event_sequence.max(0) as u64,
-                    recorded_at: pg_micros_to_systime(recorded_at_micros),
-                }
-            })
+            .map(
+                |(tenant, owner, task_id, event_sequence, recorded_at_micros)| {
+                    crate::push::claim::PendingDispatch {
+                        tenant,
+                        owner,
+                        task_id,
+                        event_sequence: event_sequence.max(0) as u64,
+                        recorded_at: pg_micros_to_systime(recorded_at_micros),
+                    }
+                },
+            )
             .collect())
     }
 

@@ -45,10 +45,7 @@ impl SecurityContribution {
         let name = name.into();
         self.schemes.push((name.clone(), scheme));
         let mut req_schemes = std::collections::HashMap::new();
-        req_schemes.insert(
-            name,
-            turul_a2a_proto::StringList { list: scopes },
-        );
+        req_schemes.insert(name, turul_a2a_proto::StringList { list: scopes });
         self.requirements
             .push(turul_a2a_proto::SecurityRequirement {
                 schemes: req_schemes,

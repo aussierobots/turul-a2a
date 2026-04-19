@@ -113,11 +113,10 @@ pub(crate) fn spawn_tracked_executor(
 
     // Register BEFORE spawn so an immediate `:cancel` on this instance
     // can trip the token even if the executor hasn't started running yet.
-    deps.in_flight.try_insert(key.clone(), handle.clone())
+    deps.in_flight
+        .try_insert(key.clone(), handle.clone())
         .map_err(|collision| {
-            A2aError::Internal(format!(
-                "double-spawn for in-flight task: {collision}"
-            ))
+            A2aError::Internal(format!("double-spawn for in-flight task: {collision}"))
         })?;
 
     // Build the live sink and capture the pieces the executor task

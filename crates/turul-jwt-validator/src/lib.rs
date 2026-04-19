@@ -154,20 +154,17 @@ impl JwtValidator {
             validation.validate_aud = false;
         }
 
-        let token_data = decode::<TokenClaims>(token, &key, &validation).map_err(|e| {
-            match e.kind() {
+        let token_data =
+            decode::<TokenClaims>(token, &key, &validation).map_err(|e| match e.kind() {
                 jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
                     JwtValidationError::TokenExpired
                 }
                 jsonwebtoken::errors::ErrorKind::InvalidAudience => {
                     JwtValidationError::InvalidAudience
                 }
-                jsonwebtoken::errors::ErrorKind::InvalidIssuer => {
-                    JwtValidationError::InvalidIssuer
-                }
+                jsonwebtoken::errors::ErrorKind::InvalidIssuer => JwtValidationError::InvalidIssuer,
                 _ => JwtValidationError::InvalidToken(e.to_string()),
-            }
-        })?;
+            })?;
 
         Ok(token_data.claims)
     }
@@ -341,9 +338,10 @@ mod tests {
 
     #[test]
     fn validator_builder_api() {
-        let _validator = JwtValidator::new("https://example.com/.well-known/jwks.json", "my-audience")
-            .with_issuer("https://example.com")
-            .with_algorithms(vec![Algorithm::RS256])
-            .with_refresh_interval(Duration::from_secs(120));
+        let _validator =
+            JwtValidator::new("https://example.com/.well-known/jwks.json", "my-audience")
+                .with_issuer("https://example.com")
+                .with_algorithms(vec![Algorithm::RS256])
+                .with_refresh_interval(Duration::from_secs(120));
     }
 }

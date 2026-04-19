@@ -53,8 +53,8 @@
 //!    This keeps `ExecutionContext::anonymous` workable in executor unit
 //!    tests without requiring them to stand up storage.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Mutex as AsyncMutex;
 use turul_a2a_types::{Artifact, Message, TaskState, TaskStatus};
@@ -62,9 +62,7 @@ use turul_a2a_types::{Artifact, Message, TaskState, TaskStatus};
 use crate::error::A2aError;
 use crate::server::in_flight::InFlightHandle;
 use crate::storage::{A2aAtomicStore, A2aStorageError, A2aTaskStorage};
-use crate::streaming::{
-    ArtifactUpdatePayload, StatusUpdatePayload, StreamEvent, TaskEventBroker,
-};
+use crate::streaming::{ArtifactUpdatePayload, StatusUpdatePayload, StreamEvent, TaskEventBroker};
 
 /// Executor-side handle for emitting task lifecycle events durably.
 ///
@@ -340,10 +338,8 @@ impl EventSinkInner {
                         status_update: StatusUpdatePayload {
                             task_id: self.task_id.clone(),
                             context_id: self.context_id.clone(),
-                            status: serde_json::to_value(
-                                turul_a2a_types::TaskStatus::new(state),
-                            )
-                            .unwrap_or_default(),
+                            status: serde_json::to_value(turul_a2a_types::TaskStatus::new(state))
+                                .unwrap_or_default(),
                         },
                     };
                     dispatcher.dispatch(
@@ -366,9 +362,7 @@ impl EventSinkInner {
             Err(A2aStorageError::TerminalStateAlreadySet { current_state, .. }) => {
                 self.is_closed.store(true, Ordering::Release);
                 Err(A2aError::InvalidRequest {
-                    message: format!(
-                        "EventSink is closed: terminal already set ({current_state})"
-                    ),
+                    message: format!("EventSink is closed: terminal already set ({current_state})"),
                 })
             }
             Err(other) => Err(A2aError::from(other)),
@@ -439,9 +433,7 @@ impl EventSinkInner {
                 // From impl uses for cancel-handler callers.
                 self.is_closed.store(true, Ordering::Release);
                 Err(A2aError::InvalidRequest {
-                    message: format!(
-                        "EventSink is closed: terminal already set ({current_state})"
-                    ),
+                    message: format!("EventSink is closed: terminal already set ({current_state})"),
                 })
             }
             Err(other) => Err(A2aError::from(other)),
@@ -635,13 +627,10 @@ mod tests {
 
         // The yielded receiver got the persisted task — its state is
         // COMPLETED, matching what we just committed.
-        let yielded_task = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            yielded_rx,
-        )
-        .await
-        .expect("yielded fires promptly")
-        .expect("yielded sender not dropped");
+        let yielded_task = tokio::time::timeout(std::time::Duration::from_millis(200), yielded_rx)
+            .await
+            .expect("yielded fires promptly")
+            .expect("yielded sender not dropped");
         assert_eq!(
             yielded_task.status().unwrap().state().unwrap(),
             TaskState::Completed,
@@ -679,10 +668,7 @@ mod tests {
             .expect_err("emits after terminal must fail");
         match err {
             A2aError::InvalidRequest { message } => {
-                assert!(
-                    message.contains("EventSink is closed"),
-                    "msg: {message}"
-                );
+                assert!(message.contains("EventSink is closed"), "msg: {message}");
             }
             other => panic!("expected InvalidRequest, got {other:?}"),
         }
@@ -723,10 +709,7 @@ mod tests {
             .expect_err("losing-CAS terminal must not Ok()");
         match err {
             A2aError::InvalidRequest { message } => {
-                assert!(
-                    message.contains("terminal already set"),
-                    "msg: {message}"
-                );
+                assert!(message.contains("terminal already set"), "msg: {message}");
                 assert!(
                     message.contains("TASK_STATE_CANCELED"),
                     "error reports persisted terminal: {message}"
@@ -745,9 +728,7 @@ mod tests {
         // yielded_rx is still live; immediately polling it returns empty.
         match yielded_rx.try_recv() {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
-            other => panic!(
-                "yielded must remain un-fired on CAS loss, got {other:?}"
-            ),
+            other => panic!("yielded must remain un-fired on CAS loss, got {other:?}"),
         }
     }
 
@@ -917,6 +898,9 @@ mod tests {
             late_sink.is_closed(),
             "storage-layer terminal-preservation CAS must close the sink"
         );
-        assert!(!handle2.yielded_fired(), "artifact emit never fires yielded");
+        assert!(
+            !handle2.yielded_fired(),
+            "artifact emit never fires yielded"
+        );
     }
 }

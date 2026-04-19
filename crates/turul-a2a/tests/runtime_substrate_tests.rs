@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use secrecy::{ExposeSecret, SecretBox};
+use tokio::sync::Notify; // used by normal-exit test
 use tokio::sync::oneshot;
-use tokio::sync::Notify;  // used by normal-exit test
 use tokio_util::sync::CancellationToken;
 use tracing::Level;
 use tracing_subscriber::layer::SubscriberExt;
@@ -61,7 +61,11 @@ impl EventCapture {
 }
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         let metadata = event.metadata();
         let mut visitor = FieldVisitor(HashMap::new());
         event.record(&mut visitor);
@@ -80,7 +84,8 @@ impl tracing::field::Visit for FieldVisitor {
         self.0.insert(field.name().to_string(), value.to_string());
     }
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0.insert(field.name().to_string(), format!("{value:?}"));
+        self.0
+            .insert(field.name().to_string(), format!("{value:?}"));
     }
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
         self.0.insert(field.name().to_string(), value.to_string());
@@ -128,8 +133,7 @@ fn make_key(tenant: &str, task_id: &str) -> InFlightKey {
 /// Build a minimal Task suitable for firing `yielded`.
 fn dummy_task(task_id: &str) -> Task {
     use turul_a2a_types::{TaskState, TaskStatus};
-    Task::new(task_id.to_string(), TaskStatus::new(TaskState::Submitted))
-        .with_context_id("ctx-1")
+    Task::new(task_id.to_string(), TaskStatus::new(TaskState::Submitted)).with_context_id("ctx-1")
 }
 
 // ---------------------------------------------------------------------------
@@ -158,16 +162,27 @@ async fn in_flight_registry_insert_remove_roundtrip() {
     registry
         .try_insert(key.clone(), Arc::clone(&handle))
         .expect("first insert on empty key must succeed");
-    assert!(registry.get(&key).is_some(), "entry should be present after insert");
+    assert!(
+        registry.get(&key).is_some(),
+        "entry should be present after insert"
+    );
 
     // Release the spawned task and let it resolve.
     let _ = exit_tx.send(());
-    let taken = handle.take_spawned().expect("JoinHandle should still be in the handle");
+    let taken = handle
+        .take_spawned()
+        .expect("JoinHandle should still be in the handle");
     taken.await.expect("spawned task should complete cleanly");
 
     let removed = registry.remove_if_current(&key, &handle);
-    assert!(removed, "remove_if_current should succeed for the owning handle");
-    assert!(registry.get(&key).is_none(), "entry must be gone after remove");
+    assert!(
+        removed,
+        "remove_if_current should succeed for the owning handle"
+    );
+    assert!(
+        registry.get(&key).is_none(),
+        "entry must be gone after remove"
+    );
 }
 
 /// Test 2: sentinel Drop on normal exit path removes the registry entry and
@@ -197,11 +212,8 @@ async fn supervisor_sentinel_drops_on_normal_exit_removes_entry() {
     // Simulate the supervisor body. The sentinel is a local; it drops when
     // this block exits, running the cleanup path.
     {
-        let _sentinel = SupervisorSentinel::new(
-            Arc::clone(&registry),
-            key.clone(),
-            Arc::clone(&handle),
-        );
+        let _sentinel =
+            SupervisorSentinel::new(Arc::clone(&registry), key.clone(), Arc::clone(&handle));
 
         // Release the spawned task and await its resolution explicitly.
         exit_notify.notify_one();
@@ -209,7 +221,10 @@ async fn supervisor_sentinel_drops_on_normal_exit_removes_entry() {
         taken.await.expect("spawned task should complete cleanly");
     }
 
-    assert!(registry.get(&key).is_none(), "registry entry must be removed on sentinel Drop");
+    assert!(
+        registry.get(&key).is_none(),
+        "registry entry must be removed on sentinel Drop"
+    );
     assert!(abort_handle.is_finished(), "spawned task must be finished");
 }
 
@@ -251,7 +266,10 @@ async fn supervisor_sentinel_drops_on_panic_still_cleans_up() {
     let result = supervisor_handle.await;
     assert!(result.is_err(), "supervisor task should have panicked");
     let join_error = result.unwrap_err();
-    assert!(join_error.is_panic(), "JoinError should reflect panic, not cancellation");
+    assert!(
+        join_error.is_panic(),
+        "JoinError should reflect panic, not cancellation"
+    );
 
     // Cleanup must have run via Drop during unwind.
     assert!(
@@ -335,7 +353,11 @@ async fn supervisor_panic_emits_structured_event() {
     );
 
     let evt = &panic_events[0];
-    assert_eq!(evt.level, Level::ERROR, "supervisor_panic should be ERROR level");
+    assert_eq!(
+        evt.level,
+        Level::ERROR,
+        "supervisor_panic should be ERROR level"
+    );
     assert_eq!(
         evt.fields.get("tenant").map(String::as_str),
         Some(tenant),
@@ -421,7 +443,10 @@ async fn yielded_oneshot_fires_once_under_concurrent_triggers() {
 
     // Subsequent attempt on the sender side is a no-op.
     let task = dummy_task("task-after");
-    assert!(!handle.fire_yielded(task), "after-terminal attempt must NOT fire");
+    assert!(
+        !handle.fire_yielded(task),
+        "after-terminal attempt must NOT fire"
+    );
 }
 
 /// Test 6 (secret handling): `secrecy::SecretBox<String>` redacts in Debug
@@ -486,7 +511,11 @@ async fn secrecy_newtype_never_leaks_in_debug_or_display() {
 /// Helper: construct a handle wrapping a tokio task that waits on the given
 /// receiver then exits. Returns the handle, its abort handle, and the
 /// sender that releases the task.
-fn make_waiting_handle() -> (Arc<InFlightHandle>, tokio::task::AbortHandle, oneshot::Sender<()>) {
+fn make_waiting_handle() -> (
+    Arc<InFlightHandle>,
+    tokio::task::AbortHandle,
+    oneshot::Sender<()>,
+) {
     let (exit_tx, exit_rx) = oneshot::channel::<()>();
     let spawned = tokio::spawn(async move {
         let _ = exit_rx.await;
@@ -582,7 +611,10 @@ async fn stale_sentinel_does_not_remove_newer_handle_for_same_key() {
     // outlives the registry entry — e.g. the supervisor's sentinel is
     // still on the stack but the registry has already cycled).
     let removed_a = registry.remove_if_current(&key, &handle_a);
-    assert!(removed_a, "A must be removable while it is the current entry");
+    assert!(
+        removed_a,
+        "A must be removable while it is the current entry"
+    );
 
     // Step 3: install B under the same key.
     registry
@@ -593,11 +625,8 @@ async fn stale_sentinel_does_not_remove_newer_handle_for_same_key() {
     // `remove_if_current(&key, &handle_a)`. Since the registry now holds
     // B (Arc::ptr_eq == false), the call must be a no-op on the registry.
     {
-        let _stale_sentinel = SupervisorSentinel::new(
-            Arc::clone(&registry),
-            key.clone(),
-            Arc::clone(&handle_a),
-        );
+        let _stale_sentinel =
+            SupervisorSentinel::new(Arc::clone(&registry), key.clone(), Arc::clone(&handle_a));
         // scope exit → Drop → remove_if_current(&key, &handle_a) → no-op
     }
 
@@ -652,11 +681,8 @@ async fn stale_sentinel_still_aborts_own_spawned_handle() {
     // Dropping a sentinel wrapped around A triggers A's abort path, even
     // though the registry entry now belongs to B.
     {
-        let _stale_sentinel = SupervisorSentinel::new(
-            Arc::clone(&registry),
-            key.clone(),
-            Arc::clone(&handle_a),
-        );
+        let _stale_sentinel =
+            SupervisorSentinel::new(Arc::clone(&registry), key.clone(), Arc::clone(&handle_a));
     }
 
     // `abort()` schedules a cancel wake for the aborted task; the task's

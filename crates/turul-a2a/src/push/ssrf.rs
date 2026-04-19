@@ -297,15 +297,17 @@ mod tests {
         assert!(is_blocked_ip(IpAddr::V6(
             "::ffff:7f00:0001".parse().unwrap()
         )));
-        assert!(is_blocked_ip(IpAddr::V6("::ffff:10.0.0.5".parse().unwrap())));
+        assert!(is_blocked_ip(IpAddr::V6(
+            "::ffff:10.0.0.5".parse().unwrap()
+        )));
     }
 
     #[test]
     fn allows_ipv6_public() {
+        assert!(!is_blocked_ip(IpAddr::V6("2001:db8::1".parse().unwrap()))); // doc range, fine for testing intent
         assert!(!is_blocked_ip(IpAddr::V6(
-            "2001:db8::1".parse().unwrap()
-        ))); // doc range, fine for testing intent
-        assert!(!is_blocked_ip(IpAddr::V6("2606:4700:4700::1111".parse().unwrap())));
+            "2606:4700:4700::1111".parse().unwrap()
+        )));
     }
 
     #[test]
@@ -402,7 +404,10 @@ mod tests {
             if u.host_str() == Some("webhook.example.com") {
                 Ok(())
             } else {
-                Err(format!("host {} not in allowlist", u.host_str().unwrap_or("")))
+                Err(format!(
+                    "host {} not in allowlist",
+                    u.host_str().unwrap_or("")
+                ))
             }
         });
         let ips = vec![ipv4(203, 0, 113, 10)];

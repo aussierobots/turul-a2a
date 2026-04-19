@@ -51,11 +51,9 @@ pub mod http {
 
     // Push notification config operations (proto lines 92, 104, 114, 133)
     pub const CREATE_PUSH_CONFIG: &str = "/tasks/{task_id=*}/pushNotificationConfigs";
-    pub const GET_PUSH_CONFIG: &str =
-        "/tasks/{task_id=*}/pushNotificationConfigs/{id=*}";
+    pub const GET_PUSH_CONFIG: &str = "/tasks/{task_id=*}/pushNotificationConfigs/{id=*}";
     pub const LIST_PUSH_CONFIGS: &str = "/tasks/{task_id=*}/pushNotificationConfigs";
-    pub const DELETE_PUSH_CONFIG: &str =
-        "/tasks/{task_id=*}/pushNotificationConfigs/{id=*}";
+    pub const DELETE_PUSH_CONFIG: &str = "/tasks/{task_id=*}/pushNotificationConfigs/{id=*}";
 
     // Agent card (proto line 124; well-known from discovery docs)
     pub const EXTENDED_AGENT_CARD: &str = "/extendedAgentCard";
@@ -216,7 +214,10 @@ mod tests {
     fn http_tenant_prefixed_routes_exist() {
         // All proto additional_bindings (proto lines 26,38,49,59,69,80,95,106,116,126,135)
         assert_eq!(http::TENANT_SEND_MESSAGE, "/{tenant}/message:send");
-        assert_eq!(http::TENANT_SEND_STREAMING_MESSAGE, "/{tenant}/message:stream");
+        assert_eq!(
+            http::TENANT_SEND_STREAMING_MESSAGE,
+            "/{tenant}/message:stream"
+        );
         assert_eq!(http::TENANT_GET_TASK, "/{tenant}/tasks/{id=*}");
         assert_eq!(http::TENANT_LIST_TASKS, "/{tenant}/tasks");
         assert_eq!(http::TENANT_CANCEL_TASK, "/{tenant}/tasks/{id=*}:cancel");

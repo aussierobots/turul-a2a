@@ -139,10 +139,9 @@ fn middleware_error_to_response(err: &MiddlewareError) -> Response<Body> {
         }
     });
 
-    let mut builder = Response::builder().status(status).header(
-        http::header::CONTENT_TYPE,
-        "application/json",
-    );
+    let mut builder = Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json");
 
     // Add WWW-Authenticate header for challenges
     if let MiddlewareError::HttpChallenge {
@@ -154,10 +153,5 @@ fn middleware_error_to_response(err: &MiddlewareError) -> Response<Body> {
 
     builder
         .body(Body::from(serde_json::to_string(&body).unwrap_or_default()))
-        .unwrap_or_else(|_| {
-            Response::builder()
-                .status(500)
-                .body(Body::empty())
-                .unwrap()
-        })
+        .unwrap_or_else(|_| Response::builder().status(500).body(Body::empty()).unwrap())
 }

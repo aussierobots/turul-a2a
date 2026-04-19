@@ -9,8 +9,8 @@
 use async_trait::async_trait;
 use turul_a2a_types::{Task, TaskStatus};
 
-use crate::streaming::StreamEvent;
 use super::error::A2aStorageError;
+use crate::streaming::StreamEvent;
 
 /// Atomic task+event write operations.
 ///

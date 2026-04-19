@@ -94,13 +94,15 @@ impl A2aMiddleware for ApiKeyMiddleware {
         SecurityContribution::new().with_scheme(
             "apiKey",
             turul_a2a_proto::SecurityScheme {
-                scheme: Some(turul_a2a_proto::security_scheme::Scheme::ApiKeySecurityScheme(
-                    turul_a2a_proto::ApiKeySecurityScheme {
-                        description: String::new(),
-                        location: "header".into(),
-                        name: self.header_name.clone(),
-                    },
-                )),
+                scheme: Some(
+                    turul_a2a_proto::security_scheme::Scheme::ApiKeySecurityScheme(
+                        turul_a2a_proto::ApiKeySecurityScheme {
+                            description: String::new(),
+                            location: "header".into(),
+                            name: self.header_name.clone(),
+                        },
+                    ),
+                ),
             },
             vec![],
         )
@@ -147,8 +149,7 @@ mod tests {
     async fn invalid_key_returns_unauthenticated() {
         let mw = middleware();
         let mut ctx = RequestContext::new();
-        ctx.headers
-            .insert("x-api-key", "bad-key".parse().unwrap());
+        ctx.headers.insert("x-api-key", "bad-key".parse().unwrap());
         let err = mw.before_request(&mut ctx).await.unwrap_err();
         assert!(matches!(err, MiddlewareError::Unauthenticated(_)));
     }

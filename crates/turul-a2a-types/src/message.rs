@@ -91,9 +91,7 @@ impl Part {
     /// Returns `None` if this is not a Data part.
     pub fn as_data(&self) -> Option<serde_json::Value> {
         match &self.inner.content {
-            Some(pb::part::Content::Data(proto_struct)) => {
-                serde_json::to_value(proto_struct).ok()
-            }
+            Some(pb::part::Content::Data(proto_struct)) => serde_json::to_value(proto_struct).ok(),
             _ => None,
         }
     }
@@ -105,12 +103,14 @@ impl Part {
     /// so `u32`/`i32`/`u8` fields work correctly.
     ///
     /// Returns `None` if not a Data part. Returns `Err` if deserialization fails.
-    pub fn parse_data<T: serde::de::DeserializeOwned>(&self) -> Option<Result<T, crate::error::A2aTypeError>> {
+    pub fn parse_data<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> Option<Result<T, crate::error::A2aTypeError>> {
         let json = self.as_data()?;
         let normalized = normalize_proto_numbers_for_deser(json);
         Some(
             serde_json::from_value(normalized)
-                .map_err(|e| crate::error::A2aTypeError::Deserialization(e.to_string()))
+                .map_err(|e| crate::error::A2aTypeError::Deserialization(e.to_string())),
         )
     }
 
@@ -252,14 +252,17 @@ impl Message {
     /// Deserialize the first Data part into `T`, normalizing proto f64 integers.
     ///
     /// Returns `None` if no Data part exists. Returns `Err` if deserialization fails.
-    pub fn parse_first_data<T: serde::de::DeserializeOwned>(&self) -> Option<Result<T, crate::error::A2aTypeError>> {
+    pub fn parse_first_data<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> Option<Result<T, crate::error::A2aTypeError>> {
         for part in &self.inner.parts {
             if let Some(pb::part::Content::Data(proto_struct)) = &part.content {
                 if let Ok(json) = serde_json::to_value(proto_struct) {
                     let normalized = normalize_proto_numbers_for_deser(json);
                     return Some(
-                        serde_json::from_value(normalized)
-                            .map_err(|e| crate::error::A2aTypeError::Deserialization(e.to_string()))
+                        serde_json::from_value(normalized).map_err(|e| {
+                            crate::error::A2aTypeError::Deserialization(e.to_string())
+                        }),
                     );
                 }
             }
@@ -289,8 +292,9 @@ impl Message {
             if let Some(pb::part::Content::Text(text)) = &part.content {
                 if text.trim_start().starts_with('{') {
                     return Some(
-                        serde_json::from_str(text)
-                            .map_err(|e| crate::error::A2aTypeError::Deserialization(e.to_string()))
+                        serde_json::from_str(text).map_err(|e| {
+                            crate::error::A2aTypeError::Deserialization(e.to_string())
+                        }),
                     );
                 }
             }
@@ -313,8 +317,7 @@ impl TryFrom<pb::Message> for Message {
 
     fn try_from(inner: pb::Message) -> Result<Self, Self::Error> {
         // Validate role is not UNSPECIFIED
-        let role_val = pb::Role::try_from(inner.role)
-            .unwrap_or(pb::Role::Unspecified);
+        let role_val = pb::Role::try_from(inner.role).unwrap_or(pb::Role::Unspecified);
         if role_val == pb::Role::Unspecified {
             return Err(crate::error::A2aTypeError::MissingField("role"));
         }
@@ -362,16 +365,16 @@ fn normalize_proto_numbers_for_deser(value: serde_json::Value) -> serde_json::Va
             }
             serde_json::Value::Number(n)
         }
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.into_iter().map(normalize_proto_numbers_for_deser).collect())
-        }
-        serde_json::Value::Object(map) => {
-            serde_json::Value::Object(
-                map.into_iter()
-                    .map(|(k, v)| (k, normalize_proto_numbers_for_deser(v)))
-                    .collect(),
-            )
-        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.into_iter()
+                .map(normalize_proto_numbers_for_deser)
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, normalize_proto_numbers_for_deser(v)))
+                .collect(),
+        ),
         other => other,
     }
 }
@@ -386,23 +389,29 @@ fn json_to_proto_value(value: serde_json::Value) -> pbjson_types::Value {
             kind: Some(pbjson_types::value::Kind::BoolValue(b)),
         },
         serde_json::Value::Number(n) => pbjson_types::Value {
-            kind: Some(pbjson_types::value::Kind::NumberValue(n.as_f64().unwrap_or(0.0))),
+            kind: Some(pbjson_types::value::Kind::NumberValue(
+                n.as_f64().unwrap_or(0.0),
+            )),
         },
         serde_json::Value::String(s) => pbjson_types::Value {
             kind: Some(pbjson_types::value::Kind::StringValue(s)),
         },
         serde_json::Value::Array(arr) => pbjson_types::Value {
-            kind: Some(pbjson_types::value::Kind::ListValue(pbjson_types::ListValue {
-                values: arr.into_iter().map(json_to_proto_value).collect(),
-            })),
+            kind: Some(pbjson_types::value::Kind::ListValue(
+                pbjson_types::ListValue {
+                    values: arr.into_iter().map(json_to_proto_value).collect(),
+                },
+            )),
         },
         serde_json::Value::Object(map) => pbjson_types::Value {
-            kind: Some(pbjson_types::value::Kind::StructValue(pbjson_types::Struct {
-                fields: map
-                    .into_iter()
-                    .map(|(k, v)| (k, json_to_proto_value(v)))
-                    .collect(),
-            })),
+            kind: Some(pbjson_types::value::Kind::StructValue(
+                pbjson_types::Struct {
+                    fields: map
+                        .into_iter()
+                        .map(|(k, v)| (k, json_to_proto_value(v)))
+                        .collect(),
+                },
+            )),
         },
     }
 }
@@ -421,10 +430,12 @@ mod tests {
 
     #[test]
     fn part_url_constructor() {
-        let part = Part::url("https://example.com/file.pdf", "application/pdf")
-            .with_filename("file.pdf");
+        let part =
+            Part::url("https://example.com/file.pdf", "application/pdf").with_filename("file.pdf");
         let proto = part.as_proto();
-        assert!(matches!(proto.content, Some(pb::part::Content::Url(ref u)) if u == "https://example.com/file.pdf"));
+        assert!(
+            matches!(proto.content, Some(pb::part::Content::Url(ref u)) if u == "https://example.com/file.pdf")
+        );
         assert_eq!(proto.filename, "file.pdf");
         assert_eq!(proto.media_type, "application/pdf");
     }
@@ -456,11 +467,7 @@ mod tests {
 
     #[test]
     fn message_constructor() {
-        let msg = Message::new(
-            "msg-1",
-            Role::User,
-            vec![Part::text("hello")],
-        );
+        let msg = Message::new("msg-1", Role::User, vec![Part::text("hello")]);
         assert_eq!(msg.message_id(), "msg-1");
         assert_eq!(msg.as_proto().role, i32::from(pb::Role::User));
         assert_eq!(msg.as_proto().parts.len(), 1);
@@ -540,7 +547,10 @@ mod tests {
         let json = part.as_data().unwrap();
         // Proto f64: 25544 → 25544.0 in raw JSON
         let count = json.get("count").unwrap();
-        assert!(count.is_f64() || count.is_u64(), "Raw JSON may be f64 from proto: {count}");
+        assert!(
+            count.is_f64() || count.is_u64(),
+            "Raw JSON may be f64 from proto: {count}"
+        );
     }
 
     #[test]
@@ -657,7 +667,9 @@ mod tests {
         let msg = Message::new(
             "m-1",
             Role::User,
-            vec![Part::text(r#"{"skill": "solar_elevation", "version": "1.0"}"#)],
+            vec![Part::text(
+                r#"{"skill": "solar_elevation", "version": "1.0"}"#,
+            )],
         );
 
         let result: Req = msg.parse_first_data_or_text().unwrap().unwrap();
@@ -667,12 +679,11 @@ mod tests {
 
     #[test]
     fn parse_first_data_or_text_ignores_non_json_text() {
-        let msg = Message::new(
-            "m-1",
-            Role::User,
-            vec![Part::text("hello world")],
-        );
+        let msg = Message::new("m-1", Role::User, vec![Part::text("hello world")]);
 
-        assert!(msg.parse_first_data_or_text::<serde_json::Value>().is_none());
+        assert!(
+            msg.parse_first_data_or_text::<serde_json::Value>()
+                .is_none()
+        );
     }
 }

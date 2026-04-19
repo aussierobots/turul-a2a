@@ -261,8 +261,7 @@ impl PushDispatcher {
             // isn't deleted until every per-config deliver has returned.
             let mut join_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
             for cfg in &configs {
-                let Some(target) =
-                    PushTarget::from_config(&tenant, &owner, &task_id, *seq, cfg)
+                let Some(target) = PushTarget::from_config(&tenant, &owner, &task_id, *seq, cfg)
                 else {
                     continue;
                 };
@@ -597,10 +596,7 @@ impl PushDispatcher {
                     auth_credentials: Secret::new(String::new()),
                     token: None,
                 };
-                let _ = self
-                    .worker
-                    .abandon_reclaimed(&target, abandon_reason)
-                    .await;
+                let _ = self.worker.abandon_reclaimed(&target, abandon_reason).await;
             }
         }
     }
@@ -713,7 +709,8 @@ mod tests {
                 credentials: "CRED-Y".into(),
             }),
         };
-        let t = PushTarget::from_config("t", "anonymous", "task-1", 42, &cfg).expect("valid target");
+        let t =
+            PushTarget::from_config("t", "anonymous", "task-1", 42, &cfg).expect("valid target");
         assert_eq!(t.config_id, "cfg-A");
         assert_eq!(t.event_sequence, 42);
         assert_eq!(t.auth_scheme, "Bearer");

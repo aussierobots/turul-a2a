@@ -62,7 +62,11 @@ where
 
             // 1. A2A-Version validation (skip for discovery)
             if !is_version_exempt(&path) {
-                match req.headers().get("a2a-version").and_then(|v| v.to_str().ok()) {
+                match req
+                    .headers()
+                    .get("a2a-version")
+                    .and_then(|v| v.to_str().ok())
+                {
                     Some(v) if v == SUPPORTED_VERSION => {} // OK
                     Some(v) => {
                         let err = A2aError::VersionNotSupported {
@@ -120,11 +124,6 @@ impl A2aError {
             .status(status)
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(Body::from(serde_json::to_string(&body).unwrap_or_default()))
-            .unwrap_or_else(|_| {
-                Response::builder()
-                    .status(500)
-                    .body(Body::empty())
-                    .unwrap()
-            })
+            .unwrap_or_else(|_| Response::builder().status(500).body(Body::empty()).unwrap())
     }
 }

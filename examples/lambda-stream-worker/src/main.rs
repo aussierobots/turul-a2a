@@ -44,12 +44,10 @@ use std::sync::Arc;
 
 use aws_lambda_events::event::dynamodb::Event as DynamoDbEvent;
 use aws_lambda_events::event::streams::DynamoDbEventResponse;
-use lambda_runtime::{service_fn, Error, LambdaEvent};
+use lambda_runtime::{Error, LambdaEvent, service_fn};
 use turul_a2a::push::delivery::{PushDeliveryConfig, PushDeliveryWorker};
 use turul_a2a::push::{A2aPushDeliveryStore, PushDispatcher};
-use turul_a2a::storage::{
-    A2aPushNotificationStorage, A2aTaskStorage, InMemoryA2aStorage,
-};
+use turul_a2a::storage::{A2aPushNotificationStorage, A2aTaskStorage, InMemoryA2aStorage};
 use turul_a2a_aws_lambda::LambdaStreamRecoveryHandler;
 
 /// In a real deployment, replace this with
@@ -70,8 +68,7 @@ fn build_storage() -> Arc<InMemoryA2aStorage> {
 async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_target(false)
         .without_time()
@@ -103,8 +100,7 @@ async fn main() -> Result<(), Error> {
     lambda_runtime::run(service_fn(move |event: LambdaEvent<DynamoDbEvent>| {
         let handler = handler.clone();
         async move {
-            let response: DynamoDbEventResponse =
-                handler.handle_stream_event(event.payload).await;
+            let response: DynamoDbEventResponse = handler.handle_stream_event(event.payload).await;
             Ok::<_, Error>(response)
         }
     }))

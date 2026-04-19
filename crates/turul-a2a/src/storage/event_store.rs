@@ -5,8 +5,8 @@
 
 use async_trait::async_trait;
 
-use crate::streaming::StreamEvent;
 use super::error::A2aStorageError;
+use crate::streaming::StreamEvent;
 
 /// Durable event store for streaming coordination.
 ///
@@ -38,11 +38,7 @@ pub trait A2aEventStore: Send + Sync {
 
     /// Get the latest event sequence number for a task.
     /// Returns 0 if no events exist. Tenant-scoped.
-    async fn latest_sequence(
-        &self,
-        tenant: &str,
-        task_id: &str,
-    ) -> Result<u64, A2aStorageError>;
+    async fn latest_sequence(&self, tenant: &str, task_id: &str) -> Result<u64, A2aStorageError>;
 
     /// Delete events older than the configured TTL.
     /// Returns count of deleted events.

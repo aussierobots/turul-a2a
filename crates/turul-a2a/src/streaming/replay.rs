@@ -62,12 +62,8 @@ mod tests {
 
     #[test]
     fn valid_uuid_task_id() {
-        let result =
-            parse_last_event_id("019d7b4d-e360-7430-a4ba-b121d3387beb:100").unwrap();
-        assert_eq!(
-            result.task_id,
-            "019d7b4d-e360-7430-a4ba-b121d3387beb"
-        );
+        let result = parse_last_event_id("019d7b4d-e360-7430-a4ba-b121d3387beb:100").unwrap();
+        assert_eq!(result.task_id, "019d7b4d-e360-7430-a4ba-b121d3387beb");
         assert_eq!(result.sequence, 100);
     }
 

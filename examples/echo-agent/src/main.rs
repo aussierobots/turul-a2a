@@ -6,26 +6,27 @@
 //!         -H 'a2a-version: 1.0' \
 //!         -d '{"message":{"messageId":"1","role":"ROLE_USER","parts":[{"text":"hello"}]}}'
 
+use turul_a2a::A2aServer;
 use turul_a2a::card_builder::{AgentCardBuilder, AgentSkillBuilder};
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
-use turul_a2a::A2aServer;
 use turul_a2a_types::{Message, Task};
 
 struct EchoExecutor;
 
 #[async_trait::async_trait]
 impl AgentExecutor for EchoExecutor {
-    async fn execute(&self, task: &mut Task, message: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
+    async fn execute(
+        &self,
+        task: &mut Task,
+        message: &Message,
+        _ctx: &turul_a2a::executor::ExecutionContext,
+    ) -> Result<(), A2aError> {
         // Echo the user's text parts back as an artifact
         let parts = message.text_parts();
         let echo_text = format!("Echo: {}", parts.join(" "));
 
-        task.push_text_artifact(
-            uuid::Uuid::now_v7().to_string(),
-            "Echo Response",
-            echo_text,
-        );
+        task.push_text_artifact(uuid::Uuid::now_v7().to_string(), "Echo Response", echo_text);
         task.complete();
         Ok(())
     }
@@ -64,7 +65,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Try: curl -X POST http://localhost:3000/message:send \\");
     println!("  -H 'Content-Type: application/json' \\");
     println!("  -H 'a2a-version: 1.0' \\");
-    println!("  -d '{{\"message\":{{\"messageId\":\"1\",\"role\":\"ROLE_USER\",\"parts\":[{{\"text\":\"hello\"}}]}}}}'");
+    println!(
+        "  -d '{{\"message\":{{\"messageId\":\"1\",\"role\":\"ROLE_USER\",\"parts\":[{{\"text\":\"hello\"}}]}}}}'"
+    );
 
     server.run().await?;
     Ok(())

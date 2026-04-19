@@ -43,23 +43,24 @@ impl BearerMiddleware {
 #[async_trait]
 impl A2aMiddleware for BearerMiddleware {
     async fn before_request(&self, ctx: &mut RequestContext) -> Result<(), MiddlewareError> {
-        let token = ctx.bearer_token.as_deref().ok_or_else(|| {
-            MiddlewareError::HttpChallenge {
+        let token = ctx
+            .bearer_token
+            .as_deref()
+            .ok_or_else(|| MiddlewareError::HttpChallenge {
                 status: 401,
                 www_authenticate: "Bearer realm=\"a2a\"".into(),
-            }
-        })?;
-
-        let claims = self
-            .validator
-            .validate(token)
-            .await
-            .map_err(|e| MiddlewareError::HttpChallenge {
-                status: 401,
-                www_authenticate: format!(
-                    "Bearer realm=\"a2a\", error=\"invalid_token\", error_description=\"{e}\""
-                ),
             })?;
+
+        let claims =
+            self.validator
+                .validate(token)
+                .await
+                .map_err(|e| MiddlewareError::HttpChallenge {
+                    status: 401,
+                    www_authenticate: format!(
+                        "Bearer realm=\"a2a\", error=\"invalid_token\", error_description=\"{e}\""
+                    ),
+                })?;
 
         // Extract principal from configured claim
         let owner = if self.principal_claim == "sub" {

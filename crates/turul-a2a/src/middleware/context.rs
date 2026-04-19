@@ -5,8 +5,7 @@ use std::collections::HashMap;
 /// Authentication identity — type-level distinction, not a sentinel string.
 ///
 /// Per ADR-007: auth state is an enum, not `owner != "anonymous"`.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum AuthIdentity {
     /// No auth middleware configured or no credentials provided.
     #[default]
@@ -39,7 +38,6 @@ impl AuthIdentity {
         }
     }
 }
-
 
 /// Request context threaded through middleware and handlers.
 #[derive(Debug, Clone)]

@@ -13,7 +13,7 @@ use tower::ServiceExt;
 
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
-use turul_a2a::router::{build_router, AppState};
+use turul_a2a::router::{AppState, build_router};
 use turul_a2a::storage::InMemoryA2aStorage;
 use turul_a2a_types::{Message, Task};
 
@@ -22,7 +22,12 @@ struct CompletingExecutor;
 
 #[async_trait::async_trait]
 impl AgentExecutor for CompletingExecutor {
-    async fn execute(&self, task: &mut Task, _message: &Message, _ctx: &turul_a2a::executor::ExecutionContext) -> Result<(), A2aError> {
+    async fn execute(
+        &self,
+        task: &mut Task,
+        _message: &Message,
+        _ctx: &turul_a2a::executor::ExecutionContext,
+    ) -> Result<(), A2aError> {
         // Move to Working, then Completed
         let mut proto = task.as_proto().clone();
         proto.status = Some(turul_a2a_proto::TaskStatus {
@@ -95,14 +100,11 @@ fn test_state() -> AppState {
         in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
-            push_dispatcher: None,
+        push_dispatcher: None,
     }
 }
 
-async fn json_response(
-    router: axum::Router,
-    req: Request<Body>,
-) -> (u16, serde_json::Value) {
+async fn json_response(router: axum::Router, req: Request<Body>) -> (u16, serde_json::Value) {
     let resp = router.oneshot(req).await.unwrap();
     let status = resp.status().as_u16();
     let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -302,8 +304,10 @@ async fn cancel_nonexistent_task_returns_404_with_error_info() {
 #[tokio::test]
 async fn list_tasks_returns_required_pagination_fields() {
     let router = build_router(test_state());
-    let req = Request::get("/tasks").header("a2a-version", "1.0")
-        .body(Body::empty()).unwrap();
+    let req = Request::get("/tasks")
+        .header("a2a-version", "1.0")
+        .body(Body::empty())
+        .unwrap();
 
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 200);
@@ -321,8 +325,10 @@ async fn list_tasks_returns_required_pagination_fields() {
 #[tokio::test]
 async fn list_tasks_empty_result_still_has_all_fields() {
     let router = build_router(test_state());
-    let req = Request::get("/tasks").header("a2a-version", "1.0")
-        .body(Body::empty()).unwrap();
+    let req = Request::get("/tasks")
+        .header("a2a-version", "1.0")
+        .body(Body::empty())
+        .unwrap();
 
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 200);
@@ -362,7 +368,10 @@ async fn push_config_crud_through_http() {
         .unwrap();
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 200);
-    assert!(!body["id"].as_str().unwrap_or("").is_empty(), "config must have server-generated id");
+    assert!(
+        !body["id"].as_str().unwrap_or("").is_empty(),
+        "config must have server-generated id"
+    );
     let config_id = body["id"].as_str().unwrap();
 
     // Get push config
@@ -371,7 +380,7 @@ async fn push_config_crud_through_http() {
         "/tasks/{task_id}/pushNotificationConfigs/{config_id}"
     ))
     .header("a2a-version", "1.0")
-        .body(Body::empty())
+    .body(Body::empty())
     .unwrap();
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 200);
@@ -406,7 +415,7 @@ async fn push_config_crud_through_http() {
         "/tasks/{task_id}/pushNotificationConfigs/{config_id}"
     ))
     .header("a2a-version", "1.0")
-        .body(Body::empty())
+    .body(Body::empty())
     .unwrap();
     let (status, _) = json_response(router, req).await;
     assert_eq!(status, 404);
@@ -469,7 +478,10 @@ async fn tenant_prefixed_send_scopes_to_tenant() {
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(router, req).await;
-    assert_eq!(status, 404, "Task should be invisible under different tenant");
+    assert_eq!(
+        status, 404,
+        "Task should be invisible under different tenant"
+    );
 
     // Get the same task under tenant "other" — should NOT find it
     let router = build_router(state.clone());
@@ -498,7 +510,10 @@ async fn tenant_prefixed_send_scopes_to_tenant() {
         .unwrap();
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 200);
-    assert_eq!(body["totalSize"], 0, "Default tenant should not see acme's tasks");
+    assert_eq!(
+        body["totalSize"], 0,
+        "Default tenant should not see acme's tasks"
+    );
 }
 
 #[tokio::test]
@@ -539,7 +554,7 @@ async fn list_tasks_status_filter_narrows_results() {
         let req = Request::post("/message:send")
             .header("content-type", "application/json")
             .header("a2a-version", "1.0")
-        .body(Body::from(send_message_json(&format!("m-sf-{i}"), "task")))
+            .body(Body::from(send_message_json(&format!("m-sf-{i}"), "task")))
             .unwrap();
         json_response(router, req).await;
     }
@@ -603,7 +618,10 @@ async fn push_config_list_pagination_through_http() {
     let req = Request::post("/message:send")
         .header("content-type", "application/json")
         .header("a2a-version", "1.0")
-        .body(Body::from(send_message_json("m-pcp", "for push pagination")))
+        .body(Body::from(send_message_json(
+            "m-pcp",
+            "for push pagination",
+        )))
         .unwrap();
     let (_, send_body) = json_response(router, req).await;
     let task_id = send_body["task"]["id"].as_str().unwrap();
@@ -619,7 +637,7 @@ async fn push_config_list_pagination_through_http() {
         let req = Request::post(format!("/tasks/{task_id}/pushNotificationConfigs"))
             .header("content-type", "application/json")
             .header("a2a-version", "1.0")
-        .body(Body::from(config_body))
+            .body(Body::from(config_body))
             .unwrap();
         let (status, _) = json_response(router, req).await;
         assert_eq!(status, 200);
@@ -631,7 +649,7 @@ async fn push_config_list_pagination_through_http() {
         "/tasks/{task_id}/pushNotificationConfigs?pageSize=2"
     ))
     .header("a2a-version", "1.0")
-        .body(Body::empty())
+    .body(Body::empty())
     .unwrap();
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 200);

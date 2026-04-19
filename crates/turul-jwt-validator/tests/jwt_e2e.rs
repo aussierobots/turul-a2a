@@ -21,7 +21,9 @@ fn generate_rsa_keypair(kid: &str) -> (String, serde_json::Value) {
     // is not compatible. Use rsa's re-exported OsRng to avoid version skew.
     let mut rng = rsa::rand_core::OsRng;
     let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-    let private_pem = private_key.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap();
+    let private_pem = private_key
+        .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+        .unwrap();
 
     let public_key = private_key.to_public_key();
 
