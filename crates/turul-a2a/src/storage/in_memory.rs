@@ -91,10 +91,6 @@ impl StoredDeliveryClaim {
     }
 }
 
-/// In-memory A2A storage backend.
-/// Implements A2aTaskStorage, A2aPushNotificationStorage, A2aEventStore,
-/// and A2aPushDeliveryStore on the same struct — enforcing the
-/// same-backend requirement from ADR-009.
 /// `(tenant, task_id, event_sequence)` lookup key for the
 /// in-memory pending-dispatch map. Matches the tuple
 /// `A2aPushDeliveryStore::record_pending_dispatch` writes.
@@ -104,6 +100,10 @@ type PendingDispatchKey = (String, String, u64);
 /// `(event_sequence, event)` pairs the atomic store appended.
 type EventLog = Vec<(u64, StreamEvent)>;
 
+/// In-memory A2A storage backend.
+/// Implements A2aTaskStorage, A2aPushNotificationStorage, A2aEventStore,
+/// and A2aPushDeliveryStore on the same struct — enforcing the
+/// same-backend requirement from ADR-009.
 #[derive(Clone)]
 pub struct InMemoryA2aStorage {
     tasks: Arc<RwLock<HashMap<TaskKey, StoredTask>>>,
