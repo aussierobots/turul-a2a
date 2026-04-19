@@ -4,6 +4,75 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.4] — 2026-04-20
+
+### Added
+- **ADR-013: Lambda push-delivery parity.** Push fan-out now survives the
+  request-Lambda returning before deliveries complete. A durable
+  `a2a_push_pending_dispatches` marker is written atomically with the
+  terminal task/event commit (opt-in via
+  `InMemoryA2aStorage::with_push_dispatch_enabled(true)` and per-backend
+  equivalents). Two recovery workers in `turul-a2a-aws-lambda`:
+  - `LambdaStreamRecoveryHandler` — DynamoDB Streams trigger with
+    `BatchItemFailures` partial-batch semantics.
+  - `LambdaScheduledRecoveryHandler` — EventBridge Scheduler backstop that
+    sweeps stale markers + reclaimable claims with bounded batch limits and
+    a structured count summary for CloudWatch alerting.
+  Two runnable examples: `examples/lambda-stream-worker` and
+  `examples/lambda-scheduled-worker`.
+- **Causal no-backfill for push configs** (ADR-013 §4.5 / §6). New column
+  `a2a_tasks.latest_event_sequence` (+ `latestEventSequence` attribute on
+  DynamoDB) is maintained by every atomic commit. `create_config` stamps
+  `registered_after_event_sequence` under a CAS against the read sequence;
+  `list_configs_eligible_at_event(seq)` enforces a strict-less-than
+  eligibility filter so a config registered concurrently with the terminal
+  commit is never retroactively delivered.
+- **Server and Lambda builder consistency gates** (ADR-013 §4.3): both
+  `A2aServer::builder()` and `LambdaA2aServerBuilder` reject any
+  configuration where `push_delivery_store` is wired but
+  `push_dispatch_enabled` is false (or vice versa), in either direction.
+- **Per-crate license files.** Every publish crate now ships
+  `LICENSE-APACHE` and `LICENSE-MIT` inline (symlinks in git; cargo
+  package copies the real file content). Previously only the SPDX
+  identifier was published.
+
+### Changed
+- **Release-scoped compliance wording.** `CLAUDE.md` §169 no longer
+  asserts "No known spec compliance gaps remaining" as an absolute claim.
+  The new wording scopes compliance to the tested A2A v1.0 HTTP+JSON and
+  JSON-RPC server surfaces and names out-of-scope items separately:
+  gRPC transport (deferred), deployment-layer TLS 1.2+ / gzip
+  (reverse-proxy concern), and deeper per-skill security-scheme
+  semantics (agent-level only). Re-verification of
+  `proto/a2a.proto` SHA256 against
+  `a2aproject/A2A:main/specification/a2a.proto` is now an explicit
+  pre-release gate.
+- **Upstream proto identity verified.** Vendored
+  `crates/turul-a2a-proto/proto/a2a.proto` SHA256
+  `4b74c0baa923ae0acb55474e548f1d6e5d3f83b80d757b65f8bf3e99a3c2257f` is
+  byte-identical to upstream `a2aproject/A2A:main/specification/a2a.proto`
+  as of the 0.1.4 release gate.
+- **Workspace fmt sweep** under `rustfmt 1.9.0-stable` (2026-04-14). No
+  semantic changes; purely cosmetic line-joining.
+
+### Fixed
+- **Package hygiene — tokio dev-dep dedup.** Per-crate dev-dependencies no
+  longer redeclare `"full"` on top of the workspace-level base; the
+  normalized `Cargo.toml` in every published `.crate` now ships
+  `features = ["full", "test-util"]` (previously
+  `["full", "full", "test-util"]`). No runtime effect.
+- **Cargo-doc workspace build unblocked.** All three Lambda example
+  crates declare `[[bin]] name = "bootstrap"` (required by cargo-lambda);
+  added `doc = false` to the bin targets so
+  `cargo doc --workspace --no-deps` no longer collides on output
+  filenames.
+- **Three rustdoc broken-link warnings** in `turul-a2a` resolved
+  (`EventSinkInner` private-item link, `storage::parity_tests`
+  `pub(crate)` link, `PushDispatcher::dispatch` unqualified path).
+- **`InMemoryA2aStorage` rustdoc placement** restored after the clippy
+  sweep had accidentally re-anchored the backend-level docs to a newly
+  extracted type alias.
+
 ## [0.1.3] — 2026-04-17
 
 First version published to crates.io.
@@ -63,4 +132,5 @@ Pre-crates.io development. Highlights from the 0.1.x series (not published):
   `proto/a2a.proto`, wrapped in ergonomic Rust types with state-machine
   enforcement (ADR-002).
 
+[0.1.4]: https://github.com/aussierobots/turul-a2a/releases/tag/v0.1.4
 [0.1.3]: https://github.com/aussierobots/turul-a2a/releases/tag/v0.1.3
