@@ -154,6 +154,56 @@ lambda_http::run(lambda_http::service_fn(move |event| {
 })).await?;
 ```
 
+### Lambda push-notification recovery (ADR-013)
+
+Push-notification delivery on Lambda requires **external triggers**.
+`tokio::spawn` continuations created inside a Lambda invocation are
+opportunistic only: the execution environment may be frozen
+indefinitely between invocations, so the in-process
+`PushDeliveryWorker` reclaim loop from the binary server (ADR-011)
+has no equivalent. Correctness is carried by an atomic pending-dispatch
+marker (ADR-013 §4.3) plus two external workers:
+
+| Worker | Trigger | Role |
+|---|---|---|
+| `LambdaStreamRecoveryHandler` | DynamoDB Stream on `a2a_push_pending_dispatches` (NEW_IMAGE) | Fast path — fires within ~1s of the marker commit. DynamoDB backends only. |
+| `LambdaScheduledRecoveryHandler` | EventBridge Scheduler (e.g. every 5 min) | Mandatory backstop for all backends. For SQLite/Postgres/in-memory this is the **only** recovery path. |
+
+Minimal wiring — see `examples/lambda-stream-worker` and
+`examples/lambda-scheduled-worker`:
+
+```rust
+// Stream worker (DynamoDB only)
+use turul_a2a_aws_lambda::LambdaStreamRecoveryHandler;
+let handler = LambdaStreamRecoveryHandler::new(dispatcher);
+// Lambda input type: aws_lambda_events::dynamodb::Event
+// Response type: aws_lambda_events::streams::DynamoDbEventResponse
+
+// Scheduled worker (all backends)
+use turul_a2a_aws_lambda::{LambdaScheduledRecoveryHandler, LambdaScheduledRecoveryConfig};
+let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery_store)
+    .with_config(LambdaScheduledRecoveryConfig::default());
+// Lambda input type: aws_lambda_events::eventbridge::EventBridgeEvent
+// Response: LambdaScheduledRecoveryResponse (per-stage counts + error sample)
+```
+
+Release-gate invariants (pinned by tests in `turul-a2a-aws-lambda/src/stream_recovery_tests.rs` and `scheduled_recovery_tests.rs`):
+
+- Valid INSERT + successful redispatch → no `BatchItemFailure`, one POST per config.
+- `get_task → Ok(None)` (task deleted) → delete marker, return success.
+- Transient storage error → `BatchItemFailure` with the record's `SequenceNumber`.
+- Unparseable NEW_IMAGE → `BatchItemFailure` (logged).
+- Duplicate stream records → exactly one POST (claim fencing).
+- Scheduled sweep: stale markers recovered, transient errors counted and markers retained, reclaimable claims redispatched, batch limits honoured.
+
+Operator responsibilities (not framework-managed):
+
+1. Provision the DynamoDB Stream (NEW_IMAGE view) on `a2a_push_pending_dispatches` — DynamoDB backends only.
+2. Create an event-source mapping with `FunctionResponseTypes: ["ReportBatchItemFailures"]`, a DLQ, and `MaximumRetryAttempts`.
+3. Create an EventBridge Scheduler schedule (recommended every 5 min) targeting the scheduled worker.
+4. Grant IAM: stream-worker reads the stream, scheduled-worker scans + deletes markers, both read tasks and configs.
+5. Set TTL on `a2a_push_pending_dispatches` to outlast the worst-case scheduler outage.
+
 ## Interoperability
 
 Verified against the official [Go A2A SDK](https://github.com/a2aproject/a2a-go) (v2, spec v1.0):

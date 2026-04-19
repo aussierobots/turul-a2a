@@ -2,6 +2,14 @@
 
 - **Status:** Accepted
 - **Date:** 2026-04-11
+- **Superseded / refined by:** [ADR-013](ADR-013-lambda-push-delivery-parity.md)
+  for push-notification delivery. ADR-013 §4.4 makes the
+  correctness-critical statement that `tokio::spawn` continuations
+  created inside a Lambda invocation are opportunistic only; push
+  recovery requires external triggers (DynamoDB Stream +
+  EventBridge Scheduler) implemented by the
+  `LambdaStreamRecoveryHandler` and `LambdaScheduledRecoveryHandler`
+  in `turul-a2a-aws-lambda`.
 
 ## Context
 

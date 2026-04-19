@@ -13,6 +13,34 @@
 //!   returns `UnsupportedOperationError` per A2A v1.0 §3.1.6 / ADR-010
 //!   §4.3. For retrieving a terminal task's final state use `GetTask`.
 //!
+//! # Push-notification delivery — external triggers are mandatory
+//!
+//! Push delivery on Lambda (ADR-013) is architecturally different
+//! from the binary server. The request Lambda installed via
+//! [`LambdaA2aServerBuilder`] still constructs a `PushDispatcher`
+//! when `push_delivery_store` is wired, but any `tokio::spawn`
+//! continuation it emits post-return is **opportunistic only** — the
+//! Lambda execution environment may be frozen indefinitely between
+//! invocations, so nothing can depend on that continuation completing
+//! (ADR-013 §4.4).
+//!
+//! Correctness for push delivery on Lambda is carried by:
+//!
+//! 1. The atomic pending-dispatch marker written inside the request
+//!    Lambda's commit transaction (ADR-013 §4.3 — opt in via
+//!    `StorageImpl::with_push_dispatch_enabled(true)`).
+//! 2. [`LambdaStreamRecoveryHandler`] — DynamoDB Streams trigger on
+//!    `a2a_push_pending_dispatches`. DynamoDB backends only.
+//! 3. [`LambdaScheduledRecoveryHandler`] — EventBridge Scheduler
+//!    backstop. **Required for all backends**; it is the sole
+//!    recovery path for SQLite / PostgreSQL / in-memory deployments.
+//!
+//! Without at least the scheduled worker, push delivery on Lambda is
+//! not durable — a marker written on a cold invocation may never be
+//! consumed. The example wiring lives in
+//! `examples/lambda-stream-worker` and
+//! `examples/lambda-scheduled-worker`.
+//!
 //! Lambda streaming is request-scoped (not persistent SSE connections). The durable
 //! event store ensures events survive across invocations. Clients reconnect with
 //! `Last-Event-ID` for continuation.
