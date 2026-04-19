@@ -297,7 +297,7 @@ fn storage_bundle_requires_cancellation_supervisor_trait_bound() {
     // the runtime rejection.
     let result = LambdaA2aHandler::builder()
         .executor(DummyExecutor)
-        .storage(InMemoryA2aStorage::new())
+        .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
         .build();
     assert!(result.is_ok(), "unified storage bundle should build");
 }
@@ -390,3 +390,117 @@ fn build_succeeds_with_explicit_cancellation_supervisor_same_backend() {
         result.err()
     );
 }
+
+// ---------------------------------------------------------------------
+// ADR-013 §7 / §10.2 Lambda builder mirror of main-server consistency.
+// ---------------------------------------------------------------------
+
+#[test]
+fn lambda_builder_rejects_push_consumer_without_dispatch_enabled() {
+    // push_delivery_store wired + atomic_store.push_dispatch_enabled() = false
+    // ⇒ build error with the pinned main-server wording.
+    let storage = InMemoryA2aStorage::new(); // flag defaults to false
+    let result = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .task_storage(storage.clone())
+        .push_storage(storage.clone())
+        .event_store(storage.clone())
+        .atomic_store(storage.clone())
+        .cancellation_supervisor(storage.clone())
+        .push_delivery_store(storage)
+        .build();
+    let err = match result {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("orphan delivery store must be rejected"),
+    };
+    assert!(
+        err.contains("push_delivery_store wired")
+            && err.contains("push_dispatch_enabled")
+            && err.contains("with_push_dispatch_enabled(true)"),
+        "lambda error must mirror main server wording: {err}"
+    );
+}
+
+#[test]
+fn lambda_builder_rejects_push_dispatch_without_consumer() {
+    // push_dispatch_enabled=true + no push_delivery_store ⇒ build error.
+    let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
+    let result = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .task_storage(storage.clone())
+        .push_storage(storage.clone())
+        .event_store(storage.clone())
+        .atomic_store(storage.clone())
+        .cancellation_supervisor(storage)
+        // deliberately no .push_delivery_store(...)
+        .build();
+    let err = match result {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("orphan dispatch flag must be rejected"),
+    };
+    assert!(
+        err.contains("push_dispatch_enabled() is true") && err.contains("no consumer"),
+        "lambda error must cite the orphaned-marker rationale: {err}"
+    );
+}
+
+#[test]
+fn lambda_builder_accepts_push_fully_wired() {
+    let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
+    let result = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .storage(storage)
+        .build();
+    assert!(
+        result.is_ok(),
+        "lambda push fully wired must build: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn lambda_builder_accepts_non_push_deployment() {
+    let storage = InMemoryA2aStorage::new(); // flag defaults to false
+    let result = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .task_storage(storage.clone())
+        .push_storage(storage.clone())
+        .event_store(storage.clone())
+        .atomic_store(storage.clone())
+        .cancellation_supervisor(storage)
+        .build();
+    assert!(
+        result.is_ok(),
+        "lambda non-push deployment must build: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn lambda_builder_rejects_retry_horizon_violation() {
+    // push_claim_expiry <= max_attempts * backoff_cap must fail fast
+    // (ADR-011 §10.3). Mirror of the main server's pinning test.
+    use std::time::Duration;
+    use turul_a2a::server::RuntimeConfig;
+
+    let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
+    let mut cfg = RuntimeConfig::default();
+    cfg.push_max_attempts = 10;
+    cfg.push_backoff_cap = Duration::from_secs(60);
+    // 10 * 60s = 600s — equal to claim expiry, <= so rejected.
+    cfg.push_claim_expiry = Duration::from_secs(600);
+    let result = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .storage(storage)
+        .runtime_config(cfg)
+        .build();
+    let err = match result {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("retry horizon violation must be rejected"),
+    };
+    assert!(
+        err.contains("retry horizon") || err.contains("push_claim_expiry"),
+        "lambda error must cite the retry horizon: {err}"
+    );
+}
+

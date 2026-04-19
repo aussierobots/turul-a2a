@@ -35,7 +35,13 @@ impl AgentExecutor for LambdaEchoExecutor {
 async fn main() -> Result<(), lambda_http::Error> {
     let handler = LambdaA2aServerBuilder::new()
         .executor(LambdaEchoExecutor)
-        .storage(InMemoryA2aStorage::new())
+        // `.storage(...)` wires the unified backend including
+        // `A2aPushDeliveryStore`. Per ADR-013 §4.3, a non-push Lambda
+        // deployment must either supply storage without the push flag
+        // (via individual setters) or opt in explicitly as shown here.
+        // The in-memory backend is demo-only — Lambda streaming and
+        // push recovery require a shared backend (DynamoDB/Postgres).
+        .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
         .build()
         .map_err(|e| lambda_http::Error::from(format!("{e}")))?;
 

@@ -3644,6 +3644,7 @@ dependencies = [
  "turul-a2a",
  "turul-a2a-proto",
  "turul-a2a-types",
+ "uuid",
 ]
 
 [[package]]
