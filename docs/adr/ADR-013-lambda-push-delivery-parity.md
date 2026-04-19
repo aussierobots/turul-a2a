@@ -1,6 +1,9 @@
 # ADR-013: Lambda Push Delivery Parity
 
-- **Status:** Proposed (rev 4 — 2026-04-19)
+- **Status:** Accepted (rev 4 errata — 2026-04-19 after a four-cycle
+  agent-team review; AGENTS.md requires acceptance before the
+  implementation phase begins, so E.22→E.26 proceed against this
+  accepted contract)
 - **Depends on:** ADR-008 (Lambda adapter), ADR-009 (durable event coordination),
   ADR-011 (push notification delivery), E.20 (`a2a_push_pending_dispatches`
   table)
@@ -44,7 +47,14 @@
     reintroduces a smaller version of the load-bearing optional-
     infra problem: terminal commits depend on the pending-dispatch
     table even though nothing consumes the markers.
-- **rev 4 (this doc)** — corrections:
+- **rev 4 (accepted 2026-04-19)** — this document. Errata pass
+  addressed three codex-flagged inconsistencies (stream-worker
+  pseudocode still using rev 3 API name; §14 contradicting §6.3 on
+  `latest_event_sequence` maintenance; rev 3 `created_at_micros`
+  leftovers in §12/§13). Accepted as-is after the errata; no
+  architectural blockers identified. Implementation (E.22 → E.26)
+  proceeds against this contract.
+- **rev 4 (this doc) original corrections:**
   - **Causal eligibility via event sequence.** `a2a_tasks` gains
     `latest_event_sequence`, maintained atomically by every commit.
     `a2a_push_configs` gains `registered_after_event_sequence`
