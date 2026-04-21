@@ -129,9 +129,11 @@ where
 fn middleware_error_to_grpc_response(err: &MiddlewareError) -> Response<Body> {
     let message = format!("{err:?}");
     let status = match err {
-        MiddlewareError::HttpChallenge { .. } => tonic::Status::unauthenticated(message),
-        MiddlewareError::Forbidden { .. } => tonic::Status::permission_denied(message),
-        _ => tonic::Status::internal(message),
+        MiddlewareError::Unauthenticated(_) | MiddlewareError::HttpChallenge { .. } => {
+            tonic::Status::unauthenticated(message)
+        }
+        MiddlewareError::Forbidden(_) => tonic::Status::permission_denied(message),
+        MiddlewareError::Internal(_) => tonic::Status::internal(message),
     };
     status.into_http()
 }
