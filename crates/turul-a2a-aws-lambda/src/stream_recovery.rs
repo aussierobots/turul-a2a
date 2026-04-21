@@ -104,18 +104,18 @@ impl LambdaStreamRecoveryHandler {
             }
         }
 
-        DynamoDbEventResponse {
-            batch_item_failures: failures,
-        }
+        let mut resp = DynamoDbEventResponse::default();
+        resp.batch_item_failures = failures;
+        resp
     }
 }
 
 fn push_failure(failures: &mut Vec<DynamoDbBatchItemFailure>, seq: Option<String>) {
     match seq {
         Some(identifier) => {
-            failures.push(DynamoDbBatchItemFailure {
-                item_identifier: Some(identifier),
-            });
+            let mut f = DynamoDbBatchItemFailure::default();
+            f.item_identifier = Some(identifier);
+            failures.push(f);
         }
         None => {
             // Without a SequenceNumber we cannot tell Lambda which

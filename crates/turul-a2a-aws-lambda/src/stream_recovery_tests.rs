@@ -144,26 +144,7 @@ fn make_insert_record(
     })
     .expect("serialize NEW_IMAGE");
 
-    EventRecord {
-        aws_region: "us-east-1".into(),
-        change: StreamRecord {
-            approximate_creation_date_time: Utc.timestamp_opt(0, 0).unwrap(),
-            keys: serde_dynamo::Item::default(),
-            new_image,
-            old_image: serde_dynamo::Item::default(),
-            sequence_number: Some(sequence_number.into()),
-            size_bytes: 0,
-            stream_view_type: Some(aws_lambda_events::event::dynamodb::StreamViewType::NewImage),
-        },
-        event_id: format!("evt-{sequence_number}"),
-        event_name: "INSERT".into(),
-        event_source: None,
-        event_version: None,
-        event_source_arn: None,
-        user_identity: None,
-        record_format: None,
-        table_name: None,
-    }
+    build_event_record(new_image, sequence_number, "INSERT")
 }
 
 /// Variant that omits a field or uses wrong types so NEW_IMAGE parses fail.
@@ -176,26 +157,38 @@ fn make_malformed_record(sequence_number: &str) -> EventRecord {
     }
     let new_image: serde_dynamo::Item =
         serde_dynamo::to_item(OnlyTenant { tenant: "t" }).expect("serialize");
-    EventRecord {
-        aws_region: "us-east-1".into(),
-        change: StreamRecord {
-            approximate_creation_date_time: Utc.timestamp_opt(0, 0).unwrap(),
-            keys: serde_dynamo::Item::default(),
-            new_image,
-            old_image: serde_dynamo::Item::default(),
-            sequence_number: Some(sequence_number.into()),
-            size_bytes: 0,
-            stream_view_type: Some(aws_lambda_events::event::dynamodb::StreamViewType::NewImage),
-        },
-        event_id: format!("evt-{sequence_number}"),
-        event_name: "INSERT".into(),
-        event_source: None,
-        event_version: None,
-        event_source_arn: None,
-        user_identity: None,
-        record_format: None,
-        table_name: None,
-    }
+    build_event_record(new_image, sequence_number, "INSERT")
+}
+
+/// Shared builder for test `EventRecord` values. aws_lambda_events 1.0
+/// made `EventRecord` and `StreamRecord` `#[non_exhaustive]`, so struct
+/// expressions are no longer legal from downstream crates — build via
+/// `Default::default()` and mutate.
+fn build_event_record(
+    new_image: serde_dynamo::Item,
+    sequence_number: &str,
+    event_name: &str,
+) -> EventRecord {
+    let mut change = StreamRecord::default();
+    change.approximate_creation_date_time = Utc.timestamp_opt(0, 0).unwrap();
+    change.new_image = new_image;
+    change.sequence_number = Some(sequence_number.into());
+    change.stream_view_type = Some(aws_lambda_events::event::dynamodb::StreamViewType::NewImage);
+
+    let mut record = EventRecord::default();
+    record.aws_region = "us-east-1".into();
+    record.change = change;
+    record.event_id = format!("evt-{sequence_number}");
+    record.event_name = event_name.into();
+    record
+}
+
+/// `DynamoDbEvent` is also `#[non_exhaustive]` in 1.0+ — wrap records
+/// through `Default`.
+fn event_with_records(records: Vec<EventRecord>) -> DynamoDbEvent {
+    let mut e = DynamoDbEvent::default();
+    e.records = records;
+    e
 }
 
 // ---------- Release-gate tests ----------
@@ -218,9 +211,9 @@ async fn stream_success_path_fires_one_post_and_no_batch_failures() {
         seed_task_with_marker(&storage, &format!("{}/webhook", mock.uri()), "t-success").await;
 
     let handler = LambdaStreamRecoveryHandler::new(dispatcher);
-    let event = DynamoDbEvent {
-        records: vec![make_insert_record(&tenant, &task_id, &owner, seq, "seq-1")],
-    };
+    let event = event_with_records(vec![make_insert_record(
+        &tenant, &task_id, &owner, seq, "seq-1",
+    )]);
     let response = handler.handle_stream_event(event).await;
 
     assert!(
@@ -245,9 +238,9 @@ async fn stream_deleted_task_returns_success_and_deletes_marker() {
         .expect("delete task");
 
     let handler = LambdaStreamRecoveryHandler::new(dispatcher);
-    let event = DynamoDbEvent {
-        records: vec![make_insert_record(&tenant, &task_id, &owner, seq, "seq-1")],
-    };
+    let event = event_with_records(vec![make_insert_record(
+        &tenant, &task_id, &owner, seq, "seq-1",
+    )]);
     let response = handler.handle_stream_event(event).await;
 
     assert!(
@@ -386,15 +379,13 @@ async fn stream_transient_storage_error_surfaces_batch_item_failure() {
     let dispatcher = Arc::new(PushDispatcher::new(worker, push_storage, flaky));
 
     let handler = LambdaStreamRecoveryHandler::new(dispatcher);
-    let event = DynamoDbEvent {
-        records: vec![make_insert_record(
-            &tenant,
-            &task_id,
-            &owner,
-            seq,
-            "seq-flaky",
-        )],
-    };
+    let event = event_with_records(vec![make_insert_record(
+        &tenant,
+        &task_id,
+        &owner,
+        seq,
+        "seq-flaky",
+    )]);
     let response = handler.handle_stream_event(event).await;
 
     assert_eq!(
@@ -414,9 +405,7 @@ async fn stream_unparseable_new_image_surfaces_batch_item_failure() {
     // ADR-013 §5.2: malformed NEW_IMAGE → BatchItemFailure.
     let (_storage, dispatcher, _delivery) = build_stack().await;
     let handler = LambdaStreamRecoveryHandler::new(dispatcher);
-    let event = DynamoDbEvent {
-        records: vec![make_malformed_record("seq-malformed")],
-    };
+    let event = event_with_records(vec![make_malformed_record("seq-malformed")]);
     let response = handler.handle_stream_event(event).await;
 
     assert_eq!(response.batch_item_failures.len(), 1);
@@ -440,9 +429,7 @@ async fn stream_non_insert_records_are_skipped() {
     let mut remove = make_insert_record(&tenant, &task_id, &owner, seq, "seq-rem");
     remove.event_name = "REMOVE".into();
 
-    let event = DynamoDbEvent {
-        records: vec![record, remove],
-    };
+    let event = event_with_records(vec![record, remove]);
     let response = handler.handle_stream_event(event).await;
 
     assert!(
@@ -469,12 +456,10 @@ async fn stream_duplicate_inserts_produce_exactly_one_post() {
         seed_task_with_marker(&storage, &format!("{}/webhook", mock.uri()), "t-dupe").await;
 
     let handler = LambdaStreamRecoveryHandler::new(dispatcher);
-    let event = DynamoDbEvent {
-        records: vec![
-            make_insert_record(&tenant, &task_id, &owner, seq, "seq-a"),
-            make_insert_record(&tenant, &task_id, &owner, seq, "seq-b"),
-        ],
-    };
+    let event = event_with_records(vec![
+        make_insert_record(&tenant, &task_id, &owner, seq, "seq-a"),
+        make_insert_record(&tenant, &task_id, &owner, seq, "seq-b"),
+    ]);
     let response = handler.handle_stream_event(event).await;
 
     assert!(
