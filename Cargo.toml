@@ -10,6 +10,7 @@ members = [
   "crates/turul-a2a-aws-lambda",
   "examples/echo-agent",
   "examples/auth-agent",
+  "examples/streaming-agent",
   "examples/lambda-agent",
   "examples/lambda-stream-worker",
   "examples/lambda-scheduled-worker",
