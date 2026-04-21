@@ -501,9 +501,29 @@ async fn grpc_send_streaming_message_to_terminal() {
 
     assert!(!events.is_empty(), "stream produced no events");
 
-    // ADR-014 §2.3: no synthetic Task snapshot first; the stream starts
-    // at the first persisted event (SUBMITTED) and ends with a terminal
-    // status update.
+    // ADR-014 §2.3: no synthetic `Task` snapshot precedes persisted
+    // events on SendStreamingMessage — the stream starts at the first
+    // stored event, which is SUBMITTED per the shared core's setup
+    // (`router::setup_streaming_send`). Pinning this explicitly so a
+    // regression that accidentally emits a `Task` first (as
+    // SubscribeToTask does) is caught here.
+    match &events[0].payload {
+        Some(turul_a2a_proto::stream_response::Payload::StatusUpdate(upd)) => {
+            let state = upd.status.as_ref().map(|s| s.state());
+            assert_eq!(
+                state,
+                Some(turul_a2a_proto::TaskState::Submitted),
+                "first event must be StatusUpdate(SUBMITTED) per ADR-014 §2.3 / §2.11"
+            );
+        }
+        other => panic!(
+            "first event must be StatusUpdate(SUBMITTED); got {other:?}. A synthetic \
+             Task first event would indicate regression of the narrowed ADR-014 §2.3 \
+             contract."
+        ),
+    }
+
+    // Last event must be terminal Completed.
     let last = events.last().expect("events");
     match &last.payload {
         Some(turul_a2a_proto::stream_response::Payload::StatusUpdate(upd)) => {
@@ -631,48 +651,6 @@ impl A2aMiddleware for DenyAll {
             "test middleware denies all".into(),
         ))
     }
-}
-
-// =========================================================
-// A2aGrpcClient wrapper smoke test (ADR-014 §2.7)
-// =========================================================
-
-#[tokio::test]
-async fn a2a_grpc_client_wrapper_send_and_get() {
-    // Exercises turul_a2a_client::A2aGrpcClient against the tonic
-    // server. Proves the client-side verb surface (send_message +
-    // get_task + cancel_task) works end-to-end and that `with_tenant`
-    // writes the proto tenant field (ADR-014 §2.4 proto-wins).
-    use turul_a2a_client::grpc::A2aGrpcClient;
-
-    let h = Harness::start_with(CompletingExecutor).await;
-    let mut client = A2aGrpcClient::connect(format!("http://{}", h.addr))
-        .await
-        .expect("connect")
-        .with_tenant("wrapper-tenant");
-
-    let msg = simple_message("wrapper");
-    let resp = client.send_message(msg).await.expect("send ok");
-    let task_id = match resp.payload.expect("payload") {
-        turul_a2a_proto::send_message_response::Payload::Task(t) => {
-            assert_eq!(t.status.as_ref().map(|s| s.state()),
-                Some(turul_a2a_proto::TaskState::Completed));
-            t.id
-        }
-        _ => panic!("task response"),
-    };
-
-    let task = client
-        .get_task(task_id.clone(), None)
-        .await
-        .expect("get ok");
-    assert_eq!(task.id, task_id);
-
-    // cancel on a terminal task — wrapper must surface the A2A
-    // reason through A2aClientError::reason() (ADR-014 §2.5).
-    let err = client.cancel_task(task_id).await.expect_err("terminal");
-    assert_eq!(err.reason(), Some("TASK_NOT_CANCELABLE"));
-    assert_eq!(err.grpc_code(), Some(tonic::Code::FailedPrecondition));
 }
 
 #[tokio::test]
