@@ -34,9 +34,15 @@ cargo test -p turul-a2a --features sqlite --lib -- storage::sqlite
 cargo test -p turul-a2a --features postgres --lib -- storage::postgres --test-threads=1
 cargo test -p turul-a2a --features dynamodb --lib -- storage::dynamodb --test-threads=1
 
+# gRPC transport tests (feature-gated, ADR-014)
+cargo test -p turul-a2a --features grpc --lib grpc::                # grpc module unit tests (error + service)
+cargo test -p turul-a2a --features grpc --test grpc_tests           # gRPC end-to-end (all 11 RPCs + auth)
+cargo test -p turul-a2a --features grpc --test spec_compliance      # 3-transport parity axis
+
 # Examples
 cargo run -p echo-agent                    # Echo agent on :3000
 cargo run -p auth-agent                    # Auth agent on :3001 (requires X-API-Key)
+cargo run -p grpc-agent --bin grpc-agent   # gRPC agent on :3005 (requires --features grpc, on by default)
 cargo lambda watch -p lambda-agent         # Lambda agent via cargo-lambda
 ```
 
@@ -104,7 +110,7 @@ The workspace publishes 7 crates. The workflow is:
 ### Preludes
 
 - `turul_a2a::prelude::*` — server/agent authoring: `A2aServer`, `AgentExecutor`, `ExecutionContext`, `A2aError`, `AgentCardBuilder`, `Task`, `Message`, `Part`, `Artifact`, `TaskState`, `TaskStatus`
-- `turul_a2a_client::prelude::*` — client/caller: `A2aClient`, `ClientAuth`, `MessageBuilder`, `SseEvent`, `SseStream`, `A2aClientError`, `ListTasksParams`
+- `turul_a2a_client::prelude::*` — client/caller: `A2aClient`, `ClientAuth`, `MessageBuilder`, `SseEvent`, `SseStream`, `A2aClientError`, `ListTasksParams`; under `--features grpc` also re-exports `A2aGrpcClient` and `GrpcStreamResponses` (ADR-014 §2.7)
 
 These are separate by design. Only add types that are genuinely part of the common happy path — do not turn preludes into "export everything."
 
@@ -152,6 +158,7 @@ Documented under `docs/adr/`:
 - **ADR-011**: Push notification delivery — claim-based fan-out, retry horizon, SSRF, secret redaction
 - **ADR-012**: Cancellation propagation — cross-instance cancel marker, supervisor sweep, same-backend requirement
 - **ADR-013**: Lambda push-delivery parity — atomic pending-dispatch marker, causal no-backfill CAS, stream + scheduled recovery workers. §4.3 errata (0.1.5): `.storage()` does not auto-wire push delivery; explicit `.push_delivery_store(...)` required.
+- **ADR-014**: gRPC transport — third thin adapter via tonic over the shared core handlers (ADR-005 extended). Feature-gated on `turul-a2a-proto/grpc`, `turul-a2a/grpc`, `turul-a2a-client/grpc`; default builds are tonic-free. `grpc-reflection` / `grpc-health` are separate opt-in sub-features. Streaming consumes the ADR-009 durable event store with `a2a-last-event-id` ASCII metadata for replay. Proto `tenant` field wins over `x-tenant-id` metadata (§2.4). Out of scope for `turul-a2a-aws-lambda` (§2.6).
 
 For non-trivial architecture changes, the ADR should be accepted before implementation starts.
 
@@ -198,7 +205,7 @@ Our vendored `proto/a2a.proto` is byte-identical to upstream `a2aproject/A2A/spe
 **Release scope.** turul-a2a is tested against the current upstream A2A v1.0 proto (`proto/a2a.proto`) and implements the core HTTP+JSON and JSON-RPC server surfaces covered by that vendored contract. Within those covered surfaces there are no known compliance gaps: ListTasks sorts by `updated_at DESC` across all four backends; pagination cursor encodes `updated_at|task_id` for stable iteration; the spec-compliance suite (`crates/turul-a2a/tests/spec_compliance.rs`) walks every core RPC on both transports.
 
 **Out of scope for the framework release:**
-- gRPC transport (the proto is generated but the gRPC service surface is not wired — see "Deferred" below).
+- gRPC transport on AWS Lambda (ADR-014 §2.6: Lambda lacks persistent HTTP/2). The feature itself is fully wired for self-hosted targets (ECS / Fargate / AppRunner / Kubernetes / bare VMs) — see [ADR-014](docs/adr/ADR-014-grpc-transport.md) and `examples/grpc-agent`.
 - Deployment-layer transport requirements: TLS 1.2+ (spec §7.1) and gzip (§11.4) are met at the reverse proxy / load balancer, not framework-enforced.
 - Deeper per-skill security-scheme semantics (agent-level only; see "Deferred").
 
@@ -211,9 +218,9 @@ Before describing a release as "A2A v1.0 compliant", re-verify the vendored `pro
 - **ADR-011 — Push notification delivery**: `PushDispatcher` + `PushDeliveryWorker`, claim-based fan-out, bounded retry horizon (`push_claim_expiry > max_attempts * backoff_cap`), SSRF allowlist, secret redaction.
 - **ADR-012 — Cancellation propagation**: cross-instance cancel marker + supervisor sweep; same-backend check on the builder.
 - **ADR-013 — Lambda push-delivery parity**: atomic `a2a_push_pending_dispatches` marker, causal `latest_event_sequence` CAS, `LambdaStreamRecoveryHandler` (BatchItemFailures) + `LambdaScheduledRecoveryHandler` (EventBridge backstop).
+- **ADR-014 — gRPC transport**: third thin adapter over the shared core handlers. All 11 RPCs (9 unary + 2 server-streaming) wired via tonic; Tower auth layer reuses `MiddlewareStack`; streaming feeds from the ADR-009 durable event store with `a2a-last-event-id` metadata resume; `tenant` proto field wins over `x-tenant-id` metadata. Feature-gated (`grpc` on `turul-a2a-proto` + `turul-a2a` + `turul-a2a-client`); default builds remain tonic-free. Example: `examples/grpc-agent` (server + CLI client). Not available under `turul-a2a-aws-lambda`.
 
 ### Deferred (ordered by priority)
 
-1. **gRPC transport** — feature-gated in `turul-a2a-proto`
-2. **Skill-level `security_requirements`** — agent-level only for now
-3. **Shared `turul-jwt-validator` extraction** — currently local, see ADR-007
+1. **Skill-level `security_requirements`** — agent-level only for now
+2. **Shared `turul-jwt-validator` extraction** — currently local, see ADR-007

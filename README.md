@@ -223,9 +223,36 @@ cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ```
 
+## gRPC (ADR-014)
+
+gRPC is a third transport alongside HTTP+JSON and JSON-RPC, behind
+the `grpc` feature. The default dependency tree does **not** include
+tonic — HTTP-only deployments pay zero tonic weight.
+
+```bash
+# Build with gRPC enabled
+cargo build -p turul-a2a --features grpc
+
+# Run the example server + client
+cargo run -p grpc-agent --bin grpc-agent            # terminal A
+cargo run -p grpc-agent --bin grpc-client -- send "hello"   # terminal B
+cargo run -p grpc-agent --bin grpc-client -- stream "hello"
+```
+
+All 11 `lf.a2a.v1.A2AService` RPCs are served via
+`A2aServer::into_tonic_router()` — the single public entry point,
+which always layers the same Tower auth stack as the HTTP path
+(ADR-014 §2.4). Streaming consumes the same durable event store
+as SSE (ADR-009), with `a2a-last-event-id` ASCII metadata for
+resume. `grpc-reflection` and `grpc-health` are optional sub-features.
+
+The client wrapper `turul_a2a_client::grpc::A2aGrpcClient` ships
+under the same feature flag. Not available under
+`turul-a2a-aws-lambda` (Lambda lacks persistent HTTP/2).
+
 ## Architecture Decision Records
 
-Documented under `docs/adr/`. Key decisions: proto-first types (ADR-001), storage traits (ADR-003), dual transport (ADR-005), SSE streaming (ADR-006), auth middleware (ADR-007), Lambda adapter (ADR-008), durable event coordination (ADR-009).
+Documented under `docs/adr/`. Key decisions: proto-first types (ADR-001), storage traits (ADR-003), dual transport (ADR-005), SSE streaming (ADR-006), auth middleware (ADR-007), Lambda adapter (ADR-008), durable event coordination (ADR-009), gRPC transport (ADR-014).
 
 ## License
 

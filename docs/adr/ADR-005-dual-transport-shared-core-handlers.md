@@ -5,7 +5,7 @@
 
 ## Context
 
-A2A v1.0 defines HTTP/REST and JSON-RPC protocol bindings. Both must be supported in v0.1. The HTTP routes come from proto `google.api.http` annotations (e.g., `POST /message:send`, `GET /tasks/{id=*}:cancel`). JSON-RPC uses PascalCase method names (SendMessage, GetTask, etc.). gRPC is deferred.
+A2A v1.0 defines HTTP/REST and JSON-RPC protocol bindings. Both must be supported in v0.1. The HTTP routes come from proto `google.api.http` annotations (e.g., `POST /message:send`, `GET /tasks/{id=*}:cancel`). JSON-RPC uses PascalCase method names (SendMessage, GetTask, etc.). gRPC is now the third transport under the same shared-core invariant — see [ADR-014](ADR-014-grpc-transport.md); feature-gated behind `grpc`, default off.
 
 ## Decision
 

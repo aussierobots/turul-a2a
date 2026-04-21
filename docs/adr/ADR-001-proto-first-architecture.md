@@ -26,7 +26,7 @@ Generate from proto with `prost` + `pbjson`, then wrap in ergonomic Rust types. 
    - State machine enforcement for task lifecycle transitions.
    - Builder patterns for constructing valid instances.
 
-gRPC support via `tonic` is deferred and will be feature-gated behind `grpc` when needed.
+gRPC support via `tonic` is feature-gated behind `grpc` on `turul-a2a-proto`, `turul-a2a`, and `turul-a2a-client` (see [ADR-014](ADR-014-grpc-transport.md)). Default HTTP+JSON-only builds pay zero tonic weight; enabling the feature adds tonic service + client stubs alongside the same prost message types.
 
 ## Consequences
 
@@ -35,4 +35,4 @@ gRPC support via `tonic` is deferred and will be feature-gated behind `grpc` whe
 - **Two-layer type system adds conversion boilerplate.** Every proto type that surfaces in the public API has a corresponding wrapper, with `From` or `TryFrom` conversions in both directions.
 - **`pbjson` handles JSON serialization.** camelCase field names, `oneof` representations, and well-known type mappings all follow the proto JSON mapping spec without manual `#[serde(rename)]` annotations.
 - **`#[non_exhaustive]` on all public wrapper types.** New fields can be added to wrapper types in minor versions without breaking downstream consumers.
-- **gRPC is not an immediate dependency.** The `tonic` code-gen path exists but is gated, keeping the default dependency tree lighter for HTTP/JSON-only deployments.
+- **gRPC is opt-in, not default.** The `tonic` code-gen path is gated behind the `grpc` feature per ADR-014; HTTP/JSON-only deployments pay zero tonic weight in their dependency tree.
