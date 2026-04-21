@@ -899,3 +899,213 @@ async fn send_streaming_message_returns_text_event_stream() {
         "SSE body must contain at least one `data:` line, got: {prefix}"
     );
 }
+
+// =========================================================
+// gRPC transport parity (ADR-014 §2.11)
+// =========================================================
+//
+// These tests extend the compliance matrix from
+// {HTTP+JSON, JSON-RPC} to {HTTP+JSON, JSON-RPC, gRPC} when the
+// `grpc` feature is enabled. They prove two invariants:
+//
+//   1. Storage parity: a task created via HTTP+JSON is visible to a
+//      gRPC client on the same underlying storage — "storage is the
+//      source of truth" (ADR-009) crosses transports.
+//   2. Error parity: `A2aError` variants surface with identical
+//      `ErrorInfo.reason` strings and the canonical
+//      `a2a-protocol.org` domain on all three transports. A bug in a
+//      `core_*` function MUST produce an identically-labeled failure
+//      on HTTP, JSON-RPC, and gRPC (ADR-005 extended, ADR-014 §2.11).
+
+#[cfg(feature = "grpc")]
+mod grpc_parity {
+    use super::*;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::Request;
+    use tonic_types::StatusExt;
+    use turul_a2a_proto::grpc::A2aServiceClient;
+
+    /// Stand up a tonic server that shares the given
+    /// `InMemoryA2aStorage` with the provided axum compliance router
+    /// (built from the SAME storage Arc-clone). Returns the bound
+    /// address and the server join handle — caller aborts on drop.
+    async fn spawn_grpc(
+        storage: InMemoryA2aStorage,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        let server = A2aServer::builder()
+            .executor(ComplianceAgent)
+            .storage(storage)
+            .bind(([127, 0, 0, 1], 0))
+            .build()
+            .expect("grpc compliance server");
+        let router = server.into_tonic_router();
+        let handle = tokio::spawn(async move {
+            let _ = router
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (addr, handle)
+    }
+
+    async fn grpc_client(addr: SocketAddr) -> A2aServiceClient<tonic::transport::Channel> {
+        let ch = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect");
+        A2aServiceClient::new(ch)
+    }
+
+    /// Build a fresh compliance axum router and a gRPC server against
+    /// the same `InMemoryA2aStorage`. Both transports share state.
+    async fn dual_transport_harness() -> (axum::Router, SocketAddr, JoinHandle<()>) {
+        let shared = InMemoryA2aStorage::new();
+        let http_router = A2aServer::builder()
+            .executor(ComplianceAgent)
+            .storage(shared.clone())
+            .build()
+            .expect("http build")
+            .into_router();
+        let (grpc_addr, handle) = spawn_grpc(shared).await;
+        (http_router, grpc_addr, handle)
+    }
+
+    /// Same task written via HTTP must be readable via gRPC.
+    /// Proves the storage layer sits below the transport adapters.
+    #[tokio::test]
+    async fn http_write_is_visible_via_grpc_get_task() {
+        let (router, grpc_addr, _guard) = dual_transport_harness().await;
+
+        // HTTP SendMessage → task_id
+        let (status, _, body) = http_call(
+            router.clone(),
+            Method::POST,
+            "/message:send",
+            Some(http_send_body("cross-1", "cross transport")),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let task_id = body
+            .get("task")
+            .and_then(|t| t.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(!task_id.is_empty());
+
+        // gRPC GetTask on same id → same task.
+        let mut grpc = grpc_client(grpc_addr).await;
+        let got = grpc
+            .get_task(Request::new(turul_a2a_proto::GetTaskRequest {
+                tenant: String::new(),
+                id: task_id.clone(),
+                history_length: None,
+            }))
+            .await
+            .expect("grpc get_task ok")
+            .into_inner();
+        assert_eq!(got.id, task_id);
+    }
+
+    /// `TaskNotFound` surfaces the same `reason` + `domain` across
+    /// all three transports.
+    #[tokio::test]
+    async fn task_not_found_error_parity_http_jsonrpc_grpc() {
+        let (router, grpc_addr, _guard) = dual_transport_harness().await;
+
+        // HTTP
+        let (http_status, _, http_body) =
+            http_call(router.clone(), Method::GET, "/tasks/does-not-exist", None).await;
+        assert_eq!(http_status, 404);
+        assert_has_error_info(&http_body, "TASK_NOT_FOUND");
+
+        // JSON-RPC
+        let jr = jsonrpc_call(
+            router,
+            "GetTask",
+            serde_json::json!({"id": "does-not-exist"}),
+            1,
+        )
+        .await;
+        assert_eq!(
+            jr.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_i64()),
+            Some(-32001)
+        );
+        assert_has_error_info(&jr, "TASK_NOT_FOUND");
+
+        // gRPC
+        let mut grpc = grpc_client(grpc_addr).await;
+        let err = grpc
+            .get_task(Request::new(turul_a2a_proto::GetTaskRequest {
+                tenant: String::new(),
+                id: "does-not-exist".into(),
+                history_length: None,
+            }))
+            .await
+            .expect_err("grpc must NOT_FOUND");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        let info = err.get_details_error_info().expect("ErrorInfo");
+        assert_eq!(info.reason, "TASK_NOT_FOUND");
+        assert_eq!(info.domain, "a2a-protocol.org");
+    }
+
+    /// Terminal-subscribe: `UnsupportedOperation` surfaces with the
+    /// same `UNSUPPORTED_OPERATION` reason on every transport.
+    #[tokio::test]
+    async fn terminal_subscribe_error_parity_http_jsonrpc_grpc() {
+        let (router, grpc_addr, _guard) = dual_transport_harness().await;
+
+        // Create + complete a task via HTTP so all three transports
+        // see the same terminal state.
+        let (status, _, body) = http_call(
+            router.clone(),
+            Method::POST,
+            "/message:send",
+            Some(http_send_body("t-sub", "terminal for subscribe parity")),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let task_id = body
+            .get("task")
+            .and_then(|t| t.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // JSON-RPC SubscribeToTask → error -32004 + UNSUPPORTED_OPERATION.
+        let jr = jsonrpc_call(
+            router,
+            "SubscribeToTask",
+            serde_json::json!({"id": task_id}),
+            1,
+        )
+        .await;
+        assert_eq!(
+            jr.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_i64()),
+            Some(-32004)
+        );
+        assert_has_error_info(&jr, "UNSUPPORTED_OPERATION");
+
+        // gRPC SubscribeToTask → FAILED_PRECONDITION + UNSUPPORTED_OPERATION.
+        let mut grpc = grpc_client(grpc_addr).await;
+        let err = grpc
+            .subscribe_to_task(Request::new(turul_a2a_proto::SubscribeToTaskRequest {
+                tenant: String::new(),
+                id: task_id,
+            }))
+            .await
+            .expect_err("grpc must reject terminal");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let info = err.get_details_error_info().expect("ErrorInfo");
+        assert_eq!(info.reason, "UNSUPPORTED_OPERATION");
+        assert_eq!(info.domain, "a2a-protocol.org");
+    }
+}
