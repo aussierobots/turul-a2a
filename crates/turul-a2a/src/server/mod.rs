@@ -665,6 +665,22 @@ impl A2aServer {
         build_router(state)
     }
 
+    /// Build the tonic gRPC router with the Tower auth stack already
+    /// layered (ADR-014 §2.2 / §2.4).
+    ///
+    /// The returned `tonic::transport::server::Router` always applies
+    /// the same [`MiddlewareStack`](crate::middleware::MiddlewareStack)
+    /// as the HTTP path. A raw unauthenticated service accessor is
+    /// deliberately not exposed — returning the inner service would
+    /// permit adopters to compose it into a custom tonic server
+    /// without the auth layer and silently bypass authentication.
+    #[cfg(feature = "grpc")]
+    pub fn into_tonic_router(self) -> crate::grpc::LayeredGrpcRouter {
+        let (state, _) = self.into_augmented_state();
+        let middleware_stack = state.middleware_stack.clone();
+        crate::grpc::make_grpc_router(state, middleware_stack)
+    }
+
     /// Produce the `AppState` that `into_router` would mount, plus a flag
     /// indicating whether security augmentation was applied. Exposed to
     /// tests so they can assert post-augmentation invariants (e.g., that
