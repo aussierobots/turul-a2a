@@ -26,8 +26,8 @@ pub use pbjson_types;
 /// builds do not pull in tonic.
 #[cfg(feature = "grpc")]
 pub mod grpc {
-    pub use crate::lf::a2a::v1::a2a_service_server::{A2aService, A2aServiceServer};
     pub use crate::lf::a2a::v1::a2a_service_client::A2aServiceClient;
+    pub use crate::lf::a2a::v1::a2a_service_server::{A2aService, A2aServiceServer};
 }
 
 #[cfg(test)]

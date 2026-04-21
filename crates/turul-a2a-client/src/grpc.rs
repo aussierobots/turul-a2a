@@ -2,9 +2,9 @@
 //!
 //! Thin ergonomic layer over the tonic-generated
 //! `turul_a2a_proto::grpc::A2aServiceClient`. Purpose: offer the same
-//! verb surface as `A2aClient` (send/get/list/cancel/stream/subscribe
-//! + push config CRUD) while injecting auth + tenant metadata
-//! uniformly per call.
+//! verb surface as `A2aClient` (send, get, list, cancel, stream,
+//! subscribe, and push-config CRUD) while injecting auth + tenant
+//! metadata uniformly per call.
 //!
 //! Tenant handling matches ADR-014 §2.4 normative precedence: when
 //! the caller passes a `with_tenant(...)` value, the client writes it
@@ -19,13 +19,13 @@
 use std::pin::Pin;
 
 use futures::Stream;
+use tonic::Request;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
-use tonic::Request;
 use turul_a2a_proto as pb;
 
-use crate::error::A2aClientError;
 use crate::ClientAuth;
+use crate::error::A2aClientError;
 
 /// gRPC client for an A2A agent.
 #[derive(Clone)]
@@ -113,7 +113,11 @@ impl A2aGrpcClient {
             configuration: None,
             metadata: None,
         };
-        Ok(self.inner.send_message(self.prepare(req)).await?.into_inner())
+        Ok(self
+            .inner
+            .send_message(self.prepare(req))
+            .await?
+            .into_inner())
     }
 
     pub async fn get_task(
@@ -156,7 +160,11 @@ impl A2aGrpcClient {
             id: task_id.into(),
             metadata: None,
         };
-        Ok(self.inner.cancel_task(self.prepare(req)).await?.into_inner())
+        Ok(self
+            .inner
+            .cancel_task(self.prepare(req))
+            .await?
+            .into_inner())
     }
 
     pub async fn get_extended_agent_card(&mut self) -> Result<pb::AgentCard, A2aClientError> {

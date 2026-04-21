@@ -4,6 +4,70 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.7] — 2026-04-22
+
+### Added
+- **gRPC transport (ADR-014 — Accepted).** Third thin adapter over
+  the shared core handlers (ADR-005 extended). Default builds remain
+  HTTP+JSON-only and tonic-free; enabling the new `grpc` feature on
+  `turul-a2a-proto`, `turul-a2a`, and `turul-a2a-client` activates a
+  tonic 0.14 server and client covering every one of the 11
+  `lf.a2a.v1.A2AService` RPCs (9 unary + 2 server-streaming).
+  Highlights:
+    - `A2aServer::into_tonic_router()` is the single public entry
+      point to the gRPC surface; it always composes the same Tower
+      auth stack (`A2aMiddleware` / `MiddlewareStack`) as the HTTP
+      path, so adopters cannot silently bypass auth. No raw service
+      accessor is exposed in 0.1.7.
+    - Streaming consumes the ADR-009 durable event store and broker
+      (no parallel pipeline). Resume via `a2a-last-event-id` ASCII
+      metadata (`{task_id}:{sequence}` — mirrors the SSE
+      `Last-Event-ID` convention).
+    - `SubscribeToTask` emits the `Task` snapshot as the first event
+      on fresh attach (spec §3.1.6). `SendStreamingMessage` does NOT
+      emit a synthetic `Task` first — matching the established HTTP
+      SSE behaviour; the stream starts at the first persisted
+      `StatusUpdate(SUBMITTED)` event.
+    - Terminal `SubscribeToTask` surfaces `A2aError::UnsupportedOperation`,
+      mapped to `FAILED_PRECONDITION` with
+      `ErrorInfo { reason = "UNSUPPORTED_OPERATION", domain = "a2a-protocol.org" }`.
+      `PushNotificationNotSupported` and
+      `ExtendedAgentCardNotConfigured` map to `UNIMPLEMENTED`
+      (capability-absence vs. state-rejection — see ADR-014 §2.5).
+    - Tenant precedence (normative, ADR-014 §2.4): the proto
+      `tenant` field wins over the `x-tenant-id` metadata when both
+      are present. Metadata is a fallback for clients that cannot
+      populate the proto field.
+    - `last_chunk` is persisted as part of `ArtifactUpdatePayload` in
+      the event store (ADR-014 §2.3 two-layer contract) — the gRPC
+      adapter reads it back from stored events, never invents it.
+- **`grpc-reflection` and `grpc-health` sub-features** on
+  `turul-a2a`. Off by default; enable alongside `grpc` to serve
+  `grpc.reflection.v1alpha.ServerReflection` or
+  `grpc.health.v1.Health`.
+- **`turul_a2a_client::grpc::A2aGrpcClient`** (feature-gated): thin
+  ergonomic wrapper over the tonic-generated client with the same
+  verb surface as `A2aClient` (send/get/list/cancel/stream/subscribe
+  + push config CRUD). Exposes `A2aClientError::Grpc` +
+  `A2aClientError::grpc_code()` for tonic status inspection.
+- **Example: `examples/grpc-agent`** — a two-binary crate
+  (`grpc-agent` server + `grpc-client` CLI) demonstrating the full
+  flow end-to-end, including `send`, `stream` (chunked artifacts
+  with `last_chunk`), `list`, and `get`.
+- **Three-transport spec-compliance axis.** `spec_compliance.rs`
+  gains a `grpc_parity` module under `--features grpc` proving that
+  HTTP+JSON, JSON-RPC, and gRPC emit identical `ErrorInfo` reasons
+  and share storage state across transports. 11 new end-to-end
+  gRPC integration tests in `crates/turul-a2a/tests/grpc_tests.rs`.
+
+### Notes
+- **Not available under `turul-a2a-aws-lambda`.** Lambda lacks
+  persistent HTTP/2 (ADR-014 §2.6). Host the gRPC transport on
+  ECS / Fargate / AppRunner / Kubernetes / self-managed VMs.
+- **TLS is deployer-owned.** A2A v1.0 §7.1 requires TLS 1.2+ in
+  production; this framework defers termination to the reverse
+  proxy / service mesh (same posture as HTTP).
+
 ## [0.1.6] — 2026-04-21
 
 ### Fixed

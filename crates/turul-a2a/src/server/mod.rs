@@ -669,8 +669,8 @@ impl A2aServer {
     /// layered (ADR-014 §2.2 / §2.4).
     ///
     /// The returned `tonic::transport::server::Router` always applies
-    /// the same [`MiddlewareStack`](crate::middleware::MiddlewareStack)
-    /// as the HTTP path. A raw unauthenticated service accessor is
+    /// the same [`MiddlewareStack`] as the HTTP path. A raw
+    /// unauthenticated service accessor is
     /// deliberately not exposed — returning the inner service would
     /// permit adopters to compose it into a custom tonic server
     /// without the auth layer and silently bypass authentication.

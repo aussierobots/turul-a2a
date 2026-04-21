@@ -932,9 +932,7 @@ mod grpc_parity {
     /// `InMemoryA2aStorage` with the provided axum compliance router
     /// (built from the SAME storage Arc-clone). Returns the bound
     /// address and the server join handle — caller aborts on drop.
-    async fn spawn_grpc(
-        storage: InMemoryA2aStorage,
-    ) -> (SocketAddr, JoinHandle<()>) {
+    async fn spawn_grpc(storage: InMemoryA2aStorage) -> (SocketAddr, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -1036,7 +1034,9 @@ mod grpc_parity {
         )
         .await;
         assert_eq!(
-            jr.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_i64()),
+            jr.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_i64()),
             Some(-32001)
         );
         assert_has_error_info(&jr, "TASK_NOT_FOUND");
@@ -1089,7 +1089,9 @@ mod grpc_parity {
         )
         .await;
         assert_eq!(
-            jr.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_i64()),
+            jr.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_i64()),
             Some(-32004)
         );
         assert_has_error_info(&jr, "UNSUPPORTED_OPERATION");

@@ -7,7 +7,7 @@
 //!   cargo run -p grpc-agent --bin grpc-client -- send    "your text"
 //!   cargo run -p grpc-agent --bin grpc-client -- stream  "your text"
 //!   cargo run -p grpc-agent --bin grpc-client -- list
-//!   cargo run -p grpc-agent --bin grpc-client -- get     <task-id>
+//!   cargo run -p grpc-agent --bin grpc-client -- get     TASK_ID
 //!
 //! Endpoint defaults to http://127.0.0.1:3005 — override with
 //! A2A_GRPC_ENDPOINT=http://host:port.

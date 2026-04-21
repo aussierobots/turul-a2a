@@ -47,9 +47,10 @@ pub const LAST_EVENT_ID_METADATA: &str = "a2a-last-event-id";
 
 /// Build the streaming response for `SendStreamingMessage`.
 ///
-/// Reuses [`router::setup_streaming_send`] to create the task + emit
-/// SUBMITTED/WORKING + spawn the executor, then wraps the broker
-/// wake-up receiver in the shared replay-then-live loop.
+/// Reuses the crate-internal `router::setup_streaming_send` helper to
+/// create the task + emit SUBMITTED/WORKING + spawn the executor,
+/// then wraps the broker wake-up receiver in the shared
+/// replay-then-live loop.
 pub async fn handle_send_streaming_message(
     state: AppState,
     tenant: String,
@@ -116,7 +117,11 @@ pub async fn handle_subscribe_to_task(
 
     // Spec §3.1.6 + ADR-014 §2.11: the first event on a fresh attach is
     // the `Task` snapshot. On resume the client already has it — skip.
-    let initial_task = if after_sequence == 0 { Some(task) } else { None };
+    let initial_task = if after_sequence == 0 {
+        Some(task)
+    } else {
+        None
+    };
 
     let wake_rx = state.event_broker.subscribe(&task_id).await;
     Ok(make_store_grpc_stream(
@@ -141,9 +146,8 @@ fn make_store_grpc_stream(
     mut wake_rx: broadcast::Receiver<()>,
     initial_task: Option<Task>,
 ) -> BoxedStreamResponseStream {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<pb::StreamResponse, Status>>(
-        STREAM_CHANNEL_DEPTH,
-    );
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<Result<pb::StreamResponse, Status>>(STREAM_CHANNEL_DEPTH);
 
     tokio::spawn(async move {
         // Spec §3.1.6: emit the Task snapshot as the first event on a
@@ -161,12 +165,13 @@ fn make_store_grpc_stream(
         let mut last_seq = after_sequence;
 
         loop {
-            let events = match event_store.get_events_after(&tenant, &task_id, last_seq).await {
+            let events = match event_store
+                .get_events_after(&tenant, &task_id, last_seq)
+                .await
+            {
                 Ok(events) => events,
                 Err(err) => {
-                    let _ = tx
-                        .send(Err(a2a_to_status(A2aError::from(err))))
-                        .await;
+                    let _ = tx.send(Err(a2a_to_status(A2aError::from(err)))).await;
                     return;
                 }
             };

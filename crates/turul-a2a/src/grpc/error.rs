@@ -50,10 +50,9 @@ pub fn a2a_to_status(err: A2aError) -> Status {
             Code::InvalidArgument,
             Some(errors::REASON_CONTENT_TYPE_NOT_SUPPORTED),
         ),
-        A2aError::InvalidAgentResponse { .. } => (
-            Code::Internal,
-            Some(errors::REASON_INVALID_AGENT_RESPONSE),
-        ),
+        A2aError::InvalidAgentResponse { .. } => {
+            (Code::Internal, Some(errors::REASON_INVALID_AGENT_RESPONSE))
+        }
         A2aError::ExtendedAgentCardNotConfigured => (
             Code::Unimplemented,
             Some(errors::REASON_EXTENDED_AGENT_CARD_NOT_CONFIGURED),
@@ -206,16 +205,22 @@ mod tests {
                 task_id: "t".into(),
             },
             A2aError::PushNotificationNotSupported,
-            A2aError::UnsupportedOperation { message: "x".into() },
+            A2aError::UnsupportedOperation {
+                message: "x".into(),
+            },
             A2aError::ContentTypeNotSupported {
                 content_type: "x".into(),
             },
-            A2aError::InvalidAgentResponse { message: "x".into() },
+            A2aError::InvalidAgentResponse {
+                message: "x".into(),
+            },
             A2aError::ExtendedAgentCardNotConfigured,
             A2aError::ExtensionSupportRequired {
                 extension: "x".into(),
             },
-            A2aError::VersionNotSupported { version: "x".into() },
+            A2aError::VersionNotSupported {
+                version: "x".into(),
+            },
         ];
         for v in variants {
             let s = a2a_to_status(v);

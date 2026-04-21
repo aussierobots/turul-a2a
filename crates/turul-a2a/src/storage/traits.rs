@@ -35,7 +35,8 @@ use super::filter::{PushConfigListPage, TaskFilter, TaskListPage};
 /// DynamoDB is the known exception — its default `GetItem` / `Query`
 /// is eventually consistent. DynamoDB backends MUST set
 /// `ConsistentRead=true` on task-table reads (see
-/// [`crate::storage::dynamodb`] for the reference implementation).
+/// `crate::storage::dynamodb` — module is feature-gated on
+/// `--features dynamodb` — for the reference implementation).
 ///
 /// New backend authors: add an integration test that writes a task
 /// and reads it back on the same instance within microseconds. If the

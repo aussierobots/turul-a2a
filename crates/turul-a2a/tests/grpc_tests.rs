@@ -592,9 +592,10 @@ async fn grpc_tenant_scoping_end_to_end() {
         metadata: None,
     });
     // Metadata disagrees with the proto tenant. Proto must win.
-    create
-        .metadata_mut()
-        .insert("x-tenant-id", tonic::metadata::MetadataValue::from_static("beta"));
+    create.metadata_mut().insert(
+        "x-tenant-id",
+        tonic::metadata::MetadataValue::from_static("beta"),
+    );
     let _ = client.send_message(create).await.expect("ok");
 
     let list_alpha = client

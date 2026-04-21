@@ -129,11 +129,16 @@ impl pb::grpc::A2aService for GrpcService {
         let task_id = request.get_ref().id.clone();
         let history_length = request.get_ref().history_length;
 
-        let value =
-            router::core_get_task(self.state.clone(), &tenant, &owner, &task_id, history_length)
-                .await
-                .map_err(a2a_to_status)?
-                .0;
+        let value = router::core_get_task(
+            self.state.clone(),
+            &tenant,
+            &owner,
+            &task_id,
+            history_length,
+        )
+        .await
+        .map_err(a2a_to_status)?
+        .0;
 
         let task: pb::Task = serde_json::from_value(value).map_err(internal_from_json)?;
         Ok(Response::new(task))
@@ -229,16 +234,11 @@ impl pb::grpc::A2aService for GrpcService {
         let task_id = request.get_ref().task_id.clone();
         let config_id = request.get_ref().id.clone();
 
-        let value = router::core_get_push_config(
-            self.state.clone(),
-            &tenant,
-            &owner,
-            &task_id,
-            &config_id,
-        )
-        .await
-        .map_err(a2a_to_status)?
-        .0;
+        let value =
+            router::core_get_push_config(self.state.clone(), &tenant, &owner, &task_id, &config_id)
+                .await
+                .map_err(a2a_to_status)?
+                .0;
 
         let config: pb::TaskPushNotificationConfig =
             serde_json::from_value(value).map_err(internal_from_json)?;
