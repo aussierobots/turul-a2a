@@ -539,8 +539,6 @@ include three cases:
   * `empty_when_neither_set`: proto `tenant = ""` + no metadata
     → request scopes to the default tenant (empty string).
 
-**Mandatory — streaming tests.**
-
 - `SendStreamingMessage` (gRPC): full event stream starting from
   the first persisted event (`SUBMITTED`) through to terminal
   event; ordering preserved; every event carries the same
