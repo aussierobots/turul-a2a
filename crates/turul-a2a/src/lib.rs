@@ -56,6 +56,8 @@ pub mod compat_v03;
 pub mod error;
 pub mod event_sink;
 pub mod executor;
+#[cfg(feature = "grpc")]
+pub mod grpc;
 pub mod jsonrpc;
 pub mod middleware;
 pub mod prelude;

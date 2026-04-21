@@ -21,6 +21,14 @@ compat-v03 = []
 sqlite = ["sqlx"]
 postgres = ["sqlx"]
 dynamodb = ["aws-config", "aws-sdk-dynamodb"]
+# gRPC transport (ADR-014). Off by default — HTTP+JSON adopters pay zero
+# tonic weight. Enabling this transitively activates turul-a2a-proto/grpc
+# and pulls in the tonic runtime + ErrorInfo support.
+grpc = ["dep:tonic", "dep:tonic-prost", "dep:tonic-types", "turul-a2a-proto/grpc"]
+# Optional sub-features on top of `grpc` (ADR-014 §2.9).
+# Enabling `grpc` alone does NOT pull in either of these.
+grpc-reflection = ["grpc", "dep:tonic-reflection"]
+grpc-health = ["grpc", "dep:tonic-health"]
 
 [dependencies]
 turul-a2a-types = { workspace = true }
@@ -50,6 +58,12 @@ secrecy = { workspace = true }
 reqwest = { workspace = true }
 # Retry jitter (push delivery).
 rand = { workspace = true }
+# gRPC transport (ADR-014); optional — activated by `grpc` feature.
+tonic = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
+tonic-types = { workspace = true, optional = true }
+tonic-reflection = { workspace = true, optional = true }
+tonic-health = { workspace = true, optional = true }
 
 [dev-dependencies]
 sqlx = { workspace = true }
