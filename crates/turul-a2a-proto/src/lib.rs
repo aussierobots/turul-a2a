@@ -15,6 +15,11 @@ pub mod lf {
 // Convenience re-export
 pub use lf::a2a::v1::*;
 
+// Re-export the well-known types crate so downstreams that don't
+// depend on pbjson-types directly (e.g. the gRPC adapter inside
+// `turul-a2a`) can name the generated types via a single namespace.
+pub use pbjson_types;
+
 /// Tonic-generated gRPC service + client stubs for `lf.a2a.v1.A2AService`.
 ///
 /// Enabled by the `grpc` Cargo feature (ADR-014 §2.2). Default HTTP+JSON

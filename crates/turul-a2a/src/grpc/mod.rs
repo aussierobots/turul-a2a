@@ -12,3 +12,6 @@
 //! `grpc.health.v1.Health` services respectively (off by default).
 
 pub mod error;
+pub mod service;
+
+pub use service::GrpcService;
