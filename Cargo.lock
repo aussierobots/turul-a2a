@@ -651,6 +651,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "callback-agent"
+version = "0.1.6"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+ "turul-a2a",
+ "turul-a2a-client",
+ "turul-a2a-proto",
+ "turul-a2a-types",
+ "uuid",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.60"
 source = "registry+https://github.com/rust-lang/crates.io-index"

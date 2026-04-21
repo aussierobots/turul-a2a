@@ -1,0 +1,21 @@
+[package]
+name = "callback-agent"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+turul-a2a = { path = "../../crates/turul-a2a" }
+turul-a2a-types = { path = "../../crates/turul-a2a-types" }
+turul-a2a-proto = { path = "../../crates/turul-a2a-proto" }
+async-trait = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+turul-a2a-client = { path = "../../crates/turul-a2a-client" }
+futures = { workspace = true }
+reqwest = { workspace = true }
