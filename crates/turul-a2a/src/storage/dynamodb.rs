@@ -272,9 +272,21 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
     ) -> Result<Option<Task>, A2aStorageError> {
         let pk = Self::task_key(tenant, task_id);
 
+        // Strongly-consistent GetItem. The A2A atomic-store contract
+        // relies on read-your-writes semantics: `update_task_status_with_events`
+        // (and siblings) read the task back immediately after
+        // `create_task_with_events` to validate the state-machine
+        // transition, and the router's `return_immediately` path
+        // re-reads the task it just wrote. DynamoDB's default
+        // eventually-consistent GetItem can miss a just-landed write
+        // during the first request on a fresh container, producing a
+        // spurious TaskNotFound that gets surfaced as a 404 to the
+        // caller even though the row exists. The 2× RCU cost is the
+        // correct trade for the state-machine guarantees A2A requires.
         let result = self
             .client
             .get_item()
+            .consistent_read(true)
             .table_name(&self.config.tasks_table)
             .key("pk", AttributeValue::S(pk))
             .send()
@@ -1083,8 +1095,13 @@ async fn query_latest_event_sequence(
     tasks_table: &str,
     pk: &str,
 ) -> Result<u64, A2aStorageError> {
+    // Strongly-consistent read: this value feeds the ADR-013 §6.3
+    // monotonic `latestEventSequence` invariant in the next
+    // TransactWriteItems — a stale read would under-compute the new
+    // sequence and risk a condition failure or monotonicity violation.
     let result = client
         .get_item()
+        .consistent_read(true)
         .table_name(tasks_table)
         .key("pk", AttributeValue::S(pk.to_string()))
         .projection_expression("latestEventSequence")
@@ -1106,9 +1123,14 @@ async fn query_max_sequence(
     table: &str,
     pk: &str,
 ) -> Result<u64, A2aStorageError> {
-    // Query in reverse order, limit 1 to get the highest sequence
+    // Strongly-consistent query: picks the next event sequence number
+    // for the upcoming TransactWriteItems. A stale read would collide
+    // with a just-written event and fail the
+    // `attribute_not_exists(pk) AND attribute_not_exists(sk)`
+    // condition on the events-table Put.
     let result = client
         .query()
+        .consistent_read(true)
         .table_name(table)
         .key_condition_expression("pk = :pk")
         .expression_attribute_values(":pk", AttributeValue::S(pk.to_string()))
@@ -2764,7 +2786,7 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
                 break;
             }
         }
-        rows.sort_by(|a, b| b.gave_up_at.cmp(&a.gave_up_at));
+        rows.sort_by_key(|r| std::cmp::Reverse(r.gave_up_at));
         rows.truncate(limit);
         Ok(rows)
     }
@@ -3677,6 +3699,12 @@ mod tests {
     async fn test_atomic_update_status_with_events() {
         skip_unless_dynamodb_env!(s);
         parity_tests::test_atomic_update_status_with_events(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_your_writes_across_traits() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_read_your_writes_across_traits(&s, &s).await;
     }
 
     #[tokio::test]

@@ -22,6 +22,16 @@ use crate::streaming::StreamEvent;
 /// Prevents:
 /// - "event committed, task failed"
 /// - "task committed, event failed"
+///
+/// # Read-your-writes across traits (normative)
+///
+/// Writes that commit successfully through this trait MUST be visible
+/// to subsequent reads on the sibling [`super::A2aTaskStorage`] and
+/// [`super::A2aEventStore`] traits on the same instance — including
+/// reads issued inside this trait's own implementation (the state-
+/// machine CAS reads the persisted task before committing). See
+/// [`super::A2aTaskStorage`] for the full read-your-writes clause;
+/// the requirement applies to every atomic-store implementation.
 #[async_trait]
 pub trait A2aAtomicStore: Send + Sync {
     fn backend_name(&self) -> &'static str;

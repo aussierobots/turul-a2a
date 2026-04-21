@@ -1722,6 +1722,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_your_writes_across_traits() {
+        let s = storage();
+        parity_tests::test_read_your_writes_across_traits(&s, &s).await;
+    }
+
+    #[tokio::test]
     async fn test_atomic_status_rejects_invalid_transition() {
         let s = storage();
         parity_tests::test_atomic_status_rejects_invalid_transition(&s, &s, &s).await;

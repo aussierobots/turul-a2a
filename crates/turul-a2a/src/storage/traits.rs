@@ -7,6 +7,39 @@ use super::filter::{PushConfigListPage, TaskFilter, TaskListPage};
 /// Core trait for A2A task storage backends.
 ///
 /// All public methods use wrapper types from `turul_a2a_types` — never raw proto types.
+///
+/// # Read-your-writes requirement (normative)
+///
+/// Every read method on this trait — `get_task`, `list_tasks`,
+/// `task_count` — MUST observe the effects of any write method on the
+/// same logical connection/instance that has already returned `Ok(_)`.
+/// In particular, a read issued immediately after a successful
+/// `create_task`, `update_task`, `update_task_status`, `append_message`,
+/// `append_artifact`, or `set_cancel_requested` (or any write on the
+/// sibling [`super::A2aAtomicStore`]) MUST see that write. There is no
+/// "eventually consistent" relaxation in this trait's contract.
+///
+/// This is not a nice-to-have: the atomic store's state-machine CAS
+/// (`update_task_status_with_events`, `update_task_with_events`) and
+/// the router's `return_immediately` response both re-read the task
+/// they just wrote. A backend that serves a stale read on that path
+/// surfaces a spurious `TaskNotFound` / 404 even though the row
+/// exists, and callers see non-deterministic failures on fresh
+/// connections.
+///
+/// Most backends provide this for free:
+/// - In-memory: single lock, no replication.
+/// - SQLite: single writer, same process.
+/// - PostgreSQL: single leader, same session.
+///
+/// DynamoDB is the known exception — its default `GetItem` / `Query`
+/// is eventually consistent. DynamoDB backends MUST set
+/// `ConsistentRead=true` on task-table reads (see
+/// [`crate::storage::dynamodb`] for the reference implementation).
+///
+/// New backend authors: add an integration test that writes a task
+/// and reads it back on the same instance within microseconds. If the
+/// read can miss, the backend does not satisfy this trait.
 #[async_trait]
 pub trait A2aTaskStorage: Send + Sync {
     fn backend_name(&self) -> &'static str;

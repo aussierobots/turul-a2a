@@ -1243,6 +1243,90 @@ pub async fn test_atomic_update_task_with_events(
     assert_eq!(stored_events.len(), 2);
 }
 
+/// RYW-001: Read-your-writes across `A2aAtomicStore` and `A2aTaskStorage`.
+///
+/// Walks the exact sequence the send-message handler uses — the path
+/// most sensitive to read-after-write races on distributed stores:
+///
+/// 1. `create_task_with_events` (Submitted) — atomic write.
+/// 2. `get_task` immediately after — MUST see the task.
+/// 3. `update_task_status_with_events` (Submitted → Working) — the
+///    implementation re-reads the task internally to validate the
+///    transition. If the backend serves a stale read here, this call
+///    returns `TaskNotFound`, which the router surfaces as a spurious
+///    404 even though the row exists in the backend.
+/// 4. `get_task` again — MUST reflect Working state.
+///
+/// Backends that satisfy the contract:
+/// - In-memory, SQLite, PostgreSQL: trivially (single lock / same
+///   session).
+/// - DynamoDB: requires `ConsistentRead=true` on task-table `GetItem`
+///   and the CAS sequence helpers (see `storage::dynamodb`).
+///
+/// A backend that fails this test under real replication conditions
+/// is non-compliant with the `A2aTaskStorage` read-your-writes clause.
+pub async fn test_read_your_writes_across_traits(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+) {
+    let task = make_task("ryw-1", "ctx-ryw");
+    let submitted_evt = make_status_event_for("ryw-1", "ctx-ryw", "TASK_STATE_SUBMITTED");
+
+    // Step 1: atomic create.
+    atomic
+        .create_task_with_events("default", "owner-ryw", task, vec![submitted_evt])
+        .await
+        .expect("atomic create_task_with_events should succeed");
+
+    // Step 2: immediate read-back via the sibling trait must see the write.
+    let fetched = tasks
+        .get_task("default", "ryw-1", "owner-ryw", None)
+        .await
+        .expect("get_task must not error on a just-created task")
+        .expect(
+            "read-your-writes: get_task on the same instance must see the row written by \
+             create_task_with_events — a None here indicates the backend violates the \
+             A2aTaskStorage read-your-writes clause (see trait docs)",
+        );
+    assert_eq!(fetched.id(), "ryw-1");
+    assert_eq!(
+        fetched.status().unwrap().state().unwrap(),
+        TaskState::Submitted
+    );
+
+    // Step 3: atomic status update — implementation internally re-reads
+    // the task to validate the state-machine transition. A stale read
+    // here would surface as `TaskNotFound` and fail this call.
+    let working_evt = make_status_event_for("ryw-1", "ctx-ryw", "TASK_STATE_WORKING");
+    atomic
+        .update_task_status_with_events(
+            "default",
+            "ryw-1",
+            "owner-ryw",
+            TaskStatus::new(TaskState::Working),
+            vec![working_evt],
+        )
+        .await
+        .expect(
+            "read-your-writes: update_task_status_with_events must observe the task just \
+             written by create_task_with_events — a TaskNotFound here indicates the backend's \
+             internal re-read serves stale data",
+        );
+
+    // Step 4: read-back after the second atomic write must reflect Working.
+    let after = tasks
+        .get_task("default", "ryw-1", "owner-ryw", None)
+        .await
+        .unwrap()
+        .expect("task must still be present after status update");
+    assert_eq!(
+        after.status().unwrap().state().unwrap(),
+        TaskState::Working,
+        "read-your-writes: second get_task must reflect the Working state written by \
+         update_task_status_with_events"
+    );
+}
+
 /// AT-005: Atomic operations enforce owner isolation.
 pub async fn test_atomic_owner_isolation(atomic: &dyn A2aAtomicStore, tasks: &dyn A2aTaskStorage) {
     // Create task owned by "alice"

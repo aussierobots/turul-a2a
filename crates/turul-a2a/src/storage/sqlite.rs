@@ -1463,6 +1463,12 @@ fn micros_to_systime(micros: i64) -> std::time::SystemTime {
     std::time::UNIX_EPOCH + std::time::Duration::from_micros(micros.max(0) as u64)
 }
 
+// Symmetric encoder to `claim_status_from_str`. Currently unused on the
+// SQLite path (status writes go through the INSERT/UPDATE SQL column
+// values directly rather than a typed formatter) but kept for parity
+// with the PostgreSQL and DynamoDB backends so future status-column
+// changes have the encoder available.
+#[allow(dead_code)]
 fn claim_status_to_str(s: ClaimStatus) -> &'static str {
     match s {
         ClaimStatus::Pending => "Pending",
@@ -2303,6 +2309,12 @@ mod tests {
     async fn test_atomic_update_status_with_events() {
         let s = storage().await;
         parity_tests::test_atomic_update_status_with_events(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_your_writes_across_traits() {
+        let s = storage().await;
+        parity_tests::test_read_your_writes_across_traits(&s, &s).await;
     }
 
     #[tokio::test]
