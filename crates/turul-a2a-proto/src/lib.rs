@@ -15,6 +15,16 @@ pub mod lf {
 // Convenience re-export
 pub use lf::a2a::v1::*;
 
+/// Tonic-generated gRPC service + client stubs for `lf.a2a.v1.A2AService`.
+///
+/// Enabled by the `grpc` Cargo feature (ADR-014 §2.2). Default HTTP+JSON
+/// builds do not pull in tonic.
+#[cfg(feature = "grpc")]
+pub mod grpc {
+    pub use crate::lf::a2a::v1::a2a_service_server::{A2aService, A2aServiceServer};
+    pub use crate::lf::a2a::v1::a2a_service_client::A2aServiceClient;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

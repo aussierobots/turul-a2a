@@ -11,12 +11,21 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 
+[features]
+# gRPC transport (ADR-014). Off by default — HTTP+JSON adopters pay
+# zero tonic weight. Enabling this activates optional runtime and
+# build-time tonic dependencies and regenerates the protos with
+# tonic service + client stubs.
+grpc = ["dep:tonic", "dep:tonic-prost", "dep:tonic-prost-build", "dep:tonic-build"]
+
 [dependencies]
 prost = { workspace = true }
 prost-types = { workspace = true }
 pbjson = { workspace = true }
 pbjson-types = { workspace = true }
 serde = { workspace = true }
+tonic = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
@@ -26,3 +35,5 @@ prost = { workspace = true }
 prost-types = { workspace = true }
 prost-build = "0.14"
 pbjson-build = "0.9"
+tonic-prost-build = { workspace = true, optional = true }
+tonic-build = { workspace = true, optional = true }
