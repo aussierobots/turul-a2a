@@ -216,8 +216,21 @@ Concretely:
   from 0" — same behaviour as SSE without the header. The `-bin`
   suffix MUST NOT be used; the value is printable ASCII by
   construction.
-- Spec §3.1.6 / §9.4.6 first-event semantics (first event is the `Task`
-  object) are enforced by the shared core, not by the gRPC adapter.
+- **Spec §3.1.6 first-event-Task semantics are SubscribeToTask-only.**
+  `SubscribeToTask` MUST emit the `Task` snapshot as the first stream
+  item on a fresh attach (`after_sequence == 0`), then replay stored
+  events. On resume (`a2a-last-event-id` present) the snapshot is
+  skipped — the caller already has it. `SendStreamingMessage`, by
+  contrast, does NOT emit a synthetic `Task` first event: the shared
+  core has already written `SUBMITTED` + `WORKING` to the durable
+  event store before the stream opens, so the first item delivered
+  is the first persisted `StreamEvent` — matching the HTTP SSE path
+  (`router.rs` `core_send_streaming_message` comment:
+  "No initial Task snapshot: SUBMITTED + WORKING are already in the
+  event store and will replay on subscription"). This is the
+  established behaviour across both transports; the gRPC adapter
+  inherits it verbatim via `initial_task: None` to
+  `make_store_grpc_stream`.
 
 Under ADR-006's single-instance local-broker model, multi-instance gRPC
 streaming inherits ADR-009's correctness guarantees (durable store is
@@ -237,9 +250,26 @@ auth pipeline. Specifically:
 - gRPC metadata keys are treated as HTTP headers for auth purposes.
   All auth-relevant metadata is ordinary ASCII metadata (no `-bin`
   suffix): `authorization` (Bearer / API key per `BearerMiddleware`
-  / `ApiKeyMiddleware`), `x-tenant-id` (tenant scoping), `x-api-key`
-  (alternative key carrier). First-party middleware MUST NOT consult
-  binary (`-bin`-suffixed) metadata.
+  / `ApiKeyMiddleware`), `x-tenant-id` (tenant scoping fallback —
+  see tenant precedence below), `x-api-key` (alternative key
+  carrier). First-party middleware MUST NOT consult binary
+  (`-bin`-suffixed) metadata.
+- **Tenant precedence (normative).** When a request carries a
+  tenant identifier through both the proto `tenant` field on the
+  request message and the `x-tenant-id` metadata, the adapter MUST
+  use the proto field. The metadata is consulted only when the
+  proto field is empty. Rationale: every A2AService request proto
+  already carries an explicit `tenant` field (e.g.
+  `SendMessageRequest.tenant`, `GetTaskRequest.tenant`, etc.) and
+  the proto is the normative wire contract (ADR-001). HTTP binds
+  tenant to the URL path (`/{tenant}/...`) and JSON-RPC binds it
+  to the `tenant` param — both explicit wire fields; gRPC follows
+  the same "explicit wire field wins" rule. `x-tenant-id`
+  metadata is kept as a fallback for generic clients that cannot
+  set the proto field. A conflict (non-empty proto value +
+  different metadata value) is NOT an error but MUST yield a
+  defined result: the proto value wins and the metadata is
+  ignored. This is tested under §2.11.
 - ADR-007 §6 anti-spoofing rules apply identically: if a client sends
   `x-authenticated-user` or `x-authenticated-tenant` metadata, the
   middleware MUST strip or reject it before dispatching. The adapter
@@ -478,11 +508,19 @@ across all three transports:
   `SubscribeToTask`.
 
 Exactly the same assertions (state transitions, error codes,
-owner/tenant enforcement, push-config CRUD lifecycle, streaming
-first-event == `Task`, terminal-subscribe rejection, pagination
-cursor stability, `ListTasks` ordering — CLAUDE.md §"Spec-aligned
-behaviors") run on all three transports. No transport MAY diverge
-from another on any of these.
+owner/tenant enforcement, push-config CRUD lifecycle,
+`SubscribeToTask` first-event == `Task` on fresh attach,
+terminal-subscribe rejection, pagination cursor stability,
+`ListTasks` ordering — CLAUDE.md §"Spec-aligned behaviors") run on
+all three transports. No transport MAY diverge from another on any
+of these.
+
+Note on `SendStreamingMessage`: neither the HTTP SSE path nor the
+gRPC stream emits a synthetic `Task` snapshot before persisted
+events, because `SUBMITTED` + `WORKING` are already in the store
+when the stream opens (§2.3). Parity tests therefore assert the
+same event-order shape on both transports — starting from the
+first persisted event — not a first-Task check.
 
 **Mandatory — core-handler sharing is enforced by parity.** ADR-005's
 "no behavior fork between transports" invariant (extended by this
@@ -492,14 +530,25 @@ JSON-RPC, and gRPC. If only one transport fails a compliance
 assertion, the gRPC adapter (or another adapter) has leaked
 business logic and MUST be corrected before merge.
 
+**Mandatory — tenant precedence (§2.4).** The gRPC test suite MUST
+include three cases:
+  * `proto_tenant_wins_over_metadata`: proto `tenant = "A"` +
+    metadata `x-tenant-id: B` → request scopes to tenant `A`.
+  * `metadata_fallback_when_proto_empty`: proto `tenant = ""` +
+    metadata `x-tenant-id: B` → request scopes to tenant `B`.
+  * `empty_when_neither_set`: proto `tenant = ""` + no metadata
+    → request scopes to the default tenant (empty string).
+
 **Mandatory — streaming tests.**
 
-- `SendStreamingMessage` (gRPC): full event stream from initial
-  `Task` event through to terminal event; ordering preserved;
-  every event carries the same `(task_id, event_sequence)` it
-  would carry over SSE. The durable event store is the source of
-  truth (ADR-009 §§3-4, §7); the gRPC stream MUST NOT invent its
-  own sequence numbers.
+- `SendStreamingMessage` (gRPC): full event stream starting from
+  the first persisted event (`SUBMITTED`) through to terminal
+  event; ordering preserved; every event carries the same
+  `(task_id, event_sequence)` it would carry over SSE. No
+  synthetic `Task` snapshot precedes the first stored event (see
+  §2.3). The durable event store is the source of truth (ADR-009
+  §§3-4, §7); the gRPC stream MUST NOT invent its own sequence
+  numbers.
 - `SubscribeToTask` (gRPC):
   - Attach-to-non-terminal + replay-from-0: identical event set
     to the SSE equivalent.

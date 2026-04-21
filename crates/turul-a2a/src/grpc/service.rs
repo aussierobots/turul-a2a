@@ -38,11 +38,21 @@ impl GrpcService {
     }
 }
 
-/// Pull the tenant ID for this request. Precedence (ADR-014 §2.4):
-///   1. `x-tenant-id` ASCII metadata
-///   2. `tenant` field on the proto request
-///   3. empty string (= DEFAULT_TENANT, matches the HTTP default route)
-fn tenant_from<T>(req: &Request<T>, proto_tenant: &str) -> String {
+/// Pull the tenant ID for this request. Precedence (ADR-014 §2.4,
+/// normative):
+///   1. Proto `tenant` field on the request, when non-empty.
+///   2. `x-tenant-id` ASCII metadata, when the proto field is empty.
+///   3. Empty string (= DEFAULT_TENANT, matches the HTTP default route).
+///
+/// When both are set and differ, the proto field wins — the metadata is
+/// ignored rather than raising an error. Rationale is in the ADR:
+/// every A2AService request proto carries `tenant` explicitly, and
+/// HTTP/JSON-RPC also bind tenant via explicit wire fields (URL path /
+/// JSON-RPC param).
+pub(crate) fn tenant_from<T>(req: &Request<T>, proto_tenant: &str) -> String {
+    if !proto_tenant.is_empty() {
+        return proto_tenant.to_string();
+    }
     if let Some(val) = req.metadata().get(TENANT_METADATA) {
         if let Ok(s) = val.to_str() {
             if !s.is_empty() {
@@ -50,7 +60,7 @@ fn tenant_from<T>(req: &Request<T>, proto_tenant: &str) -> String {
             }
         }
     }
-    proto_tenant.to_string()
+    String::new()
 }
 
 /// Pull the caller's owner identity from the request extensions.
@@ -350,5 +360,65 @@ impl pb::grpc::A2aService for GrpcService {
         )
         .await?;
         Ok(Response::new(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for adapter-local helpers. Full end-to-end gRPC
+    //! integration tests (later commits in IMPLEMENTATION-PLAN-grpc.md)
+    //! cover the request paths end-to-end; these tests pin the
+    //! precedence rules the integration harness assumes.
+
+    use super::*;
+
+    fn make_request<T>(value: T, metadata_tenant: Option<&str>) -> Request<T> {
+        let mut req = Request::new(value);
+        if let Some(t) = metadata_tenant {
+            req.metadata_mut().insert(
+                TENANT_METADATA,
+                tonic::metadata::MetadataValue::try_from(t).expect("ascii metadata"),
+            );
+        }
+        req
+    }
+
+    // ADR-014 §2.4 test obligations: proto wins over metadata.
+
+    #[test]
+    fn proto_tenant_wins_over_metadata() {
+        let req = make_request((), Some("tenant-from-metadata"));
+        assert_eq!(tenant_from(&req, "tenant-from-proto"), "tenant-from-proto");
+    }
+
+    #[test]
+    fn metadata_fallback_when_proto_empty() {
+        let req = make_request((), Some("tenant-from-metadata"));
+        assert_eq!(tenant_from(&req, ""), "tenant-from-metadata");
+    }
+
+    #[test]
+    fn empty_when_neither_set() {
+        let req = make_request((), None);
+        assert_eq!(tenant_from(&req, ""), "");
+    }
+
+    #[test]
+    fn metadata_ignored_when_proto_non_empty_even_on_conflict() {
+        // The conflict case: proto and metadata disagree. Contract: proto
+        // wins, metadata silently ignored (no error). Add-on to the three
+        // ADR-mandated cases above — covers the "accidentally addressing
+        // two tenants" scenario flagged during ADR review.
+        let req = make_request((), Some("tenant-B"));
+        assert_eq!(tenant_from(&req, "tenant-A"), "tenant-A");
+    }
+
+    #[test]
+    fn empty_proto_and_empty_metadata_yields_empty() {
+        // Edge case: both set but both empty. Expected: empty string
+        // (default tenant). Proves we don't fall through when the
+        // metadata header is present but blank.
+        let req = make_request((), Some(""));
+        assert_eq!(tenant_from(&req, ""), "");
     }
 }
