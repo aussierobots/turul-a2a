@@ -4,6 +4,65 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.6] — 2026-04-21
+
+### Fixed
+- **DynamoDB cold-start read-after-write race.** A request Lambda on a
+  fresh container could write a task via `create_task_with_events`
+  and then immediately fail its own follow-up
+  `update_task_status_with_events` (the Submitted → Working
+  transition) with `TaskNotFound`, because the atomic store's
+  internal pre-transaction read used DynamoDB's default
+  eventually-consistent `GetItem`. The handler surfaced the error as
+  HTTP 404 to the caller even though the task row existed, and the
+  executor never ran. Classic symptom: a task stuck in `Submitted`
+  state with a ~240 ms Lambda invocation and a 404 response body on
+  the first call to a just-warmed container. Fix flips
+  `ConsistentRead=true` on three read paths in
+  `crates/turul-a2a/src/storage/dynamodb.rs`: `get_task`'s
+  `GetItem`, `query_latest_event_sequence`'s `GetItem` (feeds the
+  ADR-013 §6.3 monotonic sequence invariant), and
+  `query_max_sequence`'s `Query` (picks the next event seq for the
+  transact write). Cost: 2× RCU on these specific reads; the right
+  trade for A2A's state-machine contract. No changes to other
+  backends — SQLite, PostgreSQL and in-memory already satisfy
+  read-your-writes by construction.
+
+### Added
+- **Read-your-writes requirement is now normative in the storage trait
+  docs.** `A2aTaskStorage` grew a top-level "Read-your-writes
+  requirement" section spelling out that a read issued after a
+  successful write on the same instance MUST observe that write, the
+  concrete failure mode when the contract is violated, and which
+  backends satisfy it natively vs. which (DynamoDB) require an
+  explicit `ConsistentRead=true`. `A2aAtomicStore` grew a companion
+  "Read-your-writes across traits" clause making the cross-trait
+  visibility guarantee explicit. Future backend authors have a
+  durable anchor to point at.
+- **Parity test `test_read_your_writes_across_traits`** walks the
+  exact four-step send-message sequence
+  (`create_task_with_events` → `get_task` →
+  `update_task_status_with_events` → `get_task`) and asserts
+  visibility at each step. Wired into all four backend test modules
+  (in-memory, SQLite, PostgreSQL, DynamoDB). Against DynamoDB-Local
+  (synchronous, in-memory) the test cannot empirically reproduce the
+  cold-start race, but it documents the contract as executable code
+  and will catch any future regression (e.g. an unintended read cache
+  in front of `get_task`).
+- **Example `README.md` files** for all five examples
+  (`echo-agent`, `auth-agent`, `lambda-agent`, `lambda-stream-worker`,
+  `lambda-scheduled-worker`) covering purpose, run/deploy steps, and
+  how the three Lambda examples compose into an ADR-013 deployment.
+  GitHub now renders a README on each example directory.
+
+### Internal
+- **Pre-existing clippy cleanups** surfaced by the publish gate:
+  `rows.sort_by(|a, b| b.cmp(&a))` in `storage/dynamodb.rs` switched
+  to `sort_by_key(|r| Reverse(r))`; unused symmetric encoder
+  `claim_status_to_str` in `storage/sqlite.rs` marked
+  `#[allow(dead_code)]` with a comment explaining parity with the
+  PostgreSQL and DynamoDB analogs.
+
 ## [0.1.5] — 2026-04-20
 
 ### Fixed
@@ -162,6 +221,7 @@ Pre-crates.io development. Highlights from the 0.1.x series (not published):
   `proto/a2a.proto`, wrapped in ergonomic Rust types with state-machine
   enforcement (ADR-002).
 
+[0.1.6]: https://github.com/aussierobots/turul-a2a/releases/tag/v0.1.6
 [0.1.5]: https://github.com/aussierobots/turul-a2a/releases/tag/v0.1.5
 [0.1.4]: https://github.com/aussierobots/turul-a2a/releases/tag/v0.1.4
 [0.1.3]: https://github.com/aussierobots/turul-a2a/releases/tag/v0.1.3
