@@ -419,12 +419,20 @@ async fn tenant_send_streaming_message_handler(
     core_send_streaming_message(state, &tenant, ctx.identity.owner(), body).await
 }
 
-pub(crate) async fn core_send_streaming_message(
+/// Task-side setup for streaming send: parse request, create task,
+/// emit SUBMITTED + WORKING through the atomic store, spawn the
+/// executor. Returns the `task_id` and a broker wake-up receiver.
+///
+/// Shared by the HTTP SSE path (`core_send_streaming_message`) and the
+/// gRPC streaming adapter. Keeping both transports on this single entry
+/// point is the ADR-005 invariant extended to three transports — no
+/// behaviour fork between SSE and gRPC streaming.
+pub(crate) async fn setup_streaming_send(
     state: AppState,
     tenant: &str,
     owner: &str,
     body: String,
-) -> Result<axum::response::Response, A2aError> {
+) -> Result<(String, broadcast::Receiver<()>), A2aError> {
     let request: turul_a2a_proto::SendMessageRequest =
         serde_json::from_str(&body).map_err(|e| A2aError::InvalidRequest {
             message: format!("Invalid request body: {e}"),
@@ -512,6 +520,16 @@ pub(crate) async fn core_send_streaming_message(
     };
     let _spawn = crate::server::spawn::spawn_tracked_executor(spawn_deps, scope)?;
 
+    Ok((task_id, wake_rx))
+}
+
+pub(crate) async fn core_send_streaming_message(
+    state: AppState,
+    tenant: &str,
+    owner: &str,
+    body: String,
+) -> Result<axum::response::Response, A2aError> {
+    let (task_id, wake_rx) = setup_streaming_send(state.clone(), tenant, owner, body).await?;
     // SSE stream reads from the durable store. No initial Task
     // snapshot: SUBMITTED + WORKING are already in the event store and
     // will replay on subscription.

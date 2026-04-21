@@ -303,27 +303,52 @@ impl pb::grpc::A2aService for GrpcService {
         }
     }
 
-    // --- Streaming RPCs (placeholder — real impl lands in next commit) --
+    // --- Streaming RPCs -------------------------------------------------
 
     type SendStreamingMessageStream = BoxedStreamResponseStream;
 
     async fn send_streaming_message(
         &self,
-        _request: Request<pb::SendMessageRequest>,
+        request: Request<pb::SendMessageRequest>,
     ) -> Result<Response<Self::SendStreamingMessageStream>, Status> {
-        Err(Status::unimplemented(
-            "SendStreamingMessage not yet wired to event broker",
-        ))
+        let owner = owner_from(&request);
+        let tenant = tenant_from(&request, &request.get_ref().tenant);
+        let body = serde_json::to_string(request.get_ref()).map_err(internal_from_json)?;
+
+        let stream = crate::grpc::streaming::handle_send_streaming_message(
+            self.state.clone(),
+            tenant,
+            owner,
+            body,
+        )
+        .await?;
+        Ok(Response::new(stream))
     }
 
     type SubscribeToTaskStream = BoxedStreamResponseStream;
 
     async fn subscribe_to_task(
         &self,
-        _request: Request<pb::SubscribeToTaskRequest>,
+        request: Request<pb::SubscribeToTaskRequest>,
     ) -> Result<Response<Self::SubscribeToTaskStream>, Status> {
-        Err(Status::unimplemented(
-            "SubscribeToTask not yet wired to event broker",
-        ))
+        let owner = owner_from(&request);
+        let tenant = tenant_from(&request, &request.get_ref().tenant);
+        let task_id = request.get_ref().id.clone();
+
+        let last_event_id = request
+            .metadata()
+            .get(crate::grpc::streaming::LAST_EVENT_ID_METADATA)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
+        let stream = crate::grpc::streaming::handle_subscribe_to_task(
+            self.state.clone(),
+            tenant,
+            owner,
+            task_id,
+            last_event_id,
+        )
+        .await?;
+        Ok(Response::new(stream))
     }
 }

@@ -13,5 +13,6 @@
 
 pub mod error;
 pub mod service;
+pub mod streaming;
 
 pub use service::GrpcService;
