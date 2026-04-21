@@ -1232,6 +1232,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "grpc-agent"
+version = "0.1.6"
+dependencies = [
+ "async-trait",
+ "futures",
+ "tokio",
+ "tonic",
+ "tracing-subscriber",
+ "turul-a2a",
+ "turul-a2a-client",
+ "turul-a2a-proto",
+ "turul-a2a-types",
+ "uuid",
+]
+
+[[package]]
 name = "h2"
 version = "0.3.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"

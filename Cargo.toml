@@ -12,6 +12,7 @@ members = [
   "examples/auth-agent",
   "examples/streaming-agent",
   "examples/callback-agent",
+  "examples/grpc-agent",
   "examples/lambda-agent",
   "examples/lambda-stream-worker",
   "examples/lambda-scheduled-worker",
