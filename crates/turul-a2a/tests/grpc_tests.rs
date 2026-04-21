@@ -633,6 +633,48 @@ impl A2aMiddleware for DenyAll {
     }
 }
 
+// =========================================================
+// A2aGrpcClient wrapper smoke test (ADR-014 §2.7)
+// =========================================================
+
+#[tokio::test]
+async fn a2a_grpc_client_wrapper_send_and_get() {
+    // Exercises turul_a2a_client::A2aGrpcClient against the tonic
+    // server. Proves the client-side verb surface (send_message +
+    // get_task + cancel_task) works end-to-end and that `with_tenant`
+    // writes the proto tenant field (ADR-014 §2.4 proto-wins).
+    use turul_a2a_client::grpc::A2aGrpcClient;
+
+    let h = Harness::start_with(CompletingExecutor).await;
+    let mut client = A2aGrpcClient::connect(format!("http://{}", h.addr))
+        .await
+        .expect("connect")
+        .with_tenant("wrapper-tenant");
+
+    let msg = simple_message("wrapper");
+    let resp = client.send_message(msg).await.expect("send ok");
+    let task_id = match resp.payload.expect("payload") {
+        turul_a2a_proto::send_message_response::Payload::Task(t) => {
+            assert_eq!(t.status.as_ref().map(|s| s.state()),
+                Some(turul_a2a_proto::TaskState::Completed));
+            t.id
+        }
+        _ => panic!("task response"),
+    };
+
+    let task = client
+        .get_task(task_id.clone(), None)
+        .await
+        .expect("get ok");
+    assert_eq!(task.id, task_id);
+
+    // cancel on a terminal task — wrapper must surface the A2A
+    // reason through A2aClientError::reason() (ADR-014 §2.5).
+    let err = client.cancel_task(task_id).await.expect_err("terminal");
+    assert_eq!(err.reason(), Some("TASK_NOT_CANCELABLE"));
+    assert_eq!(err.grpc_code(), Some(tonic::Code::FailedPrecondition));
+}
+
 #[tokio::test]
 async fn grpc_auth_middleware_rejects_with_unauthenticated() {
     let h = Harness::start_with_middleware(CompletingExecutor, vec![Arc::new(DenyAll)]).await;

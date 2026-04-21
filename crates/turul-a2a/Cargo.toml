@@ -70,7 +70,7 @@ sqlx = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
-turul-a2a-client = { path = "../turul-a2a-client" }
+turul-a2a-client = { path = "../turul-a2a-client", features = ["grpc"] }
 turul-a2a-auth = { path = "../turul-a2a-auth" }
 reqwest = { workspace = true }
 # Structured-event capture for observability-contract tests (phase A onward).

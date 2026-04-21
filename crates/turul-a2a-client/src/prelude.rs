@@ -9,3 +9,6 @@ pub use crate::error::A2aClientError;
 pub use crate::response::{ListResponse, SendResponse, artifact_text, first_data_artifact};
 pub use crate::sse::{StreamEvent, TypedSseEvent, TypedSseStream};
 pub use crate::{A2aClient, ClientAuth, ListTasksParams};
+
+#[cfg(feature = "grpc")]
+pub use crate::grpc::{A2aGrpcClient, GrpcStreamResponses};

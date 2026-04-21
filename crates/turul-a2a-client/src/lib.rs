@@ -4,6 +4,8 @@
 
 pub mod builders;
 mod error;
+#[cfg(feature = "grpc")]
+pub mod grpc;
 pub mod prelude;
 pub mod response;
 pub mod sse;
