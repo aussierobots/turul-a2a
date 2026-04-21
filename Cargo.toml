@@ -45,6 +45,15 @@ prost-types = "0.14"
 pbjson = "0.9"
 pbjson-types = "0.9"
 
+# gRPC (ADR-014; feature-gated, default off)
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-types = "0.14"
+tonic-reflection = "0.14"
+tonic-health = "0.14"
+tonic-prost-build = "0.14"
+tonic-build = "0.14"
+
 # Internal
 # HTTP server
 axum = { version = "0.8", features = ["json"] }
