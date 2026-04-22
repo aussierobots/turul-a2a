@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 authors = ["Nick Hortovanyi <nick@aussierobots.com.au>"]
 license = "MIT OR Apache-2.0"
@@ -94,7 +94,7 @@ wiremock = "0.6"
 # Misc
 bytes = "1"
 
-turul-a2a = { version = "0.1.10", path = "crates/turul-a2a" }
-turul-a2a-proto = { version = "0.1.10", path = "crates/turul-a2a-proto" }
-turul-a2a-types = { version = "0.1.10", path = "crates/turul-a2a-types" }
-turul-jwt-validator = "0.1"
+turul-a2a = { version = "0.1.11", path = "crates/turul-a2a" }
+turul-a2a-proto = { version = "0.1.11", path = "crates/turul-a2a-proto" }
+turul-a2a-types = { version = "0.1.11", path = "crates/turul-a2a-types" }
+turul-jwt-validator = "0.2"

@@ -4,6 +4,18 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.11] — 2026-04-23
+
+### Changed
+- Dependency on `turul-jwt-validator` bumped from `"0.1"` → `"0.2"`.
+  The `0.2.0` release of `turul-jwt-validator` is the first version
+  published exclusively from its own standalone repository
+  ([aussierobots/turul-jwt-validator](https://github.com/aussierobots/turul-jwt-validator));
+  the `0.1.x` line on crates.io had originated from the pre-extraction
+  embedded copy in this workspace. Runtime behaviour is unchanged —
+  the `0.2.0` source is API-identical to `0.1.9`.
+- No public API changes in any `turul-a2a*` crate.
+
 ## [0.1.10] — 2026-04-23
 
 ### Changed
