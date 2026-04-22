@@ -4,6 +4,37 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.9] — 2026-04-22
+
+### Added
+- **Skill-level `security_requirements` — declaration-only (ADR-015 — Accepted).**
+  Adopters can now publish per-skill security metadata on the
+  `AgentCard` via `AgentSkillBuilder::security_requirements(Vec<SecurityRequirement>)`
+  and adopter-supplied agent-level metadata via
+  `AgentCardBuilder::security_scheme(name, scheme)` /
+  `::security_requirement(requirement)`. Post-merge truthfulness
+  validation at `A2aServerBuilder::build()` rejects cards whose public
+  or no-claims extended card references a scheme not present in the
+  merged `security_schemes` map, with per-surface error messages
+  (`agent_card` vs. `extended_agent_card`). Runtime skill-level
+  enforcement remains deferred — advertising a requirement does NOT
+  install a middleware. See `docs/adr/ADR-015-skill-level-security-requirements.md`
+  for the full rationale and the normative constraint blocking
+  enforcement (no `skill_id` binding on `Message`).
+- **New example: `examples/skill-security-agent`.** Two skills on
+  one agent, one advertising a bearer requirement, no auth middleware
+  installed — demonstrates the declaration-vs-enforcement distinction.
+
+### Internal
+- `SecurityAugmentedExecutor::{agent_card, extended_agent_card}`
+  refactored to share a single `apply_security_merge` helper with the
+  build-time validator so served and validated cards are structurally
+  identical.
+
+No breaking changes. Additive API surface; cards that did not set
+skill-level or adopter-supplied agent-level security metadata in 0.1.8
+continue to build and serve byte-identical output.
+
 ## [0.1.8] — 2026-04-22
 
 ### Changed

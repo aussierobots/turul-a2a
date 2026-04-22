@@ -16,7 +16,7 @@ default = []
 dynamodb = ["turul-a2a/dynamodb"]
 
 [dependencies]
-turul-a2a = { version = "0.1.8", path = "../turul-a2a" }
+turul-a2a = { version = "0.1.9", path = "../turul-a2a" }
 turul-a2a-types = { workspace = true }
 turul-a2a-proto = { workspace = true }
 lambda_http = { workspace = true }
