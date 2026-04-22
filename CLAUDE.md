@@ -156,6 +156,7 @@ Documented under `docs/adr/`:
 - **ADR-012**: Cancellation propagation — cross-instance cancel marker, supervisor sweep, same-backend requirement
 - **ADR-013**: Lambda push-delivery parity — atomic pending-dispatch marker, causal no-backfill CAS, stream + scheduled recovery workers. §4.3 errata (0.1.5): `.storage()` does not auto-wire push delivery; explicit `.push_delivery_store(...)` required.
 - **ADR-014**: gRPC transport — third thin adapter via tonic over the shared core handlers (ADR-005 extended). Feature-gated on `turul-a2a-proto/grpc`, `turul-a2a/grpc`, `turul-a2a-client/grpc`; default builds are tonic-free. `grpc-reflection` / `grpc-health` are separate opt-in sub-features. Streaming consumes the ADR-009 durable event store with `a2a-last-event-id` ASCII metadata for replay. Proto `tenant` field wins over `x-tenant-id` metadata (§2.4). Out of scope for `turul-a2a-aws-lambda` (§2.6).
+- **ADR-015**: Skill-level `security_requirements` — declaration-only advertisement. Adopters set `AgentSkillBuilder::security_requirements(...)` and `AgentCardBuilder::security_scheme(...)` / `::security_requirement(...)` to publish richer cards; post-merge validation at `A2aServerBuilder::build()` rejects cards whose public or extended (no-claims) surface references an undeclared scheme. Runtime enforcement deferred pending a normative `skill_id` binding on `Message`.
 
 For non-trivial architecture changes, the ADR should be accepted before implementation starts.
 
@@ -216,8 +217,9 @@ Before describing a release as "A2A v1.0 compliant", re-verify the vendored `pro
 - **ADR-012 — Cancellation propagation**: cross-instance cancel marker + supervisor sweep; same-backend check on the builder.
 - **ADR-013 — Lambda push-delivery parity**: atomic `a2a_push_pending_dispatches` marker, causal `latest_event_sequence` CAS, `LambdaStreamRecoveryHandler` (BatchItemFailures) + `LambdaScheduledRecoveryHandler` (EventBridge backstop).
 - **ADR-014 — gRPC transport**: third thin adapter over the shared core handlers. All 11 RPCs (9 unary + 2 server-streaming) wired via tonic; Tower auth layer reuses `MiddlewareStack`; streaming feeds from the ADR-009 durable event store with `a2a-last-event-id` metadata resume; `tenant` proto field wins over `x-tenant-id` metadata. Feature-gated (`grpc` on `turul-a2a-proto` + `turul-a2a` + `turul-a2a-client`); default builds remain tonic-free. Example: `examples/grpc-agent` (server + CLI client). Not available under `turul-a2a-aws-lambda`.
+- **ADR-015 — Skill-level `security_requirements` (declaration-only)**: `AgentSkillBuilder::security_requirements(...)` + `AgentCardBuilder::security_scheme(...)` / `::security_requirement(...)` publish skill-level and adopter-supplied agent-level metadata. Post-merge validation at `A2aServerBuilder::build()` rejects cards whose public or no-claims extended surface references a scheme not present in the merged `security_schemes` map. Runtime skill-level enforcement remains deferred; advertising a requirement does not install a middleware.
 
 ### Deferred (ordered by priority)
 
-1. **Skill-level `security_requirements`** — agent-level only for now
+1. **Skill-level `security_requirements` enforcement at request time** — blocked on upstream proto adding a normative skill binding on `Message`. ADR-015 ships declaration-only advertisement with post-merge truthfulness validation; runtime gatekeeping for a specific skill remains adopter responsibility inside `AgentExecutor`.
 2. **Shared `turul-jwt-validator` extraction** — currently local, see ADR-007

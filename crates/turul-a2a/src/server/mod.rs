@@ -515,6 +515,17 @@ impl A2aServerBuilder {
             .collect();
         let merged = merge_stacked_contributions(&contributions)?;
 
+        // ADR-015 §2.3: validate scheme references in every
+        // build-materializable advertised card surface. The merge
+        // applied here mirrors `SecurityAugmentedExecutor::agent_card()`
+        // so validation sees the exact surface clients will receive.
+        let public_materialized = apply_security_merge(executor.agent_card(), &merged);
+        validate_card_security_references(&public_materialized, "agent_card")?;
+        if let Some(extended_raw) = executor.extended_agent_card(None) {
+            let extended_materialized = apply_security_merge(extended_raw, &merged);
+            validate_card_security_references(&extended_materialized, "extended_agent_card")?;
+        }
+
         Ok(A2aServer {
             state: AppState {
                 executor,
@@ -620,6 +631,66 @@ fn merge_stacked_contributions(
 
     merged.requirements = combined;
     Ok(merged)
+}
+
+/// Apply a `SecurityContribution` to a raw `AgentCard`, producing the
+/// card that clients actually see. Mirrors the per-request merge in
+/// `SecurityAugmentedExecutor::agent_card()` so build-time validation
+/// and runtime serving agree on the final surface.
+fn apply_security_merge(
+    mut card: turul_a2a_proto::AgentCard,
+    security: &SecurityContribution,
+) -> turul_a2a_proto::AgentCard {
+    for (name, scheme) in &security.schemes {
+        card.security_schemes
+            .entry(name.clone())
+            .or_insert_with(|| scheme.clone());
+    }
+    for req in &security.requirements {
+        card.security_requirements.push(req.clone());
+    }
+    card
+}
+
+/// ADR-015 §2.3: every scheme name referenced by a `SecurityRequirement`
+/// on the card MUST appear in `card.security_schemes`. Runs post-merge
+/// against the final advertised card (public or extended).
+///
+/// `surface` is the human-readable surface label (`agent_card` or
+/// `extended_agent_card`) — included verbatim in the error so the
+/// adopter can tell which card failed.
+fn validate_card_security_references(
+    card: &turul_a2a_proto::AgentCard,
+    surface: &str,
+) -> Result<(), A2aError> {
+    for req in &card.security_requirements {
+        for scheme_name in req.schemes.keys() {
+            if !card.security_schemes.contains_key(scheme_name) {
+                return Err(A2aError::InvalidRequest {
+                    message: format!(
+                        "{surface}: agent-level security requirement references \
+                         undeclared scheme '{scheme_name}'"
+                    ),
+                });
+            }
+        }
+    }
+    for skill in &card.skills {
+        for req in &skill.security_requirements {
+            for scheme_name in req.schemes.keys() {
+                if !card.security_schemes.contains_key(scheme_name) {
+                    return Err(A2aError::InvalidRequest {
+                        message: format!(
+                            "{surface}: skill '{skill_id}' references \
+                             undeclared security scheme '{scheme_name}'",
+                            skill_id = skill.id
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Semantic equality for SecurityScheme.
@@ -882,34 +953,16 @@ impl AgentExecutor for SecurityAugmentedExecutor {
     }
 
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
-        let mut card = self.inner.agent_card();
-        // Merge security contributions into the card
-        for (name, scheme) in &self.security.schemes {
-            card.security_schemes
-                .entry(name.clone())
-                .or_insert_with(|| scheme.clone());
-        }
-        for req in &self.security.requirements {
-            card.security_requirements.push(req.clone());
-        }
-        card
+        apply_security_merge(self.inner.agent_card(), &self.security)
     }
 
     fn extended_agent_card(
         &self,
         claims: Option<&serde_json::Value>,
     ) -> Option<turul_a2a_proto::AgentCard> {
-        self.inner.extended_agent_card(claims).map(|mut card| {
-            for (name, scheme) in &self.security.schemes {
-                card.security_schemes
-                    .entry(name.clone())
-                    .or_insert_with(|| scheme.clone());
-            }
-            for req in &self.security.requirements {
-                card.security_requirements.push(req.clone());
-            }
-            card
-        })
+        self.inner
+            .extended_agent_card(claims)
+            .map(|card| apply_security_merge(card, &self.security))
     }
 }
 

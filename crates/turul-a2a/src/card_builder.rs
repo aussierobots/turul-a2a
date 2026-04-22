@@ -14,6 +14,7 @@ pub struct AgentSkillBuilder {
     examples: Vec<String>,
     input_modes: Vec<String>,
     output_modes: Vec<String>,
+    security_requirements: Vec<turul_a2a_proto::SecurityRequirement>,
 }
 
 impl AgentSkillBuilder {
@@ -30,6 +31,7 @@ impl AgentSkillBuilder {
             examples: vec![],
             input_modes: vec![],
             output_modes: vec![],
+            security_requirements: vec![],
         }
     }
 
@@ -53,6 +55,22 @@ impl AgentSkillBuilder {
         self
     }
 
+    /// Advertise skill-level security requirements on the built skill.
+    ///
+    /// turul-a2a does NOT enforce these at request time in 0.1.x — they
+    /// are published as-is for discovery and out-of-band tooling. Any
+    /// runtime gatekeeping for a specific skill is the adopter's
+    /// responsibility inside `AgentExecutor`. See ADR-015 for the
+    /// rationale and the post-merge truthfulness invariant validated at
+    /// server build.
+    pub fn security_requirements(
+        mut self,
+        requirements: Vec<turul_a2a_proto::SecurityRequirement>,
+    ) -> Self {
+        self.security_requirements = requirements;
+        self
+    }
+
     pub fn build(self) -> turul_a2a_proto::AgentSkill {
         turul_a2a_proto::AgentSkill {
             id: self.id,
@@ -62,7 +80,7 @@ impl AgentSkillBuilder {
             examples: self.examples,
             input_modes: self.input_modes,
             output_modes: self.output_modes,
-            security_requirements: vec![],
+            security_requirements: self.security_requirements,
         }
     }
 }
@@ -86,6 +104,8 @@ pub struct AgentCardBuilder {
     default_output_modes: Vec<String>,
     skills: Vec<turul_a2a_proto::AgentSkill>,
     icon_url: Option<String>,
+    security_schemes: std::collections::HashMap<String, turul_a2a_proto::SecurityScheme>,
+    security_requirements: Vec<turul_a2a_proto::SecurityRequirement>,
 }
 
 impl AgentCardBuilder {
@@ -104,6 +124,8 @@ impl AgentCardBuilder {
             default_output_modes: vec![],
             skills: vec![],
             icon_url: None,
+            security_schemes: std::collections::HashMap::new(),
+            security_requirements: vec![],
         }
     }
 
@@ -176,6 +198,36 @@ impl AgentCardBuilder {
         self
     }
 
+    /// Declare a named security scheme on the agent card.
+    ///
+    /// Adopter-supplied schemes are merged with any schemes contributed
+    /// by installed middleware at server build; collisions between an
+    /// adopter scheme and a middleware scheme with the same name are
+    /// rejected at build time. See ADR-015.
+    pub fn security_scheme(
+        mut self,
+        name: impl Into<String>,
+        scheme: turul_a2a_proto::SecurityScheme,
+    ) -> Self {
+        self.security_schemes.insert(name.into(), scheme);
+        self
+    }
+
+    /// Advertise an agent-level security requirement not derived from
+    /// middleware (e.g., mTLS enforced at a reverse proxy).
+    ///
+    /// turul-a2a does not install a runtime gatekeeper for
+    /// adopter-supplied agent-level requirements; they are declarative
+    /// only. Authorization at the framework layer is governed solely by
+    /// installed middleware. See ADR-015.
+    pub fn security_requirement(
+        mut self,
+        requirement: turul_a2a_proto::SecurityRequirement,
+    ) -> Self {
+        self.security_requirements.push(requirement);
+        self
+    }
+
     /// Build and validate the AgentCard.
     ///
     /// Validates REQUIRED fields per proto field_behavior:
@@ -219,8 +271,8 @@ impl AgentCardBuilder {
                 extensions: vec![],
                 extended_agent_card: self.extended_agent_card,
             }),
-            security_schemes: std::collections::HashMap::new(),
-            security_requirements: vec![],
+            security_schemes: self.security_schemes,
+            security_requirements: self.security_requirements,
             default_input_modes: self.default_input_modes,
             default_output_modes: self.default_output_modes,
             skills: self.skills,
@@ -370,5 +422,44 @@ mod tests {
         assert_eq!(json["name"], "json-test");
         assert!(json.get("defaultInputModes").is_some());
         assert!(json.get("defaultOutputModes").is_some());
+    }
+
+    // ADR-015 §4.1 test 1: builder does NOT reject a skill-level
+    // `SecurityRequirement` whose scheme name is absent from the
+    // adopter-supplied `security_schemes` map on the agent card.
+    //
+    // Rationale: the missing scheme may be contributed by installed
+    // middleware at server-build time, so validating at builder time
+    // would false-reject legitimate configurations. Cross-field
+    // consistency is enforced post-merge in `A2aServerBuilder::build()`
+    // per ADR-015 §2.3, not here.
+    #[test]
+    fn builder_permits_requirement_with_scheme_to_be_merged_later() {
+        let mut bearer_ref = std::collections::HashMap::new();
+        bearer_ref.insert(
+            "bearer".to_string(),
+            turul_a2a_proto::StringList { list: vec![] },
+        );
+        let req = turul_a2a_proto::SecurityRequirement {
+            schemes: bearer_ref,
+        };
+
+        // AgentSkillBuilder::security_requirements does not exist on
+        // current main — this call is the load-bearing red-phase
+        // compile-error assertion for ADR-015. After the ADR §5.5
+        // implementation lands, the builder exposes this setter and
+        // the body below becomes the regression assertion that the
+        // requirement survives `build()` without a cross-field check.
+        let skill = AgentSkillBuilder::new("echo", "Echo", "Echoes input")
+            .tags(vec!["echo"])
+            .security_requirements(vec![req])
+            .build();
+
+        assert_eq!(skill.security_requirements.len(), 1);
+        let only = &skill.security_requirements[0];
+        assert!(
+            only.schemes.contains_key("bearer"),
+            "requirement must preserve the scheme name the adopter set"
+        );
     }
 }

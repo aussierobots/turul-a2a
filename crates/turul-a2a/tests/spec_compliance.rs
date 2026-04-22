@@ -841,6 +841,274 @@ async fn jsonrpc_unknown_method_returns_method_not_found() {
     assert_eq!(code, Some(-32601), "JSON-RPC Method Not Found per spec");
 }
 
+// ---------------------------------------------------------------------------
+// ADR-015 §4.3 test 8 — skill-level security_requirements round-trip
+// across every build-materializable card transport.
+//
+// The A2A proto has exactly one public-card RPC: HTTP discovery at
+// `/.well-known/agent-card.json`. The extended card is served over
+// HTTP at `/extendedAgentCard`, over JSON-RPC as
+// `GetExtendedAgentCard`, and over gRPC as
+// `A2AService.GetExtendedAgentCard`. There is no `GetAgentCard` /
+// `A2AService.GetAgentCard` in the proto — see ADR-015 §4.3.
+// ---------------------------------------------------------------------------
+
+/// Executor whose public + extended cards both carry the same
+/// skill-level `SecurityRequirement`, declaring the scheme in
+/// `security_schemes` so build-time validation is satisfied.
+struct Adr015RoundtripExecutor;
+
+#[async_trait]
+impl AgentExecutor for Adr015RoundtripExecutor {
+    async fn execute(
+        &self,
+        task: &mut Task,
+        _msg: &Message,
+        _ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        let mut p = task.as_proto().clone();
+        p.status = Some(turul_a2a_proto::TaskStatus {
+            state: turul_a2a_proto::TaskState::Completed.into(),
+            message: None,
+            timestamp: None,
+        });
+        *task = Task::try_from(p).unwrap();
+        Ok(())
+    }
+
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        adr015_card("ADR-015 round-trip agent")
+    }
+
+    fn extended_agent_card(
+        &self,
+        _claims: Option<&serde_json::Value>,
+    ) -> Option<turul_a2a_proto::AgentCard> {
+        Some(adr015_card("ADR-015 round-trip agent (extended)"))
+    }
+}
+
+fn adr015_card(description: &str) -> turul_a2a_proto::AgentCard {
+    let mut schemes_map = HashMap::new();
+    schemes_map.insert(
+        "bearer".to_string(),
+        turul_a2a_proto::SecurityScheme {
+            scheme: Some(
+                turul_a2a_proto::security_scheme::Scheme::HttpAuthSecurityScheme(
+                    turul_a2a_proto::HttpAuthSecurityScheme {
+                        description: String::new(),
+                        scheme: "Bearer".into(),
+                        bearer_format: "JWT".into(),
+                    },
+                ),
+            ),
+        },
+    );
+    let mut skill_schemes = HashMap::new();
+    skill_schemes.insert(
+        "bearer".to_string(),
+        turul_a2a_proto::StringList {
+            list: vec!["read".into(), "write".into()],
+        },
+    );
+    turul_a2a_proto::AgentCard {
+        name: "adr015-roundtrip".into(),
+        description: description.into(),
+        supported_interfaces: vec![turul_a2a_proto::AgentInterface {
+            url: "http://127.0.0.1:0".into(),
+            protocol_binding: "HTTP+JSON".into(),
+            tenant: String::new(),
+            protocol_version: "1.0".into(),
+        }],
+        provider: None,
+        version: "1.0.0".into(),
+        documentation_url: None,
+        capabilities: Some(turul_a2a_proto::AgentCapabilities {
+            streaming: Some(false),
+            push_notifications: Some(false),
+            extensions: vec![],
+            extended_agent_card: Some(true),
+        }),
+        security_schemes: schemes_map,
+        security_requirements: vec![],
+        default_input_modes: vec!["text/plain".into()],
+        default_output_modes: vec!["text/plain".into()],
+        skills: vec![turul_a2a_proto::AgentSkill {
+            id: "search".into(),
+            name: "Search".into(),
+            description: "Skill with ADR-015 skill-level security".into(),
+            tags: vec!["adr015".into()],
+            examples: vec![],
+            input_modes: vec!["text/plain".into()],
+            output_modes: vec!["text/plain".into()],
+            security_requirements: vec![turul_a2a_proto::SecurityRequirement {
+                schemes: skill_schemes,
+            }],
+        }],
+        signatures: vec![],
+        icon_url: None,
+    }
+}
+
+fn adr015_compliance_router() -> axum::Router {
+    A2aServer::builder()
+        .executor(Adr015RoundtripExecutor)
+        .storage(InMemoryA2aStorage::new())
+        .build()
+        .expect("ADR-015 round-trip server build")
+        .into_router()
+}
+
+/// Canonicalize a JSON `skills[0].securityRequirements` array so
+/// map-order differences do not cause spurious inequality.
+fn canonicalize(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted: std::collections::BTreeMap<String, serde_json::Value> =
+                std::collections::BTreeMap::new();
+            for (k, v) in map {
+                sorted.insert(k.clone(), canonicalize(v));
+            }
+            serde_json::to_value(sorted).unwrap()
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(canonicalize).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn skill_requirements_of(card: &serde_json::Value) -> serde_json::Value {
+    canonicalize(
+        card.pointer("/skills/0/securityRequirements")
+            .expect("skills[0].securityRequirements present on card"),
+    )
+}
+
+#[tokio::test]
+async fn agent_card_with_skill_level_security_roundtrips_via_all_card_paths() {
+    let router = adr015_compliance_router();
+
+    // HTTP public discovery — the only normative path for the public card.
+    let (status, _, public_card) = http_call(
+        router.clone(),
+        Method::GET,
+        "/.well-known/agent-card.json",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let public_reqs = skill_requirements_of(&public_card);
+    assert!(
+        public_reqs
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
+        "public card must expose the skill-level securityRequirements"
+    );
+
+    // HTTP extended card.
+    let (status, _, http_extended) =
+        http_call(router.clone(), Method::GET, "/extendedAgentCard", None).await;
+    assert_eq!(status, 200);
+    let http_extended_reqs = skill_requirements_of(&http_extended);
+    assert_eq!(
+        http_extended_reqs, public_reqs,
+        "HTTP extended card skill requirements MUST match public card"
+    );
+
+    // JSON-RPC GetExtendedAgentCard. `GetAgentCard` / `A2AService.GetAgentCard`
+    // are not present in the proto service (only `GetExtendedAgentCard`),
+    // so no JSON-RPC arm exists for the public card — HTTP discovery is
+    // its sole transport.
+    let jrpc = jsonrpc_call(
+        router.clone(),
+        "GetExtendedAgentCard",
+        serde_json::json!({}),
+        1,
+    )
+    .await;
+    let jrpc_card = jrpc.get("result").expect("result envelope present");
+    let jrpc_reqs = skill_requirements_of(jrpc_card);
+    assert_eq!(
+        jrpc_reqs, public_reqs,
+        "JSON-RPC extended card skill requirements MUST match public card"
+    );
+}
+
+#[cfg(feature = "grpc")]
+mod adr015_grpc_roundtrip {
+    use super::*;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::Request;
+    use turul_a2a_proto::grpc::A2aServiceClient;
+
+    async fn spawn_grpc() -> (SocketAddr, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let server = A2aServer::builder()
+            .executor(Adr015RoundtripExecutor)
+            .storage(InMemoryA2aStorage::new())
+            .bind(([127, 0, 0, 1], 0))
+            .build()
+            .expect("grpc server build");
+        let router = server.into_tonic_router();
+        let handle = tokio::spawn(async move {
+            let _ = router
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (addr, handle)
+    }
+
+    /// gRPC `A2AService.GetExtendedAgentCard` arm of ADR-015 §4.3 test 8.
+    #[tokio::test]
+    async fn adr015_extended_card_skill_requirements_roundtrip_over_grpc() {
+        let (addr, _handle) = spawn_grpc().await;
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect");
+        let mut client = A2aServiceClient::new(channel);
+        let resp = client
+            .get_extended_agent_card(Request::new(turul_a2a_proto::GetExtendedAgentCardRequest {
+                tenant: String::new(),
+            }))
+            .await
+            .expect("grpc extended card")
+            .into_inner();
+        let card_json = serde_json::to_value(&resp).expect("serialize proto card");
+        let grpc_reqs = skill_requirements_of(&card_json);
+
+        // Fetch the public card via HTTP for parity.
+        let http_router = A2aServer::builder()
+            .executor(Adr015RoundtripExecutor)
+            .storage(InMemoryA2aStorage::new())
+            .build()
+            .expect("http server build")
+            .into_router();
+        let (status, _, public_card) = http_call(
+            http_router,
+            Method::GET,
+            "/.well-known/agent-card.json",
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let public_reqs = skill_requirements_of(&public_card);
+
+        assert_eq!(
+            grpc_reqs, public_reqs,
+            "gRPC extended card skill requirements MUST match public card"
+        );
+    }
+}
+
 #[tokio::test]
 async fn jsonrpc_list_tasks_returns_paginated_result() {
     let router = compliance_router();
