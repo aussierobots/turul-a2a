@@ -3219,6 +3219,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "skill-security-agent"
+version = "0.1.8"
+dependencies = [
+ "async-trait",
+ "tokio",
+ "tracing-subscriber",
+ "turul-a2a",
+ "turul-a2a-proto",
+ "turul-a2a-types",
+ "uuid",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
