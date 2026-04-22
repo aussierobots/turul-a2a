@@ -4,7 +4,6 @@ members = [
   "crates/turul-a2a-proto",
   "crates/turul-a2a-types",
   "crates/turul-a2a",
-  "crates/turul-jwt-validator",
   "crates/turul-a2a-auth",
   "crates/turul-a2a-client",
   "crates/turul-a2a-aws-lambda",
@@ -20,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 authors = ["Nick Hortovanyi <nick@aussierobots.com.au>"]
 license = "MIT OR Apache-2.0"
@@ -95,5 +94,7 @@ wiremock = "0.6"
 # Misc
 bytes = "1"
 
-turul-a2a-proto = { version = "0.1.9", path = "crates/turul-a2a-proto" }
-turul-a2a-types = { version = "0.1.9", path = "crates/turul-a2a-types" }
+turul-a2a = { version = "0.1.10", path = "crates/turul-a2a" }
+turul-a2a-proto = { version = "0.1.10", path = "crates/turul-a2a-proto" }
+turul-a2a-types = { version = "0.1.10", path = "crates/turul-a2a-types" }
+turul-jwt-validator = "0.1"

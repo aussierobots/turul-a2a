@@ -4,6 +4,30 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.10] — 2026-04-23
+
+### Changed
+- **`turul-jwt-validator` extracted to its own repository and consumed
+  as an external dependency.** The crate now lives at
+  [`aussierobots/turul-jwt-validator`](https://github.com/aussierobots/turul-jwt-validator)
+  and is pulled from crates.io as `turul-jwt-validator = "0.1"`. Source
+  is API-identical to the 0.1.9 embedded copy; the split is structural,
+  not behavioural, and enables other Rust projects (including
+  `turul-mcp-framework`) to consume the same validator without cloning
+  this workspace. No public API changes for `turul-a2a-auth` consumers.
+- **Workspace dependency normalization.** All intra-workspace deps
+  (`turul-a2a`, `turul-a2a-proto`, `turul-a2a-types`) plus the now-external
+  `turul-jwt-validator` are declared once in
+  `[workspace.dependencies]` and referenced via `{ workspace = true }`
+  in every consuming crate, matching the workspace's existing house rule.
+
+### Removed
+- `crates/turul-jwt-validator/` and its workspace-members entry.
+
+No breaking changes — the public API of `turul-a2a-auth` is unchanged,
+and `turul-jwt-validator 0.1.9` on crates.io is the same source that
+shipped with `turul-a2a 0.1.9`.
+
 ## [0.1.9] — 2026-04-22
 
 ### Added
