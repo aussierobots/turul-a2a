@@ -4,6 +4,30 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.8] — 2026-04-22
+
+### Changed
+- **`turul-a2a-aws-lambda`: `aws_lambda_events` 0.15 → 1.1** (resolves
+  to 1.1.3). 1.0 added `#[non_exhaustive]` to the DynamoDB stream
+  types (`Event`, `EventRecord`, `StreamRecord`,
+  `DynamoDbEventResponse`, `DynamoDbBatchItemFailure`), so struct
+  expressions on those types are no longer legal from downstream
+  crates. Internal call sites in `stream_recovery.rs` and its test
+  helpers now build through `Default::default()` followed by field
+  assignment; two shared helpers (`build_event_record`,
+  `event_with_records`) keep the pattern in one place.
+
+  **Breaking for adopters of `turul-a2a-aws-lambda`.** If your
+  Lambda handler code passes `aws_lambda_events::dynamodb::Event`
+  values to `LambdaStreamRecoveryHandler::handle_stream_event`,
+  you must bump your own `aws_lambda_events` dep to `^1.1` — the
+  two major versions produce incompatible types.
+
+  Workspace, `examples/lambda-*` crates, and every other publish
+  crate are unchanged by this release — only `turul-a2a-aws-lambda`
+  has behavioural / ABI impact. Versions bumped across all seven
+  publish crates to keep workspace-versioned semantics intact.
+
 ## [0.1.7] — 2026-04-22
 
 ### Added

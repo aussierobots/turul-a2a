@@ -12,9 +12,9 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-turul-a2a = { version = "0.1.7", path = "../turul-a2a" }
+turul-a2a = { version = "0.1.8", path = "../turul-a2a" }
 turul-a2a-proto = { workspace = true }
-turul-jwt-validator = { version = "0.1.7", path = "../turul-jwt-validator" }
+turul-jwt-validator = { version = "0.1.8", path = "../turul-jwt-validator" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
