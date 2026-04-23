@@ -8,7 +8,7 @@ Turul-a2a is a Rust implementation of the A2A (Agent-to-Agent) Protocol v1.0. Li
 
 **Proto-first architecture**: Types are generated from the normative `proto/a2a.proto` (package `lf.a2a.v1`) using `prost` + `pbjson`, then wrapped in ergonomic Rust types.
 
-**Current release**: 0.1.11 — see `CHANGELOG.md` for the per-release contract. §Completed below tracks which ADRs have shipped.
+**Current release**: 0.1.11 — see `CHANGELOG.md` for the per-release contract.
 
 ## Build & Development Commands
 
@@ -27,7 +27,6 @@ cargo test -p turul-a2a                    # Server, storage, handlers, auth, E2
 cargo test -p turul-a2a-auth               # Auth middleware (API key, Bearer)
 cargo test -p turul-a2a-client             # Client library
 cargo test -p turul-a2a-aws-lambda         # Lambda adapter
-cargo test -p turul-jwt-validator          # JWT validator (E2E with wiremock)
 
 # Storage backend parity tests (feature-gated)
 cargo test -p turul-a2a --features sqlite --lib -- storage::sqlite
@@ -56,7 +55,7 @@ cargo lambda watch -p lambda-agent         # Lambda agent via cargo-lambda
 
 ## Release & Publish (crates.io)
 
-The workspace publishes 7 crates. Publishing is irreversible (yank only hides). Never run `cargo publish` without explicit user instruction.
+The workspace publishes 6 crates. Publishing is irreversible (yank only hides). Never run `cargo publish` without explicit user instruction.
 
 ### Sequence (always in this order)
 
@@ -74,9 +73,8 @@ The workspace publishes 7 crates. Publishing is irreversible (yank only hides). 
 7. **Publish in dependency order** (hard requirement — later crates cannot resolve otherwise):
    1. `turul-a2a-proto`
    2. `turul-a2a-types`
-   3. `turul-jwt-validator`
-   4. `turul-a2a`
-   5. `turul-a2a-client`, `turul-a2a-auth`, `turul-a2a-aws-lambda` (any order; none depend on each other)
+   3. `turul-a2a`
+   4. `turul-a2a-client`, `turul-a2a-auth`, `turul-a2a-aws-lambda` (any order; none depend on each other)
 
 Authorize each `cargo publish` call separately. A prior "go ahead" does not authorize future releases.
 
@@ -99,8 +97,7 @@ Authorize each `cargo publish` call separately. A prior "go ahead" does not auth
 - `turul-a2a-proto` — prost-generated types from `a2a.proto`. Build.rs generates via `prost-build` + `pbjson-build`. JSON serialization uses camelCase (proto JSON mapping) via pbjson.
 - `turul-a2a-types` — Ergonomic Rust wrappers over proto types. Publishable, no server/storage/auth deps. `#[non_exhaustive]` on all public types. State machine enforcement on `TaskState`.
 - `turul-a2a` — Server + storage + HTTP/JSON-RPC/SSE transports + auth middleware foundation. Feature-gated backends (in-memory default). `AgentExecutor` trait, `A2aMiddleware` trait, `A2aServer::builder()`.
-- `turul-a2a-auth` — Concrete auth middleware: `BearerMiddleware` (JWT), `ApiKeyMiddleware`. Uses `turul-jwt-validator`.
-- `turul-jwt-validator` — Local JWT validator with JWKS caching (design sourced from turul-mcp-oauth).
+- `turul-a2a-auth` — Concrete auth middleware: `BearerMiddleware` (JWT), `ApiKeyMiddleware`. Uses the external `turul-jwt-validator` crate.
 - `turul-a2a-client` — Independent A2A client: discovery, send, get, cancel, list, auth, tenant.
 - `turul-a2a-aws-lambda` — Lambda adapter: thin wrapper over same Router, request/response only (ADR-008).
 
@@ -209,17 +206,6 @@ Our vendored `proto/a2a.proto` is byte-identical to upstream `a2aproject/A2A/spe
 
 Before describing a release as "A2A v1.0 compliant", re-verify the vendored `proto/a2a.proto` SHA256 still matches `a2aproject/A2A:main/specification/a2a.proto` (AGENTS.md §55+§173).
 
-### Completed
-
-- **ADR-009 — Durable event coordination**: store is truth, broker is wake-up signal. Atomic task+event writes via `A2aAtomicStore`. Terminal replay, Last-Event-ID reconnection, cross-instance streaming all verified. Four parity-proven backends.
-- **ADR-010 — Executor `EventSink`**: proto-variant-only surface; `emit_*`/`set_status` serialize per-sink.
-- **ADR-011 — Push notification delivery**: `PushDispatcher` + `PushDeliveryWorker`, claim-based fan-out, bounded retry horizon (`push_claim_expiry > max_attempts * backoff_cap`), SSRF allowlist, secret redaction.
-- **ADR-012 — Cancellation propagation**: cross-instance cancel marker + supervisor sweep; same-backend check on the builder.
-- **ADR-013 — Lambda push-delivery parity**: atomic `a2a_push_pending_dispatches` marker, causal `latest_event_sequence` CAS, `LambdaStreamRecoveryHandler` (BatchItemFailures) + `LambdaScheduledRecoveryHandler` (EventBridge backstop).
-- **ADR-014 — gRPC transport**: third thin adapter over the shared core handlers. All 11 RPCs (9 unary + 2 server-streaming) wired via tonic; Tower auth layer reuses `MiddlewareStack`; streaming feeds from the ADR-009 durable event store with `a2a-last-event-id` metadata resume; `tenant` proto field wins over `x-tenant-id` metadata. Feature-gated (`grpc` on `turul-a2a-proto` + `turul-a2a` + `turul-a2a-client`); default builds remain tonic-free. Example: `examples/grpc-agent` (server + CLI client). Not available under `turul-a2a-aws-lambda`.
-- **ADR-015 — Skill-level `security_requirements` (declaration-only)**: `AgentSkillBuilder::security_requirements(...)` + `AgentCardBuilder::security_scheme(...)` / `::security_requirement(...)` publish skill-level and adopter-supplied agent-level metadata. Post-merge validation at `A2aServerBuilder::build()` rejects cards whose public or no-claims extended surface references a scheme not present in the merged `security_schemes` map. Runtime skill-level enforcement remains deferred; advertising a requirement does not install a middleware.
-
 ### Deferred (ordered by priority)
 
 1. **Skill-level `security_requirements` enforcement at request time** — blocked on upstream proto adding a normative skill binding on `Message`. ADR-015 ships declaration-only advertisement with post-merge truthfulness validation; runtime gatekeeping for a specific skill remains adopter responsibility inside `AgentExecutor`.
-2. **Shared `turul-jwt-validator` extraction** — currently local, see ADR-007
