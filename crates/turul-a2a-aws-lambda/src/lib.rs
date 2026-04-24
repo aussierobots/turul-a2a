@@ -1,5 +1,63 @@
 //! AWS Lambda adapter for turul-a2a.
 //!
+//! # Choosing a runner
+//!
+//! A Lambda binary receives raw event JSON; the adapter owns
+//! classifying that JSON and dispatching to the right A2A handler
+//! method. Adopters pick the runner whose name matches the Lambda's
+//! AWS trigger topology and end `main.rs` with one `.await?` call —
+//! `lambda_runtime` / `lambda_http` / event parsing never appear in
+//! adopter code.
+//!
+//! | Lambda triggers                   | Runner                                         |
+//! |-----------------------------------|------------------------------------------------|
+//! | HTTP only (Function URL / APIGW)  | [`LambdaA2aHandler::run_http_only`]            |
+//! | SQS only (event source mapping)   | [`LambdaA2aHandler::run_sqs_only`] *(`sqs`)*   |
+//! | HTTP **and** SQS on one function  | [`LambdaA2aHandler::run_http_and_sqs`] *(`sqs`)* |
+//! | not sure / just run it            | [`LambdaA2aHandler::run`]                      |
+//!
+//! [`LambdaA2aHandler::run`] is the default "it just works" entry
+//! point: without the `sqs` feature it aliases `run_http_only`; with
+//! `sqs` it aliases `run_http_and_sqs` (permissive, handles either
+//! shape). The explicit runners are **strict** — a non-matching
+//! event shape fails loudly, which is what hardened deployments
+//! and tests want.
+//!
+//! The one-call shortcut is [`LambdaA2aServerBuilder::run`] — it
+//! build-then-runs in a single fluent call. Use `.build()` + a
+//! handler method when the handler is needed for unit tests or
+//! custom middleware.
+//!
+//! ```ignore
+//! // HTTP-only Lambda (request Lambda in two-Lambda topology):
+//! LambdaA2aServerBuilder::new()
+//!     .executor(my_executor)
+//!     .storage(my_storage)
+//!     .with_sqs_return_immediately(queue_url, sqs)  // enqueues durable jobs
+//!     .build()?
+//!     .run_http_only()
+//!     .await
+//!
+//! // Single-function HTTP+SQS demo:
+//! LambdaA2aServerBuilder::new()
+//!     .executor(my_executor)
+//!     .storage(my_storage)
+//!     .with_sqs_return_immediately(queue_url, sqs)
+//!     .run()            // builder shortcut; dispatches HTTP + SQS
+//!     .await
+//!
+//! // Pure SQS worker — no with_sqs_return_immediately(...) needed
+//! // (it consumes the queue, never enqueues):
+//! LambdaA2aServerBuilder::new()
+//!     .executor(my_executor)
+//!     .storage(my_storage)
+//!     .build()?
+//!     .run_sqs_only()
+//!     .await
+//! ```
+//!
+//! # Adapter internals
+//!
 //! Thin wrapper: converts Lambda events to axum requests, delegates to the
 //! same Router, converts responses back. Per ADR-008/ADR-009:
 //! - Authorizer context mapped via synthetic headers with anti-spoofing
@@ -95,9 +153,7 @@ pub use scheduled_recovery::{
 pub use stream_recovery::LambdaStreamRecoveryHandler;
 
 #[cfg(feature = "sqs")]
-pub use durable::{
-    LambdaEvent, SqsDurableExecutorQueue, classify_event, drive_sqs_batch, run_mixed_http_and_sqs,
-};
+pub use durable::{LambdaEvent, SqsDurableExecutorQueue, classify_event, drive_sqs_batch};
 
 use std::sync::Arc;
 
@@ -529,5 +585,49 @@ impl LambdaA2aHandler {
         event: aws_lambda_events::event::sqs::SqsEvent,
     ) -> aws_lambda_events::event::sqs::SqsBatchResponse {
         durable::drive_sqs_batch(&self.state, event).await
+    }
+
+    /// Run this handler as a pure HTTP Lambda. Strict: any non-HTTP
+    /// event shape (SQS, DynamoDB stream, scheduler, …) causes
+    /// `lambda_http::run` to return a deserialization error on
+    /// invocation.
+    ///
+    /// Appropriate for Lambdas whose only trigger is a Function URL,
+    /// API Gateway, or ALB. The request Lambda in the two-Lambda
+    /// durable-executor topology is the canonical caller.
+    pub async fn run_http_only(self) -> Result<(), lambda_runtime::Error> {
+        let handler = Arc::new(self);
+        lambda_http::run(lambda_http::service_fn(move |event| {
+            let h = Arc::clone(&handler);
+            async move { h.handle(event).await }
+        }))
+        .await
+    }
+}
+
+// Default entrypoint when the `sqs` feature is off — `.run()` aliases
+// the HTTP-only runner. With the `sqs` feature enabled, `.run()` lives
+// in `durable.rs` and routes HTTP+SQS via the classifier.
+#[cfg(not(feature = "sqs"))]
+impl LambdaA2aHandler {
+    /// Default Lambda runner. Dispatches based on the event shape the
+    /// binary receives. Without the `sqs` feature this is HTTP-only
+    /// (equivalent to [`LambdaA2aHandler::run_http_only`]).
+    pub async fn run(self) -> Result<(), lambda_runtime::Error> {
+        self.run_http_only().await
+    }
+}
+
+impl LambdaA2aServerBuilder {
+    /// Build and run in one call. Sugar for
+    /// `self.build()?.run().await`. Hides the handler from the adopter —
+    /// use `.build()` + `handler.run_*()` instead when the handler is
+    /// needed for unit tests, custom middleware, or an explicit
+    /// topology runner.
+    pub async fn run(self) -> Result<(), lambda_runtime::Error> {
+        let handler = self.build().map_err(|e| {
+            lambda_runtime::Error::from(format!("LambdaA2aServerBuilder::run: {e}"))
+        })?;
+        handler.run().await
     }
 }

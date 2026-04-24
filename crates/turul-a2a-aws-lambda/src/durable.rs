@@ -357,57 +357,97 @@ async fn drive_sqs_record(state: &AppState, record: SqsMessage) -> Result<(), St
     Ok(())
 }
 
-/// Drive a single Lambda function handling both HTTP (Function URL /
-/// API Gateway / ALB) and SQS events on the same binary.
+/// Extra Lambda runners available when the `sqs` feature is on. These
+/// are methods on [`LambdaA2aHandler`] so adopters stay at one level
+/// of abstraction: pick the runner whose name matches the Lambda's
+/// AWS triggers, then `.await?` and the adapter owns the envelope
+/// dispatch.
 ///
-/// Adopter `main.rs`:
+/// Runner matrix:
 ///
-/// ```ignore
-/// let handler = LambdaA2aServerBuilder::new()
-///     .executor(my_executor)
-///     .storage(my_storage)
-///     .with_sqs_return_immediately(queue_url, sqs_client)
-///     .build()?;
-/// turul_a2a_aws_lambda::run_mixed_http_and_sqs(handler).await
-/// ```
+/// | Lambda triggers                   | Runner                     |
+/// |-----------------------------------|----------------------------|
+/// | HTTP only (Function URL / APIGW)  | [`Self::run_http_only`]    |
+/// | SQS only (event source mapping)   | [`Self::run_sqs_only`]     |
+/// | HTTP **and** SQS on one function  | [`Self::run_http_and_sqs`] |
+/// | not sure / just run it            | [`Self::run`]              |
 ///
-/// Internally classifies each incoming Lambda event via
-/// [`classify_event`], dispatches HTTP events through
-/// [`LambdaA2aHandler::handle`] (with envelope conversion to /
-/// from API Gateway v2 JSON) and SQS events through
-/// [`LambdaA2aHandler::handle_sqs`]. Unknown event shapes surface as
-/// `Err` so the Lambda runtime reports a failed invocation.
-///
-/// Does not cap concurrency, does not pin containers, does not choose
-/// a storage backend — those are adopter topology decisions.
-pub async fn run_mixed_http_and_sqs(
-    handler: LambdaA2aHandler,
-) -> Result<(), lambda_runtime::Error> {
-    let handler = Arc::new(handler);
-    lambda_runtime::run(lambda_runtime::service_fn(
-        move |event: lambda_runtime::LambdaEvent<serde_json::Value>| {
-            let handler = Arc::clone(&handler);
-            async move {
-                let (value, _ctx) = event.into_parts();
-                match classify_event(&value) {
-                    LambdaEvent::Sqs => {
-                        let sqs_event: SqsEvent = serde_json::from_value(value).map_err(|e| {
-                            lambda_runtime::Error::from(format!("invalid SQS event: {e}"))
-                        })?;
-                        let resp = handler.handle_sqs(sqs_event).await;
-                        serde_json::to_value(resp).map_err(|e| {
-                            lambda_runtime::Error::from(format!("serialise SqsBatchResponse: {e}"))
-                        })
-                    }
-                    LambdaEvent::Http => dispatch_http_event(&handler, value).await,
-                    LambdaEvent::Unknown => Err(lambda_runtime::Error::from(
-                        "unknown Lambda event shape — expected HTTP or SQS",
-                    )),
+/// The default `.run()` uses the HTTP+SQS classifier and handles both
+/// shapes — safe for any of the three topologies above. The explicit
+/// runners are strict: a non-matching event shape fails loudly, which
+/// is what you want on hardened deployments or in tests.
+impl LambdaA2aHandler {
+    /// Run this handler as a pure SQS consumer. Strict: any non-SQS
+    /// event shape fails to deserialize and the Lambda invocation
+    /// errors.
+    ///
+    /// Appropriate for the consumer Lambda in the two-Lambda durable
+    /// executor topology — it does not need
+    /// `LambdaA2aServerBuilder::with_sqs_return_immediately(...)` (the
+    /// worker never enqueues; it only consumes from the SQS event
+    /// source mapping).
+    pub async fn run_sqs_only(self) -> Result<(), lambda_runtime::Error> {
+        let handler = Arc::new(self);
+        lambda_runtime::run(lambda_runtime::service_fn(
+            move |event: lambda_runtime::LambdaEvent<SqsEvent>| {
+                let handler = Arc::clone(&handler);
+                async move {
+                    let (sqs_event, _ctx) = event.into_parts();
+                    let resp = handler.handle_sqs(sqs_event).await;
+                    Ok::<_, lambda_runtime::Error>(resp)
                 }
-            }
-        },
-    ))
-    .await
+            },
+        ))
+        .await
+    }
+
+    /// Run this handler as a dual HTTP+SQS Lambda. Routes each event
+    /// via [`classify_event`] — HTTP events go through
+    /// [`LambdaA2aHandler::handle`] with envelope conversion; SQS
+    /// events go through [`LambdaA2aHandler::handle_sqs`]. Any other
+    /// event shape errors.
+    ///
+    /// Appropriate for single-function durable-executor topologies
+    /// (e.g. `ReservedConcurrency=1` demos where the same container
+    /// handles the HTTP request that enqueues and the SQS trigger
+    /// that consumes).
+    pub async fn run_http_and_sqs(self) -> Result<(), lambda_runtime::Error> {
+        let handler = Arc::new(self);
+        lambda_runtime::run(lambda_runtime::service_fn(
+            move |event: lambda_runtime::LambdaEvent<serde_json::Value>| {
+                let handler = Arc::clone(&handler);
+                async move {
+                    let (value, _ctx) = event.into_parts();
+                    match classify_event(&value) {
+                        LambdaEvent::Sqs => {
+                            let sqs_event: SqsEvent =
+                                serde_json::from_value(value).map_err(|e| {
+                                    lambda_runtime::Error::from(format!("invalid SQS event: {e}"))
+                                })?;
+                            let resp = handler.handle_sqs(sqs_event).await;
+                            serde_json::to_value(resp).map_err(|e| {
+                                lambda_runtime::Error::from(format!(
+                                    "serialise SqsBatchResponse: {e}"
+                                ))
+                            })
+                        }
+                        LambdaEvent::Http => dispatch_http_event(&handler, value).await,
+                        LambdaEvent::Unknown => Err(lambda_runtime::Error::from(
+                            "unknown Lambda event shape — expected HTTP or SQS",
+                        )),
+                    }
+                }
+            },
+        ))
+        .await
+    }
+
+    /// Default Lambda runner (with `sqs` feature on). Same dispatch
+    /// as [`Self::run_http_and_sqs`] — routes HTTP and SQS events via
+    /// the classifier. Safe for Lambdas that receive either or both.
+    pub async fn run(self) -> Result<(), lambda_runtime::Error> {
+        self.run_http_and_sqs().await
+    }
 }
 
 /// Convert a raw Lambda HTTP event (API Gateway / Function URL / ALB)
@@ -415,7 +455,8 @@ pub async fn run_mixed_http_and_sqs(
 /// `handler.handle(...)`, then build an API Gateway v2 / Function URL
 /// response JSON.
 ///
-/// Kept `pub(crate)` — the only caller is [`run_mixed_http_and_sqs`].
+/// Kept `pub(crate)` — the only caller is
+/// [`LambdaA2aHandler::run_http_and_sqs`].
 /// This boilerplate is what `lambda_http::run` normally hides; we
 /// open-code it once because the dual-event runner needs
 /// `lambda_runtime::run` (generic) rather than `lambda_http::run`

@@ -125,31 +125,31 @@ async fn main() -> Result<(), lambda_http::Error> {
         .await
         .map_err(|e| lambda_http::Error::from(format!("dynamodb storage build failed: {e}")))?;
 
-    let handler = LambdaA2aServerBuilder::new()
+    // Pure HTTP Lambda — it accepts `message:send` and enqueues
+    // durable jobs onto SQS, but it is not itself triggered by SQS.
+    // The consumer side is `lambda-durable-worker`.
+    //
+    // DynamoDB-backed storage so the worker Lambda (different
+    // container, same AWS account) can load the task this Lambda
+    // enqueued. Deploy the five tables from
+    // examples/lambda-infra/cloudformation.yaml before running.
+    //
+    // `with_push_dispatch_enabled(true)` omitted — this demo doesn't
+    // register push configs, so the builder correctly rejects the
+    // inconsistent pairing with no `push_delivery_store`. Production
+    // deployments that want push delivery wire
+    // `.push_delivery_store(storage.clone())` and flip the flag in
+    // tandem.
+    //
+    // `.with_sqs_return_immediately(queue_url, sqs)` re-enables
+    // `supports_return_immediately` on the RuntimeConfig as a side
+    // effect of supplying the queue (capability, not intent).
+    LambdaA2aServerBuilder::new()
         .executor(DurableEchoExecutor)
-        // DynamoDB-backed storage so the worker Lambda (different
-        // container, same AWS account) can load the task the agent
-        // enqueued. Deploy the five tables from
-        // examples/lambda-infra/cloudformation.yaml before running
-        // this example.
-        //
-        // `with_push_dispatch_enabled(true)` omitted — this demo
-        // doesn't register push configs, so the builder correctly
-        // rejects the inconsistent pairing with no
-        // `push_delivery_store`. Production deployments that want
-        // push delivery wire `.push_delivery_store(storage.clone())`
-        // and flip the flag in tandem.
         .storage(dynamodb_storage)
-        // ADR-018: wire the SQS durable executor queue. Re-enables
-        // `supports_return_immediately` on the RuntimeConfig as a
-        // side effect of supplying the queue (capability, not intent).
         .with_sqs_return_immediately(queue_url, sqs)
         .build()
-        .map_err(|e| lambda_http::Error::from(format!("builder error: {e}")))?;
-
-    lambda_http::run(lambda_http::service_fn(move |event| {
-        let handler = handler.clone();
-        async move { handler.handle(event).await }
-    }))
-    .await
+        .map_err(|e| lambda_http::Error::from(format!("builder error: {e}")))?
+        .run_http_only()
+        .await
 }

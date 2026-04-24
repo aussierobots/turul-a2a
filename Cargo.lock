@@ -1894,11 +1894,7 @@ name = "lambda-durable-worker"
 version = "0.1.15"
 dependencies = [
  "async-trait",
- "aws-config",
- "aws-sdk-sqs",
- "aws_lambda_events",
  "lambda_runtime",
- "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1906,7 +1902,6 @@ dependencies = [
  "turul-a2a-aws-lambda",
  "turul-a2a-proto",
  "turul-a2a-types",
- "uuid",
 ]
 
 [[package]]

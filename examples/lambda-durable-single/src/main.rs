@@ -8,9 +8,9 @@
 //! DynamoDB.
 //!
 //! The mixed-event dispatch (HTTP envelope conversion + classify +
-//! routing) is provided by
-//! [`turul_a2a_aws_lambda::run_mixed_http_and_sqs`] — this `main.rs`
-//! only handles storage setup and wiring.
+//! routing) is hidden behind [`LambdaA2aServerBuilder::run`]; this
+//! `main.rs` only handles storage setup and wiring and ends with a
+//! single `.run().await?` call.
 
 use std::sync::Arc;
 
@@ -20,7 +20,7 @@ use turul_a2a::card_builder::AgentCardBuilder;
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
 use turul_a2a::storage::InMemoryA2aStorage;
-use turul_a2a_aws_lambda::{LambdaA2aServerBuilder, run_mixed_http_and_sqs};
+use turul_a2a_aws_lambda::LambdaA2aServerBuilder;
 use turul_a2a_types::{Artifact, Message, Part, Task};
 
 /// Echoes the incoming payload so adopters can verify that the
@@ -100,12 +100,10 @@ async fn main() -> Result<(), Error> {
     let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let sqs = Arc::new(aws_sdk_sqs::Client::new(&aws));
 
-    let handler = LambdaA2aServerBuilder::new()
+    LambdaA2aServerBuilder::new()
         .executor(DurableEchoExecutor)
         .storage(InMemoryA2aStorage::new())
         .with_sqs_return_immediately(queue_url, sqs)
-        .build()
-        .map_err(|e| Error::from(format!("builder error: {e}")))?;
-
-    run_mixed_http_and_sqs(handler).await
+        .run()
+        .await
 }

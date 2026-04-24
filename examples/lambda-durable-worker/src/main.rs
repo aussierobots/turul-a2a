@@ -4,8 +4,14 @@
 //! This is the dequeue-side half of the ADR-018 Pattern B demo. The
 //! companion is `examples/lambda-durable-agent` (the HTTP request
 //! Lambda). An SQS event source mapping triggers this Lambda with
-//! records the request Lambda enqueued via
-//! `LambdaA2aServerBuilder::with_sqs_return_immediately(...)`.
+//! records the request Lambda enqueued.
+//!
+//! Pure consumer: the builder does *not* call
+//! `with_sqs_return_immediately(...)` because this Lambda never
+//! enqueues. It only reads tasks from the shared DynamoDB backend and
+//! runs their executors. `LambdaA2aHandler::run_sqs_only` owns the
+//! `lambda_runtime::run` loop — any non-SQS event shape errors
+//! loudly.
 //!
 //! Per ADR-018 §SQS invocation, each record passes through:
 //!
@@ -39,11 +45,8 @@
 //! not survive the handoff. Production MUST share a backend —
 //! `DynamoDbA2aStorage` is the idiomatic choice.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
-use aws_lambda_events::event::sqs::{SqsBatchResponse, SqsEvent};
-use lambda_runtime::{Error, LambdaEvent, service_fn};
+use lambda_runtime::Error;
 use turul_a2a::card_builder::AgentCardBuilder;
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
@@ -114,44 +117,20 @@ async fn main() -> Result<(), Error> {
         .without_time()
         .init();
 
-    // The worker needs the same wiring as the request Lambda so the
-    // durable-queue path is available on `AppState`. `with_sqs_return_immediately`
-    // is a no-op here (the worker never enqueues); it's wired only to
-    // satisfy the same-binary deployment shape if you later consolidate.
-    // `InMemoryA2aStorage` is demo-only — swap in `DynamoDbA2aStorage`
-    // for production.
-    let queue_url = std::env::var("A2A_EXECUTOR_QUEUE_URL").map_err(|_| {
-        Error::from(
-            "A2A_EXECUTOR_QUEUE_URL is required — set it to the SQS queue URL \
-             (default name: turul-a2a-durable-executor-demo)",
-        )
-    })?;
-
-    let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let sqs = Arc::new(aws_sdk_sqs::Client::new(&aws));
-
+    // Worker is a pure SQS consumer — it reads the task the agent
+    // enqueued, runs the executor, commits the terminal via the same
+    // shared DynamoDB atomic store (ADR-009 same-backend requirement).
+    // No `with_sqs_return_immediately(...)` — that wires the builder
+    // to *enqueue*, which the worker never does.
     let dynamodb_storage = DynamoDbA2aStorage::new(DynamoDbConfig::default())
         .await
         .map_err(|e| Error::from(format!("dynamodb storage build failed: {e}")))?;
 
-    let handler = LambdaA2aServerBuilder::new()
+    LambdaA2aServerBuilder::new()
         .executor(DurableEchoExecutor)
-        // Shares DynamoDB tables with the agent Lambda (ADR-009
-        // same-backend requirement). The worker reads the task the
-        // agent wrote, runs the executor, and commits the terminal
-        // via the same CAS-guarded atomic store.
         .storage(dynamodb_storage)
-        .with_sqs_return_immediately(queue_url, sqs)
         .build()
-        .map_err(|e| Error::from(format!("builder error: {e}")))?;
-
-    lambda_runtime::run(service_fn(move |event: LambdaEvent<SqsEvent>| {
-        let handler = handler.clone();
-        async move {
-            let (sqs_event, _ctx) = event.into_parts();
-            let resp: SqsBatchResponse = handler.handle_sqs(sqs_event).await;
-            Ok::<_, Error>(resp)
-        }
-    }))
-    .await
+        .map_err(|e| Error::from(format!("builder error: {e}")))?
+        .run_sqs_only()
+        .await
 }

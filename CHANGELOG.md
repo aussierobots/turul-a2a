@@ -23,9 +23,28 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   let req = MessageBuilder::new().data(req).metadata_json(corrs).build();
   ```
 
-### Added — mixed-event dispatch helper + builder configuration shape
+### Added — Lambda runners hide envelope dispatch from adopters
 
-- **`turul-a2a-aws-lambda::run_mixed_http_and_sqs`** (gated on `sqs`) — one-liner adopter API for Lambdas that serve both HTTP (Function URL / API Gateway v2) and SQS on the same function. Wraps `LambdaA2aHandler` in `Arc`, drives `lambda_runtime::run(service_fn(...))` with the crate-internal `classify_event`, and routes HTTP events through the envelope-conversion helper and SQS events through `LambdaA2aHandler::handle_sqs`. Lets single-Lambda topologies (`ReservedConcurrency=1` demo, adopter-specific shapes) replace ~80 lines of open-coded envelope plumbing with a single call. The `examples/lambda-durable-single` main.rs is now ~15 lines of wiring.
+Adopter `main.rs` no longer reaches for `lambda_http::run`,
+`lambda_runtime::run`, `service_fn`, `SqsEvent`, or any AWS
+event-envelope type. Pick the runner whose name matches the Lambda's
+AWS triggers and `.await?` — the adapter owns the dispatch.
+
+- **`LambdaA2aHandler::run_http_only`** — strict HTTP Lambda (Function URL / APIGW / ALB). Any non-HTTP event errors.
+- **`LambdaA2aHandler::run_sqs_only`** *(gated on `sqs`)* — strict SQS consumer. Any non-SQS event errors. Pure consumer Lambdas do **not** need `LambdaA2aServerBuilder::with_sqs_return_immediately(...)` — that wires *enqueueing*, which consumers never do.
+- **`LambdaA2aHandler::run_http_and_sqs`** *(gated on `sqs`)* — dual-event Lambda. Classifies each event and routes HTTP → `handle()`, SQS → `handle_sqs()`, anything else → error. Replaces the previous `run_mixed_http_and_sqs` free function (removed, see below).
+- **`LambdaA2aHandler::run`** — default entry point. Without `sqs` it aliases `run_http_only`; with `sqs` it aliases `run_http_and_sqs` (handles either shape). Use the explicit runners when you want strict fail-fast on a mis-configured trigger.
+- **`LambdaA2aServerBuilder::run`** — fluent shortcut for `self.build()?.run().await`. Builder ends with `.run().await` in `main.rs`; no handler variable needed for the common case.
+- Crate-level **"Choosing a runner"** docs in `turul-a2a-aws-lambda/src/lib.rs` with the topology-to-runner matrix.
+
+### Changed (breaking) — runner surface is handler methods, not free functions
+
+- **Removed: `turul-a2a-aws-lambda::run_mixed_http_and_sqs`** (free function, gated on `sqs`). Replaced by `LambdaA2aHandler::run_http_and_sqs` with the same dispatch semantics. Migration: `run_mixed_http_and_sqs(handler).await` → `handler.run_http_and_sqs().await` (or `handler.run().await` for the default).
+
+Unpublished pre-release change — `run_mixed_http_and_sqs` shipped earlier
+in this same 0.1.15 commit stack; no `cargo publish` happened between
+the introduction and the rename, so no external adopter can have
+depended on the free-function shape.
 
 - **`turul-a2a-client::MessageBuilder` configuration-shape methods** — the builder now reaches the `SendMessageRequest.configuration` fields that were previously only accessible by dropping to raw proto literals:
   - `tenant(impl Into<String>)` — request-root tenant.
