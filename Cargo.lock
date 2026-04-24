@@ -1868,6 +1868,7 @@ dependencies = [
  "turul-a2a-aws-lambda",
  "turul-a2a-proto",
  "turul-a2a-types",
+ "uuid",
 ]
 
 [[package]]
@@ -1877,13 +1878,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-sqs",
- "aws_lambda_events",
- "base64 0.22.1",
- "http 1.4.0",
- "http-body-util",
- "lambda_http",
  "lambda_runtime",
- "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1891,6 +1886,7 @@ dependencies = [
  "turul-a2a-aws-lambda",
  "turul-a2a-proto",
  "turul-a2a-types",
+ "uuid",
 ]
 
 [[package]]
@@ -1910,6 +1906,7 @@ dependencies = [
  "turul-a2a-aws-lambda",
  "turul-a2a-proto",
  "turul-a2a-types",
+ "uuid",
 ]
 
 [[package]]
@@ -4130,6 +4127,7 @@ dependencies = [
  "aws-sdk-sqs",
  "aws_lambda_events",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "http 1.4.0",

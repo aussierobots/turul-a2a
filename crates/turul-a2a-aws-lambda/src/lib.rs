@@ -95,7 +95,9 @@ pub use scheduled_recovery::{
 pub use stream_recovery::LambdaStreamRecoveryHandler;
 
 #[cfg(feature = "sqs")]
-pub use durable::{LambdaEvent, SqsDurableExecutorQueue, classify_event, drive_sqs_batch};
+pub use durable::{
+    LambdaEvent, SqsDurableExecutorQueue, classify_event, drive_sqs_batch, run_mixed_http_and_sqs,
+};
 
 use std::sync::Arc;
 

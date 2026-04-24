@@ -24,6 +24,16 @@ pub struct MessageBuilder {
     context_id: String,
     task_id: String,
     metadata: Option<pbjson_types::Struct>,
+    // Request-root fields.
+    tenant: String,
+    // Fields on `SendMessageRequest.configuration`. The builder only
+    // emits a `Some(SendMessageConfiguration)` when one of these is
+    // populated; callers that never touch them see `configuration: None`
+    // on the wire.
+    return_immediately: bool,
+    accepted_output_modes: Vec<String>,
+    history_length: Option<i32>,
+    task_push_notification_config: Option<pb::TaskPushNotificationConfig>,
 }
 
 impl MessageBuilder {
@@ -35,6 +45,11 @@ impl MessageBuilder {
             context_id: String::new(),
             task_id: String::new(),
             metadata: None,
+            tenant: String::new(),
+            return_immediately: false,
+            accepted_output_modes: vec![],
+            history_length: None,
+            task_push_notification_config: None,
         }
     }
 
@@ -128,6 +143,73 @@ impl MessageBuilder {
         self
     }
 
+    /// Set the request-root `SendMessageRequest.tenant`.
+    pub fn tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = tenant.into();
+        self
+    }
+
+    /// Set `SendMessageConfiguration.return_immediately`. When `true`,
+    /// the server creates the task, returns `WORKING` immediately, and
+    /// continues executor work in the background.
+    pub fn return_immediately(mut self, flag: bool) -> Self {
+        self.return_immediately = flag;
+        self
+    }
+
+    /// Set `SendMessageConfiguration.accepted_output_modes`. Populates
+    /// the list in full; calling again replaces the previous value.
+    pub fn accepted_output_modes<I, S>(mut self, modes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.accepted_output_modes = modes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set `SendMessageConfiguration.history_length`. Preserves the
+    /// proto tri-state (unset = unbounded, `Some(0)` = empty,
+    /// `Some(n)` = last n messages); pass an `i32` to set, or call
+    /// [`Self::clear_history_length`] to unset after having set it.
+    pub fn history_length(mut self, n: i32) -> Self {
+        self.history_length = Some(n);
+        self
+    }
+
+    /// Unset `SendMessageConfiguration.history_length` (restore
+    /// unbounded default).
+    pub fn clear_history_length(mut self) -> Self {
+        self.history_length = None;
+        self
+    }
+
+    /// Set `SendMessageConfiguration.task_push_notification_config`
+    /// for inline (atomic) registration. `task_id` is left empty for
+    /// inline registration; the server assigns it during task
+    /// creation. `authentication` is left unset; use
+    /// [`Self::push_config`] for a pre-built struct when you need it.
+    pub fn inline_push_config(mut self, url: impl Into<String>, token: impl Into<String>) -> Self {
+        self.task_push_notification_config = Some(pb::TaskPushNotificationConfig {
+            tenant: String::new(),
+            id: String::new(),
+            task_id: String::new(),
+            url: url.into(),
+            token: token.into(),
+            authentication: None,
+        });
+        self
+    }
+
+    /// Set `SendMessageConfiguration.task_push_notification_config`
+    /// from a pre-built proto struct. Use this when you need to
+    /// populate `authentication` or pre-mint a config `id`;
+    /// [`Self::inline_push_config`] covers the 80% case.
+    pub fn push_config(mut self, cfg: pb::TaskPushNotificationConfig) -> Self {
+        self.task_push_notification_config = Some(cfg);
+        self
+    }
+
     /// Attach `Message.metadata` from a pre-built proto `Struct`.
     /// Lower-level than [`Self::metadata_json`] — use when the caller
     /// already holds a `pbjson_types::Struct` (e.g., passing through
@@ -140,6 +222,24 @@ impl MessageBuilder {
 
     /// Build the `SendMessageRequest`.
     pub fn build(self) -> pb::SendMessageRequest {
+        // Only emit `Some(SendMessageConfiguration)` when the caller
+        // actually populated one of its fields; otherwise the server
+        // sees `configuration: None` — behaviour-identical to the
+        // pre-0.1.15 builder for callers not touching these methods.
+        let has_config = self.return_immediately
+            || !self.accepted_output_modes.is_empty()
+            || self.history_length.is_some()
+            || self.task_push_notification_config.is_some();
+        let configuration = if has_config {
+            Some(pb::SendMessageConfiguration {
+                accepted_output_modes: self.accepted_output_modes,
+                task_push_notification_config: self.task_push_notification_config,
+                history_length: self.history_length,
+                return_immediately: self.return_immediately,
+            })
+        } else {
+            None
+        };
         pb::SendMessageRequest {
             message: Some(pb::Message {
                 message_id: self.message_id,
@@ -151,9 +251,9 @@ impl MessageBuilder {
                 extensions: vec![],
                 reference_task_ids: vec![],
             }),
-            configuration: None,
+            configuration,
             metadata: None,
-            tenant: String::new(),
+            tenant: self.tenant,
         }
     }
 }
@@ -259,6 +359,123 @@ mod tests {
             "second call must replace first"
         );
         assert!(!s.fields.contains_key("k1"));
+    }
+
+    #[test]
+    fn default_build_leaves_configuration_none() {
+        let req: pb::SendMessageRequest = MessageBuilder::new().text("hi").build();
+        assert!(req.configuration.is_none());
+        assert_eq!(req.tenant, "");
+    }
+
+    #[test]
+    fn tenant_sets_request_root() {
+        let req: pb::SendMessageRequest =
+            MessageBuilder::new().text("hi").tenant("tenant-a").build();
+        assert_eq!(req.tenant, "tenant-a");
+    }
+
+    #[test]
+    fn return_immediately_populates_configuration() {
+        let req: pb::SendMessageRequest = MessageBuilder::new()
+            .text("hi")
+            .return_immediately(true)
+            .build();
+        let cfg = req.configuration.expect("configuration set");
+        assert!(cfg.return_immediately);
+        assert!(cfg.accepted_output_modes.is_empty());
+        assert!(cfg.history_length.is_none());
+        assert!(cfg.task_push_notification_config.is_none());
+    }
+
+    #[test]
+    fn accepted_output_modes_populates_configuration() {
+        let req: pb::SendMessageRequest = MessageBuilder::new()
+            .text("hi")
+            .accepted_output_modes(["text/plain", "application/json"])
+            .build();
+        let cfg = req.configuration.expect("configuration set");
+        assert_eq!(
+            cfg.accepted_output_modes,
+            vec!["text/plain", "application/json"]
+        );
+    }
+
+    #[test]
+    fn history_length_preserves_tri_state() {
+        // history_length is tri-state on the proto: None / Some(0) / Some(n>0).
+        let req: pb::SendMessageRequest =
+            MessageBuilder::new().text("hi").history_length(0).build();
+        let cfg = req.configuration.expect("configuration set");
+        assert_eq!(cfg.history_length, Some(0), "Some(0) must round-trip");
+
+        let req_unset: pb::SendMessageRequest = MessageBuilder::new()
+            .text("hi")
+            .history_length(5)
+            .clear_history_length()
+            .build();
+        assert!(req_unset.configuration.is_none(), "cleared => no config");
+
+        let req_n: pb::SendMessageRequest =
+            MessageBuilder::new().text("hi").history_length(42).build();
+        let cfg = req_n.configuration.expect("configuration set");
+        assert_eq!(cfg.history_length, Some(42));
+    }
+
+    #[test]
+    fn inline_push_config_leaves_task_id_empty() {
+        let req: pb::SendMessageRequest = MessageBuilder::new()
+            .text("hi")
+            .inline_push_config("https://cb.example.test/webhook", "tok-1")
+            .build();
+        let cfg = req.configuration.expect("configuration set");
+        let push = cfg
+            .task_push_notification_config
+            .expect("inline push config set");
+        assert_eq!(push.url, "https://cb.example.test/webhook");
+        assert_eq!(push.token, "tok-1");
+        assert_eq!(
+            push.task_id, "",
+            "task_id is left empty for inline registration; the server assigns it during task creation"
+        );
+        assert_eq!(push.id, "");
+        assert_eq!(push.tenant, "");
+        assert!(push.authentication.is_none());
+    }
+
+    #[test]
+    fn push_config_raw_struct_passthrough() {
+        let custom = pb::TaskPushNotificationConfig {
+            tenant: String::new(),
+            id: "pre-minted-id".into(),
+            task_id: String::new(),
+            url: "https://cb.example.test/webhook".into(),
+            token: "tok-1".into(),
+            authentication: None,
+        };
+        let req: pb::SendMessageRequest =
+            MessageBuilder::new().text("hi").push_config(custom).build();
+        let cfg = req.configuration.expect("configuration set");
+        let push = cfg.task_push_notification_config.expect("push config set");
+        assert_eq!(push.id, "pre-minted-id");
+    }
+
+    #[test]
+    fn configuration_fields_compose() {
+        let req: pb::SendMessageRequest = MessageBuilder::new()
+            .text("hi")
+            .tenant("tenant-a")
+            .return_immediately(true)
+            .accepted_output_modes(["text/plain"])
+            .history_length(10)
+            .inline_push_config("https://cb.example.test/webhook", "tok-1")
+            .build();
+        assert_eq!(req.tenant, "tenant-a");
+        let cfg = req.configuration.expect("configuration set");
+        assert!(cfg.return_immediately);
+        assert_eq!(cfg.accepted_output_modes, vec!["text/plain"]);
+        assert_eq!(cfg.history_length, Some(10));
+        assert!(cfg.task_push_notification_config.is_some());
     }
 
     #[test]

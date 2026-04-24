@@ -474,3 +474,209 @@ async fn pending_dispatch_skipped_when_no_push_configs() {
         stale.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Payload-survival regression (reviewer pin):
+//
+// Prove that the original message text, task_id, and context_id
+// survive the HTTP enqueue -> dequeue -> executor hop intact. Without
+// this test the example executors can claim payload survival but the
+// framework has no pinned assertion — a silent regression could break
+// adopters relying on correlation keys arriving at the executor.
+//
+// Flow: core_send_message with return_immediately=true + a
+// capturing fake queue + a Message.metadata with two keys. Pull the
+// captured QueuedExecutorJob. Build a SpawnScope from its fields and
+// call run_queued_executor_job directly — the SQS Lambda handler
+// does this same thing under the hood on dequeue. Read the terminal
+// task and assert: text verbatim, task_id preserved, context_id
+// preserved, metadata keys observable (keys only, never values).
+// ---------------------------------------------------------------------------
+
+/// Echoing executor for the payload-survival test: same behaviour as
+/// the example executors (text + ids + metadata keys into a single
+/// text artifact), but lives inside the framework test suite so the
+/// assertion is independent of example code.
+struct EchoingExecutor;
+
+#[async_trait]
+impl AgentExecutor for EchoingExecutor {
+    async fn execute(
+        &self,
+        task: &mut Task,
+        msg: &Message,
+        ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        let text = msg.joined_text();
+        let keys = msg.metadata_keys();
+        let context_id = ctx.context_id.as_deref().unwrap_or("");
+        let body = format!(
+            "echoed | text={text} | task_id={task_id} | context_id={context_id} | metadata_keys=[{keys}]",
+            task_id = ctx.task_id,
+            keys = keys.join(","),
+        );
+        task.append_artifact(turul_a2a_types::Artifact::new(
+            "echo",
+            vec![turul_a2a_types::Part::text(body)],
+        ));
+        let mut proto = task.as_proto().clone();
+        proto.status = Some(turul_a2a_proto::TaskStatus {
+            state: turul_a2a_proto::TaskState::Completed.into(),
+            message: None,
+            timestamp: None,
+        });
+        *task = Task::try_from(proto).unwrap();
+        Ok(())
+    }
+
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        turul_a2a::card_builder::AgentCardBuilder::new("echo", "1.0.0")
+            .description("payload-survival echoing test executor")
+            .url("http://localhost", "JSONRPC", "1.0")
+            .default_input_modes(vec!["text/plain"])
+            .default_output_modes(vec!["text/plain"])
+            .build()
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn durable_path_preserves_text_task_id_and_context_id_across_enqueue_dequeue() {
+    // Distinctive probe text — if a regression drops the text somewhere
+    // between HTTP enqueue and executor, this specific string goes
+    // missing in the artifact assertion.
+    const PROBE_TEXT: &str = "payload-survival-probe-4242";
+
+    let (queue, captured) = FakeQueue::new(256 * 1024);
+    let executor: Arc<dyn AgentExecutor> = Arc::new(EchoingExecutor);
+    let state = state_with_queue(executor, queue);
+    let task_storage = state.task_storage.clone();
+
+    // HTTP enqueue path with return_immediately=true + a Message.metadata
+    // containing two correlation keys. Values are distinctive enough
+    // that a leak would be visible.
+    let body = serde_json::json!({
+        "message": {
+            "messageId": "probe-1",
+            "role": "ROLE_USER",
+            "parts": [{"text": PROBE_TEXT, "mediaType": "text/plain"}],
+            "metadata": {
+                "trigger_id": "trig-4242",
+                "attempt": 1,
+            }
+        },
+        "configuration": {"returnImmediately": true},
+    })
+    .to_string();
+    let response = turul_a2a::router::core_send_message(state.clone(), "", "anonymous", None, body)
+        .await
+        .expect("send");
+    let response_json = response.0;
+    let task_id_from_http = response_json
+        .pointer("/task/id")
+        .and_then(|v| v.as_str())
+        .expect("task.id in response")
+        .to_string();
+    let context_id_from_http = response_json
+        .pointer("/task/contextId")
+        .and_then(|v| v.as_str())
+        .expect("task.contextId in response")
+        .to_string();
+
+    // Pull the captured envelope. This IS what SQS would carry on a
+    // real deployment.
+    let jobs = captured.lock().await;
+    assert_eq!(jobs.len(), 1, "exactly one job enqueued");
+    let job = jobs[0].clone();
+    drop(jobs);
+
+    // Envelope-level assertions (wire-shape of what crosses SQS).
+    assert_eq!(job.version, QueuedExecutorJob::VERSION);
+    assert_eq!(
+        job.task_id, task_id_from_http,
+        "enqueued task_id matches HTTP response"
+    );
+    assert_eq!(job.context_id, context_id_from_http);
+    assert_eq!(job.tenant, "");
+    assert_eq!(job.owner, "anonymous");
+    let enqueued_text = job
+        .message
+        .parts
+        .iter()
+        .filter_map(|p| match &p.content {
+            Some(turul_a2a_proto::part::Content::Text(t)) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(enqueued_text, PROBE_TEXT, "text survived HTTP -> envelope");
+
+    // Dequeue path: build SpawnScope from the envelope, call
+    // run_queued_executor_job directly — same function the Lambda SQS
+    // handler invokes per record.
+    use turul_a2a::server::spawn::{SpawnDeps, SpawnScope, run_queued_executor_job};
+    let deps = SpawnDeps {
+        executor: state.executor.clone(),
+        task_storage: state.task_storage.clone(),
+        atomic_store: state.atomic_store.clone(),
+        event_broker: state.event_broker.clone(),
+        in_flight: state.in_flight.clone(),
+        push_dispatcher: state.push_dispatcher.clone(),
+    };
+    let scope = SpawnScope {
+        tenant: job.tenant.clone(),
+        owner: job.owner.clone(),
+        task_id: job.task_id.clone(),
+        context_id: job.context_id.clone(),
+        message: Message::try_from(job.message.clone()).expect("message round-trips"),
+        claims: job.claims.clone(),
+    };
+    run_queued_executor_job(deps, scope).await;
+
+    // Read the terminal task. Artifact must contain the exact probe
+    // text + task_id + context_id + metadata KEYS (not values).
+    let task = task_storage
+        .get_task("", &task_id_from_http, "anonymous", None)
+        .await
+        .expect("get_task")
+        .expect("task exists");
+    assert_eq!(
+        task.status().unwrap().state().unwrap(),
+        TaskState::Completed,
+        "terminal state is Completed after dequeue-side executor run"
+    );
+
+    let artifact = &task.artifacts()[0];
+    let artifact_text = artifact
+        .parts
+        .iter()
+        .filter_map(|p| match &p.content {
+            Some(turul_a2a_proto::part::Content::Text(t)) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+
+    // Positive assertions: the three ids + text all survived.
+    assert!(
+        artifact_text.contains(PROBE_TEXT),
+        "artifact must contain probe text verbatim; got {artifact_text:?}"
+    );
+    assert!(
+        artifact_text.contains(&task_id_from_http),
+        "artifact must contain the task_id HTTP returned; got {artifact_text:?}"
+    );
+    assert!(
+        artifact_text.contains(&context_id_from_http),
+        "artifact must contain context_id; got {artifact_text:?}"
+    );
+    assert!(
+        artifact_text.contains("trigger_id") && artifact_text.contains("attempt"),
+        "artifact must mention metadata keys; got {artifact_text:?}"
+    );
+
+    // Negative assertions: metadata VALUES are NOT surfaced in the
+    // artifact or log (the demo guardrail — keys only, no values).
+    assert!(
+        !artifact_text.contains("trig-4242"),
+        "artifact must NOT contain metadata VALUE 'trig-4242' (keys-only guardrail); got {artifact_text:?}"
+    );
+}

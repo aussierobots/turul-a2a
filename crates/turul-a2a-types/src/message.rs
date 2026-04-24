@@ -215,6 +215,43 @@ impl Message {
         &self.inner.message_id
     }
 
+    /// Context id, or empty string if unset. Proto default for the
+    /// `context_id` field is the empty string, not `null`.
+    pub fn context_id(&self) -> &str {
+        &self.inner.context_id
+    }
+
+    /// Task id the message is bound to, or empty string if unset.
+    /// Callers making a fresh request leave this empty; continuations
+    /// set it to the existing task's id.
+    pub fn task_id(&self) -> &str {
+        &self.inner.task_id
+    }
+
+    /// Borrow the raw `Message.metadata` proto struct. Prefer
+    /// [`Self::metadata_keys`] for the common "which correlation fields
+    /// arrived" check; drop to this accessor when you need to read
+    /// specific values.
+    pub fn metadata(&self) -> Option<&pb::pbjson_types::Struct> {
+        self.inner.metadata.as_ref()
+    }
+
+    // `pb::pbjson_types` is re-exported from `turul_a2a_proto` so
+    // adopters don't need to depend on `pbjson_types` directly.
+
+    /// Sorted list of keys present on `Message.metadata`. Returns an
+    /// empty vec if `metadata` is unset. Convenient for log lines and
+    /// demo-level "which correlation fields did the caller supply"
+    /// inspection without exposing the values themselves.
+    pub fn metadata_keys(&self) -> Vec<String> {
+        let Some(s) = self.inner.metadata.as_ref() else {
+            return Vec::new();
+        };
+        let mut keys: Vec<String> = s.fields.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     /// Returns individual text parts, preserving part boundaries.
     /// This is the primary safe accessor for message text content.
     /// Callers decide how to combine parts.

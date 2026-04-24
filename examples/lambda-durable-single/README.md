@@ -12,17 +12,13 @@ Verified end-to-end on AWS `ap-southeast-2` (2026-04-25): HTTP `returnImmediatel
 4. Because the function is deployed with `ReservedConcurrency=1`, AWS uses the same (now warm) container. The worker's `handle_sqs` path loads the task from the container's `InMemoryA2aStorage`, runs the executor, commits `COMPLETED`.
 5. A subsequent `GET /tasks/{id}` shows the terminal artifact.
 
-The dual-event routing is a ten-line `match` in `main.rs`:
+The dual-event routing is now one call in `main.rs`:
 
 ```rust
-match turul_a2a_aws_lambda::classify_event(&value) {
-    RoutedEvent::Sqs   => handler.handle_sqs(sqs_event).await,
-    RoutedEvent::Http  => http_invoke(&handler, value).await,
-    RoutedEvent::Unknown => Err(...),
-}
+turul_a2a_aws_lambda::run_mixed_http_and_sqs(handler).await
 ```
 
-Because `lambda_runtime::run` is generic over the event type (unlike `lambda_http::run`, which is HTTP-only), `main.rs` open-codes ~30 lines of HTTP envelope conversion (`lambda_http::request::LambdaRequest` → `http::Request<Body>` → dispatch → `ApiGatewayV2httpResponse`). That's the boilerplate `lambda_http::run` normally hides — see ADR-018 §"Event dispatch".
+Since 0.1.15, `run_mixed_http_and_sqs` (gated on the `sqs` feature) hides the HTTP envelope conversion and the `classify_event`-based dispatch loop. Earlier revisions of this example open-coded ~80 lines of `LambdaRequest` → `http::Request<Body>` / `ApiGatewayV2httpResponse` plumbing directly in `main.rs` — all of that now lives in the framework. `main.rs` is down to ~15 lines of wiring (storage + executor + queue URL + the helper call).
 
 ## When to use this vs the two-Lambda example
 
@@ -136,23 +132,44 @@ echo "FN_URL=$FN_URL"
 ## Try it
 
 ```bash
-# 1. Fire the HTTP request.
+# 1. Fire the HTTP request with a distinctive probe text + metadata.
+PROBE="payload-survival-probe-$(date +%s)"
 RESP=$(curl -sS -X POST "$FN_URL/message:send" \
   -H 'a2a-version: 1.0' \
   -H 'content-type: application/json' \
-  -d '{
-    "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hello"}]},
-    "configuration": {"returnImmediately": true}
-  }')
+  -d "{
+    \"message\": {
+      \"messageId\": \"m1\",
+      \"role\": \"ROLE_USER\",
+      \"parts\": [{\"text\": \"$PROBE\"}],
+      \"metadata\": {\"trigger_id\": \"trig-$PROBE\", \"attempt\": 1}
+    },
+    \"configuration\": {\"returnImmediately\": true}
+  }")
 echo "$RESP" | jq .
 TASK_ID=$(echo "$RESP" | jq -r .task.id)
+CONTEXT_ID=$(echo "$RESP" | jq -r .task.contextId)
 
 # 2. Wait for the SQS trigger + executor run.
 sleep 8
 
-# 3. Verify: task should be COMPLETED with the echo artifact.
-curl -sS "$FN_URL/tasks/$TASK_ID" -H 'a2a-version: 1.0' | jq '{state: .task.status.state, artifact: .task.artifacts[0].parts[0].text}'
-# → {"state": "TASK_STATE_COMPLETED", "artifact": "Hello from the SQS-invoked executor!"}
+# 3. Verify the payload survived HTTP → SQS → dequeue → executor:
+#    state=COMPLETED, artifact echoes the probe text, task_id, context_id, and metadata keys.
+curl -sS "$FN_URL/tasks/$TASK_ID" -H 'a2a-version: 1.0' \
+  | jq '{state: .task.status.state, artifact: .task.artifacts[0].parts[0].text}'
+# → {
+#     "state": "TASK_STATE_COMPLETED",
+#     "artifact": "echoed from durable executor\n  text: payload-survival-probe-…\n  task_id: … context_id: …\n  metadata_keys: [attempt, trigger_id]"
+#   }
+
+# 4. Assert that the artifact text contains the probe + task_id + context_id +
+#    metadata KEYS (values must not leak — see ADR-018 follow-on guardrail).
+ART=$(curl -sS "$FN_URL/tasks/$TASK_ID" -H 'a2a-version: 1.0' | jq -r '.task.artifacts[0].parts[0].text')
+echo "$ART" | grep -q "$PROBE"      && echo "OK probe text"    || echo "MISSING probe text"
+echo "$ART" | grep -q "$TASK_ID"    && echo "OK task_id"       || echo "MISSING task_id"
+echo "$ART" | grep -q "$CONTEXT_ID" && echo "OK context_id"    || echo "MISSING context_id"
+echo "$ART" | grep -q "trigger_id"  && echo "OK metadata keys" || echo "MISSING metadata keys"
+echo "$ART" | grep -q "trig-"       && echo "LEAK value!"      || echo "OK values not echoed"
 
 # 4. Zero ERRORs in the log:
 aws logs tail /aws/lambda/turul-a2a-durable-single --since 3m --format short

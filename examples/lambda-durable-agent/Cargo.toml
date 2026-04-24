@@ -22,5 +22,6 @@ tokio = { workspace = true }
 lambda_http = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-sqs = { workspace = true }
+uuid = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

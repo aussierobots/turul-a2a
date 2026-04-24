@@ -17,13 +17,8 @@ turul-a2a-proto = { path = "../../crates/turul-a2a-proto" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 lambda_runtime = { workspace = true }
-lambda_http = { workspace = true }
-aws_lambda_events = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-sqs = { workspace = true }
-http = { workspace = true }
-http-body-util = { workspace = true }
-serde_json = { workspace = true }
-base64 = { workspace = true }
+uuid = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

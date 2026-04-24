@@ -279,27 +279,42 @@ Plus `AWSLambdaBasicExecutionRole` for CloudWatch Logs.
 ## Try it
 
 ```bash
-# 1. Fire the HTTP request.
+# 1. Fire the HTTP request with a distinctive probe text + metadata.
+PROBE="payload-survival-probe-$(date +%s)"
 RESP=$(curl -sS -X POST "$FN_URL/message:send" \
   -H 'a2a-version: 1.0' \
   -H 'content-type: application/json' \
-  -d '{
-    "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hello durable executor"}]},
-    "configuration": {"returnImmediately": true}
-  }')
+  -d "{
+    \"message\": {
+      \"messageId\": \"m1\",
+      \"role\": \"ROLE_USER\",
+      \"parts\": [{\"text\": \"$PROBE\"}],
+      \"metadata\": {\"trigger_id\": \"trig-$PROBE\", \"attempt\": 1}
+    },
+    \"configuration\": {\"returnImmediately\": true}
+  }")
 echo "$RESP" | jq .
 TASK_ID=$(echo "$RESP" | jq -r .task.id)
+CONTEXT_ID=$(echo "$RESP" | jq -r .task.contextId)
 
 # 2. Wait for SQS → worker → DynamoDB commit.
 sleep 8
 
-# 3. Verify — task should be COMPLETED with the echo artifact attached.
+# 3. Verify the payload survived HTTP → SQS → worker → executor:
+#    state=COMPLETED, artifact echoes the probe text, task_id, context_id, and metadata keys.
 curl -sS "$FN_URL/tasks/$TASK_ID" -H 'a2a-version: 1.0' \
   | jq '{state: .task.status.state, artifact: .task.artifacts[0].parts[0].text}'
-# → {"state": "TASK_STATE_COMPLETED",
-#    "artifact": "Hello from the SQS-invoked executor!"}
 
-# 4. Clean worker log — no ERRORs on the happy path.
+# 4. Assert the artifact contains the probe + task_id + context_id + metadata KEYS;
+#    metadata values must NOT leak into the artifact (keys-only guardrail).
+ART=$(curl -sS "$FN_URL/tasks/$TASK_ID" -H 'a2a-version: 1.0' | jq -r '.task.artifacts[0].parts[0].text')
+echo "$ART" | grep -q "$PROBE"      && echo "OK probe text"    || echo "MISSING probe text"
+echo "$ART" | grep -q "$TASK_ID"    && echo "OK task_id"       || echo "MISSING task_id"
+echo "$ART" | grep -q "$CONTEXT_ID" && echo "OK context_id"    || echo "MISSING context_id"
+echo "$ART" | grep -q "trigger_id"  && echo "OK metadata keys" || echo "MISSING metadata keys"
+echo "$ART" | grep -q "trig-"       && echo "LEAK value!"      || echo "OK values not echoed"
+
+# 5. Clean worker log — no ERRORs on the happy path.
 aws logs tail /aws/lambda/turul-a2a-durable-worker --since 3m --format short
 aws logs tail /aws/lambda/turul-a2a-durable-agent  --since 3m --format short
 ```

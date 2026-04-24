@@ -55,14 +55,30 @@ impl AgentExecutor for DurableEchoExecutor {
     async fn execute(
         &self,
         task: &mut Task,
-        _msg: &Message,
-        _ctx: &ExecutionContext,
+        msg: &Message,
+        ctx: &ExecutionContext,
     ) -> Result<(), A2aError> {
-        task.push_text_artifact(
-            "durable-echo",
-            "Durable Echo",
-            "Hello from the SQS-invoked executor!",
+        let text = msg.joined_text();
+        let metadata_keys = msg.metadata_keys();
+        let context_id = ctx.context_id.as_deref().unwrap_or("");
+
+        tracing::info!(
+            task_id = %ctx.task_id,
+            context_id = %context_id,
+            text = %text,
+            metadata_keys = ?metadata_keys,
+            "durable executor echoed incoming payload"
         );
+
+        let body = format!(
+            "echoed from durable executor\n  text: {text}\n  task_id: {task_id} context_id: {context_id}\n  metadata_keys: [{keys}]",
+            task_id = ctx.task_id,
+            keys = metadata_keys.join(", "),
+        );
+        task.append_artifact(turul_a2a_types::Artifact::new(
+            "durable-echo",
+            vec![turul_a2a_types::Part::text(body)],
+        ));
         task.complete();
         Ok(())
     }
@@ -71,7 +87,10 @@ impl AgentExecutor for DurableEchoExecutor {
         AgentCardBuilder::new("Durable Echo Agent", "0.1.0")
             .description(
                 "ADR-018 demo: Lambda durable executor continuation via SQS. \
-                 HTTP invocation enqueues; SQS invocation runs the executor.",
+                 HTTP invocation enqueues; SQS invocation runs the executor. \
+                 Executor echoes the incoming text, task_id, context_id, and \
+                 metadata keys so the payload-survival invariant is visible \
+                 in the task's artifact.",
             )
             .url("https://lambda.example.com", "JSONRPC", "1.0")
             .default_input_modes(vec!["text/plain"])

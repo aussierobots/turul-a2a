@@ -23,6 +23,26 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   let req = MessageBuilder::new().data(req).metadata_json(corrs).build();
   ```
 
+### Added — mixed-event dispatch helper + builder configuration shape
+
+- **`turul-a2a-aws-lambda::run_mixed_http_and_sqs`** (gated on `sqs`) — one-liner adopter API for Lambdas that serve both HTTP (Function URL / API Gateway v2) and SQS on the same function. Wraps `LambdaA2aHandler` in `Arc`, drives `lambda_runtime::run(service_fn(...))` with the crate-internal `classify_event`, and routes HTTP events through the envelope-conversion helper and SQS events through `LambdaA2aHandler::handle_sqs`. Lets single-Lambda topologies (`ReservedConcurrency=1` demo, adopter-specific shapes) replace ~80 lines of open-coded envelope plumbing with a single call. The `examples/lambda-durable-single` main.rs is now ~15 lines of wiring.
+
+- **`turul-a2a-client::MessageBuilder` configuration-shape methods** — the builder now reaches the `SendMessageRequest.configuration` fields that were previously only accessible by dropping to raw proto literals:
+  - `tenant(impl Into<String>)` — request-root tenant.
+  - `return_immediately(bool)` — configuration flag.
+  - `accepted_output_modes(impl IntoIterator<Item = impl Into<String>>)` — configuration list.
+  - `history_length(i32)` / `clear_history_length()` — preserves proto tri-state (None / 0 / n).
+  - `inline_push_config(url, token)` — 80%-case inline `TaskPushNotificationConfig`; leaves `task_id` empty for server assignment during atomic registration.
+  - `push_config(pb::TaskPushNotificationConfig)` — raw-struct passthrough for adopters who need `authentication` or a pre-minted id.
+  - `build()` emits `Some(SendMessageConfiguration)` only when any field is non-default, so callers not touching these methods see no wire change.
+
+- **`turul-a2a-types::Message` wrapper accessors** — `context_id()`, `task_id()`, `metadata()`, `metadata_keys()`. Covers the repeated `msg.as_proto().context_id` / `msg.as_proto().metadata.as_ref().map(...)` patterns without forcing adopters into `as_proto()`. `metadata_keys()` returns a sorted `Vec<String>` of the top-level metadata keys (values intentionally not exposed — adopters who want values reach for `metadata()`).
+
+### Tests
+
+- `crates/turul-a2a/tests/adr018_tests.rs::durable_path_preserves_text_task_id_and_context_id_across_enqueue_dequeue` — automated payload-survival regression. Captures the `QueuedExecutorJob` enqueued by `core_send_message` with `return_immediately=true`, drives `run_queued_executor_job` directly, and asserts the terminal artifact contains the probe text + task id + context id + metadata keys — with a negative assertion that metadata values never leak into the artifact.
+- 2 new unit tests for the HTTP envelope helper in `crates/turul-a2a-aws-lambda/src/durable.rs` (agent-card round-trip + unknown-shape rejection).
+
 ### Added — earlier on 0.1.14 (examples, not in the release contract)
 
 - `examples/lambda-durable-agent` + `examples/lambda-durable-worker` — ADR-018 production-shape demo (two Lambdas + shared DynamoDB + `examples/lambda-infra/cloudformation.yaml`).
