@@ -72,7 +72,11 @@ The demo uses **SSE-SQS** — SQS-owned key, no KMS calls, no per-request charge
 | `KmsMasterKeyId: alias/aws/sqs` | **SSE-KMS, AWS-managed key** | KMS request charges (~$0.03 / 10k requests) + CloudTrail audit-trail visibility | When you want a KMS audit trail without managing a CMK. |
 | `KmsMasterKeyId: <your CMK ARN>` | **SSE-KMS, customer-managed key** | CMK monthly fee + request charges | **ADR-018 §Security recommendation for tenant-sensitive deployments.** Lets you rotate keys and grant/revoke access per your IAM posture. |
 
-If you swap in a CMK, the Lambda execution role also needs `kms:Decrypt` on the key for the consumer (worker) and `kms:GenerateDataKey` for the producer (agent). `alias/aws/sqs` uses an AWS-scoped policy so no additional grants are needed. `SqsManagedSseEnabled` needs no KMS IAM at all.
+**Cost rider.** `SqsManagedSseEnabled: true` is the only option with zero encryption-related charges — SQS uses its own keys, no `kms:*` calls, no per-request KMS fees, no CMK monthly. Both `KmsMasterKeyId` options go through KMS and attract the usual KMS pricing (request charges for every `SendMessage`/`ReceiveMessage`, plus the CMK monthly fee if you own the key).
+
+**Why set it explicitly.** New SQS queues currently default to SSE-SQS, but the default can drift with AWS policy changes. Writing `SqsManagedSseEnabled: true` into your IaC / setup commands locks the "no-KMS-cost" posture in source so a future default flip won't quietly opt you into KMS charges.
+
+**IAM rider.** If you swap in a CMK, the Lambda execution role also needs `kms:Decrypt` on the key for the consumer (worker) and `kms:GenerateDataKey` for the producer (agent). `alias/aws/sqs` uses an AWS-scoped policy so no additional grants are needed. `SqsManagedSseEnabled` needs no KMS IAM at all.
 
 ### 2. Build both Lambda bundles
 
