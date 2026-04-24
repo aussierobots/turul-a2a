@@ -23,6 +23,42 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   let req = MessageBuilder::new().data(req).metadata_json(corrs).build();
   ```
 
+### Fixed — `handle_http_event_value` emits the matching response shape
+
+`LambdaA2aHandler::handle_http_event_value` previously hardcoded the
+response envelope as `ApiGatewayV2httpResponse`. Adopters whose
+Lambda sat behind a REST API Gateway (`AWS::ApiGateway::RestApi` with
+`AWS_PROXY` integration) received a v2 response shape for a v1
+invocation, which API Gateway rejected with `502 Bad Gateway` —
+agent-card discovery, `/message:send`, and every other route returned
+502 against REST v1 deployments.
+
+The method now detects the inbound shape via
+`lambda_http::request::LambdaRequest` and emits the matching
+envelope:
+
+| Inbound shape                                       | Response envelope             |
+|-----------------------------------------------------|-------------------------------|
+| API Gateway v1 (REST) — top-level `httpMethod`/`path` | `ApiGatewayProxyResponse`     |
+| API Gateway v2 / Function URL — `requestContext.http` | `ApiGatewayV2httpResponse`    |
+| ALB target group — `requestContext.elb`             | `AlbTargetGroupResponse`      |
+| WebSocket / unrecognised                             | `Err(...)`                    |
+
+Five new regression tests in
+`crates/turul-a2a-aws-lambda/src/lib.rs::handle_http_event_value_shape_tests`
+pin the contract: REST v1 in / REST v1 out (the live-fleet 502
+regression), v2 in / v2 out, ALB in / ALB out, the wire-distinguishability
+of v1 vs v2 envelopes, and the realistic stage-prefixed `/dev/...`
+path combined with `strip_path_prefix("/dev")` on the handler — all
+emitting v1-shaped responses.
+
+This also corrects the same bug for `LambdaA2aHandler::run_http_and_sqs`,
+which dispatches HTTP events through `handle_http_event_value`
+internally, and for any adopter composition that calls
+`handler.handle_http_event_value(value)` directly. `run_http_only`
+was unaffected because it dispatches through `lambda_http::run`,
+which has shape-aware response handling of its own.
+
 ### Added — HTTP envelope primitive + classifier exposed for composition
 
 Adopters whose single Lambda receives HTTP plus one non-framework

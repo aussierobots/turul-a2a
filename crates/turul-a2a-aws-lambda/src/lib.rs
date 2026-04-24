@@ -688,7 +688,22 @@ impl LambdaA2aHandler {
     }
 
     /// Handle a raw Lambda HTTP event delivered as `serde_json::Value`
-    /// and return the API Gateway v2 / Function URL response JSON.
+    /// and return a response envelope **matching the inbound event
+    /// shape**:
+    ///
+    /// | Inbound shape detected by `lambda_http::LambdaRequest`   | Response envelope                  |
+    /// |----------------------------------------------------------|------------------------------------|
+    /// | API Gateway v1 (REST) — top-level `httpMethod` + `path`  | `ApiGatewayProxyResponse`          |
+    /// | API Gateway v2 / Function URL — `requestContext.http`    | `ApiGatewayV2httpResponse`         |
+    /// | ALB target group — `requestContext.elb`                  | `AlbTargetGroupResponse`           |
+    /// | WebSocket / unrecognised                                  | `Err(...)`                         |
+    ///
+    /// Mismatching envelopes — most commonly a v2 response sent in
+    /// response to a v1 invocation — cause API Gateway to return
+    /// `502 Bad Gateway` regardless of the body, because the response
+    /// fails the gateway's contract validation. This method ensures
+    /// symmetry: response shape is always picked from the inbound
+    /// shape, never hardcoded.
     ///
     /// This is the framework's canonical HTTP envelope conversion
     /// primitive — useful when a single Lambda function routes among
@@ -696,8 +711,7 @@ impl LambdaA2aHandler {
     /// DynamoDB streams, custom invoke) and the adopter drives
     /// [`lambda_runtime::run`] with `serde_json::Value` directly.
     /// Handles the `LambdaRequest` deserialization, the text-vs-base64
-    /// content-type detection, and the `ApiGatewayV2httpResponse`
-    /// rebuild.
+    /// content-type detection, and the response envelope rebuild.
     ///
     /// Body encoding: text for `text/*`, `application/json`,
     /// `application/xml`, `application/javascript`, or anything with
@@ -718,6 +732,25 @@ impl LambdaA2aHandler {
 
         let lambda_req: lambda_http::request::LambdaRequest = serde_json::from_value(value)
             .map_err(|e| lambda_runtime::Error::from(format!("invalid HTTP event: {e}")))?;
+
+        // Capture the inbound shape so we can emit the matching
+        // response envelope. Lost once we convert to `lambda_http::Request`.
+        let shape = match &lambda_req {
+            lambda_http::request::LambdaRequest::ApiGatewayV1(_) => HttpEventShape::ApiGatewayV1,
+            lambda_http::request::LambdaRequest::ApiGatewayV2(_) => HttpEventShape::ApiGatewayV2,
+            lambda_http::request::LambdaRequest::Alb(_) => HttpEventShape::Alb,
+            lambda_http::request::LambdaRequest::WebSocket(_) => {
+                return Err(lambda_runtime::Error::from(
+                    "WebSocket Lambda events are not supported by this adapter",
+                ));
+            }
+            _ => {
+                return Err(lambda_runtime::Error::from(
+                    "unsupported Lambda HTTP event variant",
+                ));
+            }
+        };
+
         let req: lambda_http::Request = lambda_req.into();
 
         let resp = self
@@ -761,16 +794,57 @@ impl LambdaA2aHandler {
             )
         };
 
-        let mut api_resp = aws_lambda_events::apigw::ApiGatewayV2httpResponse::default();
-        api_resp.status_code = parts.status.as_u16() as i64;
-        api_resp.headers = parts.headers;
-        api_resp.body = body_str.map(aws_lambda_events::encodings::Body::Text);
-        api_resp.is_base64_encoded = is_base64;
+        let status = parts.status.as_u16() as i64;
+        let headers = parts.headers;
+        let body_lambda = body_str.map(aws_lambda_events::encodings::Body::Text);
 
-        serde_json::to_value(api_resp)
-            .map_err(|e| lambda_runtime::Error::from(format!("serialise HTTP response: {e}")))
+        match shape {
+            HttpEventShape::ApiGatewayV1 => {
+                let mut api_resp = aws_lambda_events::apigw::ApiGatewayProxyResponse::default();
+                api_resp.status_code = status;
+                api_resp.headers = headers;
+                api_resp.body = body_lambda;
+                api_resp.is_base64_encoded = is_base64;
+                serde_json::to_value(api_resp).map_err(|e| {
+                    lambda_runtime::Error::from(format!("serialise APIGW v1 response: {e}"))
+                })
+            }
+            HttpEventShape::ApiGatewayV2 => {
+                let mut api_resp = aws_lambda_events::apigw::ApiGatewayV2httpResponse::default();
+                api_resp.status_code = status;
+                api_resp.headers = headers;
+                api_resp.body = body_lambda;
+                api_resp.is_base64_encoded = is_base64;
+                serde_json::to_value(api_resp).map_err(|e| {
+                    lambda_runtime::Error::from(format!("serialise APIGW v2 response: {e}"))
+                })
+            }
+            HttpEventShape::Alb => {
+                let mut api_resp = aws_lambda_events::alb::AlbTargetGroupResponse::default();
+                api_resp.status_code = status;
+                api_resp.headers = headers;
+                api_resp.body = body_lambda;
+                api_resp.is_base64_encoded = is_base64;
+                serde_json::to_value(api_resp).map_err(|e| {
+                    lambda_runtime::Error::from(format!("serialise ALB response: {e}"))
+                })
+            }
+        }
     }
+}
 
+/// Inbound HTTP event shape detected by [`LambdaA2aHandler::handle_http_event_value`].
+///
+/// The response envelope must match the inbound shape — see method
+/// docs for the contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpEventShape {
+    ApiGatewayV1,
+    ApiGatewayV2,
+    Alb,
+}
+
+impl LambdaA2aHandler {
     /// Handle an SQS batch from the durable executor queue (ADR-018).
     ///
     /// Returns `SqsBatchResponse` whose `batch_item_failures` list
@@ -831,5 +905,324 @@ impl LambdaA2aServerBuilder {
             lambda_runtime::Error::from(format!("LambdaA2aServerBuilder::run: {e}"))
         })?;
         handler.run().await
+    }
+}
+
+#[cfg(test)]
+mod handle_http_event_value_shape_tests {
+    //! Regression tests for the event-shape symmetry contract on
+    //! [`LambdaA2aHandler::handle_http_event_value`]. The wire-shape
+    //! mismatch (v2 response to a v1 invocation) is what causes API
+    //! Gateway REST integrations to return `502 Bad Gateway`. These
+    //! tests pin the contract: response envelope must always match
+    //! the inbound request envelope.
+
+    use super::*;
+    use std::sync::Arc;
+    use turul_a2a::executor::{AgentExecutor, ExecutionContext};
+    use turul_a2a::server::RuntimeConfig;
+    use turul_a2a::server::in_flight::InFlightRegistry;
+    use turul_a2a::storage::InMemoryA2aStorage;
+    use turul_a2a::streaming::TaskEventBroker;
+    use turul_a2a_types::{Message, Task};
+
+    struct NoOpExecutor;
+
+    #[async_trait::async_trait]
+    impl AgentExecutor for NoOpExecutor {
+        async fn execute(
+            &self,
+            task: &mut Task,
+            _msg: &Message,
+            _ctx: &ExecutionContext,
+        ) -> Result<(), turul_a2a::error::A2aError> {
+            let mut proto = task.as_proto().clone();
+            proto.status = Some(turul_a2a_proto::TaskStatus {
+                state: turul_a2a_proto::TaskState::Completed.into(),
+                message: None,
+                timestamp: None,
+            });
+            *task = Task::try_from(proto).unwrap();
+            Ok(())
+        }
+        fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+            turul_a2a_proto::AgentCard {
+                name: "test-agent".to_string(),
+                ..Default::default()
+            }
+        }
+    }
+
+    fn build_handler() -> LambdaA2aHandler {
+        let s = Arc::new(InMemoryA2aStorage::new());
+        let state = AppState {
+            executor: Arc::new(NoOpExecutor),
+            task_storage: s.clone(),
+            push_storage: s.clone(),
+            event_store: s.clone(),
+            atomic_store: s.clone(),
+            event_broker: TaskEventBroker::new(),
+            middleware_stack: Arc::new(MiddlewareStack::new(vec![])),
+            runtime_config: RuntimeConfig::default(),
+            in_flight: Arc::new(InFlightRegistry::new()),
+            cancellation_supervisor: s.clone(),
+            push_delivery_store: None,
+            push_dispatcher: None,
+            durable_executor_queue: None,
+        };
+        let router = build_router(state.clone());
+        LambdaA2aHandler {
+            router,
+            state,
+            path_prefix: None,
+        }
+    }
+
+    /// API Gateway v2 / Function URL event. `requestContext.http.method`
+    /// is what `LambdaRequest::ApiGatewayV2` keys off.
+    fn apigw_v2_agent_card_get() -> serde_json::Value {
+        serde_json::json!({
+            "version": "2.0",
+            "routeKey": "GET /.well-known/agent-card.json",
+            "rawPath": "/.well-known/agent-card.json",
+            "rawQueryString": "",
+            "headers": {"accept": "application/json", "a2a-version": "1.0"},
+            "requestContext": {
+                "accountId": "000000000000",
+                "apiId": "api",
+                "domainName": "fake.execute-api",
+                "domainPrefix": "fake",
+                "http": {
+                    "method": "GET",
+                    "path": "/.well-known/agent-card.json",
+                    "protocol": "HTTP/1.1",
+                    "sourceIp": "127.0.0.1",
+                    "userAgent": "test"
+                },
+                "requestId": "rid",
+                "routeKey": "GET /.well-known/agent-card.json",
+                "stage": "$default",
+                "time": "01/Jan/2026:00:00:00 +0000",
+                "timeEpoch": 1_735_689_600_000i64
+            },
+            "isBase64Encoded": false
+        })
+    }
+
+    /// API Gateway v1 (REST) event. Top-level `httpMethod` + `path` and
+    /// `requestContext.identity` (no `requestContext.http`) is what
+    /// `LambdaRequest::ApiGatewayV1` keys off. This is the shape REST
+    /// API + AWS_PROXY integrations send into the Lambda — the live
+    /// fleet topology that 502'd against a hardcoded v2 response.
+    ///
+    /// `stage` is `$default` here so `lambda_http` does not prepend a
+    /// stage prefix — this fixture exists to pin the response-shape
+    /// contract, not the path-rewriting behaviour. See the
+    /// `strip_path_prefix_*` tests for stage-prefix coverage.
+    fn apigw_v1_agent_card_get_with_stage(stage: &str, path: &str) -> serde_json::Value {
+        let request_context_path = if stage == "$default" {
+            path.to_string()
+        } else {
+            format!("/{stage}{path}")
+        };
+        serde_json::json!({
+            "resource": "/{proxy+}",
+            "path": path,
+            "httpMethod": "GET",
+            "headers": {"accept": "application/json", "a2a-version": "1.0"},
+            "multiValueHeaders": {},
+            "queryStringParameters": null,
+            "multiValueQueryStringParameters": null,
+            "pathParameters": {"proxy": path.trim_start_matches('/').to_string()},
+            "stageVariables": null,
+            "requestContext": {
+                "accountId": "000000000000",
+                "apiId": "abc123",
+                "domainName": "fake.execute-api",
+                "domainPrefix": "fake",
+                "extendedRequestId": "xrid",
+                "httpMethod": "GET",
+                "identity": {
+                    "sourceIp": "127.0.0.1",
+                    "userAgent": "test"
+                },
+                "path": request_context_path,
+                "protocol": "HTTP/1.1",
+                "requestId": "rid",
+                "requestTime": "01/Jan/2026:00:00:00 +0000",
+                "requestTimeEpoch": 1_735_689_600_000i64,
+                "resourceId": "rsrc",
+                "resourcePath": "/{proxy+}",
+                "stage": stage
+            },
+            "body": null,
+            "isBase64Encoded": false
+        })
+    }
+
+    fn apigw_v1_agent_card_get() -> serde_json::Value {
+        apigw_v1_agent_card_get_with_stage("$default", "/.well-known/agent-card.json")
+    }
+
+    /// ALB target-group event. `requestContext.elb` is what
+    /// `LambdaRequest::Alb` keys off.
+    fn alb_agent_card_get() -> serde_json::Value {
+        serde_json::json!({
+            "requestContext": {
+                "elb": {
+                    "targetGroupArn": "arn:aws:elasticloadbalancing:ap-southeast-2:000:targetgroup/fake/00"
+                }
+            },
+            "httpMethod": "GET",
+            "path": "/.well-known/agent-card.json",
+            "queryStringParameters": {},
+            "headers": {"accept": "application/json", "a2a-version": "1.0"},
+            "body": "",
+            "isBase64Encoded": false
+        })
+    }
+
+    /// REST v1 inbound MUST produce a v1 response shape. This is the
+    /// regression for the live-fleet 502.
+    #[tokio::test]
+    async fn v1_inbound_event_emits_v1_response_envelope() {
+        let handler = build_handler();
+        let resp_value = handler
+            .handle_http_event_value(apigw_v1_agent_card_get())
+            .await
+            .expect("handle_http_event_value(v1) must succeed");
+
+        // Parses cleanly as v1.
+        let v1: aws_lambda_events::apigw::ApiGatewayProxyResponse =
+            serde_json::from_value(resp_value.clone())
+                .expect("response must deserialize as ApiGatewayProxyResponse (v1)");
+        assert_eq!(v1.status_code, 200);
+        match v1.body {
+            Some(aws_lambda_events::encodings::Body::Text(s)) => {
+                assert!(s.contains("\"name\""), "v1 body shape: {s}");
+            }
+            other => panic!("expected text body, got {other:?}"),
+        }
+
+        // Negative: v1 response JSON must NOT contain the v2-only
+        // `cookies` field. Presence of `cookies` is API Gateway REST's
+        // 502 trigger.
+        assert!(
+            resp_value.get("cookies").is_none(),
+            "v1 response must not carry v2-only `cookies` field; payload: {resp_value}"
+        );
+    }
+
+    /// API Gateway v2 / Function URL inbound MUST produce a v2 response
+    /// shape (current behaviour, locked in to prevent the inverse
+    /// regression).
+    #[tokio::test]
+    async fn v2_inbound_event_emits_v2_response_envelope() {
+        let handler = build_handler();
+        let resp_value = handler
+            .handle_http_event_value(apigw_v2_agent_card_get())
+            .await
+            .expect("handle_http_event_value(v2) must succeed");
+
+        let v2: aws_lambda_events::apigw::ApiGatewayV2httpResponse =
+            serde_json::from_value(resp_value.clone())
+                .expect("response must deserialize as ApiGatewayV2httpResponse (v2)");
+        assert_eq!(v2.status_code, 200);
+        match v2.body {
+            Some(aws_lambda_events::encodings::Body::Text(s)) => {
+                assert!(s.contains("\"name\""), "v2 body shape: {s}");
+            }
+            other => panic!("expected text body, got {other:?}"),
+        }
+    }
+
+    /// ALB inbound MUST produce an ALB response shape.
+    #[tokio::test]
+    async fn alb_inbound_event_emits_alb_response_envelope() {
+        let handler = build_handler();
+        let resp_value = handler
+            .handle_http_event_value(alb_agent_card_get())
+            .await
+            .expect("handle_http_event_value(alb) must succeed");
+
+        let alb: aws_lambda_events::alb::AlbTargetGroupResponse =
+            serde_json::from_value(resp_value)
+                .expect("response must deserialize as AlbTargetGroupResponse");
+        assert_eq!(alb.status_code, 200);
+    }
+
+    /// Live-fleet end-to-end regression: REST v1 stage-prefixed event
+    /// + `strip_path_prefix("/dev")` on the handler routes through
+    /// the agent-card endpoint AND emits a v1 response envelope. This
+    /// is the exact scenario the live fleet was 502'ing on.
+    #[tokio::test]
+    async fn v1_stage_prefix_inbound_with_strip_emits_v1_response() {
+        let s = Arc::new(InMemoryA2aStorage::new());
+        let state = AppState {
+            executor: Arc::new(NoOpExecutor),
+            task_storage: s.clone(),
+            push_storage: s.clone(),
+            event_store: s.clone(),
+            atomic_store: s.clone(),
+            event_broker: TaskEventBroker::new(),
+            middleware_stack: Arc::new(MiddlewareStack::new(vec![])),
+            runtime_config: RuntimeConfig::default(),
+            in_flight: Arc::new(InFlightRegistry::new()),
+            cancellation_supervisor: s.clone(),
+            push_delivery_store: None,
+            push_dispatcher: None,
+            durable_executor_queue: None,
+        };
+        let router = build_router(state.clone());
+        let handler = LambdaA2aHandler {
+            router,
+            state,
+            path_prefix: Some(Arc::from("/dev")),
+        };
+
+        let event = apigw_v1_agent_card_get_with_stage("dev", "/.well-known/agent-card.json");
+        let resp_value = handler
+            .handle_http_event_value(event)
+            .await
+            .expect("v1 stage-prefixed event must succeed under strip_path_prefix");
+
+        let v1: aws_lambda_events::apigw::ApiGatewayProxyResponse =
+            serde_json::from_value(resp_value)
+                .expect("response must deserialize as ApiGatewayProxyResponse");
+        assert_eq!(v1.status_code, 200);
+        match v1.body {
+            Some(aws_lambda_events::encodings::Body::Text(s)) => {
+                assert!(s.contains("\"name\""), "v1 stage-prefix body: {s}");
+            }
+            other => panic!("expected text body, got {other:?}"),
+        }
+    }
+
+    /// Cross-shape decoding regression: a v1 response JSON carries
+    /// `multiValueHeaders` (REST shape) but no `cookies`; a v2 response
+    /// carries `cookies` but no v1-only `multiValueHeaders` semantics.
+    /// Confirms the two shapes are wire-distinguishable, which is why
+    /// the gateway 502s on a mismatch.
+    #[tokio::test]
+    async fn v1_response_does_not_match_v2_envelope_strictly() {
+        let handler = build_handler();
+        let v1_value = handler
+            .handle_http_event_value(apigw_v1_agent_card_get())
+            .await
+            .unwrap();
+
+        // Sanity: v1 response JSON has no v2-only `cookies` field.
+        assert!(v1_value.get("cookies").is_none());
+
+        let v2_value = handler
+            .handle_http_event_value(apigw_v2_agent_card_get())
+            .await
+            .unwrap();
+        // Sanity: v2 response JSON carries the v2 `cookies` field
+        // (default empty array — still present on the wire).
+        assert!(
+            v2_value.get("cookies").is_some(),
+            "v2 response should carry the v2-only cookies field"
+        );
     }
 }
