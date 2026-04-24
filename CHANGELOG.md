@@ -4,6 +4,31 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.15] — 2026-04-25
+
+### Added — shared pbjson conversion + `Message.metadata` on the client builder
+
+- **`turul-a2a-types::pbjson`** — new module with `json_to_value`, `value_to_json`, `json_object_to_struct`, and `struct_to_json_object` for conversions between `serde_json::Value` and proto `google.protobuf.Value` / `Struct` (re-exported from `turul_a2a_proto::pbjson_types`). Adopters setting `Message.metadata` or `Part.metadata` no longer need to hand-roll the ~20 lines of recursive conversion. Numeric precision note: proto `NumberValue` is `f64`, so `serde_json` integers collapse to floats through the conversion (documented in the module).
+
+- **`turul-a2a-client::MessageBuilder::metadata_json`** + **`metadata`** — new builder methods for populating `Message.metadata`. `metadata_json(HashMap<String, serde_json::Value>)` is the ergonomic form (converts via `pbjson::json_object_to_struct`); `metadata(pbjson_types::Struct)` takes a pre-built proto `Struct`. Calling `metadata_json` with an empty `HashMap` leaves `metadata` as `None` on the wire.
+
+- **Drop-in replacement** for code that previously constructed `SendMessageRequest` by hand to attach `Message.metadata`:
+  ```rust
+  // Before:
+  let base: pb::SendMessageRequest = MessageBuilder::new().data(req).into();
+  let mut message = base.message.unwrap();
+  message.metadata = Some(my_json_to_pbjson_helper(corrs));
+  // ... construct the rest of SendMessageRequest manually
+  // After:
+  let req = MessageBuilder::new().data(req).metadata_json(corrs).build();
+  ```
+
+### Added — earlier on 0.1.14 (examples, not in the release contract)
+
+- `examples/lambda-durable-agent` + `examples/lambda-durable-worker` — ADR-018 production-shape demo (two Lambdas + shared DynamoDB + `examples/lambda-infra/cloudformation.yaml`).
+- `examples/lambda-durable-single` — simplest ADR-018 demo (single Lambda, `ReservedConcurrency=1`, in-memory).
+- Both verified end-to-end on AWS `ap-southeast-2`; zero ERROR logs on the happy path.
+
 ## [0.1.14] — 2026-04-24
 
 ### Added — ADR-018 Phase 1 + Phase 2

@@ -19,6 +19,7 @@
 pub mod artifact;
 pub mod error;
 pub mod message;
+pub mod pbjson;
 pub mod state_machine;
 pub mod task;
 pub mod wire;

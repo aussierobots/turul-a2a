@@ -1,6 +1,6 @@
 //! Executor spawn-and-track machinery (ADR-010 §4).
 //!
-//! Single entry point [`spawn_tracked_executor`] that:
+//! Single entry point `spawn_tracked_executor` that:
 //!
 //! 1. Builds an [`InFlightHandle`] with a placeholder JoinHandle so the
 //!    executor body can capture `Arc<InFlightHandle>` via its EventSink.
@@ -18,7 +18,7 @@
 //!
 //! # Post-execute detection rule (ADR-010 §7.2)
 //!
-//! After the executor's `execute()` returns, [`commit_post_execute`]
+//! After the executor's `execute()` returns, `commit_post_execute`
 //! routes the final outcome through the CAS-guarded atomic store:
 //!
 //! - If the executor used `ctx.events` and committed a terminal, the
