@@ -29,7 +29,10 @@ cargo lambda build --release -p lambda-stream-worker
 ## Deploy
 
 1. Create a DynamoDB Stream on the `a2a_push_pending_dispatches` table with
-   `StreamViewType: NEW_IMAGE`.
+   `StreamViewType: NEW_IMAGE`. See `examples/lambda-infra` for
+   CloudFormation, Terraform, and a shell script that provision this
+   table and enable the stream — the stream ARN they emit is the input
+   to step 2.
 2. Create an event source mapping from the stream to this Lambda with:
    - `FunctionResponseTypes: ["ReportBatchItemFailures"]` — so the handler's
      `batch_item_failures` response controls retries.
@@ -37,6 +40,8 @@ cargo lambda build --release -p lambda-stream-worker
 3. Grant the execution role:
    - `Put` / `Delete` on the deliveries and pending-dispatch tables.
    - `Get` / `Query` on the tasks table.
+   - `DescribeStream` / `GetRecords` / `GetShardIterator` / `ListStreams`
+     on the pending-dispatch table stream.
 
 ## Partial-batch response contract
 

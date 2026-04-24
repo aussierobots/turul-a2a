@@ -61,5 +61,6 @@ As with the stream worker, the example uses `InMemoryA2aStorage` for
 
 ## See also
 
+- `examples/lambda-infra` — reference IaC for the five DynamoDB tables.
 - ADR-011 (push delivery), ADR-013 (Lambda push-delivery parity).
 - `examples/lambda-stream-worker` — the fast path this worker backs up.

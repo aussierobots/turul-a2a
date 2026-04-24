@@ -1,0 +1,185 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  turul-a2a DynamoDB tables for the Lambda adapter. Provisions the five
+  tables DynamoDbA2aStorage expects, enables TTL on the 'ttl' attribute,
+  and emits the a2a_push_pending_dispatches stream ARN as an output so
+  the stream-worker Lambda can wire an EventSourceMapping to it.
+
+  Deploy:
+    aws cloudformation deploy \
+      --stack-name a2a-tables \
+      --template-file cloudformation.yaml
+
+  Teardown:
+    aws cloudformation delete-stack --stack-name a2a-tables
+    (DeleteTable on a populated table is instant data loss — confirm first.)
+
+Parameters:
+  TablePrefix:
+    Type: String
+    Default: ''
+    Description: Optional prefix for table names (e.g. 'staging-' or 'prod-').
+  BillingMode:
+    Type: String
+    Default: PAY_PER_REQUEST
+    AllowedValues: [PAY_PER_REQUEST, PROVISIONED]
+    Description: On-demand by default. Switch to provisioned only if traffic is steady.
+
+Conditions:
+  IsOnDemand: !Equals [!Ref BillingMode, PAY_PER_REQUEST]
+
+Resources:
+
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${TablePrefix}a2a_tasks'
+      BillingMode: !Ref BillingMode
+      ProvisionedThroughput: !If
+        - IsOnDemand
+        - !Ref AWS::NoValue
+        - ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  PushConfigsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${TablePrefix}a2a_push_configs'
+      BillingMode: !Ref BillingMode
+      ProvisionedThroughput: !If
+        - IsOnDemand
+        - !Ref AWS::NoValue
+        - ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  TaskEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${TablePrefix}a2a_task_events'
+      BillingMode: !Ref BillingMode
+      ProvisionedThroughput: !If
+        - IsOnDemand
+        - !Ref AWS::NoValue
+        - ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  PushDeliveriesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${TablePrefix}a2a_push_deliveries'
+      BillingMode: !Ref BillingMode
+      ProvisionedThroughput: !If
+        - IsOnDemand
+        - !Ref AWS::NoValue
+        - ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # The only table that needs a DynamoDB Stream. Every committed
+  # terminal-event marker becomes an INSERT record that feeds
+  # lambda-stream-worker via an EventSourceMapping. View type must be
+  # NEW_IMAGE so the worker receives the marker payload.
+  PushPendingDispatchesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${TablePrefix}a2a_push_pending_dispatches'
+      BillingMode: !Ref BillingMode
+      ProvisionedThroughput: !If
+        - IsOnDemand
+        - !Ref AWS::NoValue
+        - ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+
+Outputs:
+  TasksTableName:
+    Value: !Ref TasksTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TasksTable'
+
+  PushConfigsTableName:
+    Value: !Ref PushConfigsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PushConfigsTable'
+
+  TaskEventsTableName:
+    Value: !Ref TaskEventsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TaskEventsTable'
+
+  PushDeliveriesTableName:
+    Value: !Ref PushDeliveriesTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PushDeliveriesTable'
+
+  PushPendingDispatchesTableName:
+    Value: !Ref PushPendingDispatchesTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PushPendingDispatchesTable'
+
+  PushPendingDispatchesStreamArn:
+    Description: Wire this into the lambda-stream-worker EventSourceMapping.
+    Value: !GetAtt PushPendingDispatchesTable.StreamArn
+    Export:
+      Name: !Sub '${AWS::StackName}-PushPendingDispatchesStreamArn'

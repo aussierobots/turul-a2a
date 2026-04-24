@@ -54,7 +54,13 @@ backend (DynamoDB for production Lambda, or Postgres if you're behind a VPC).
 ADR-009's same-backend requirement means all three Lambdas must point at the
 same store.
 
+The DynamoDB backend does **not** auto-create tables — see
+`examples/lambda-infra` for CloudFormation, Terraform, and an `aws` CLI
+script that provisions the five tables and enables the
+`a2a_push_pending_dispatches` stream.
+
 ## See also
 
+- `examples/lambda-infra` — reference IaC for the five DynamoDB tables.
 - `examples/lambda-stream-worker` — DynamoDB Stream push-recovery worker.
 - `examples/lambda-scheduled-worker` — EventBridge backstop.
