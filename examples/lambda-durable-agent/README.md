@@ -58,7 +58,15 @@ echo "QUEUE_URL=$QUEUE_URL"
 echo "QUEUE_ARN=$QUEUE_ARN"
 ```
 
-`KmsMasterKeyId=alias/aws/sqs` enables SSE-SQS (AWS-managed key). Swap for a customer-managed KMS key ARN if the ADR-018 §Security "tenant-sensitive" recommendation applies.
+Encryption: three choices, pick per deployment posture.
+
+| Setting | Acronym | What it is | When |
+|---|---|---|---|
+| Omit `KmsMasterKeyId` (or set `SqsManagedSseEnabled: true`) | **SSE-SQS** | SQS-owned key, no KMS calls, no KMS cost | Demo / internal deployments where SQS-owned keys are sufficient |
+| `KmsMasterKeyId: alias/aws/sqs` *(what this walk-through uses)* | **SSE-KMS, AWS-managed key** | KMS-encrypted with the AWS-managed `alias/aws/sqs` key | When you want KMS-audit-trail but not the cost/policy of a customer-managed CMK |
+| `KmsMasterKeyId: <your CMK ARN>` | **SSE-KMS, customer-managed key** | KMS-encrypted with a CMK you control | ADR-018 §Security recommendation for tenant-sensitive deployments — lets you rotate keys and grant/revoke access per your IAM posture |
+
+If you swap in a CMK, the Lambda execution role also needs `kms:Decrypt` on the key for the consumer (worker) and `kms:GenerateDataKey` for the producer (agent). `alias/aws/sqs` uses an AWS-scoped policy so no additional grants are needed.
 
 ### 2. Build both Lambda bundles
 
