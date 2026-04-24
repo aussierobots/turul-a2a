@@ -43,6 +43,13 @@ Earlier revisions of this example open-coded ~80 lines of `LambdaRequest` → `h
 | **`lambda-durable-single`** *(this crate)* | Quickest demo. One Lambda, `ReservedConcurrency=1`, `InMemoryA2aStorage`. Container-level storage means HTTP and SQS invocations share state. **Not for production** — the concurrency pin caps you at one inflight invocation. |
 | `lambda-durable-agent` + `lambda-durable-worker` | Production shape. Two Lambda functions, shared DynamoDB backend (via `examples/lambda-infra/`), no concurrency limits. What you'd actually deploy. |
 
+## Local testing
+
+Before deploying to AWS, see `examples/LOCAL_TESTING.md` for the
+local-first test matrix — automated in-process tests, `cargo lambda
+watch` + `cargo lambda invoke` for HTTP and SQS dispatch, hybrid
+patterns against real AWS, and LocalStack full-local setup.
+
 ## Prerequisites
 
 - AWS account + credentials (`aws sts get-caller-identity`).

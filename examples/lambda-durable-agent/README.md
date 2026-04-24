@@ -21,6 +21,14 @@ ADR-018's dispatch pattern splits across two Lambda functions that share the sam
 
 This split matches the existing pattern (`lambda-agent` + `lambda-stream-worker` + `lambda-scheduled-worker`). The agent writes the task, the worker reads it — both via `DynamoDbA2aStorage` pointed at the same five tables (ADR-009 same-backend requirement).
 
+## Local testing
+
+Before deploying to AWS, see `examples/LOCAL_TESTING.md` for the
+full local-first test matrix — automated in-process payload-survival
+tests, `cargo lambda watch` + `cargo lambda invoke` for HTTP and SQS
+dispatch, hybrid patterns that run the local Lambda binary against
+real AWS SQS / DynamoDB, and LocalStack full-local setup.
+
 ## Prerequisites
 
 - AWS account + credentials in your environment (`aws sts get-caller-identity`).

@@ -55,13 +55,13 @@ async fn main() -> Result<(), lambda_runtime::Error> {
 
     LambdaA2aServerBuilder::new()
         .executor(LambdaEchoExecutor { public_url })
-        // `.storage(...)` wires the unified backend including
-        // `A2aPushDeliveryStore`. A non-push Lambda deployment must
-        // either supply storage without the push flag (via individual
-        // setters) or opt in explicitly as shown here. The in-memory
-        // backend is demo-only — Lambda streaming and push recovery
-        // require a shared backend (DynamoDB / Postgres).
-        .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
+        // Demo: in-memory storage, no push-notification delivery. If
+        // you want push delivery, wire both `.storage(store.clone())`
+        // and `.push_delivery_store(store)` on a backend that
+        // implements `A2aPushDeliveryStore`, and flip the
+        // `with_push_dispatch_enabled(true)` flag on the storage. The
+        // builder rejects mismatched combinations.
+        .storage(InMemoryA2aStorage::new())
         .run()
         .await
 }
