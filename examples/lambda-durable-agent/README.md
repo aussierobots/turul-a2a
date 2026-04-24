@@ -1,8 +1,14 @@
 # lambda-durable-agent + lambda-durable-worker
 
-**ADR-018 end-to-end demo**: Lambda durable executor continuation via AWS SQS.
+**ADR-018 production-shape demo**: Lambda durable executor continuation via AWS SQS, with shared DynamoDB storage.
 
-The one example pair in the workspace where `SendMessageConfiguration.returnImmediately = true` actually works on AWS Lambda. Without the SQS wiring shown here, the Lambda adapter rejects that flag with `UnsupportedOperationError` per ADR-017.
+Two Lambda functions share a DynamoDB backend (via `examples/lambda-infra/`), so the agent and worker run in separate containers without concurrency restrictions. This is what a production ADR-018 deployment looks like.
+
+For a simpler single-Lambda demo that doesn't need DynamoDB — suitable for `cargo lambda watch` loops and throwaway experiments — see [`examples/lambda-durable-single`](../lambda-durable-single).
+
+Verified end-to-end on AWS `ap-southeast-2` (2026-04-25): HTTP `returnImmediately=true` → task enqueued → SQS trigger on the worker Lambda → task reaches `TASK_STATE_COMPLETED` via the shared DynamoDB backend. Zero ERROR logs.
+
+Without the SQS wiring shown here, the Lambda adapter rejects `returnImmediately=true` with `UnsupportedOperationError` per ADR-017.
 
 ## Two Lambdas, one deployable workflow
 
@@ -13,7 +19,7 @@ ADR-018's dispatch pattern splits across two Lambda functions that share the sam
 | `lambda-durable-agent` | HTTP (Function URL / API Gateway / ALB) | Receives `/message:send` with `returnImmediately=true`, size-checks the envelope, creates the task as `WORKING`, enqueues a `QueuedExecutorJob` on SQS, returns 200. Executor is NOT run locally. |
 | `lambda-durable-worker` | SQS event source mapping | Triggered by the queue. Per record: loads the task, idempotency-checks it (terminal → no-op), checks the ADR-012 cancel marker (set → CANCELED direct commit, executor never invoked), otherwise runs the executor via `run_queued_executor_job`. Returns `SqsBatchResponse` with partial-batch failure semantics. |
 
-This split matches the existing pattern (`lambda-agent` + `lambda-stream-worker` + `lambda-scheduled-worker`). Both Lambdas share storage — the request Lambda writes the task, the worker reads it. **In-memory storage will not work across the handoff**; production deployments need DynamoDB (or another shared backend).
+This split matches the existing pattern (`lambda-agent` + `lambda-stream-worker` + `lambda-scheduled-worker`). The agent writes the task, the worker reads it — both via `DynamoDbA2aStorage` pointed at the same five tables (ADR-009 same-backend requirement).
 
 ## Prerequisites
 
@@ -23,7 +29,20 @@ This split matches the existing pattern (`lambda-agent` + `lambda-stream-worker`
 
 ## Deploy
 
-### 1. Create the SQS queue + DLQ
+### 1. Deploy the DynamoDB tables
+
+Both Lambdas point at the five A2A tables from `examples/lambda-infra/cloudformation.yaml` (`a2a_tasks`, `a2a_push_configs`, `a2a_task_events`, `a2a_push_deliveries`, `a2a_push_pending_dispatches`).
+
+```bash
+aws cloudformation deploy \
+  --stack-name a2a-tables \
+  --template-file ../lambda-infra/cloudformation.yaml \
+  --no-fail-on-empty-changeset
+```
+
+Wait for the stack to finish (~30s) before creating the Lambda functions. You can verify with `aws dynamodb list-tables --query 'TableNames[?starts_with(@,\`a2a_\`)]'`.
+
+### 2. Create the SQS queue + DLQ
 
 ```bash
 # DLQ first.
@@ -78,7 +97,7 @@ The demo uses **SSE-SQS** — SQS-owned key, no KMS calls, no per-request charge
 
 **IAM rider.** If you swap in a CMK, the Lambda execution role also needs `kms:Decrypt` on the key for the consumer (worker) and `kms:GenerateDataKey` for the producer (agent). `alias/aws/sqs` uses an AWS-scoped policy so no additional grants are needed. `SqsManagedSseEnabled` needs no KMS IAM at all.
 
-### 2. Build both Lambda bundles
+### 3. Build both Lambda bundles
 
 ```bash
 cargo lambda build --release -p lambda-durable-agent
@@ -89,7 +108,7 @@ Outputs:
 - `target/lambda/lambda-durable-agent/bootstrap.zip`
 - `target/lambda/lambda-durable-worker/bootstrap.zip`
 
-### 3. (If needed) Create an ephemeral IAM role
+### 4. (If needed) Create an ephemeral IAM role
 
 If you don't already have a Lambda execution role, create one scoped to this demo. Skip this step and substitute `ROLE_ARN=<your existing role>` below if you already have one.
 
@@ -127,6 +146,32 @@ aws iam put-role-policy --role-name turul-a2a-demo-lambda-role \
   --policy-name SqsProducer \
   --policy-document file:///tmp/sqs-producer-policy.json
 
+# DynamoDB perms (both Lambdas read + write the five A2A tables).
+cat > /tmp/dynamo-policy.json <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
+      "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan",
+      "dynamodb:BatchGetItem", "dynamodb:BatchWriteItem",
+      "dynamodb:TransactWriteItems", "dynamodb:TransactGetItems"
+    ],
+    "Resource": [
+      "arn:aws:dynamodb:*:*:table/a2a_tasks",
+      "arn:aws:dynamodb:*:*:table/a2a_push_configs",
+      "arn:aws:dynamodb:*:*:table/a2a_task_events",
+      "arn:aws:dynamodb:*:*:table/a2a_push_deliveries",
+      "arn:aws:dynamodb:*:*:table/a2a_push_pending_dispatches"
+    ]
+  }]
+}
+EOF
+aws iam put-role-policy --role-name turul-a2a-demo-lambda-role \
+  --policy-name DynamoDbTables \
+  --policy-document file:///tmp/dynamo-policy.json
+
 ROLE_ARN=$(aws iam get-role --role-name turul-a2a-demo-lambda-role --query 'Role.Arn' --output text)
 echo "ROLE_ARN=$ROLE_ARN"
 
@@ -134,7 +179,7 @@ echo "ROLE_ARN=$ROLE_ARN"
 sleep 10
 ```
 
-### 4. Create the **request** Lambda function (HTTP)
+### 5. Create the **request** Lambda function (HTTP)
 
 ```bash
 aws lambda create-function \
@@ -166,7 +211,7 @@ echo "FN_URL=$FN_URL"
 
 `auth-type NONE` is for the demo. Production: put API Gateway + an authoriser in front.
 
-### 5. Create the **worker** Lambda function (SQS)
+### 6. Create the **worker** Lambda function (SQS)
 
 ```bash
 aws lambda create-function \
@@ -181,7 +226,7 @@ aws lambda create-function \
   --memory-size 256
 ```
 
-### 6. Wire the SQS event source mapping → worker
+### 7. Wire the SQS event source mapping → worker
 
 This is the bit that ties it all together. `ReportBatchItemFailures` is required so the worker's `SqsBatchResponse { batch_item_failures }` is honoured — without it, Lambda retries the entire batch on any failure.
 
@@ -234,45 +279,32 @@ Plus `AWSLambdaBasicExecutionRole` for CloudWatch Logs.
 ## Try it
 
 ```bash
-curl -sS -X POST "$FN_URL/message:send" \
+# 1. Fire the HTTP request.
+RESP=$(curl -sS -X POST "$FN_URL/message:send" \
   -H 'a2a-version: 1.0' \
   -H 'content-type: application/json' \
   -d '{
-    "message": {
-      "messageId": "m1",
-      "role": "ROLE_USER",
-      "parts": [{"text": "hello durable executor"}]
-    },
+    "message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hello durable executor"}]},
     "configuration": {"returnImmediately": true}
-  }' | jq .
-```
+  }')
+echo "$RESP" | jq .
+TASK_ID=$(echo "$RESP" | jq -r .task.id)
 
-Expected: `task.status.state == "TASK_STATE_WORKING"`, task id echoed back, HTTP 200.
+# 2. Wait for SQS → worker → DynamoDB commit.
+sleep 8
 
-A few seconds later, the SQS event source mapping fires the worker Lambda:
+# 3. Verify — task should be COMPLETED with the echo artifact attached.
+curl -sS "$FN_URL/tasks/$TASK_ID" -H 'a2a-version: 1.0' \
+  | jq '{state: .task.status.state, artifact: .task.artifacts[0].parts[0].text}'
+# → {"state": "TASK_STATE_COMPLETED",
+#    "artifact": "Hello from the SQS-invoked executor!"}
 
-```bash
+# 4. Clean worker log — no ERRORs on the happy path.
 aws logs tail /aws/lambda/turul-a2a-durable-worker --since 3m --format short
+aws logs tail /aws/lambda/turul-a2a-durable-agent  --since 3m --format short
 ```
 
-### Expected demo behavior (important)
-
-**On this in-memory demo**, the worker log will contain a single line like:
-
-```
-ERROR ... task not found on SQS dequeue item=<uuid> tenant= task_id=<task id from the HTTP response>
-```
-
-**This is correct and is what the storage caveat below warns about.** The pipeline is wired end-to-end — the HTTP Lambda enqueued, the SQS event source mapping delivered, the worker deserialised the envelope, decoded the `tenant` + `task_id` correctly, and tried to load the task. The task was written into the **agent Lambda's** `InMemoryA2aStorage`, which lives in a different container; the worker's in-memory storage has no record of it, so `get_task` returns `None` and the worker reports the record as a batch-item failure. SQS retries three times (per our `RedrivePolicy`), then the record lands in the DLQ. Everything the framework is responsible for — envelope serialisation, size preflight, event source mapping, partial-batch response, terminal-no-op detection — is working.
-
-In **production** with a shared DynamoDB backend (see `examples/lambda-infra/cloudformation.yaml`), the worker's `get_task` finds the task, runs the executor, and commits the terminal. GetTask then shows the task is `TASK_STATE_COMPLETED`:
-
-```bash
-TASK_ID=<task id from the first response>
-curl -sS "$FN_URL/tasks/$TASK_ID" -H 'a2a-version: 1.0' | jq .task.status.state
-# production with shared DynamoDB: "TASK_STATE_COMPLETED"
-# demo with in-memory:             "TASK_STATE_WORKING" (agent's container never sees worker's commit)
-```
+The shared DynamoDB backend is what makes this work — the agent writes the task to `a2a_tasks`, the worker reads the same row, runs the executor, and the terminal commit goes through the same CAS-guarded atomic store as a single-process deployment would use.
 
 ## Tear down
 
@@ -296,12 +328,17 @@ aws sqs delete-queue --queue-url "$QUEUE_URL"
 aws sqs delete-queue --queue-url "$(aws sqs get-queue-url \
   --queue-name turul-a2a-durable-executor-demo-dlq --query QueueUrl --output text)"
 
-# 5. Delete the demo IAM role.
+# 5. Delete the DynamoDB tables (CloudFormation stack).
+aws cloudformation delete-stack --stack-name a2a-tables
+aws cloudformation wait stack-delete-complete --stack-name a2a-tables
+
+# 6. Delete the demo IAM role.
 aws iam detach-role-policy --role-name turul-a2a-demo-lambda-role \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 aws iam detach-role-policy --role-name turul-a2a-demo-lambda-role \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
 aws iam delete-role-policy --role-name turul-a2a-demo-lambda-role --policy-name SqsProducer
+aws iam delete-role-policy --role-name turul-a2a-demo-lambda-role --policy-name DynamoDbTables
 aws iam delete-role --role-name turul-a2a-demo-lambda-role
 ```
 
@@ -341,6 +378,7 @@ Both Lambdas call `.with_sqs_return_immediately(queue_url, sqs)`. The worker nev
 ## See also
 
 - [ADR-018](../../docs/adr/ADR-018-lambda-durable-executor-sqs.md) — the design this example demonstrates.
+- [`examples/lambda-durable-single`](../lambda-durable-single) — simplest ADR-018 demo: one Lambda, in-memory, no DynamoDB. Good for quick experiments or `cargo lambda watch` loops.
 - [`examples/lambda-agent`](../lambda-agent) — request Lambda without durable continuation (ADR-017 reject path; use when `returnImmediately=false` is fine for your call pattern).
 - [`examples/lambda-stream-worker`](../lambda-stream-worker) / [`examples/lambda-scheduled-worker`](../lambda-scheduled-worker) — push-delivery workers (ADR-013). A production durable-agent deployment typically wires these alongside to fan out push notifications on terminal events.
-- [`examples/lambda-infra`](../lambda-infra) — DynamoDB tables IaC reference.
+- [`examples/lambda-infra`](../lambda-infra) — DynamoDB tables IaC (deployed by step 1 above).

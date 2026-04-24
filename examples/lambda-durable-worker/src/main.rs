@@ -47,7 +47,7 @@ use lambda_runtime::{Error, LambdaEvent, service_fn};
 use turul_a2a::card_builder::AgentCardBuilder;
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
-use turul_a2a::storage::InMemoryA2aStorage;
+use turul_a2a::storage::dynamodb::{DynamoDbA2aStorage, DynamoDbConfig};
 use turul_a2a_aws_lambda::LambdaA2aServerBuilder;
 use turul_a2a_types::{Message, Task};
 
@@ -114,13 +114,17 @@ async fn main() -> Result<(), Error> {
     let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let sqs = Arc::new(aws_sdk_sqs::Client::new(&aws));
 
+    let dynamodb_storage = DynamoDbA2aStorage::new(DynamoDbConfig::default())
+        .await
+        .map_err(|e| Error::from(format!("dynamodb storage build failed: {e}")))?;
+
     let handler = LambdaA2aServerBuilder::new()
         .executor(DurableEchoExecutor)
-        // Same storage shape as `lambda-durable-agent` — no push
-        // dispatch in the demo (no push_delivery_store wired). In
-        // production, share a backend (DynamoDB) and wire push
-        // delivery on both Lambdas.
-        .storage(InMemoryA2aStorage::new())
+        // Shares DynamoDB tables with the agent Lambda (ADR-009
+        // same-backend requirement). The worker reads the task the
+        // agent wrote, runs the executor, and commits the terminal
+        // via the same CAS-guarded atomic store.
+        .storage(dynamodb_storage)
         .with_sqs_return_immediately(queue_url, sqs)
         .build()
         .map_err(|e| Error::from(format!("builder error: {e}")))?;

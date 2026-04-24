@@ -1871,6 +1871,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "lambda-durable-single"
+version = "0.1.14"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-sqs",
+ "aws_lambda_events",
+ "base64 0.22.1",
+ "http 1.4.0",
+ "http-body-util",
+ "lambda_http",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "turul-a2a",
+ "turul-a2a-aws-lambda",
+ "turul-a2a-proto",
+ "turul-a2a-types",
+]
+
+[[package]]
 name = "lambda-durable-worker"
 version = "0.1.14"
 dependencies = [

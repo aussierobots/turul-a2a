@@ -1,5 +1,5 @@
 [package]
-name = "lambda-durable-worker"
+name = "lambda-durable-single"
 version.workspace = true
 edition.workspace = true
 publish = false
@@ -7,22 +7,23 @@ publish = false
 [[bin]]
 name = "bootstrap"
 path = "src/main.rs"
-# cargo-lambda requires the binary to be named `bootstrap`; all Lambda
-# example crates declare the same name. Exclude from rustdoc so
-# `cargo doc --workspace` does not collide on the output filename.
 doc = false
 
 [dependencies]
-turul-a2a = { path = "../../crates/turul-a2a", features = ["dynamodb"] }
+turul-a2a = { path = "../../crates/turul-a2a" }
 turul-a2a-aws-lambda = { path = "../../crates/turul-a2a-aws-lambda", features = ["sqs"] }
 turul-a2a-types = { path = "../../crates/turul-a2a-types" }
 turul-a2a-proto = { path = "../../crates/turul-a2a-proto" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 lambda_runtime = { workspace = true }
+lambda_http = { workspace = true }
 aws_lambda_events = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-sqs = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
 serde_json = { workspace = true }
+base64 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

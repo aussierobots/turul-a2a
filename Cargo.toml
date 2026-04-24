@@ -15,6 +15,7 @@ members = [
   "examples/skill-security-agent",
   "examples/lambda-agent",
   "examples/lambda-durable-agent",
+  "examples/lambda-durable-single",
   "examples/lambda-durable-worker",
   "examples/lambda-stream-worker",
   "examples/lambda-scheduled-worker",

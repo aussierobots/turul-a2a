@@ -61,7 +61,8 @@ script that provisions the five tables and enables the
 
 ## See also
 
-- `examples/lambda-durable-agent` + `examples/lambda-durable-worker` — ADR-018 durable executor continuation via SQS (when `returnImmediately=true` on Lambda must actually work).
+- `examples/lambda-durable-single` — ADR-018 durable executor continuation, single-Lambda simplest demo (in-memory + ReservedConcurrency=1).
+- `examples/lambda-durable-agent` + `examples/lambda-durable-worker` — ADR-018 production-shape demo (two Lambdas + shared DynamoDB).
 - `examples/lambda-infra` — reference IaC for the five DynamoDB tables.
 - `examples/lambda-stream-worker` — DynamoDB Stream push-recovery worker.
 - `examples/lambda-scheduled-worker` — EventBridge backstop.

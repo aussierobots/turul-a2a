@@ -44,7 +44,7 @@ use async_trait::async_trait;
 use turul_a2a::card_builder::AgentCardBuilder;
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
-use turul_a2a::storage::InMemoryA2aStorage;
+use turul_a2a::storage::dynamodb::{DynamoDbA2aStorage, DynamoDbConfig};
 use turul_a2a_aws_lambda::LambdaA2aServerBuilder;
 use turul_a2a_types::{Message, Task};
 
@@ -102,21 +102,25 @@ async fn main() -> Result<(), lambda_http::Error> {
     let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let sqs = Arc::new(aws_sdk_sqs::Client::new(&aws));
 
+    let dynamodb_storage = DynamoDbA2aStorage::new(DynamoDbConfig::default())
+        .await
+        .map_err(|e| lambda_http::Error::from(format!("dynamodb storage build failed: {e}")))?;
+
     let handler = LambdaA2aServerBuilder::new()
         .executor(DurableEchoExecutor)
-        // InMemoryA2aStorage is for demo convenience only. Real
-        // deployments MUST use a shared backend — the worker Lambda
-        // runs in a different container and can't see this one's
-        // in-memory state. Swap for `DynamoDbA2aStorage`.
+        // DynamoDB-backed storage so the worker Lambda (different
+        // container, same AWS account) can load the task the agent
+        // enqueued. Deploy the five tables from
+        // examples/lambda-infra/cloudformation.yaml before running
+        // this example.
         //
-        // Note: `with_push_dispatch_enabled(true)` is omitted on
-        // purpose — this demo does not register push configs, so
-        // the builder correctly rejects the inconsistent pairing
-        // of push_dispatch_enabled + no push_delivery_store. In a
-        // real deployment that needs push delivery, wire
-        // `.push_delivery_store(storage.clone())` and flip
-        // `with_push_dispatch_enabled(true)` in tandem.
-        .storage(InMemoryA2aStorage::new())
+        // `with_push_dispatch_enabled(true)` omitted — this demo
+        // doesn't register push configs, so the builder correctly
+        // rejects the inconsistent pairing with no
+        // `push_delivery_store`. Production deployments that want
+        // push delivery wire `.push_delivery_store(storage.clone())`
+        // and flip the flag in tandem.
+        .storage(dynamodb_storage)
         // ADR-018: wire the SQS durable executor queue. Re-enables
         // `supports_return_immediately` on the RuntimeConfig as a
         // side effect of supplying the queue (capability, not intent).
