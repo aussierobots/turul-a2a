@@ -14,6 +14,9 @@ rust-version.workspace = true
 [features]
 default = []
 dynamodb = ["turul-a2a/dynamodb"]
+# ADR-018 §Phase 2: durable executor continuation via AWS SQS. Off by
+# default — adopters opt in via `LambdaA2aServerBuilder::with_sqs_return_immediately`.
+sqs = ["dep:aws-sdk-sqs"]
 
 [dependencies]
 turul-a2a = { workspace = true }
@@ -22,6 +25,7 @@ turul-a2a-proto = { workspace = true }
 lambda_http = { workspace = true }
 lambda_runtime = { workspace = true }
 aws_lambda_events = { workspace = true }
+aws-sdk-sqs = { workspace = true, optional = true }
 serde_dynamo = { version = "4" }
 thiserror = { workspace = true }
 axum = { workspace = true }
@@ -35,8 +39,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }
-chrono = { workspace = true }

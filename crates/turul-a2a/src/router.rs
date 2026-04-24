@@ -72,6 +72,19 @@ pub struct AppState {
     /// FAILED — fans out to registered push configs by the same
     /// contract.
     pub push_dispatcher: Option<Arc<crate::push::PushDispatcher>>,
+
+    /// Durable executor queue (ADR-018). When `Some`, the
+    /// `return_immediately = true` path in
+    /// [`core_send_message`] enqueues a
+    /// [`crate::durable_executor::QueuedExecutorJob`] instead of
+    /// spawning the executor locally. A separate invocation consumes
+    /// the queue and runs the executor to terminal. Wired exclusively
+    /// through `LambdaA2aServerBuilder::with_durable_executor` /
+    /// `with_sqs_return_immediately` in `turul-a2a-aws-lambda`; the
+    /// long-lived [`crate::server::A2aServerBuilder`] keeps this
+    /// `None` because `tokio::spawn` is already durable in a
+    /// long-lived process.
+    pub durable_executor_queue: Option<Arc<dyn crate::durable_executor::DurableExecutorQueue>>,
 }
 
 /// Build the axum router with all proto-defined routes.
@@ -234,7 +247,8 @@ async fn tenant_send_message_handler(
     Path(tenant): Path<String>,
     body: String,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    core_send_message(state, &tenant, ctx.identity.owner(), body).await
+    let claims = ctx.identity.claims().cloned();
+    core_send_message(state, &tenant, ctx.identity.owner(), claims, body).await
 }
 
 async fn tenant_list_tasks_handler(
@@ -407,7 +421,8 @@ async fn send_streaming_message_handler(
     axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
     body: String,
 ) -> Result<axum::response::Response, A2aError> {
-    core_send_streaming_message(state, DEFAULT_TENANT, ctx.identity.owner(), body).await
+    let claims = ctx.identity.claims().cloned();
+    core_send_streaming_message(state, DEFAULT_TENANT, ctx.identity.owner(), claims, body).await
 }
 
 async fn tenant_send_streaming_message_handler(
@@ -416,7 +431,8 @@ async fn tenant_send_streaming_message_handler(
     Path(tenant): Path<String>,
     body: String,
 ) -> Result<axum::response::Response, A2aError> {
-    core_send_streaming_message(state, &tenant, ctx.identity.owner(), body).await
+    let claims = ctx.identity.claims().cloned();
+    core_send_streaming_message(state, &tenant, ctx.identity.owner(), claims, body).await
 }
 
 /// Task-side setup for streaming send: parse request, create task,
@@ -431,6 +447,7 @@ pub(crate) async fn setup_streaming_send(
     state: AppState,
     tenant: &str,
     owner: &str,
+    claims: Option<serde_json::Value>,
     body: String,
 ) -> Result<(String, broadcast::Receiver<()>), A2aError> {
     let request: turul_a2a_proto::SendMessageRequest =
@@ -517,6 +534,7 @@ pub(crate) async fn setup_streaming_send(
         task_id: task_id.clone(),
         context_id: context_id.clone(),
         message: message.clone(),
+        claims: claims.clone(),
     };
     let _spawn = crate::server::spawn::spawn_tracked_executor(spawn_deps, scope)?;
 
@@ -527,9 +545,11 @@ pub(crate) async fn core_send_streaming_message(
     state: AppState,
     tenant: &str,
     owner: &str,
+    claims: Option<serde_json::Value>,
     body: String,
 ) -> Result<axum::response::Response, A2aError> {
-    let (task_id, wake_rx) = setup_streaming_send(state.clone(), tenant, owner, body).await?;
+    let (task_id, wake_rx) =
+        setup_streaming_send(state.clone(), tenant, owner, claims, body).await?;
     // SSE stream reads from the durable store. No initial Task
     // snapshot: SUBMITTED + WORKING are already in the event store and
     // will replay on subscription.
@@ -700,7 +720,8 @@ async fn send_message_handler(
     axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
     body: String,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    core_send_message(state, DEFAULT_TENANT, ctx.identity.owner(), body).await
+    let claims = ctx.identity.claims().cloned();
+    core_send_message(state, DEFAULT_TENANT, ctx.identity.owner(), claims, body).await
 }
 
 async fn list_tasks_handler(
@@ -763,6 +784,7 @@ pub async fn core_send_message(
     state: AppState,
     tenant: &str,
     owner: &str,
+    claims: Option<serde_json::Value>,
     body: String,
 ) -> Result<Json<serde_json::Value>, A2aError> {
     let request: turul_a2a_proto::SendMessageRequest =
@@ -888,6 +910,41 @@ pub async fn core_send_message(
         };
         (uuid::Uuid::now_v7().to_string(), context_id, false)
     };
+
+    // ADR-018 §HTTP invocation step 3-4: if a durable executor queue
+    // is wired AND `return_immediately` is requested, build the
+    // envelope and run `check_payload_size` BEFORE any storage write.
+    // Oversize payloads return `A2aError::InvalidRequest` (HTTP 400 /
+    // JSON-RPC -32602 / gRPC INVALID_ARGUMENT) with zero task
+    // persistence. The built envelope is stashed for the enqueue call
+    // after task creation to avoid re-cloning.
+    let durable_queue = if return_immediately {
+        state.durable_executor_queue.clone()
+    } else {
+        None
+    };
+    let durable_job: Option<crate::durable_executor::QueuedExecutorJob> =
+        if let Some(queue) = durable_queue.as_ref() {
+            let now_micros = chrono::Utc::now().timestamp_micros();
+            let job = crate::durable_executor::QueuedExecutorJob {
+                version: crate::durable_executor::QueuedExecutorJob::VERSION,
+                tenant: tenant.to_string(),
+                owner: owner.to_string(),
+                task_id: task_id.clone(),
+                context_id: context_id.clone(),
+                message: message.as_proto().clone(),
+                claims: claims.clone(),
+                enqueued_at_micros: now_micros,
+            };
+            if let Err(e) = queue.check_payload_size(&job) {
+                return Err(A2aError::InvalidRequest {
+                    message: format!("durable executor queue: {e}"),
+                });
+            }
+            Some(job)
+        } else {
+            None
+        };
 
     // Set up task storage in WORKING atomically, emitting SUBMITTED
     // + WORKING events through the CAS-guarded atomic store so that
@@ -1030,6 +1087,78 @@ pub async fn core_send_message(
         }
     }
 
+    // ADR-018 §HTTP invocation step 7: if the durable executor path
+    // is active, enqueue the (already-built + size-checked) job and
+    // return the Working task. The executor is NOT spawned locally —
+    // a separate invocation consumes the queue (SQS Lambda handler)
+    // and runs the executor to terminal via
+    // `run_executor_for_existing_task`.
+    //
+    // Enqueue failure → FAILED compensation in the same shape as
+    // ADR-017 Bug 2 inline-push-config storage-failure compensation.
+    if let (Some(queue), Some(job)) = (durable_queue.as_ref(), durable_job) {
+        match queue.enqueue(job).await {
+            Ok(()) => {
+                let current = state
+                    .task_storage
+                    .get_task(tenant, &task_id, owner, history_length)
+                    .await
+                    .map_err(A2aError::from)?
+                    .ok_or_else(|| A2aError::TaskNotFound {
+                        task_id: task_id.clone(),
+                    })?;
+                return Ok(Json(serde_json::json!({
+                    "task": serde_json::to_value(&current).unwrap_or_default()
+                })));
+            }
+            Err(e) => {
+                let reason = format!("durable executor enqueue failed: {e}");
+                tracing::warn!(
+                    tenant = tenant,
+                    owner = owner,
+                    task_id = %task_id,
+                    queue_kind = queue.kind(),
+                    "ADR-018 enqueue failed: transitioning task to FAILED"
+                );
+                let reason_msg = Message::new(
+                    uuid::Uuid::now_v7().to_string(),
+                    turul_a2a_types::Role::Agent,
+                    vec![turul_a2a_types::Part::text(reason.clone())],
+                );
+                let failed_status = TaskStatus::new(TaskState::Failed).with_message(reason_msg);
+                let failed_event = StreamEvent::StatusUpdate {
+                    status_update: crate::streaming::StatusUpdatePayload {
+                        task_id: task_id.clone(),
+                        context_id: context_id.clone(),
+                        status: serde_json::to_value(&failed_status).unwrap_or_default(),
+                    },
+                };
+                if let Err(compensate_err) = state
+                    .atomic_store
+                    .update_task_status_with_events(
+                        tenant,
+                        &task_id,
+                        owner,
+                        failed_status,
+                        vec![failed_event],
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        tenant = tenant,
+                        owner = owner,
+                        task_id = %task_id,
+                        error = %compensate_err,
+                        "ADR-018 FAILED-compensation itself failed: task may \
+                         remain in WORKING until supervisor sweep"
+                    );
+                }
+                state.event_broker.notify(&task_id).await;
+                return Err(A2aError::Internal(reason));
+            }
+        }
+    }
+
     // Spawn the executor on a tracked handle with a live EventSink.
     let spawn_deps = crate::server::spawn::SpawnDeps {
         executor: state.executor.clone(),
@@ -1045,6 +1174,7 @@ pub async fn core_send_message(
         task_id: task_id.clone(),
         context_id: context_id.clone(),
         message: message.clone(),
+        claims: claims.clone(),
     };
     let spawn = crate::server::spawn::spawn_tracked_executor(spawn_deps, scope)?;
 

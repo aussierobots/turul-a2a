@@ -76,6 +76,9 @@ mod no_streaming;
 mod scheduled_recovery;
 mod stream_recovery;
 
+#[cfg(feature = "sqs")]
+mod durable;
+
 #[cfg(test)]
 mod builder_tests;
 #[cfg(test)]
@@ -90,6 +93,9 @@ pub use scheduled_recovery::{
     LambdaScheduledRecoveryConfig, LambdaScheduledRecoveryHandler, LambdaScheduledRecoveryResponse,
 };
 pub use stream_recovery::LambdaStreamRecoveryHandler;
+
+#[cfg(feature = "sqs")]
+pub use durable::{LambdaEvent, SqsDurableExecutorQueue, classify_event, drive_sqs_batch};
 
 use std::sync::Arc;
 
@@ -125,6 +131,7 @@ pub struct LambdaA2aServerBuilder {
     push_delivery_store: Option<Arc<dyn A2aPushDeliveryStore>>,
     middleware: Vec<Arc<dyn A2aMiddleware>>,
     runtime_config: RuntimeConfig,
+    durable_executor_queue: Option<Arc<dyn turul_a2a::durable_executor::DurableExecutorQueue>>,
 }
 
 impl LambdaA2aServerBuilder {
@@ -139,7 +146,44 @@ impl LambdaA2aServerBuilder {
             push_delivery_store: None,
             middleware: vec![],
             runtime_config: RuntimeConfig::default(),
+            durable_executor_queue: None,
         }
+    }
+
+    /// Wire a durable executor queue (ADR-018). When set, the
+    /// `return_immediately = true` path in `core_send_message` enqueues
+    /// a [`turul_a2a::durable_executor::QueuedExecutorJob`] on this
+    /// queue instead of spawning the executor locally, and the
+    /// capability flag `RuntimeConfig::supports_return_immediately` is
+    /// turned **back on** as an implementation detail — the capability
+    /// cannot be claimed without supplying the queue.
+    ///
+    /// Adopters should typically reach for the SQS-specific helper
+    /// [`Self::with_sqs_return_immediately`] instead; this generic
+    /// method exists so adopters can inject in-memory fakes for tests
+    /// or provide non-SQS transports (Kinesis, Step Functions task
+    /// token, self-invoke, etc.).
+    pub fn with_durable_executor(
+        mut self,
+        queue: Arc<dyn turul_a2a::durable_executor::DurableExecutorQueue>,
+    ) -> Self {
+        self.durable_executor_queue = Some(queue);
+        self.runtime_config.supports_return_immediately = true;
+        self
+    }
+
+    /// Wire the AWS SQS durable executor queue (ADR-018). Ergonomic
+    /// helper over [`Self::with_durable_executor`] that constructs a
+    /// [`SqsDurableExecutorQueue`] from a `queue_url` + shared SQS
+    /// client. Requires the `sqs` feature.
+    #[cfg(feature = "sqs")]
+    pub fn with_sqs_return_immediately(
+        self,
+        queue_url: impl Into<String>,
+        sqs_client: Arc<aws_sdk_sqs::Client>,
+    ) -> Self {
+        let queue = Arc::new(SqsDurableExecutorQueue::new(queue_url, sqs_client));
+        self.with_durable_executor(queue)
     }
 
     pub fn executor(mut self, exec: impl AgentExecutor + 'static) -> Self {
@@ -331,8 +375,17 @@ impl LambdaA2aServerBuilder {
         // (ADR-013 §4.4). Refuse `SendMessageConfiguration.return_immediately
         // = true` at the `core_send_message` entry point via this
         // capability flag instead of silently orphaning the executor.
+        //
+        // ADR-018: if a durable executor queue is wired via
+        // [`Self::with_durable_executor`] (or the SQS helper), the
+        // capability is re-enabled because enqueueing is durable
+        // across the Lambda freeze. The explicit re-enable lives in
+        // the builder method so the capability cannot be claimed
+        // without the mechanism.
         let mut runtime_config = self.runtime_config;
-        runtime_config.supports_return_immediately = false;
+        if self.durable_executor_queue.is_none() {
+            runtime_config.supports_return_immediately = false;
+        }
 
         // Push dispatcher wiring (ADR-011 §10 / ADR-013 §7). When
         // `push_delivery_store` is present, validate its backend matches,
@@ -412,11 +465,12 @@ impl LambdaA2aServerBuilder {
             cancellation_supervisor,
             push_delivery_store,
             push_dispatcher,
+            durable_executor_queue: self.durable_executor_queue,
         };
 
-        let router = build_router(state);
+        let router = build_router(state.clone());
 
-        Ok(LambdaA2aHandler { router })
+        Ok(LambdaA2aHandler { router, state })
     }
 }
 
@@ -430,6 +484,12 @@ impl Default for LambdaA2aServerBuilder {
 #[derive(Clone)]
 pub struct LambdaA2aHandler {
     router: axum::Router,
+    /// Held for ADR-018 SQS-event dispatch (`handle_sqs`). Always
+    /// populated — the SQS handler method is gated behind the `sqs`
+    /// feature but the state is carried unconditionally so callers can
+    /// reach it for diagnostics or future non-HTTP / non-SQS handlers.
+    #[cfg_attr(not(feature = "sqs"), allow(dead_code))]
+    state: AppState,
 }
 
 impl LambdaA2aHandler {
@@ -449,5 +509,23 @@ impl LambdaA2aHandler {
             .map_err(|e| lambda_http::Error::from(format!("Router error: {e}")))?;
 
         axum_to_lambda_response(axum_resp).await
+    }
+
+    /// Handle an SQS batch from the durable executor queue (ADR-018).
+    ///
+    /// Returns `SqsBatchResponse` whose `batch_item_failures` list
+    /// tells the event source mapping which records to retry.
+    /// Requires `FunctionResponseTypes: ["ReportBatchItemFailures"]`
+    /// on the mapping.
+    ///
+    /// Each record: deserialize envelope → load task → terminal-no-op
+    /// check → cancel-marker direct-CANCELED commit → run executor.
+    /// See `durable::drive_sqs_batch` for the full semantics.
+    #[cfg(feature = "sqs")]
+    pub async fn handle_sqs(
+        &self,
+        event: aws_lambda_events::event::sqs::SqsEvent,
+    ) -> aws_lambda_events::event::sqs::SqsBatchResponse {
+        durable::drive_sqs_batch(&self.state, event).await
     }
 }

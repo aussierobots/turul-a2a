@@ -56,6 +56,7 @@ fn make_state(executor: Arc<dyn AgentExecutor>) -> AppState {
         cancellation_supervisor: storage,
         push_delivery_store: None,
         push_dispatcher: None,
+        durable_executor_queue: None,
     }
 }
 
@@ -141,9 +142,10 @@ impl AgentExecutor for SinkDrivenCompleter {
 async fn blocking_send_long_running_sink_driven_completes() {
     let state = make_state(Arc::new(SinkDrivenCompleter { delay_ms: 50 }));
     let start = std::time::Instant::now();
-    let axum::Json(v) = core_send_message(state.clone(), "", "owner-1", send_request_body("hi"))
-        .await
-        .expect("blocking send completes");
+    let axum::Json(v) =
+        core_send_message(state.clone(), "", "owner-1", None, send_request_body("hi"))
+            .await
+            .expect("blocking send completes");
     let elapsed = start.elapsed();
     let task = task_from_response(v);
     assert!(
@@ -223,9 +225,10 @@ impl AgentExecutor for DirectMutationChunkExtender {
 #[tokio::test]
 async fn blocking_send_direct_task_mutation_extended_artifact_is_persisted() {
     let state = make_state(Arc::new(DirectMutationChunkExtender));
-    let axum::Json(v) = core_send_message(state.clone(), "", "owner-ext", send_request_body("x"))
-        .await
-        .expect("blocking send on direct-mutation chunk extender");
+    let axum::Json(v) =
+        core_send_message(state.clone(), "", "owner-ext", None, send_request_body("x"))
+            .await
+            .expect("blocking send on direct-mutation chunk extender");
     let task = task_from_response(v);
     assert_eq!(
         task.status().unwrap().state().unwrap(),
@@ -250,10 +253,15 @@ async fn blocking_send_direct_task_mutation_extended_artifact_is_persisted() {
 #[tokio::test]
 async fn blocking_send_direct_task_mutation_still_terminates_via_cas() {
     let state = make_state(Arc::new(DirectMutationCompleter));
-    let axum::Json(v) =
-        core_send_message(state.clone(), "", "owner-legacy", send_request_body("x"))
-            .await
-            .expect("blocking send on direct-task-mutation executor");
+    let axum::Json(v) = core_send_message(
+        state.clone(),
+        "",
+        "owner-legacy",
+        None,
+        send_request_body("x"),
+    )
+    .await
+    .expect("blocking send on direct-task-mutation executor");
     let task = task_from_response(v);
     assert_eq!(
         task.status().unwrap().state().unwrap(),
@@ -291,9 +299,10 @@ impl AgentExecutor for ErrReturner {
 #[tokio::test]
 async fn blocking_send_executor_err_commits_failed() {
     let state = make_state(Arc::new(ErrReturner));
-    let axum::Json(v) = core_send_message(state.clone(), "", "owner-err", send_request_body("x"))
-        .await
-        .expect("blocking send returns the FAILED task, not an Err");
+    let axum::Json(v) =
+        core_send_message(state.clone(), "", "owner-err", None, send_request_body("x"))
+            .await
+            .expect("blocking send returns the FAILED task, not an Err");
     let task = task_from_response(v);
     assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Failed);
     // The framework's agent-authored failure message carries the
@@ -347,9 +356,10 @@ impl AgentExecutor for PolicyRejecter {
 #[tokio::test]
 async fn blocking_send_executor_rejects_via_sink_reject() {
     let state = make_state(Arc::new(PolicyRejecter));
-    let axum::Json(v) = core_send_message(state.clone(), "", "owner-r", send_request_body("x"))
-        .await
-        .expect("blocking send returns the REJECTED task");
+    let axum::Json(v) =
+        core_send_message(state.clone(), "", "owner-r", None, send_request_body("x"))
+            .await
+            .expect("blocking send returns the REJECTED task");
     let task = task_from_response(v);
     let state_val = task.status().unwrap().state().unwrap();
     assert_eq!(
@@ -407,7 +417,7 @@ async fn blocking_send_two_deadline_cooperative_returns_canceled() {
         Duration::from_millis(500),
     );
     let start = std::time::Instant::now();
-    let axum::Json(v) = core_send_message(state, "", "owner-coop", send_request_body("x"))
+    let axum::Json(v) = core_send_message(state, "", "owner-coop", None, send_request_body("x"))
         .await
         .expect("blocking send returns within grace window");
     let elapsed = start.elapsed();
@@ -483,7 +493,7 @@ async fn blocking_send_two_deadline_abort_fallback_returns_failed() {
         Duration::from_millis(200),
     );
     let start = std::time::Instant::now();
-    let axum::Json(v) = core_send_message(state, "", "owner-abort", send_request_body("x"))
+    let axum::Json(v) = core_send_message(state, "", "owner-abort", None, send_request_body("x"))
         .await
         .expect("blocking send force-commits FAILED");
     let elapsed = start.elapsed();
@@ -537,9 +547,10 @@ async fn blocking_send_hard_timeout_actually_aborts_executor() {
         Duration::from_millis(150),
     );
 
-    let axum::Json(_v) = core_send_message(state, "", "owner-abort-probe", send_request_body("x"))
-        .await
-        .expect("blocking send force-commits FAILED");
+    let axum::Json(_v) =
+        core_send_message(state, "", "owner-abort-probe", None, send_request_body("x"))
+            .await
+            .expect("blocking send force-commits FAILED");
 
     // The Sender lives inside the executor future. When the future
     // drops (via abort), the Sender drops, and `rx` resolves —
@@ -609,7 +620,7 @@ async fn blocking_send_two_deadline_last_moment_executor_wins_cas() {
         fire_clone.notify_waiters();
     });
 
-    let axum::Json(v) = core_send_message(state, "", "owner-race", send_request_body("x"))
+    let axum::Json(v) = core_send_message(state, "", "owner-race", None, send_request_body("x"))
         .await
         .expect("blocking send resolves either way");
     let task = task_from_response(v);
@@ -655,6 +666,7 @@ async fn non_blocking_send_return_immediately_returns_before_terminal() {
         state.clone(),
         "",
         "owner-ni",
+        None,
         send_request_body_return_immediately("x"),
     )
     .await

@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.13"
+version = "0.1.14"
 edition = "2024"
 authors = ["Nick Hortovanyi <nick@aussierobots.com.au>"]
 license = "MIT OR Apache-2.0"
@@ -83,7 +83,8 @@ aws-sdk-dynamodb = "1"
 # Lambda
 lambda_http = "1"
 lambda_runtime = "1"
-aws_lambda_events = { version = "1.1", default-features = false, features = ["dynamodb", "eventbridge"] }
+aws_lambda_events = { version = "1.1", default-features = false, features = ["dynamodb", "eventbridge", "sqs"] }
+aws-sdk-sqs = "1"
 
 # Testing / crypto
 rsa = { version = "0.9", features = ["pem"] }
@@ -95,7 +96,7 @@ static_assertions = "1.1"
 # Misc
 bytes = "1"
 
-turul-a2a = { version = "0.1.13", path = "crates/turul-a2a" }
-turul-a2a-proto = { version = "0.1.13", path = "crates/turul-a2a-proto" }
-turul-a2a-types = { version = "0.1.13", path = "crates/turul-a2a-types" }
+turul-a2a = { version = "0.1.14", path = "crates/turul-a2a" }
+turul-a2a-proto = { version = "0.1.14", path = "crates/turul-a2a-proto" }
+turul-a2a-types = { version = "0.1.14", path = "crates/turul-a2a-types" }
 turul-jwt-validator = "0.2"

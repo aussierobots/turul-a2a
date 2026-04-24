@@ -74,6 +74,7 @@ fn single_instance_state() -> AppState {
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
         push_dispatcher: None,
+        durable_executor_queue: None,
     }
 }
 
@@ -93,6 +94,7 @@ fn two_instances() -> (AppState, AppState) {
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
         push_dispatcher: None,
+        durable_executor_queue: None,
     };
     (make(&s), make(&s))
 }
@@ -432,6 +434,7 @@ async fn d3_no_broker_correctness_dependency() {
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
         push_dispatcher: None,
+        durable_executor_queue: None,
     };
 
     // Create non-terminal task with events — NO broker.notify()

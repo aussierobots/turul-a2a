@@ -146,6 +146,7 @@ fn state_no_auth() -> AppState {
         atomic_store: Arc::new(s),
         push_delivery_store: None,
         push_dispatcher: None,
+        durable_executor_queue: None,
     }
 }
 
@@ -164,6 +165,7 @@ fn state_with_auth() -> AppState {
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
         push_dispatcher: None,
+        durable_executor_queue: None,
     }
 }
 

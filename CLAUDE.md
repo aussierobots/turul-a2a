@@ -8,7 +8,7 @@ Turul-a2a is a Rust implementation of the A2A (Agent-to-Agent) Protocol v1.0. Li
 
 **Proto-first architecture**: Types are generated from the normative `proto/a2a.proto` (package `lf.a2a.v1`) using `prost` + `pbjson`, then wrapped in ergonomic Rust types.
 
-**Current release**: 0.1.13 — see `CHANGELOG.md` for the per-release contract.
+**Current release**: 0.1.14 — see `CHANGELOG.md` for the per-release contract.
 
 ## Build & Development Commands
 

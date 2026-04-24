@@ -981,6 +981,20 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         // tasks → event_counters → events → pending_dispatches.
         // The last guard is held only when the push_dispatch opt-in is on
         // so the non-push path never contends on it.
+        // ADR-018 §Pending-dispatch optimization: acquire a READ guard
+        // on push_configs BEFORE the tasks write, in consistent lock
+        // order, so the marker-write loop below can check whether any
+        // config exists for the task and skip the marker when zero
+        // configs are registered. A config registered after terminal
+        // is not eligible for that terminal event anyway (ADR-009
+        // `registered_after_event_sequence` filter), so the check is
+        // safe without adding read-modify-write atomicity against
+        // concurrent config registration.
+        let push_configs_snapshot = if self.push_dispatch_enabled {
+            Some(self.push_configs.read().await)
+        } else {
+            None
+        };
         let mut tasks = self.tasks.write().await;
         let mut counters = self.event_counters.write().await;
         let mut event_map = self.events.write().await;
@@ -1062,13 +1076,27 @@ impl A2aAtomicStore for InMemoryA2aStorage {
 
             if let Some(guard) = pending_dispatches.as_mut() {
                 if event.is_terminal() && matches!(event, StreamEvent::StatusUpdate { .. }) {
-                    guard.insert(
-                        (tenant.to_string(), task_id.to_string(), seq),
-                        StoredPendingDispatch {
-                            owner: owner.to_string(),
-                            recorded_at: std::time::SystemTime::now(),
-                        },
-                    );
+                    // ADR-018 §Pending-dispatch optimization: skip the
+                    // marker write if no push configs exist for the
+                    // task. Configs registered after terminal are not
+                    // eligible for that terminal event anyway
+                    // (ADR-009), so skipping costs zero correctness
+                    // and avoids steady-state row accumulation for
+                    // deployments that terminate tasks without ever
+                    // registering a webhook.
+                    let has_configs = push_configs_snapshot.as_ref().is_some_and(|cfgs| {
+                        cfgs.keys()
+                            .any(|(t, tid, _)| t.as_str() == tenant && tid.as_str() == task_id)
+                    });
+                    if has_configs {
+                        guard.insert(
+                            (tenant.to_string(), task_id.to_string(), seq),
+                            StoredPendingDispatch {
+                                owner: owner.to_string(),
+                                recorded_at: std::time::SystemTime::now(),
+                            },
+                        );
+                    }
                 }
             }
 
@@ -1946,7 +1974,7 @@ mod tests {
     #[tokio::test]
     async fn test_atomic_marker_written_for_terminal_status() {
         let s = opted_in_storage();
-        parity_tests::test_atomic_marker_written_for_terminal_status(&s, &s, &s).await;
+        parity_tests::test_atomic_marker_written_for_terminal_status(&s, &s, &s, &s).await;
     }
 
     #[tokio::test]

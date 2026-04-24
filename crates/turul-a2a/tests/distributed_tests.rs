@@ -64,6 +64,7 @@ fn two_instances() -> (axum::Router, axum::Router) {
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
         push_dispatcher: None,
+        durable_executor_queue: None,
     };
 
     let state_b = AppState {
@@ -79,6 +80,7 @@ fn two_instances() -> (axum::Router, axum::Router) {
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
         push_dispatcher: None,
+        durable_executor_queue: None,
     };
 
     (build_router(state_a), build_router(state_b))

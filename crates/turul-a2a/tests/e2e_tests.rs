@@ -149,6 +149,7 @@ fn state_with(executor: impl AgentExecutor + 'static) -> AppState {
         cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
         push_delivery_store: None,
         push_dispatcher: None,
+        durable_executor_queue: None,
     }
 }
 

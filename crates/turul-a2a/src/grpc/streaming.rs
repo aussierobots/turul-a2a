@@ -57,9 +57,12 @@ pub async fn handle_send_streaming_message(
     owner: String,
     body: String,
 ) -> Result<BoxedStreamResponseStream, Status> {
-    let (task_id, wake_rx) = router::setup_streaming_send(state.clone(), &tenant, &owner, body)
-        .await
-        .map_err(a2a_to_status)?;
+    // gRPC auth claims are not yet wired (future ADR). Pass None for now;
+    // matches the pre-ADR-018 runtime behaviour on this path.
+    let (task_id, wake_rx) =
+        router::setup_streaming_send(state.clone(), &tenant, &owner, None, body)
+            .await
+            .map_err(a2a_to_status)?;
     Ok(make_store_grpc_stream(
         state.event_store,
         tenant,

@@ -1290,23 +1290,43 @@ impl A2aAtomicStore for SqliteA2aStorage {
                 && event.is_terminal()
                 && matches!(event, StreamEvent::StatusUpdate { .. })
             {
-                let now_micros = systime_to_micros(std::time::SystemTime::now());
-                sqlx::query(
-                    "INSERT INTO a2a_push_pending_dispatches \
-                        (tenant, task_id, event_sequence, owner, recorded_at_micros) \
-                     VALUES (?1, ?2, ?3, ?4, ?5) \
-                     ON CONFLICT (tenant, task_id, event_sequence) DO UPDATE SET \
-                        owner = excluded.owner, \
-                        recorded_at_micros = excluded.recorded_at_micros",
+                // ADR-018 §Pending-dispatch optimization: skip the
+                // marker write if no push configs exist for the task.
+                // A config registered after terminal is not eligible
+                // for that terminal event anyway (ADR-009
+                // `registered_after_event_sequence`), so skipping is
+                // correctness-neutral and avoids steady-state row
+                // accumulation on deployments that never register
+                // webhooks.
+                let config_count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM a2a_push_configs \
+                     WHERE tenant = ?1 AND task_id = ?2",
                 )
                 .bind(tenant)
                 .bind(task_id)
-                .bind(seq.0)
-                .bind(owner)
-                .bind(now_micros)
-                .execute(&mut *tx)
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+                if config_count > 0 {
+                    let now_micros = systime_to_micros(std::time::SystemTime::now());
+                    sqlx::query(
+                        "INSERT INTO a2a_push_pending_dispatches \
+                            (tenant, task_id, event_sequence, owner, recorded_at_micros) \
+                         VALUES (?1, ?2, ?3, ?4, ?5) \
+                         ON CONFLICT (tenant, task_id, event_sequence) DO UPDATE SET \
+                            owner = excluded.owner, \
+                            recorded_at_micros = excluded.recorded_at_micros",
+                    )
+                    .bind(tenant)
+                    .bind(task_id)
+                    .bind(seq.0)
+                    .bind(owner)
+                    .bind(now_micros)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+                }
             }
 
             sequences.push(seq.0 as u64);
@@ -2530,7 +2550,7 @@ mod tests {
     #[tokio::test]
     async fn test_atomic_marker_written_for_terminal_status() {
         let s = opted_in_storage().await;
-        parity_tests::test_atomic_marker_written_for_terminal_status(&s, &s, &s).await;
+        parity_tests::test_atomic_marker_written_for_terminal_status(&s, &s, &s, &s).await;
     }
 
     #[tokio::test]

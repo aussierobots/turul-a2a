@@ -3645,6 +3645,7 @@ pub async fn test_atomic_marker_written_for_terminal_status(
     atomic: &dyn A2aAtomicStore,
     tasks: &dyn A2aTaskStorage,
     delivery: &dyn A2aPushDeliveryStore,
+    push: &dyn A2aPushNotificationStorage,
 ) {
     assert!(
         atomic.push_dispatch_enabled(),
@@ -3659,6 +3660,23 @@ pub async fn test_atomic_marker_written_for_terminal_status(
         .create_task("default", "owner-1", task)
         .await
         .expect("seed task");
+
+    // Task 45 (ADR-018 §Pending-dispatch optimization): a push config
+    // MUST be registered for the marker to be written. Without a
+    // registered config the framework skips the marker write — a
+    // config registered after terminal is not eligible for that
+    // terminal event anyway (ADR-009), so skipping is
+    // correctness-neutral.
+    let config = turul_a2a_proto::TaskPushNotificationConfig {
+        tenant: "default".into(),
+        id: "cfg-pdm-001".into(),
+        task_id: "pdm-001".into(),
+        url: "https://webhook.example.test/pdm".into(),
+        ..Default::default()
+    };
+    push.create_config("default", config)
+        .await
+        .expect("register push config");
 
     let terminal = make_status_event_for("pdm-001", "ctx-pdm-001", "TASK_STATE_COMPLETED");
     let (_task, seqs) = atomic

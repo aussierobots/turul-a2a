@@ -38,6 +38,7 @@ pub async fn jsonrpc_dispatch_handler(
     body: String,
 ) -> axum::response::Response {
     let owner = ctx.identity.owner().to_string();
+    let claims = ctx.identity.claims().cloned();
     // 1. Parse JSON
     let value: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
@@ -150,6 +151,7 @@ pub async fn jsonrpc_dispatch_handler(
             &method,
             &tenant,
             &owner,
+            claims,
             params,
             id.clone(),
             last_event_id.as_deref(),
@@ -162,7 +164,7 @@ pub async fn jsonrpc_dispatch_handler(
     }
 
     // 7. Non-streaming dispatch
-    let result = dispatch(state, &method, &tenant, &owner, params).await;
+    let result = dispatch(state, &method, &tenant, &owner, claims, params).await;
 
     // 8. Notifications: suppress response entirely
     if is_notification {
@@ -194,10 +196,11 @@ async fn dispatch(
     method: &str,
     tenant: &str,
     owner: &str,
+    claims: Option<serde_json::Value>,
     params: Value,
 ) -> Result<Value, A2aError> {
     match method {
-        methods::SEND_MESSAGE => dispatch_send_message(state, tenant, owner, params).await,
+        methods::SEND_MESSAGE => dispatch_send_message(state, tenant, owner, claims, params).await,
         methods::GET_TASK => dispatch_get_task(state, tenant, owner, params).await,
         methods::LIST_TASKS => dispatch_list_tasks(state, tenant, owner, params).await,
         methods::CANCEL_TASK => dispatch_cancel_task(state, tenant, owner, params).await,
@@ -226,18 +229,20 @@ async fn dispatch(
 // JSON-RPC streaming dispatch
 // =========================================================
 
+#[allow(clippy::too_many_arguments)] // dispatch glue: all args are request-derived
 async fn dispatch_streaming(
     state: AppState,
     method: &str,
     tenant: &str,
     owner: &str,
+    claims: Option<serde_json::Value>,
     params: Value,
     request_id: Value,
     last_event_id: Option<&str>,
 ) -> Result<axum::response::Response, A2aError> {
     match method {
         methods::SEND_STREAMING_MESSAGE => {
-            dispatch_send_streaming_message(state, tenant, owner, params, request_id).await
+            dispatch_send_streaming_message(state, tenant, owner, claims, params, request_id).await
         }
         methods::SUBSCRIBE_TO_TASK => {
             dispatch_subscribe_to_task(state, tenant, owner, params, request_id, last_event_id)
@@ -251,6 +256,7 @@ async fn dispatch_send_streaming_message(
     state: AppState,
     tenant: &str,
     owner: &str,
+    claims: Option<serde_json::Value>,
     params: Value,
     request_id: Value,
 ) -> Result<axum::response::Response, A2aError> {
@@ -336,6 +342,7 @@ async fn dispatch_send_streaming_message(
         task_id: task_id.clone(),
         context_id: context_id.clone(),
         message: message.clone(),
+        claims,
     };
     let _spawn = crate::server::spawn::spawn_tracked_executor(spawn_deps, scope)?;
 
@@ -523,13 +530,15 @@ async fn dispatch_send_message(
     state: AppState,
     tenant: &str,
     owner: &str,
+    claims: Option<serde_json::Value>,
     params: Value,
 ) -> Result<Value, A2aError> {
     let body = serde_json::to_string(&params).map_err(|e| A2aError::InvalidRequest {
         message: format!("Invalid params: {e}"),
     })?;
     // Reuse the core handler, which returns Json<Value> with SendMessageResponse shape
-    let Json(response) = crate::router::core_send_message(state, tenant, owner, body).await?;
+    let Json(response) =
+        crate::router::core_send_message(state, tenant, owner, claims, body).await?;
     Ok(response)
 }
 

@@ -88,6 +88,7 @@ fn base_state() -> AppState {
         cancellation_supervisor: Arc::new(s),
         push_delivery_store: None,
         push_dispatcher: None,
+        durable_executor_queue: None,
     }
 }
 
@@ -458,6 +459,7 @@ async fn send_message_inline_push_config_storage_failure_compensates() {
         cancellation_supervisor: inner.clone(),
         push_delivery_store: None,
         push_dispatcher: None,
+        durable_executor_queue: None,
     };
     let task_storage = state.task_storage.clone();
     let router = build_router(state);

@@ -108,7 +108,10 @@ impl pb::grpc::A2aService for GrpcService {
         // existing input path (including `configuration.returnImmediately`).
         let body = serde_json::to_string(request.get_ref()).map_err(internal_from_json)?;
 
-        let value = router::core_send_message(self.state.clone(), &tenant, &owner, body)
+        // gRPC auth claims are not yet wired (future ADR). Pass None for now;
+        // matches the pre-ADR-018 runtime behaviour where executors observed
+        // `ctx.claims = None` on this path.
+        let value = router::core_send_message(self.state.clone(), &tenant, &owner, None, body)
             .await
             .map_err(a2a_to_status)?
             .0;

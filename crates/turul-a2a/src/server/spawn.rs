@@ -53,8 +53,13 @@ use crate::streaming::TaskEventBroker;
 
 /// Shared spawn-path dependencies pulled out of `AppState` to keep the
 /// call sites in `router.rs` / `jsonrpc.rs` ergonomic.
+///
+/// Public so ADR-018 consumers outside the core crate (e.g.,
+/// `turul-a2a-aws-lambda`'s SQS handler) can construct it from an
+/// [`crate::router::AppState`] reference before calling
+/// [`run_queued_executor_job`].
 #[derive(Clone)]
-pub(crate) struct SpawnDeps {
+pub struct SpawnDeps {
     pub executor: Arc<dyn AgentExecutor>,
     pub task_storage: Arc<dyn A2aTaskStorage>,
     pub atomic_store: Arc<dyn A2aAtomicStore>,
@@ -68,12 +73,20 @@ pub(crate) struct SpawnDeps {
 
 /// Per-spawn scope: identifies the task whose executor we are spawning
 /// and the message that triggered it.
-pub(crate) struct SpawnScope {
+///
+/// `claims` carries the authenticated JWT claims from the transport
+/// layer through to the executor's `ExecutionContext`. Before ADR-018
+/// Phase 1 this field did not exist and `ExecutionContext.claims` was
+/// hardcoded to `None`, silently dropping claims even on blocking send.
+/// All three transports (HTTP, JSON-RPC, gRPC) now populate this where
+/// they have claims; gRPC passes `None` until gRPC auth is wired.
+pub struct SpawnScope {
     pub tenant: String,
     pub owner: String,
     pub task_id: String,
     pub context_id: String,
     pub message: Message,
+    pub claims: Option<serde_json::Value>,
 }
 
 /// Result of a successful spawn. The caller awaits `yielded_rx`
@@ -135,26 +148,19 @@ pub(crate) fn spawn_tracked_executor(
     );
 
     let exec_deps = deps.clone();
-    let exec_scope_tenant = scope.tenant.clone();
-    let exec_scope_owner = scope.owner.clone();
-    let exec_scope_task_id = scope.task_id.clone();
-    let exec_scope_context_id = scope.context_id.clone();
-    let exec_scope_message = scope.message.clone();
+    let exec_scope = SpawnScope {
+        tenant: scope.tenant.clone(),
+        owner: scope.owner.clone(),
+        task_id: scope.task_id.clone(),
+        context_id: scope.context_id.clone(),
+        message: scope.message.clone(),
+        claims: scope.claims.clone(),
+    };
     let exec_cancellation = cancellation.clone();
     let exec_sink = sink.clone();
 
     let executor_jh = tokio::spawn(async move {
-        run_executor_body(
-            exec_deps,
-            exec_sink,
-            exec_cancellation,
-            exec_scope_tenant,
-            exec_scope_owner,
-            exec_scope_task_id,
-            exec_scope_context_id,
-            exec_scope_message,
-        )
-        .await;
+        run_executor_for_existing_task(exec_deps, exec_scope, exec_sink, exec_cancellation).await;
     });
 
     handle.set_spawned(executor_jh);
@@ -179,19 +185,67 @@ pub(crate) fn spawn_tracked_executor(
     })
 }
 
-/// Body of the spawned executor task. Loads the task, runs
-/// `execute()`, applies the §7.2 detection rule.
-#[allow(clippy::too_many_arguments)]
-async fn run_executor_body(
+/// ADR-018 consumer entry: build a fresh EventSink + throwaway
+/// InFlightHandle, run the executor body, apply the §7.2 detection
+/// rule. This is the single function the SQS / durable-continuation
+/// handler calls per record.
+///
+/// Creates a local `CancellationToken` the executor observes through
+/// `ExecutionContext.cancellation`. There is no registry entry (the
+/// SQS invocation is not visible to a concurrent `:cancel` on the
+/// same instance) and no yielded-rx awaiter (durable-continuation
+/// paths do not block the HTTP response).
+pub async fn run_queued_executor_job(deps: SpawnDeps, scope: SpawnScope) {
+    let cancellation = CancellationToken::new();
+    let (yielded_tx, _yielded_rx) = oneshot::channel::<Task>();
+    let placeholder_jh = tokio::spawn(async {});
+    let in_flight_handle = Arc::new(InFlightHandle::new(
+        cancellation.clone(),
+        yielded_tx,
+        placeholder_jh,
+    ));
+    let sink = EventSink::new(
+        scope.tenant.clone(),
+        scope.task_id.clone(),
+        scope.context_id.clone(),
+        scope.owner.clone(),
+        deps.atomic_store.clone(),
+        deps.task_storage.clone(),
+        deps.event_broker.clone(),
+        in_flight_handle,
+        deps.push_dispatcher.clone(),
+    );
+    run_executor_for_existing_task(deps, scope, sink, cancellation).await;
+}
+
+/// Run the executor body for an already-created task.
+///
+/// Extracted from the former inline `run_executor_body` so both the
+/// tokio-spawn path (`spawn_tracked_executor`) and the SQS-dispatch
+/// path (ADR-018 `LambdaA2aHandler::handle_sqs`) share the same load →
+/// execute → post-execute-detection flow. The caller owns constructing
+/// `sink` and `cancellation`; this function loads the task, builds the
+/// `ExecutionContext`, drives `execute`, and applies the §7.2 detection
+/// rule.
+///
+/// Threads `scope.claims` into `ExecutionContext.claims`. Prior to
+/// ADR-018 Phase 1 this was hardcoded to `None`, silently dropping
+/// claims from executors even on the blocking-send path.
+pub(crate) async fn run_executor_for_existing_task(
     deps: SpawnDeps,
+    scope: SpawnScope,
     sink: EventSink,
     cancellation: CancellationToken,
-    tenant: String,
-    owner: String,
-    task_id: String,
-    context_id: String,
-    message: Message,
 ) {
+    let SpawnScope {
+        tenant,
+        owner,
+        task_id,
+        context_id,
+        message,
+        claims,
+    } = scope;
+
     let mut task = match deps
         .task_storage
         .get_task(&tenant, &task_id, &owner, None)
@@ -246,7 +300,7 @@ async fn run_executor_body(
         },
         task_id: task_id.clone(),
         context_id: Some(context_id),
-        claims: None,
+        claims,
         cancellation,
         events: sink.clone(),
     };

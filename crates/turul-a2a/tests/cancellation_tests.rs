@@ -63,6 +63,7 @@ fn make_state() -> (AppState, InMemoryA2aStorage) {
         cancellation_supervisor: Arc::new(storage.clone()),
         push_delivery_store: None,
         push_dispatcher: None,
+        durable_executor_queue: None,
     };
     (state, storage)
 }
@@ -223,6 +224,7 @@ async fn cross_instance_cancel_via_storage_marker() {
         cancellation_supervisor: Arc::new(storage),
         push_delivery_store: None,
         push_dispatcher: None,
+        durable_executor_queue: None,
     };
     let state_a = make_state_for_storage(storage.clone());
     let state_b = make_state_for_storage(storage.clone());

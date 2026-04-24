@@ -1480,6 +1480,33 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         // TransactWriteItems (ADR-013 §4.3). Terminal `StatusUpdate`
         // events only — non-terminal / artifact events do not produce
         // markers.
+        //
+        // ADR-018 §Pending-dispatch optimization: if push_dispatch is
+        // on, pre-flight a single Query on the push_configs table
+        // scoped to this task. When zero configs exist, skip marker
+        // writes for any terminal events in this batch. Configs
+        // registered after terminal are not eligible for that
+        // terminal event anyway (ADR-009
+        // `registered_after_event_sequence`), so this is
+        // correctness-neutral and avoids steady-state row
+        // accumulation on deployments that never register webhooks.
+        let has_push_configs = if self.push_dispatch_enabled {
+            let query = self
+                .client
+                .query()
+                .table_name(&self.config.push_configs_table)
+                .key_condition_expression("pk = :pk")
+                .expression_attribute_values(":pk", AttributeValue::S(pk.clone()))
+                .select(aws_sdk_dynamodb::types::Select::Count)
+                .limit(1);
+            let out = query
+                .send()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            out.count() > 0
+        } else {
+            false
+        };
         let now_micros = ddb_systime_to_micros(std::time::SystemTime::now());
         let marker_ttl = Self::ttl_epoch(self.config.push_delivery_ttl_seconds);
         let mut sequences = Vec::with_capacity(events.len());
@@ -1511,6 +1538,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             );
 
             if self.push_dispatch_enabled
+                && has_push_configs
                 && event.is_terminal()
                 && matches!(event, StreamEvent::StatusUpdate { .. })
             {
@@ -4100,7 +4128,7 @@ mod tests {
     async fn test_atomic_marker_written_for_terminal_status() {
         skip_unless_dynamodb_env!(s);
         let s = s.with_push_dispatch_enabled(true);
-        parity_tests::test_atomic_marker_written_for_terminal_status(&s, &s, &s).await;
+        parity_tests::test_atomic_marker_written_for_terminal_status(&s, &s, &s, &s).await;
     }
 
     #[tokio::test]

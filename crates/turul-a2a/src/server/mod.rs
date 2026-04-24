@@ -2,7 +2,7 @@
 
 pub mod in_flight;
 pub mod obs;
-pub(crate) mod spawn;
+pub mod spawn;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -580,6 +580,9 @@ impl A2aServerBuilder {
                 cancellation_supervisor,
                 push_delivery_store,
                 push_dispatcher,
+                // ADR-018: long-lived binary server never enqueues;
+                // `tokio::spawn` is durable in this runtime.
+                durable_executor_queue: None,
             },
             merged_security: merged,
             bind_addr: self.bind_addr,
@@ -824,6 +827,7 @@ impl A2aServer {
             // deployment.
             push_delivery_store: self.state.push_delivery_store,
             push_dispatcher: self.state.push_dispatcher,
+            durable_executor_queue: self.state.durable_executor_queue,
         };
 
         (augmented, true)

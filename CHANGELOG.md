@@ -4,6 +4,32 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.14] — 2026-04-24
+
+### Added — ADR-018 Phase 1 + Phase 2
+
+- **`turul-a2a::durable_executor` module.** `DurableExecutorQueue` trait + `QueuedExecutorJob` payload + `QueueError`. Public extension point for adopters who want framework-managed durable continuation on runtimes that cannot honour `return_immediately=true` with `tokio::spawn` (AWS Lambda).
+- **`turul-a2a-aws-lambda` gains `sqs` feature.** Behind the `sqs` feature: `SqsDurableExecutorQueue` (first-party impl, `max_payload_bytes = 256 * 1024`), `LambdaA2aServerBuilder::with_durable_executor(queue)` / `with_sqs_return_immediately(queue_url, client)`, `LambdaA2aHandler::handle_sqs(event)`, `LambdaEvent` + `classify_event` for dual-event routing. `aws-sdk-sqs` is an optional dep behind the `sqs` feature.
+- When a durable executor queue is wired, `LambdaA2aServerBuilder::build()` re-enables `RuntimeConfig.supports_return_immediately`. The capability-taking builder shape enforces the "capability, not intent" contract from ADR-017 / ADR-018 — no public boolean setter ships.
+- SQS dequeue path commits `TASK_STATE_CANCELED` directly via `atomic_store.update_task_status_with_events` when the ADR-012 cancel marker is set pre-dispatch. The executor is never invoked for queued-then-cancelled tasks, so no side effects leak. `TerminalStateAlreadySet` on a race with a concurrent terminal commit is treated as success.
+
+### Changed — ADR-018 Phase 1
+
+- **`core_send_message` signature change (additive).** Takes a new `claims: Option<serde_json::Value>` parameter before `body`. HTTP and JSON-RPC call sites pass `ctx.identity.claims().cloned()`; gRPC passes `None` until a future ADR wires gRPC auth. `core_send_message` is `#[doc(hidden)]` so this is not a public-API break.
+- **Claims now reach executors on the blocking-send path.** `SpawnScope` gains a `claims` field; `ExecutionContext.claims` was previously hardcoded to `None` in `server/spawn.rs` — a pre-existing bug from before ADR-018 where executors silently observed `None` even when the HTTP request presented a valid JWT. Adopter executors that branched on `ctx.claims.is_none()` will observe the fix as an additive behaviour delta.
+- **`run_executor_body` extracted as `server::spawn::run_executor_for_existing_task`** (and the SQS consumer entry `run_queued_executor_job`). `spawn_tracked_executor` unchanged externally.
+- **Pending-dispatch marker skipped when no push configs exist.** On the atomic-store terminal commit path (all four backends: in-memory, SQLite, Postgres, DynamoDB), the framework now pre-checks whether any push config is registered for the task before writing a `a2a_push_pending_dispatches` marker. Downstream impact: deployments that never register webhooks no longer accumulate marker rows that the recovery workers would scan-and-discard. Configs registered after terminal are not eligible for that terminal event per ADR-009 `registered_after_event_sequence`, so the pre-check is correctness-neutral.
+
+### Documentation
+
+- [ADR-018](https://github.com/aussierobots/turul-a2a/blob/main/docs/adr/ADR-018-lambda-durable-executor-sqs.md) — Lambda durable executor continuation via SQS. Status: Accepted.
+
+### Tests
+
+- 6 new tests in `crates/turul-a2a/tests/adr018_tests.rs` covering envelope round-trip with claims, oversize preflight, successful enqueue leaves `Working` without local executor spawn, enqueue-failure FAILED compensation, blocking-send claims-reach-executor, pending-dispatch-skipped-without-configs.
+- 9 new tests in `crates/turul-a2a-aws-lambda/tests/sqs_durable_tests.rs` (gated on `sqs`) covering event classification, terminal idempotent no-op, cancel-marker direct-CANCELED commit without executor, non-terminal executor-runs path, unknown envelope version as batch-item failure, SQS `max_payload_bytes` contract.
+- Existing `test_atomic_marker_written_for_terminal_status` parity test updated to register a push config before the terminal commit (otherwise the task-45 fix would skip the marker write).
+
 ## [0.1.13] — 2026-04-24
 
 ### Changed — `SendMessageConfiguration` honoured on all three transports (ADR-017)
