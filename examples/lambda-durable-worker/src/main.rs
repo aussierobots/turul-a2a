@@ -37,13 +37,15 @@
 //! event source mapping with
 //! `FunctionResponseTypes: ["ReportBatchItemFailures"]`.
 //!
-//! ## Storage caveat
+//! ## Shared storage
 //!
-//! Same as `lambda-durable-agent`: the in-memory backend shown here
-//! is for `cargo check` convenience only. The request Lambda and
-//! this worker run in different containers, so in-memory state does
-//! not survive the handoff. Production MUST share a backend —
-//! `DynamoDbA2aStorage` is the idiomatic choice.
+//! The worker and the request Lambda (`lambda-durable-agent`) run in
+//! **different** containers, so both must point at the same backend
+//! — the worker loads a task the request Lambda already wrote and
+//! commits its terminal state through the same CAS-guarded atomic
+//! store (ADR-009 same-backend requirement). This example uses
+//! `DynamoDbA2aStorage` against the five tables provisioned by
+//! `examples/lambda-infra/cloudformation.yaml`.
 
 use async_trait::async_trait;
 use lambda_runtime::Error;

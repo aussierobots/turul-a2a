@@ -15,10 +15,26 @@ Verified end-to-end on AWS `ap-southeast-2` (2026-04-25): HTTP `returnImmediatel
 The dual-event routing is now one call in `main.rs`:
 
 ```rust
-turul_a2a_aws_lambda::run_mixed_http_and_sqs(handler).await
+LambdaA2aServerBuilder::new()
+    .executor(DurableEchoExecutor)
+    .storage(InMemoryA2aStorage::new())
+    .with_sqs_return_immediately(queue_url, sqs)
+    .run()           // default — with the `sqs` feature, dispatches HTTP and SQS
+    .await
 ```
 
-Since 0.1.15, `run_mixed_http_and_sqs` (gated on the `sqs` feature) hides the HTTP envelope conversion and the `classify_event`-based dispatch loop. Earlier revisions of this example open-coded ~80 lines of `LambdaRequest` → `http::Request<Body>` / `ApiGatewayV2httpResponse` plumbing directly in `main.rs` — all of that now lives in the framework. `main.rs` is down to ~15 lines of wiring (storage + executor + queue URL + the helper call).
+Since 0.1.15 (gated on the `sqs` feature), the adapter owns envelope classification and dispatch — adopter `main.rs` never touches `lambda_http::run`, `lambda_runtime::run`, `service_fn`, or `SqsEvent`. The builder-fluent `.run()` is the one-call default. For a deployment that wants strict fail-fast on a non-HTTP-or-SQS event shape, drop down one level:
+
+```rust
+let handler = LambdaA2aServerBuilder::new()
+    .executor(DurableEchoExecutor)
+    .storage(InMemoryA2aStorage::new())
+    .with_sqs_return_immediately(queue_url, sqs)
+    .build()?;
+handler.run_http_and_sqs().await     // explicit dual-event runner
+```
+
+Earlier revisions of this example open-coded ~80 lines of `LambdaRequest` → `http::Request<Body>` / `ApiGatewayV2httpResponse` plumbing directly in `main.rs` — all of that now lives in the framework. `main.rs` is down to ~15 lines of wiring (storage + executor + queue URL + the runner call).
 
 ## When to use this vs the two-Lambda example
 

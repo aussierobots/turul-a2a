@@ -366,17 +366,16 @@ aws sqs list-queues --queue-name-prefix turul-a2a
 aws iam get-role --role-name turul-a2a-demo-lambda-role 2>&1 | tail -1
 # → empty; empty; NoSuchEntity
 
-## Storage caveat (again, because it matters)
+## Shared storage + builder wiring
 
-The in-memory backend shown in this example is for `cargo check` and local-invoke convenience. **On AWS with two separate Lambdas, each container has its own in-memory state — the GetTask verification above will show `WORKING` not `COMPLETED` because the agent's container never sees the worker's commit.**
+The two-Lambda topology runs the request and consumer sides in **different** containers, so both binaries must point at the same backend — the worker loads the task the request Lambda already wrote and commits the terminal through the same CAS-guarded atomic store (ADR-009 same-backend requirement). Both `main.rs` files in this demo use `DynamoDbA2aStorage` (behind the `dynamodb` feature on `turul-a2a`) against the five tables provisioned by `examples/lambda-infra/cloudformation.yaml`.
 
-For any real deployment:
+The two builders differ by exactly one line:
 
-1. Swap `InMemoryA2aStorage` for `DynamoDbA2aStorage` in both `main.rs` files (behind the `dynamodb` feature on `turul-a2a`).
-2. Deploy the five DynamoDB tables — `examples/lambda-infra/cloudformation.yaml` provisions them.
-3. Keep `.with_push_dispatch_enabled(true)` so terminal commits continue to write pending-dispatch markers (even with no push configs registered, since the ADR-018 §Pending-dispatch optimization skips the write when the task has zero configs).
+- **Request Lambda (`lambda-durable-agent`)** calls `.with_sqs_return_immediately(queue_url, sqs)` because it *enqueues* durable jobs onto SQS. The builder flips `supports_return_immediately` as a side effect of supplying the queue (capability, not intent).
+- **Consumer Lambda (`lambda-durable-worker`)** does **not** call `.with_sqs_return_immediately(...)`. A worker never enqueues — it only reads jobs an SQS event-source mapping delivers to it and runs their executors. The runner method (`handler.run_sqs_only().await`) is what wires the SQS event loop.
 
-Both Lambdas call `.with_sqs_return_immediately(queue_url, sqs)`. The worker never actually enqueues — it's consumer-only — but the builder call wires the capability flag and keeps the two binaries interchangeable in terms of the `AppState` they construct.
+If the deployment needs push-notification delivery, wire `.push_delivery_store(storage.clone())` on both builders and flip `.with_push_dispatch_enabled(true)` on the storage so terminal commits write pending-dispatch markers (ADR-013 §4.3). This demo does not register push configs, so both builders omit push-delivery wiring.
 
 ## Behavior table
 

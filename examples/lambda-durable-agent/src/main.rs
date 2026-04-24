@@ -30,13 +30,15 @@
 //! walk-through (SQS queue + DLQ, Function URL, IAM policy, event
 //! source mapping to the worker Lambda).
 //!
-//! ## Storage caveat
+//! ## Shared storage
 //!
-//! This example uses `InMemoryA2aStorage` for `cargo check` and
-//! local-invoke convenience. Production deployments MUST use a
-//! shared backend — the request Lambda and the worker Lambda run in
-//! **different** containers, so in-memory state does not survive
-//! the cold-start handoff. Swap in `DynamoDbA2aStorage`.
+//! The request Lambda and the worker Lambda run in **different**
+//! containers, so the two-Lambda topology requires a shared backend.
+//! This example uses `DynamoDbA2aStorage` — the worker reads the task
+//! this Lambda wrote, runs the executor, and commits the terminal via
+//! the same CAS-guarded atomic store (ADR-009 same-backend
+//! requirement). Deploy the five DynamoDB tables from
+//! `examples/lambda-infra/cloudformation.yaml` before running.
 
 use std::sync::Arc;
 
