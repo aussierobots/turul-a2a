@@ -4,6 +4,76 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.13] — 2026-04-24
+
+### Changed — `SendMessageConfiguration` honoured on all three transports (ADR-017)
+
+`core_send_message` (shared by HTTP `POST /message:send`, JSON-RPC
+`SendMessage`, and gRPC `SendMessage`) now honours three
+`SendMessageConfiguration` fields that were previously silently
+ignored or silently broken. One of the changes is a breaking behaviour
+change on AWS Lambda; the others are additive fixes on all runtimes.
+
+- **Lambda: `return_immediately = true` now returns
+  `UnsupportedOperationError`** (HTTP 400 / JSON-RPC -32004 / gRPC
+  `INVALID_ARGUMENT`). Previously the flag was silently accepted but
+  the background executor had no guarantee of completing in the Lambda
+  execution environment (ADR-008, ADR-013 §4.4), leaving tasks stuck
+  in `Working` indefinitely with no push callback. If your client sets
+  `returnImmediately: true` on Lambda, remove the flag or submit with
+  `returnImmediately: false` (blocking send, bounded by the API
+  Gateway timeout). Adopters needing fire-and-forget-style work on
+  Lambda should invoke their durable mechanism (Step Functions, SQS,
+  EventBridge, etc.) from inside their `AgentExecutor::execute` body;
+  the A2A task is then Completed for "workflow accepted / started",
+  not "workflow finished". See ADR-017 §"Alternatives considered"
+  Pattern A. No action required for non-Lambda deployments — the
+  existing `return_immediately=true` semantics are preserved.
+
+- **`SendMessageConfiguration.taskPushNotificationConfig` inline push
+  configs are now registered atomically with task creation on all
+  runtimes.** URL parses up front — malformed URL returns HTTP 400 /
+  JSON-RPC -32602 / gRPC `INVALID_ARGUMENT` with zero task persisted.
+  If push-storage registration fails after the task was created, the
+  task is transitioned to `TASK_STATE_FAILED` with an agent `Message`
+  whose `Part::text` reads `inline push notification config
+  registration failed: <error>`, and the error is returned to the
+  caller; the executor is never spawned. Callers that previously
+  worked around the silent drop with a separate
+  `CreateTaskPushNotificationConfig` round-trip may remove that
+  workaround.
+
+- **`SendMessageConfiguration.historyLength` now trims response
+  message history on both `return_immediately=true` and blocking send
+  responses, matching `GetTask`.** The three-valued proto semantic is
+  preserved exactly (`proto/a2a.proto:150-154`): **unset** means no
+  limit (full history returned), **`0`** means empty history, **`n > 0`**
+  means the last `n` messages. Callers that relied on receiving the
+  full history regardless of the flag must omit `historyLength` —
+  setting it to `0` now correctly clears the response history per the
+  proto contract.
+
+### Added
+
+- `RuntimeConfig.supports_return_immediately: bool` (default `true`) —
+  capability flag consumed by `core_send_message`. The AWS Lambda
+  adapter sets this to `false` in `LambdaA2aServerBuilder::build()`.
+  The field is `pub` on a `#[non_exhaustive]` struct as an escape
+  hatch for tests and advanced internal consumers; it is **not** an
+  adopter surface (ADR-017 §"Alternatives considered").
+
+### Test matrix
+
+- 12 new tests in `crates/turul-a2a/tests/adr017_tests.rs` cover
+  Lambda gate (HTTP + JSON-RPC), inline push config (HTTP + JSON-RPC
+  + invalid URL + missing URL + storage-failure compensation), and
+  `historyLength` tri-state (`unset`, `0`, `n=1` on return-immediately
+  path, `n=1` on blocking path).
+
+### Documentation
+
+- ADR-017 added under `docs/adr/`.
+
 ## [0.1.12] — 2026-04-24
 
 ### Changed — wire surface tightening (ADR-016)

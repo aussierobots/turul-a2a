@@ -325,7 +325,14 @@ impl LambdaA2aServerBuilder {
             }
         }
 
-        let runtime_config = self.runtime_config;
+        // ADR-017 §Decision Bug 1: the Lambda execution environment
+        // freezes after the HTTP response is flushed, so any
+        // `tokio::spawn`'d executor continuation is opportunistic only
+        // (ADR-013 §4.4). Refuse `SendMessageConfiguration.return_immediately
+        // = true` at the `core_send_message` entry point via this
+        // capability flag instead of silently orphaning the executor.
+        let mut runtime_config = self.runtime_config;
+        runtime_config.supports_return_immediately = false;
 
         // Push dispatcher wiring (ADR-011 §10 / ADR-013 §7). When
         // `push_delivery_store` is present, validate its backend matches,

@@ -784,6 +784,59 @@ pub async fn core_send_message(
         .map(|c| c.return_immediately)
         .unwrap_or(false);
 
+    // ADR-017 Bug 1: runtimes that cannot guarantee post-return
+    // execution (e.g., AWS Lambda) refuse `return_immediately = true`
+    // here — before any storage write — to avoid silently orphaning
+    // the spawned executor. Mapped to HTTP 400 / JSON-RPC -32004 /
+    // gRPC INVALID_ARGUMENT per ADR-004.
+    if return_immediately && !state.runtime_config.supports_return_immediately {
+        tracing::warn!(
+            tenant = tenant,
+            owner = owner,
+            "rejecting SendMessageConfiguration.return_immediately=true: \
+             this runtime does not support post-return executor continuation \
+             (ADR-017 §Decision Bug 1, ADR-013 §4.4)"
+        );
+        return Err(A2aError::UnsupportedOperation {
+            message: "return_immediately=true is not supported on this runtime \
+                      (post-return executor continuation is not guaranteed); \
+                      resubmit with return_immediately=false for a blocking \
+                      send"
+                .into(),
+        });
+    }
+
+    // ADR-017 Bug 3: extract SendMessageConfiguration.history_length
+    // preserving the proto tri-state — None=unbounded, Some(0)=empty,
+    // Some(n>0)=last n (a2a.proto:150-154). Do NOT collapse Some(0) to
+    // None; the storage layer's `trim_task` already differentiates
+    // (e.g., storage/postgres.rs:212-222).
+    let history_length: Option<i32> = request
+        .configuration
+        .as_ref()
+        .and_then(|c| c.history_length);
+
+    // ADR-017 Bug 2 step 1: validate inline push config URL BEFORE any
+    // storage write. A malformed URL returns HTTP 400 / -32602 /
+    // INVALID_ARGUMENT with zero task persistence. URL parse mirrors
+    // `core_create_push_config` (router.rs:1411) and ADR-011 §R1.
+    let inline_push_config: Option<turul_a2a_proto::TaskPushNotificationConfig> = request
+        .configuration
+        .as_ref()
+        .and_then(|c| c.task_push_notification_config.clone());
+    if let Some(cfg) = inline_push_config.as_ref() {
+        if cfg.url.is_empty() {
+            return Err(A2aError::InvalidRequest {
+                message: "inline push config url is required".into(),
+            });
+        }
+        if let Err(e) = url::Url::parse(&cfg.url) {
+            return Err(A2aError::InvalidRequest {
+                message: format!("inline push config url is not a valid URL: {e}"),
+            });
+        }
+    }
+
     let msg_task_id = message.as_proto().task_id.clone();
 
     // If message has a task_id, continue the existing task; otherwise create new.
@@ -910,6 +963,73 @@ pub async fn core_send_message(
         state.event_broker.notify(&task_id).await;
     }
 
+    // ADR-017 Bug 2 steps 4-5: register any inline push config BEFORE
+    // spawning the executor so a pre-terminal failure cannot leave a
+    // live executor with no registered callback. URL was parsed up
+    // front (step 1), so the remaining failure mode is storage.
+    // Failure path: transition the just-created task to FAILED with an
+    // agent Message carrying the reason text (pattern matches the
+    // hard-timeout compensation at router.rs:1034-1054), then return
+    // the original storage error. The executor is never spawned.
+    if let Some(mut cfg) = inline_push_config {
+        cfg.task_id = task_id.clone();
+        match state.push_storage.create_config(tenant, cfg).await {
+            Ok(_) => {}
+            Err(e) => {
+                let reason = format!("inline push notification config registration failed: {e}");
+                tracing::warn!(
+                    tenant = tenant,
+                    owner = owner,
+                    task_id = %task_id,
+                    "ADR-017 Bug 2 compensation: transitioning task to FAILED \
+                     after inline push config registration failure"
+                );
+                let reason_msg = Message::new(
+                    uuid::Uuid::now_v7().to_string(),
+                    turul_a2a_types::Role::Agent,
+                    vec![turul_a2a_types::Part::text(reason)],
+                );
+                let failed_status = TaskStatus::new(TaskState::Failed).with_message(reason_msg);
+                let failed_event = StreamEvent::StatusUpdate {
+                    status_update: crate::streaming::StatusUpdatePayload {
+                        task_id: task_id.clone(),
+                        context_id: context_id.clone(),
+                        status: serde_json::to_value(&failed_status).unwrap_or_default(),
+                    },
+                };
+                // Best-effort compensation. If the FAILED transition
+                // itself fails (backend unavailable, CAS race with a
+                // concurrent writer), we still return the original
+                // push-storage error — double-failure is flagged to
+                // the caller via the original error, and the task
+                // will be observable as Working until a supervisor
+                // sweep or manual cleanup resolves it.
+                if let Err(compensate_err) = state
+                    .atomic_store
+                    .update_task_status_with_events(
+                        tenant,
+                        &task_id,
+                        owner,
+                        failed_status,
+                        vec![failed_event],
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        tenant = tenant,
+                        owner = owner,
+                        task_id = %task_id,
+                        error = %compensate_err,
+                        "ADR-017 Bug 2 compensation failed: task may remain \
+                         in WORKING without a callback until supervisor sweep"
+                    );
+                }
+                state.event_broker.notify(&task_id).await;
+                return Err(A2aError::from(e));
+            }
+        }
+    }
+
     // Spawn the executor on a tracked handle with a live EventSink.
     let spawn_deps = crate::server::spawn::SpawnDeps {
         executor: state.executor.clone(),
@@ -934,10 +1054,14 @@ pub async fn core_send_message(
         // task in its current state immediately. Drop yielded_rx — the
         // background executor keeps running; the caller polls / streams
         // to observe completion.
+        //
+        // ADR-017 Bug 3: `history_length` threaded through so the
+        // storage-layer `trim_task` honours the proto tri-state
+        // (a2a.proto:150-154).
         drop(spawn.yielded_rx);
         let current = state
             .task_storage
-            .get_task(tenant, &task_id, owner, None)
+            .get_task(tenant, &task_id, owner, history_length)
             .await
             .map_err(A2aError::from)?
             .ok_or_else(|| A2aError::TaskNotFound {
@@ -960,6 +1084,22 @@ pub async fn core_send_message(
         &context_id,
     )
     .await?;
+
+    // ADR-017 Bug 3: if the caller supplied `history_length`, re-read
+    // from storage so the same `trim_task` path that `GetTask` uses
+    // applies to the send response. Skipping this when the field is
+    // unset avoids an unnecessary storage round-trip on the default
+    // path. The task yielded from the executor is otherwise authoritative.
+    let task = if history_length.is_some() {
+        state
+            .task_storage
+            .get_task(tenant, &task_id, owner, history_length)
+            .await
+            .map_err(A2aError::from)?
+            .unwrap_or(task)
+    } else {
+        task
+    };
 
     Ok(Json(serde_json::json!({
         "task": serde_json::to_value(&task).unwrap_or_default()

@@ -72,6 +72,45 @@ pub struct RuntimeConfig {
     /// paginates: each tick fetches up to this many rows, redispatches
     /// them, and returns. The next tick picks up any remainder.
     pub push_reclaim_sweep_batch: usize,
+
+    /// Whether this runtime can honour
+    /// `SendMessageConfiguration.return_immediately = true` (ADR-017).
+    ///
+    /// `true` (default) — the runtime keeps the process alive after
+    /// the HTTP response returns so `tokio::spawn`'d executors run to
+    /// completion. Every long-lived host (`A2aServer::run`, ECS,
+    /// Fargate, AppRunner, Kubernetes, bare VM) sets this.
+    ///
+    /// `false` — the runtime cannot guarantee post-return execution;
+    /// `core_send_message` rejects `return_immediately = true` with
+    /// `A2aError::UnsupportedOperation` before any storage write. The
+    /// AWS Lambda adapter (ADR-008, ADR-013 §4.4) sets this.
+    ///
+    /// # Override policy
+    ///
+    /// This field is an escape hatch for tests and advanced internal
+    /// consumers that construct [`crate::router::AppState`] directly.
+    /// **It is not an adopter surface.** Do not set it to `true` on a
+    /// runtime that cannot actually guarantee post-return execution —
+    /// the guard exists to prevent silent executor orphaning.
+    ///
+    /// Adopters who need fire-and-forget-style work on Lambda today
+    /// should invoke their durable mechanism (Step Functions, SQS,
+    /// EventBridge, etc.) from inside their `AgentExecutor::execute`
+    /// body. The executor returns synchronously once the workflow is
+    /// accepted; the A2A task is Completed for "workflow accepted /
+    /// started", not "workflow finished". If the A2A task is meant to
+    /// track the full workflow lifecycle, the workflow itself must
+    /// later call back into turul-a2a storage to update task state.
+    /// See ADR-017 §"Alternatives considered" — Pattern A.
+    ///
+    /// A future ADR will add a capability-taking
+    /// `LambdaA2aServerBuilder` method (shape:
+    /// `with_durable_return_immediately(handler)`) that accepts a
+    /// durable continuation mechanism as an argument and sets this
+    /// flag as a side effect. At that point the flag still SHOULD NOT
+    /// be flipped directly — reach for the builder method.
+    pub supports_return_immediately: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -96,6 +135,7 @@ impl Default for RuntimeConfig {
             allow_insecure_push_urls: false,
             push_reclaim_sweep_interval: Duration::from_secs(60),
             push_reclaim_sweep_batch: 64,
+            supports_return_immediately: true,
         }
     }
 }
