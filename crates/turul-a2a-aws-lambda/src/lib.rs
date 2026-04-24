@@ -28,6 +28,43 @@
 //! handler method when the handler is needed for unit tests or
 //! custom middleware.
 //!
+//! ## Composing with non-framework triggers
+//!
+//! Lambdas wired to HTTP **plus** a third trigger the framework does
+//! not know about (EventBridge scheduler, DynamoDB stream, custom
+//! invoke) can't use a named runner directly — the Unknown branch
+//! is adopter-owned. Reach for the public classifier + the HTTP
+//! envelope primitive instead:
+//!
+//! ```ignore
+//! lambda_runtime::run(lambda_runtime::service_fn(
+//!     move |event: lambda_runtime::LambdaEvent<serde_json::Value>| {
+//!         let handler = handler.clone();
+//!         async move {
+//!             let (value, _ctx) = event.into_parts();
+//!             match turul_a2a_aws_lambda::classify_event(&value) {
+//!                 turul_a2a_aws_lambda::LambdaEvent::Http => {
+//!                     handler.handle_http_event_value(value).await
+//!                 }
+//!                 turul_a2a_aws_lambda::LambdaEvent::Sqs => {
+//!                     let sqs = serde_json::from_value(value)?;
+//!                     Ok(serde_json::to_value(handler.handle_sqs(sqs).await)?)
+//!                 }
+//!                 turul_a2a_aws_lambda::LambdaEvent::Unknown => {
+//!                     // Adopter-owned: run your scheduled sweep,
+//!                     // DynamoDB stream consumer, etc.
+//!                     run_adopter_specific_path(value).await
+//!                 }
+//!             }
+//!         }
+//!     }
+//! )).await
+//! ```
+//!
+//! [`LambdaA2aHandler::handle_http_event_value`] is available without
+//! the `sqs` feature; `handle_sqs` is gated on `sqs`. `classify_event`
+//! + `LambdaEvent` are always available.
+//!
 //! ## API Gateway path prefix
 //!
 //! When Lambda sits behind a REST API Gateway with `AWS_PROXY`
@@ -152,6 +189,7 @@
 
 mod adapter;
 mod auth;
+mod event;
 mod no_streaming;
 mod scheduled_recovery;
 mod stream_recovery;
@@ -168,6 +206,7 @@ mod stream_recovery_tests;
 
 pub use adapter::{axum_to_lambda_response, lambda_to_axum_request};
 pub use auth::{AuthorizerMapping, LambdaAuthorizerMiddleware};
+pub use event::{LambdaEvent, classify_event};
 pub use no_streaming::NoStreamingLayer;
 pub use scheduled_recovery::{
     LambdaScheduledRecoveryConfig, LambdaScheduledRecoveryHandler, LambdaScheduledRecoveryResponse,
@@ -175,7 +214,7 @@ pub use scheduled_recovery::{
 pub use stream_recovery::LambdaStreamRecoveryHandler;
 
 #[cfg(feature = "sqs")]
-pub use durable::{LambdaEvent, SqsDurableExecutorQueue, classify_event, drive_sqs_batch};
+pub use durable::{SqsDurableExecutorQueue, drive_sqs_batch};
 
 use std::sync::Arc;
 
@@ -646,6 +685,90 @@ impl LambdaA2aHandler {
             .map_err(|e| lambda_http::Error::from(format!("Router error: {e}")))?;
 
         axum_to_lambda_response(axum_resp).await
+    }
+
+    /// Handle a raw Lambda HTTP event delivered as `serde_json::Value`
+    /// and return the API Gateway v2 / Function URL response JSON.
+    ///
+    /// This is the framework's canonical HTTP envelope conversion
+    /// primitive — useful when a single Lambda function routes among
+    /// HTTP and one or more non-framework triggers (EventBridge,
+    /// DynamoDB streams, custom invoke) and the adopter drives
+    /// [`lambda_runtime::run`] with `serde_json::Value` directly.
+    /// Handles the `LambdaRequest` deserialization, the text-vs-base64
+    /// content-type detection, and the `ApiGatewayV2httpResponse`
+    /// rebuild.
+    ///
+    /// Body encoding: text for `text/*`, `application/json`,
+    /// `application/xml`, `application/javascript`, or anything with
+    /// `charset=`; base64 otherwise.
+    ///
+    /// Path-prefix stripping (see
+    /// [`LambdaA2aServerBuilder::strip_path_prefix`]) is applied
+    /// because dispatch flows through [`Self::handle`]. Adopters who
+    /// only serve HTTP should continue to use [`Self::run_http_only`]
+    /// or [`LambdaA2aServerBuilder::run`]; this entry point exists for
+    /// composition with adopter-owned third triggers.
+    pub async fn handle_http_event_value(
+        &self,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value, lambda_runtime::Error> {
+        use base64::Engine;
+        use http_body_util::BodyExt;
+
+        let lambda_req: lambda_http::request::LambdaRequest = serde_json::from_value(value)
+            .map_err(|e| lambda_runtime::Error::from(format!("invalid HTTP event: {e}")))?;
+        let req: lambda_http::Request = lambda_req.into();
+
+        let resp = self
+            .handle(req)
+            .await
+            .map_err(|e| lambda_runtime::Error::from(format!("handler error: {e}")))?;
+        let (parts, body) = resp.into_parts();
+
+        let bytes = body
+            .collect()
+            .await
+            .map_err(|e| lambda_runtime::Error::from(format!("body collect: {e}")))?
+            .to_bytes();
+
+        let ct = parts
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_ascii_lowercase();
+        let is_text = ct.starts_with("text/")
+            || ct.starts_with("application/json")
+            || ct.starts_with("application/xml")
+            || ct.starts_with("application/javascript")
+            || ct.contains("charset=");
+
+        let (body_str, is_base64) = if bytes.is_empty() {
+            (None, false)
+        } else if is_text {
+            match std::str::from_utf8(&bytes) {
+                Ok(s) => (Some(s.to_string()), false),
+                Err(_) => (
+                    Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+                    true,
+                ),
+            }
+        } else {
+            (
+                Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+                true,
+            )
+        };
+
+        let mut api_resp = aws_lambda_events::apigw::ApiGatewayV2httpResponse::default();
+        api_resp.status_code = parts.status.as_u16() as i64;
+        api_resp.headers = parts.headers;
+        api_resp.body = body_str.map(aws_lambda_events::encodings::Body::Text);
+        api_resp.is_base64_encoded = is_base64;
+
+        serde_json::to_value(api_resp)
+            .map_err(|e| lambda_runtime::Error::from(format!("serialise HTTP response: {e}")))
     }
 
     /// Handle an SQS batch from the durable executor queue (ADR-018).

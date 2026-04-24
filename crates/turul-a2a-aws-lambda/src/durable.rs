@@ -12,26 +12,29 @@
 //!   commit, then [`turul_a2a::server::spawn::run_executor_for_existing_task`].
 //!   Returns `SqsBatchResponse` so one poison record does not block
 //!   the batch.
-//! - [`LambdaEvent`] + [`LambdaEvent::classify`] — event-shape
-//!   discriminator adopters use in `main.rs` to route HTTP vs SQS
-//!   events to the right handler on a single Lambda function.
+//! - [`LambdaA2aHandler::run_sqs_only`] and
+//!   [`LambdaA2aHandler::run_http_and_sqs`] — runtime loops for SQS
+//!   and dual HTTP+SQS Lambdas.
+//!
+//! Event-shape classification ([`crate::classify_event`] +
+//! [`crate::LambdaEvent`]) is **not** behind the `sqs` feature — it
+//! lives in `event.rs` so adopters with HTTP + a non-SQS third
+//! trigger can route in their own `main.rs`.
 
 #![cfg(feature = "sqs")]
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aws_lambda_events::apigw::ApiGatewayV2httpResponse;
 use aws_lambda_events::event::sqs::{BatchItemFailure, SqsBatchResponse, SqsEvent, SqsMessage};
 use aws_sdk_sqs::Client as SqsClient;
-use base64::Engine;
-use http_body_util::BodyExt;
 use turul_a2a::durable_executor::{DurableExecutorQueue, QueueError, QueuedExecutorJob};
 use turul_a2a::router::AppState;
 use turul_a2a::server::spawn::{SpawnDeps, SpawnScope, run_queued_executor_job};
 use turul_a2a_types::{Message, Part, Role, TaskState, TaskStatus};
 
 use crate::LambdaA2aHandler;
+use crate::event::{LambdaEvent, classify_event};
 
 /// SQS-backed [`DurableExecutorQueue`] implementation.
 ///
@@ -82,95 +85,6 @@ impl DurableExecutorQueue for SqsDurableExecutorQueue {
     fn kind(&self) -> &'static str {
         "sqs"
     }
-}
-
-/// Event-shape discriminator for a dual-mode Lambda function that
-/// handles both HTTP and SQS events on a single function (ADR-018
-/// §"Event dispatch").
-///
-/// Adopters' `main.rs` receives a raw `serde_json::Value` and uses
-/// [`classify_event`] to route:
-///
-/// ```ignore
-/// lambda_runtime::run(lambda_runtime::service_fn(
-///     move |event: lambda_runtime::LambdaEvent<serde_json::Value>| {
-///         let handler = handler.clone();
-///         async move {
-///             let (value, _ctx) = event.into_parts();
-///             match turul_a2a_aws_lambda::classify_event(&value) {
-///                 turul_a2a_aws_lambda::LambdaEvent::Sqs => {
-///                     let sqs: aws_lambda_events::event::sqs::SqsEvent =
-///                         serde_json::from_value(value)?;
-///                     let resp = handler.handle_sqs(sqs).await;
-///                     Ok(serde_json::to_value(resp)?)
-///                 }
-///                 turul_a2a_aws_lambda::LambdaEvent::Http => {
-///                     // Hand off to lambda_http for the HTTP envelope.
-///                     // Typical pattern: use a second service_fn for HTTP
-///                     // wrapped in lambda_http::run at a higher level.
-///                     Err("http handled by lambda_http layer".into())
-///                 }
-///                 turul_a2a_aws_lambda::LambdaEvent::Unknown => {
-///                     Err("unknown Lambda event shape".into())
-///                 }
-///             }
-///         }
-///     }
-/// ))
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LambdaEvent {
-    /// HTTP event (API Gateway REST, HTTP API, Function URL, ALB).
-    Http,
-    /// SQS trigger event from the durable executor queue.
-    Sqs,
-    /// Unrecognised shape (DynamoDB stream, EventBridge scheduler,
-    /// custom invocation payloads, etc.).
-    Unknown,
-}
-
-/// Classify a raw Lambda event JSON shape.
-///
-/// Heuristic:
-/// - SQS event JSON has a top-level `"Records"` array whose entries
-///   contain `"eventSource": "aws:sqs"`.
-/// - HTTP event JSON has one of `httpMethod`,
-///   `requestContext.http.method`, or `routeKey`.
-/// - Anything else is `Unknown`.
-pub fn classify_event(event: &serde_json::Value) -> LambdaEvent {
-    if is_sqs_event_shape(event) {
-        return LambdaEvent::Sqs;
-    }
-    if is_http_event_shape(event) {
-        return LambdaEvent::Http;
-    }
-    LambdaEvent::Unknown
-}
-
-fn is_sqs_event_shape(event: &serde_json::Value) -> bool {
-    event
-        .get("Records")
-        .and_then(|r| r.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|rec| rec.get("eventSource"))
-        .and_then(|s| s.as_str())
-        .map(|s| s == "aws:sqs")
-        .unwrap_or(false)
-}
-
-fn is_http_event_shape(event: &serde_json::Value) -> bool {
-    if event.get("httpMethod").is_some() {
-        return true;
-    }
-    if let Some(req_ctx) = event.get("requestContext") {
-        if req_ctx.pointer("/http/method").is_some() {
-            return true;
-        }
-    }
-    if event.get("routeKey").is_some() {
-        return true;
-    }
-    false
 }
 
 /// Drive one SQS batch through the durable-continuation path.
@@ -431,7 +345,7 @@ impl LambdaA2aHandler {
                                 ))
                             })
                         }
-                        LambdaEvent::Http => dispatch_http_event(&handler, value).await,
+                        LambdaEvent::Http => handler.handle_http_event_value(value).await,
                         LambdaEvent::Unknown => Err(lambda_runtime::Error::from(
                             "unknown Lambda event shape — expected HTTP or SQS",
                         )),
@@ -450,83 +364,10 @@ impl LambdaA2aHandler {
     }
 }
 
-/// Convert a raw Lambda HTTP event (API Gateway / Function URL / ALB)
-/// into a `lambda_http::Request`, dispatch through
-/// `handler.handle(...)`, then build an API Gateway v2 / Function URL
-/// response JSON.
-///
-/// Kept `pub(crate)` — the only caller is
-/// [`LambdaA2aHandler::run_http_and_sqs`].
-/// This boilerplate is what `lambda_http::run` normally hides; we
-/// open-code it once because the dual-event runner needs
-/// `lambda_runtime::run` (generic) rather than `lambda_http::run`
-/// (HTTP-only).
-///
-/// Body encoding: text for `text/*`, `application/json`,
-/// `application/xml`, `application/javascript`, or anything with
-/// `charset=`; base64 otherwise.
-pub(crate) async fn dispatch_http_event(
-    handler: &LambdaA2aHandler,
-    value: serde_json::Value,
-) -> Result<serde_json::Value, lambda_runtime::Error> {
-    let lambda_req: lambda_http::request::LambdaRequest = serde_json::from_value(value)
-        .map_err(|e| lambda_runtime::Error::from(format!("invalid HTTP event: {e}")))?;
-    let req: lambda_http::Request = lambda_req.into();
-
-    let resp = handler
-        .handle(req)
-        .await
-        .map_err(|e| lambda_runtime::Error::from(format!("handler error: {e}")))?;
-    let (parts, body) = resp.into_parts();
-
-    let bytes = body
-        .collect()
-        .await
-        .map_err(|e| lambda_runtime::Error::from(format!("body collect: {e}")))?
-        .to_bytes();
-
-    let ct = parts
-        .headers
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_ascii_lowercase();
-    let is_text = ct.starts_with("text/")
-        || ct.starts_with("application/json")
-        || ct.starts_with("application/xml")
-        || ct.starts_with("application/javascript")
-        || ct.contains("charset=");
-
-    let (body_str, is_base64) = if bytes.is_empty() {
-        (None, false)
-    } else if is_text {
-        match std::str::from_utf8(&bytes) {
-            Ok(s) => (Some(s.to_string()), false),
-            Err(_) => (
-                Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
-                true,
-            ),
-        }
-    } else {
-        (
-            Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
-            true,
-        )
-    };
-
-    let mut api_resp = ApiGatewayV2httpResponse::default();
-    api_resp.status_code = parts.status.as_u16() as i64;
-    api_resp.headers = parts.headers;
-    api_resp.body = body_str.map(aws_lambda_events::encodings::Body::Text);
-    api_resp.is_base64_encoded = is_base64;
-
-    serde_json::to_value(api_resp)
-        .map_err(|e| lambda_runtime::Error::from(format!("serialise HTTP response: {e}")))
-}
-
 #[cfg(test)]
-mod dispatch_http_event_tests {
+mod handle_http_event_value_tests {
     use super::*;
+    use aws_lambda_events::apigw::ApiGatewayV2httpResponse;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use turul_a2a::executor::{AgentExecutor, ExecutionContext};
     use turul_a2a::server::RuntimeConfig;
@@ -618,10 +459,10 @@ mod dispatch_http_event_tests {
     }
 
     #[tokio::test]
-    async fn dispatch_http_event_agent_card_returns_text_json() {
+    async fn handle_http_event_value_agent_card_returns_text_json() {
         let handler = build_handler();
         let event = apigw_v2_agent_card_get();
-        let resp_json = dispatch_http_event(&handler, event).await.expect("ok");
+        let resp_json = handler.handle_http_event_value(event).await.expect("ok");
         let resp: ApiGatewayV2httpResponse = serde_json::from_value(resp_json).unwrap();
         assert_eq!(resp.status_code, 200);
         assert!(!resp.is_base64_encoded, "JSON body must not be base64");
@@ -636,10 +477,11 @@ mod dispatch_http_event_tests {
     }
 
     #[tokio::test]
-    async fn dispatch_http_event_rejects_unknown_shape() {
+    async fn handle_http_event_value_rejects_unknown_shape() {
         let handler = build_handler();
         let event = serde_json::json!({"not": "an HTTP event"});
-        let err = dispatch_http_event(&handler, event)
+        let err = handler
+            .handle_http_event_value(event)
             .await
             .expect_err("unknown shape must error");
         let s = format!("{err}");

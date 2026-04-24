@@ -23,6 +23,20 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   let req = MessageBuilder::new().data(req).metadata_json(corrs).build();
   ```
 
+### Added — HTTP envelope primitive + classifier exposed for composition
+
+Adopters whose single Lambda receives HTTP plus one non-framework
+trigger (EventBridge scheduler, DynamoDB stream, custom invoke)
+previously had to re-implement the `LambdaRequest` /
+`ApiGatewayV2httpResponse` envelope conversion themselves. The
+framework now exposes the same primitive it already used internally.
+
+- **`LambdaA2aHandler::handle_http_event_value(value: serde_json::Value) -> Result<serde_json::Value, lambda_runtime::Error>`** — converts a raw Lambda HTTP event `Value` (API Gateway v1/v2 / Function URL / ALB shapes) into a `lambda_http::Request`, dispatches through `Self::handle` (so `strip_path_prefix` is applied), and rebuilds an `ApiGatewayV2httpResponse` `Value`. Text-vs-base64 content-type detection matches the internal dual-event runner. **Not behind the `sqs` feature** — HTTP + EventBridge does not imply SQS.
+- **`classify_event` and `LambdaEvent` no longer require the `sqs` feature.** Moved out of `durable.rs` (sqs-gated) into a new `event.rs`. `LambdaEvent::Sqs` is still a variant; the SQS-specific handlers (`handle_sqs`, `run_sqs_only`, `run_http_and_sqs`) remain gated.
+- **Removed:** `turul-a2a-aws-lambda::drive_sqs_batch` re-export was lost in the refactor shuffle — restored. `LambdaEvent` and `classify_event` are re-exported from the non-sqs path.
+- Docstring for `classify_event` now shows the adopter composition pattern with `handler.handle_http_event_value(value).await` on the HTTP branch (previously said "handled by lambda_http layer" which was wrong).
+- 2 unit tests carried over and renamed (`handle_http_event_value_agent_card_returns_text_json`, `handle_http_event_value_rejects_unknown_shape`); 6 new unit tests on `classify_event` in `event.rs` covering API Gateway v1, v2, SQS, EventBridge scheduled, DynamoDB stream, and custom payloads.
+
 ### Added — `LambdaA2aServerBuilder::strip_path_prefix`
 
 - **`strip_path_prefix(impl Into<String>)`** on `LambdaA2aServerBuilder`. Rewrites the incoming HTTP request URI — drops a leading path segment before the A2A router sees the request. Needed when Lambda sits behind a REST API Gateway with `AWS_PROXY` integration, which forwards the full stage + resource tree in the path (e.g. a request to `/stage/agent/message:send` hitting a router that expects `/message:send`). The prefix must start with `/` and must not end with `/`; invalid shapes are rejected at `build()` with an error that names the method. Applies to `run_http_only` and `run_http_and_sqs`; SQS events unaffected. Non-matching paths pass through unchanged (router 404s on genuinely unknown paths — the correct failure mode). Segment-boundary aware: `/dev` will not strip `/devs/...`. 13 new tests across the adapter unit tests and the builder integration tests, covering the prefix variants named in A2A spec (`/.well-known/agent-card.json`, `/message:send`, `/tasks/{id}`, `/jsonrpc`, `/extendedAgentCard`).
