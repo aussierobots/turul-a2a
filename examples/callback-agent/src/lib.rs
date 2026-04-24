@@ -1,14 +1,14 @@
 //! Callback Agent library — shared between `src/main.rs` (runnable
 //! binary) and `tests/smoke.rs` (in-process end-to-end test).
 //!
-//! Demonstrates the A2A push-notification contract (ADR-011):
+//! Demonstrates the A2A push-notification contract:
 //!
 //! 1. Caller registers a `TaskPushNotificationConfig` — webhook URL
 //!    plus a shared secret `token` — against a task id.
 //! 2. When the task reaches a terminal state, the framework POSTs
 //!    the terminal Task JSON to that URL with the `token` echoed in
 //!    the `X-Turul-Push-Token` header (note: framework header, not
-//!    the spec's `X-A2A-Notification-Token` — see ADR-011 §4).
+//!    the spec's `X-A2A-Notification-Token`).
 //! 3. The receiver validates the header matches the token it
 //!    registered. A mismatch means the call isn't ours — reject.
 //!
@@ -16,7 +16,7 @@
 //! for `delay_ms`, append one artifact with the echoed text, then
 //! commit `Completed`. The sleep lets the caller race a push-config
 //! registration in before terminal fires (configs registered *after*
-//! terminal are not retroactively delivered — ADR-013 §4.5).
+//! terminal are not retroactively delivered).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +33,7 @@ use turul_a2a::executor::{AgentExecutor, ExecutionContext};
 use turul_a2a_types::{Artifact, Message, Part, Task};
 
 /// Header the framework uses to echo the `TaskPushNotificationConfig.token`
-/// back to the receiver (ADR-011 §4 / `push/delivery.rs:592`).
+/// back to the receiver.
 pub const TOKEN_HEADER: &str = "X-Turul-Push-Token";
 
 /// Header carrying the task's event sequence (monotonic per task).
@@ -79,7 +79,7 @@ impl AgentExecutor for CallbackExecutor {
 
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
         AgentCardBuilder::new("Callback Agent", "0.1.0")
-            .description("Fires a webhook callback when a task terminates (ADR-011)")
+            .description("Fires a webhook callback when a task terminates")
             .url("http://localhost:3003/jsonrpc", "JSONRPC", "1.0")
             .provider("Example Org", "https://example.com")
             .push_notifications(true)

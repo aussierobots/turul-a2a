@@ -1,4 +1,4 @@
-//! Lambda stream-recovery worker example (ADR-013 §5.2).
+//! Lambda stream-recovery worker example.
 //!
 //! This binary is the DynamoDB Stream trigger for the
 //! `a2a_push_pending_dispatches` table. It receives NEW_IMAGE records
@@ -10,10 +10,10 @@
 //!
 //! ## Why two Lambdas (stream + scheduled)?
 //!
-//! ADR-013 §4.4: `tokio::spawn` continuations created inside a Lambda
-//! invocation are **opportunistic**. Between invocations the execution
-//! environment may be frozen indefinitely; correctness cannot depend
-//! on post-return completion. External triggers are mandatory:
+//! `tokio::spawn` continuations created inside a Lambda invocation are
+//! **opportunistic**. Between invocations the execution environment
+//! may be frozen indefinitely; correctness cannot depend on
+//! post-return completion. External triggers are mandatory:
 //!
 //! - **DynamoDB Stream (this worker)** — fast path: every atomic
 //!   marker commit in the request Lambda produces an INSERT record
@@ -52,9 +52,9 @@ use turul_a2a_aws_lambda::LambdaStreamRecoveryHandler;
 
 /// In a real deployment, replace this with
 /// `DynamoDbA2aStorage::new(config).await?` or whichever backend the
-/// request Lambda uses. The same-backend requirement (ADR-009 + ADR-013)
-/// applies: the stream worker MUST observe the same rows the request
-/// Lambda committed.
+/// request Lambda uses. The same-backend requirement applies: the
+/// stream worker MUST observe the same rows the request Lambda
+/// committed.
 ///
 /// This example uses the in-memory backend only so `cargo check` and
 /// local-invoke smoke testing work without AWS credentials. An

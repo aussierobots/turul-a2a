@@ -1,8 +1,8 @@
-//! Lambda A2A **request** agent with ADR-018 durable executor continuation.
+//! Lambda A2A **request** agent paired with an SQS worker Lambda for
+//! durable executor continuation.
 //!
-//! This is the HTTP-side half of the ADR-018 Pattern B demo. It
-//! handles `POST /message:send` with
-//! `configuration.returnImmediately = true`:
+//! This is the HTTP-side half of the two-Lambda demo. It handles
+//! `POST /message:send` with `configuration.returnImmediately = true`:
 //!
 //! 1. `core_send_message` size-checks the durable-queue payload,
 //!    creates the task as `WORKING`, registers any inline push
@@ -10,19 +10,20 @@
 //!    [`turul_a2a::durable_executor::QueuedExecutorJob`] on the SQS
 //!    queue, and returns `200 OK` with the task snapshot.
 //! 2. The executor is **not** spawned locally — post-return
-//!    `tokio::spawn` is opportunistic on Lambda (ADR-013 §4.4).
+//!    `tokio::spawn` is not guaranteed to complete on Lambda, so the
+//!    framework defers execution to the SQS-triggered Lambda.
 //!
-//! The SQS side is `examples/lambda-durable-worker`: a separate Lambda
-//! function wired via an SQS event source mapping. Both Lambdas share
-//! the same storage backend (DynamoDB in production; see
-//! `examples/lambda-infra/cloudformation.yaml`).
+//! The SQS side is `examples/lambda-durable-worker`: a separate
+//! Lambda function wired via an SQS event source mapping. Both
+//! Lambdas share the same storage backend (DynamoDB in production;
+//! see `examples/lambda-infra/cloudformation.yaml`).
 //!
 //! Without the SQS wiring, the Lambda adapter rejects
-//! `returnImmediately=true` with `UnsupportedOperationError` per
-//! ADR-017. This example flips the capability back on by calling
+//! `returnImmediately=true` with `UnsupportedOperationError`. This
+//! example flips the capability back on by calling
 //! `.with_sqs_return_immediately(queue_url, sqs_client)` —
-//! "capability, not intent": the flag cannot be claimed without
-//! supplying the queue.
+//! supplying the queue is the capability; the flag cannot be claimed
+//! without it.
 //!
 //! ## Deploy
 //!
@@ -35,10 +36,10 @@
 //! The request Lambda and the worker Lambda run in **different**
 //! containers, so the two-Lambda topology requires a shared backend.
 //! This example uses `DynamoDbA2aStorage` — the worker reads the task
-//! this Lambda wrote, runs the executor, and commits the terminal via
-//! the same CAS-guarded atomic store (ADR-009 same-backend
-//! requirement). Deploy the five DynamoDB tables from
-//! `examples/lambda-infra/cloudformation.yaml` before running.
+//! this Lambda wrote, runs the executor, and commits the terminal
+//! state via the same CAS-guarded atomic store. Deploy the DynamoDB
+//! tables from `examples/lambda-infra/cloudformation.yaml` before
+//! running.
 
 use std::sync::Arc;
 
@@ -50,7 +51,9 @@ use turul_a2a::storage::dynamodb::{DynamoDbA2aStorage, DynamoDbConfig};
 use turul_a2a_aws_lambda::LambdaA2aServerBuilder;
 use turul_a2a_types::{Message, Task};
 
-struct DurableEchoExecutor;
+struct DurableEchoExecutor {
+    public_url: String,
+}
 
 #[async_trait]
 impl AgentExecutor for DurableEchoExecutor {
@@ -88,13 +91,13 @@ impl AgentExecutor for DurableEchoExecutor {
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
         AgentCardBuilder::new("Durable Echo Agent", "0.1.0")
             .description(
-                "ADR-018 demo: Lambda durable executor continuation via SQS. \
-                 HTTP invocation enqueues; SQS invocation runs the executor. \
-                 Executor echoes the incoming text, task_id, context_id, and \
-                 metadata keys so the payload-survival invariant is visible \
-                 in the task's artifact.",
+                "Two-Lambda durable executor demo. HTTP invocation enqueues \
+                 a job; a separate SQS-triggered Lambda runs the executor. \
+                 The executor echoes the incoming text, task id, context id, \
+                 and message metadata keys so the payload survives the \
+                 HTTP → SQS → dequeue hop intact.",
             )
-            .url("https://lambda.example.com", "JSONRPC", "1.0")
+            .url(self.public_url.as_str(), "JSONRPC", "1.0")
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
             .streaming(false)
@@ -114,11 +117,20 @@ async fn main() -> Result<(), lambda_http::Error> {
         .init();
 
     let queue_url = std::env::var("A2A_EXECUTOR_QUEUE_URL").map_err(|_| {
-        lambda_http::Error::from(
-            "A2A_EXECUTOR_QUEUE_URL is required — set it to the SQS queue URL \
-             (default name: turul-a2a-durable-executor-demo)",
-        )
+        lambda_http::Error::from("A2A_EXECUTOR_QUEUE_URL is required — set it to the SQS queue URL")
     })?;
+    // Agent card advertises this URL in /.well-known/agent-card.json.
+    // Discovery clients use it — a wrong value breaks discovery.
+    let public_url = match std::env::var("A2A_PUBLIC_URL") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            tracing::warn!(
+                "A2A_PUBLIC_URL not set; agent card will advertise a placeholder URL. \
+                 Set this env var to the Function URL / API Gateway endpoint for this Lambda."
+            );
+            "https://lambda.invalid".to_string()
+        }
+    };
 
     let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let sqs = Arc::new(aws_sdk_sqs::Client::new(&aws));
@@ -133,10 +145,10 @@ async fn main() -> Result<(), lambda_http::Error> {
     //
     // DynamoDB-backed storage so the worker Lambda (different
     // container, same AWS account) can load the task this Lambda
-    // enqueued. Deploy the five tables from
-    // examples/lambda-infra/cloudformation.yaml before running.
+    // enqueued. Deploy the tables from
+    // `examples/lambda-infra/cloudformation.yaml` before running.
     //
-    // `with_push_dispatch_enabled(true)` omitted — this demo doesn't
+    // `with_push_dispatch_enabled(true)` omitted — this demo does not
     // register push configs, so the builder correctly rejects the
     // inconsistent pairing with no `push_delivery_store`. Production
     // deployments that want push delivery wire
@@ -144,10 +156,10 @@ async fn main() -> Result<(), lambda_http::Error> {
     // tandem.
     //
     // `.with_sqs_return_immediately(queue_url, sqs)` re-enables
-    // `supports_return_immediately` on the RuntimeConfig as a side
-    // effect of supplying the queue (capability, not intent).
+    // `supports_return_immediately` on the `RuntimeConfig` as a side
+    // effect of supplying the queue.
     LambdaA2aServerBuilder::new()
-        .executor(DurableEchoExecutor)
+        .executor(DurableEchoExecutor { public_url })
         .storage(dynamodb_storage)
         .with_sqs_return_immediately(queue_url, sqs)
         .build()

@@ -39,11 +39,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Agent side with push delivery wired per ADR-013 §4.3. Storage
-    // must be Clone so the builder can Arc-wrap internally; passing
-    // `storage.clone()` to `.storage()` and the original to
-    // `.push_delivery_store()` satisfies the same-backend rule
-    // (ADR-009) because both hold the same underlying in-memory maps.
+    // Agent side with push delivery wired. Storage must be Clone so
+    // the builder can Arc-wrap internally; passing `storage.clone()`
+    // to `.storage()` and the original to `.push_delivery_store()`
+    // satisfies the same-backend requirement because both hold the
+    // same underlying in-memory maps.
     let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
     let server = A2aServer::builder()
         .executor(CallbackExecutor { delay_ms: 1500 })

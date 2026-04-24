@@ -1,4 +1,4 @@
-//! Lambda scheduled-recovery worker example (ADR-013 §5.3).
+//! Lambda scheduled-recovery worker example.
 //!
 //! This binary is the EventBridge Scheduler trigger for the
 //! mandatory push-recovery backstop. One invocation equals one sweep
@@ -15,13 +15,13 @@
 //!
 //! ## Why this Lambda is mandatory
 //!
-//! `tokio::spawn` continuations created inside the request Lambda are
-//! opportunistic (ADR-013 §4.4). For non-DynamoDB backends (SQLite,
-//! Postgres, in-memory) there is no event stream — the scheduled
-//! worker IS the recovery path. For DynamoDB it runs alongside the
-//! stream worker as belt-and-braces: the stream has 24h retention and
-//! can be stalled by poison records; the scheduler picks up anything
-//! the stream missed.
+//! `tokio::spawn` continuations created inside the request Lambda
+//! are opportunistic. For non-DynamoDB backends (SQLite, Postgres,
+//! in-memory) there is no event stream — the scheduled worker IS the
+//! recovery path. For DynamoDB it runs alongside the stream worker as
+//! belt-and-braces: the stream has 24h retention and can be stalled
+//! by poison records; the scheduler picks up anything the stream
+//! missed.
 //!
 //! ## Deploy
 //!
@@ -52,8 +52,8 @@ use turul_a2a_aws_lambda::{
 
 /// Replace this with the shared backend the request Lambda uses
 /// (e.g. `DynamoDbA2aStorage::new(config).await?`). Same-backend
-/// applies (ADR-009): the scheduled worker MUST observe the same
-/// rows the request Lambda committed.
+/// applies: the scheduled worker MUST observe the same rows the
+/// request Lambda committed.
 fn build_storage() -> Arc<InMemoryA2aStorage> {
     Arc::new(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
 }

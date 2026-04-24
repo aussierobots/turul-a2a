@@ -3,11 +3,11 @@
 //! `tests/smoke.rs` (the integration smoke test) can share it.
 //!
 //! Demonstrates token-by-token SSE streaming via the
-//! `EventSink::emit_artifact(append, last_chunk)` contract (ADR-006,
-//! ADR-010). The executor tokenises a canned response and emits each
-//! word as a chunk appended to a single artifact; the final chunk
-//! flips `last_chunk=true` and then `complete(None)` fires the
-//! terminal StatusUpdate.
+//! `EventSink::emit_artifact(append, last_chunk)` contract. The
+//! executor tokenises a canned response and emits each word as a
+//! chunk appended to a single artifact; the final chunk flips
+//! `last_chunk=true` and then `complete(None)` fires the terminal
+//! StatusUpdate.
 
 use std::time::Duration;
 

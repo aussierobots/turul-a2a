@@ -10,7 +10,9 @@ use turul_a2a::storage::InMemoryA2aStorage;
 use turul_a2a_aws_lambda::LambdaA2aServerBuilder;
 use turul_a2a_types::{Message, Task};
 
-struct LambdaEchoExecutor;
+struct LambdaEchoExecutor {
+    public_url: String,
+}
 
 #[async_trait::async_trait]
 impl AgentExecutor for LambdaEchoExecutor {
@@ -28,7 +30,7 @@ impl AgentExecutor for LambdaEchoExecutor {
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
         AgentCardBuilder::new("Lambda Echo Agent", "0.1.0")
             .description("A2A agent running on AWS Lambda")
-            .url("https://lambda.example.com", "JSONRPC", "1.0")
+            .url(self.public_url.as_str(), "JSONRPC", "1.0")
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
             .build()
@@ -37,22 +39,42 @@ impl AgentExecutor for LambdaEchoExecutor {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), lambda_http::Error> {
-    let handler = LambdaA2aServerBuilder::new()
-        .executor(LambdaEchoExecutor)
-        // `.storage(...)` wires the unified backend including
-        // `A2aPushDeliveryStore`. Per ADR-013 §4.3, a non-push Lambda
-        // deployment must either supply storage without the push flag
-        // (via individual setters) or opt in explicitly as shown here.
-        // The in-memory backend is demo-only — Lambda streaming and
-        // push recovery require a shared backend (DynamoDB/Postgres).
-        .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
-        .build()
-        .map_err(|e| lambda_http::Error::from(format!("{e}")))?;
+async fn main() -> Result<(), lambda_runtime::Error> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_target(false)
+        .without_time()
+        .init();
 
-    lambda_http::run(lambda_http::service_fn(move |event| {
-        let handler = handler.clone();
-        async move { handler.handle(event).await }
-    }))
-    .await
+    // Agent card advertises this URL in `/.well-known/agent-card.json`.
+    // Discovery clients connect here — a wrong value breaks discovery.
+    // Set it to the Function URL / API Gateway endpoint for this Lambda.
+    let public_url = public_url_or_warn();
+
+    LambdaA2aServerBuilder::new()
+        .executor(LambdaEchoExecutor { public_url })
+        // `.storage(...)` wires the unified backend including
+        // `A2aPushDeliveryStore`. A non-push Lambda deployment must
+        // either supply storage without the push flag (via individual
+        // setters) or opt in explicitly as shown here. The in-memory
+        // backend is demo-only — Lambda streaming and push recovery
+        // require a shared backend (DynamoDB / Postgres).
+        .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
+        .run()
+        .await
+}
+
+fn public_url_or_warn() -> String {
+    match std::env::var("A2A_PUBLIC_URL") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            tracing::warn!(
+                "A2A_PUBLIC_URL not set; agent card will advertise a placeholder URL. \
+                 Set this env var to the real Function URL / API Gateway endpoint."
+            );
+            "https://lambda.invalid".to_string()
+        }
+    }
 }

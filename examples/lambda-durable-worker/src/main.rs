@@ -1,31 +1,28 @@
-//! Lambda A2A **SQS consumer worker** for ADR-018 durable executor
-//! continuation.
+//! Lambda A2A **SQS consumer worker** for the durable executor demo.
 //!
-//! This is the dequeue-side half of the ADR-018 Pattern B demo. The
+//! This is the dequeue-side half of the two-Lambda demo. The
 //! companion is `examples/lambda-durable-agent` (the HTTP request
 //! Lambda). An SQS event source mapping triggers this Lambda with
 //! records the request Lambda enqueued.
 //!
 //! Pure consumer: the builder does *not* call
 //! `with_sqs_return_immediately(...)` because this Lambda never
-//! enqueues. It only reads tasks from the shared DynamoDB backend and
-//! runs their executors. `LambdaA2aHandler::run_sqs_only` owns the
-//! `lambda_runtime::run` loop — any non-SQS event shape errors
+//! enqueues. It only reads tasks from the shared DynamoDB backend
+//! and runs their executors. `LambdaA2aHandler::run_sqs_only` owns
+//! the `lambda_runtime::run` loop — any non-SQS event shape errors
 //! loudly.
 //!
-//! Per ADR-018 §SQS invocation, each record passes through:
+//! Per-record dispatch:
 //!
 //! 1. Deserialise [`turul_a2a::durable_executor::QueuedExecutorJob`].
 //!    Unknown envelope `version` → batch-item failure (retry).
 //! 2. Load the task. Not found → batch-item failure (DLQ).
 //! 3. Task already terminal → idempotent success no-op.
-//! 4. Cancel marker set via ADR-012
-//!    `supervisor_get_cancel_requested` → commit CANCELED directly;
-//!    executor is NEVER invoked. `TerminalStateAlreadySet` from a
-//!    racing writer is treated as success.
-//! 5. Non-terminal + no cancel → run the executor to terminal via
-//!    `run_queued_executor_job`. The Lambda invocation *is* the
-//!    executor; no `tokio::spawn`.
+//! 4. Cancel marker set → commit `Canceled` directly; executor is
+//!    NEVER invoked. A concurrent terminal write is treated as
+//!    success.
+//! 5. Non-terminal + no cancel → run the executor to terminal. The
+//!    Lambda invocation *is* the executor; no `tokio::spawn`.
 //! 6. Partial-batch response: failed records are returned in
 //!    `SqsBatchResponse.batch_item_failures` so one poison record
 //!    does not block the rest.
@@ -43,9 +40,8 @@
 //! **different** containers, so both must point at the same backend
 //! — the worker loads a task the request Lambda already wrote and
 //! commits its terminal state through the same CAS-guarded atomic
-//! store (ADR-009 same-backend requirement). This example uses
-//! `DynamoDbA2aStorage` against the five tables provisioned by
-//! `examples/lambda-infra/cloudformation.yaml`.
+//! store. This example uses `DynamoDbA2aStorage` against the tables
+//! provisioned by `examples/lambda-infra/cloudformation.yaml`.
 
 use async_trait::async_trait;
 use lambda_runtime::Error;
@@ -97,16 +93,24 @@ impl AgentExecutor for DurableEchoExecutor {
 
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
         // Not exposed — the worker does not serve HTTP — but required
-        // by the trait.
+        // by the trait. The URL points at the companion request Lambda
+        // because that is where clients actually reach the A2A surface.
         AgentCardBuilder::new("Durable Echo Agent (worker)", "0.1.0")
-            .description("ADR-018 SQS worker for lambda-durable-agent")
-            .url("https://lambda.example.com", "JSONRPC", "1.0")
+            .description("SQS-triggered durable executor worker paired with lambda-durable-agent")
+            .url(worker_advertised_url().as_str(), "JSONRPC", "1.0")
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
             .streaming(false)
             .build()
             .expect("durable agent card should be valid")
     }
+}
+
+fn worker_advertised_url() -> String {
+    std::env::var("A2A_PUBLIC_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "https://lambda.invalid".to_string())
 }
 
 #[tokio::main]
@@ -121,9 +125,9 @@ async fn main() -> Result<(), Error> {
 
     // Worker is a pure SQS consumer — it reads the task the agent
     // enqueued, runs the executor, commits the terminal via the same
-    // shared DynamoDB atomic store (ADR-009 same-backend requirement).
-    // No `with_sqs_return_immediately(...)` — that wires the builder
-    // to *enqueue*, which the worker never does.
+    // shared DynamoDB atomic store. No
+    // `with_sqs_return_immediately(...)` — that wires the builder to
+    // *enqueue*, which the worker never does.
     let dynamodb_storage = DynamoDbA2aStorage::new(DynamoDbConfig::default())
         .await
         .map_err(|e| Error::from(format!("dynamodb storage build failed: {e}")))?;

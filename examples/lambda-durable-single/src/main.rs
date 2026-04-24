@@ -1,4 +1,5 @@
-//! ADR-018 single-Lambda demo — one function handles both HTTP and SQS.
+//! Single-Lambda durable executor demo — one function handles both
+//! HTTP and SQS.
 //!
 //! Deployed with `ReservedConcurrency=1` so the HTTP and SQS
 //! invocations reuse the same warm container, letting
@@ -29,7 +30,9 @@ use turul_a2a_types::{Artifact, Message, Part, Task};
 /// values) so callers can see their correlation fields arrived
 /// without exposing their contents. Does not surface auth identity
 /// or claims.
-struct DurableEchoExecutor;
+struct DurableEchoExecutor {
+    public_url: String,
+}
 
 #[async_trait]
 impl AgentExecutor for DurableEchoExecutor {
@@ -64,14 +67,15 @@ impl AgentExecutor for DurableEchoExecutor {
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
         AgentCardBuilder::new("Durable Echo Agent (single Lambda)", "0.1.0")
             .description(
-                "ADR-018 single-Lambda demo: one function handles both \
-                 HTTP and SQS. ReservedConcurrency=1 pins a single container \
-                 so in-memory storage works across the HTTP → SQS hand-off. \
-                 Executor echoes the incoming text, task_id, context_id, and \
-                 metadata keys so the payload-survival invariant is visible \
-                 in the task's artifact.",
+                "Single-Lambda durable executor demo: one function handles \
+                 both HTTP and SQS. Deployed with ReservedConcurrency=1 so \
+                 the same warm container handles the request and the \
+                 SQS-triggered invocation, letting in-memory storage survive \
+                 the hand-off. The executor echoes the incoming text, task \
+                 id, context id, and message metadata keys so the payload \
+                 survives the HTTP → SQS → dequeue hop intact.",
             )
-            .url("https://lambda.example.com", "JSONRPC", "1.0")
+            .url(self.public_url.as_str(), "JSONRPC", "1.0")
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
             .streaming(false)
@@ -91,17 +95,26 @@ async fn main() -> Result<(), Error> {
         .init();
 
     let queue_url = std::env::var("A2A_EXECUTOR_QUEUE_URL").map_err(|_| {
-        Error::from(
-            "A2A_EXECUTOR_QUEUE_URL is required — set it to the SQS queue URL \
-             (default name: turul-a2a-durable-executor-demo)",
-        )
+        Error::from("A2A_EXECUTOR_QUEUE_URL is required — set it to the SQS queue URL")
     })?;
+    // Agent card advertises this URL in /.well-known/agent-card.json.
+    // Discovery clients use it — a wrong value breaks discovery.
+    let public_url = match std::env::var("A2A_PUBLIC_URL") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            tracing::warn!(
+                "A2A_PUBLIC_URL not set; agent card will advertise a placeholder URL. \
+                 Set this env var to the Function URL for this Lambda."
+            );
+            "https://lambda.invalid".to_string()
+        }
+    };
 
     let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let sqs = Arc::new(aws_sdk_sqs::Client::new(&aws));
 
     LambdaA2aServerBuilder::new()
-        .executor(DurableEchoExecutor)
+        .executor(DurableEchoExecutor { public_url })
         .storage(InMemoryA2aStorage::new())
         .with_sqs_return_immediately(queue_url, sqs)
         .run()

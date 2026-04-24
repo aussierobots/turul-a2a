@@ -1,5 +1,5 @@
 //! gRPC Agent — tonic server binary that exposes the full A2A
-//! `lf.a2a.v1.A2AService` surface over gRPC (ADR-014).
+//! `lf.a2a.v1.A2AService` surface over gRPC.
 //!
 //! Run: `cargo run -p grpc-agent --bin grpc-agent`
 //!
@@ -59,7 +59,7 @@ impl AgentExecutor for GrpcEchoExecutor {
 
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
         AgentCardBuilder::new("gRPC Echo Agent", "0.1.0")
-            .description("A2A v1.0 agent exposed over gRPC via ADR-014")
+            .description("A2A v1.0 agent exposed over gRPC")
             .url(format!("grpc://127.0.0.1:{GRPC_PORT}"), "GRPC", "1.0")
             .provider("Example Org", "https://example.com")
             .streaming(true)

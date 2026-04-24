@@ -1,4 +1,5 @@
-//! Skill-Security Agent — ADR-015 adopter demo.
+//! Skill-Security Agent — demonstrates declaration-only skill-level
+//! security requirements on the agent card.
 //!
 //! Two skills on one agent:
 //! - `public-echo`: no skill-level security metadata.
@@ -7,10 +8,10 @@
 //!
 //! Both skills run under the **same** agent-level runtime. No auth
 //! middleware is installed, so every request succeeds regardless of
-//! which skill a caller has in mind — exactly the invariant in
-//! ADR-015 §4.2: advertising a skill-level requirement does NOT
-//! install a gatekeeper. The bearer scheme is declared on the card to
-//! satisfy the post-merge truthfulness invariant in ADR-015 §2.3.
+//! which skill a caller has in mind — declaring a skill-level
+//! requirement does NOT install a gatekeeper. The bearer scheme is
+//! declared at the agent card level so the skill requirement
+//! resolves against a defined scheme and the card passes validation.
 //!
 //! To see agent-level enforcement in action, look at
 //! `examples/auth-agent` instead — it installs real middleware.
@@ -49,8 +50,7 @@ impl AgentExecutor for SkillSecurityExecutor {
                 turul_a2a_proto::security_scheme::Scheme::HttpAuthSecurityScheme(
                     turul_a2a_proto::HttpAuthSecurityScheme {
                         description: "Optional bearer token for the secure-summary skill \
-                                       (advertised only; not enforced by this example — \
-                                       see ADR-015)."
+                                       (advertised only; not enforced by this example)."
                             .into(),
                         scheme: "Bearer".into(),
                         bearer_format: "JWT".into(),
@@ -90,7 +90,7 @@ impl AgentExecutor for SkillSecurityExecutor {
         .build();
 
         AgentCardBuilder::new("Skill-Security Agent", "0.1.0")
-            .description("ADR-015 demo: declaration-only skill-level security requirements.")
+            .description("Demo: declaration-only skill-level security requirements.")
             .url("http://localhost:3006/jsonrpc", "JSONRPC", "1.0")
             .provider("Example Org", "https://example.com")
             .default_input_modes(vec!["text/plain"])
@@ -99,7 +99,7 @@ impl AgentExecutor for SkillSecurityExecutor {
             .skill(public_echo)
             .skill(secure_summary)
             .build()
-            .expect("skill-security-agent card must satisfy ADR-015 §2.3 validation")
+            .expect("skill-security-agent card must satisfy declaration-truthfulness validation")
     }
 }
 

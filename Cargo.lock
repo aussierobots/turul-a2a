@@ -1844,9 +1844,11 @@ name = "lambda-agent"
 version = "0.1.15"
 dependencies = [
  "async-trait",
- "lambda_http",
+ "lambda_runtime",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "turul-a2a",
  "turul-a2a-aws-lambda",
  "turul-a2a-proto",
