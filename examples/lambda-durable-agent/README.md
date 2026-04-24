@@ -71,11 +71,54 @@ Outputs:
 - `target/lambda/lambda-durable-agent/bootstrap.zip`
 - `target/lambda/lambda-durable-worker/bootstrap.zip`
 
-### 3. Create the **request** Lambda function (HTTP)
+### 3. (If needed) Create an ephemeral IAM role
+
+If you don't already have a Lambda execution role, create one scoped to this demo. Skip this step and substitute `ROLE_ARN=<your existing role>` below if you already have one.
 
 ```bash
-ROLE_ARN=<your Lambda execution role ARN>
+cat > /tmp/trust-policy.json <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"Service": "lambda.amazonaws.com"},
+    "Action": "sts:AssumeRole"
+  }]
+}
+EOF
+aws iam create-role \
+  --role-name turul-a2a-demo-lambda-role \
+  --assume-role-policy-document file:///tmp/trust-policy.json
 
+aws iam attach-role-policy --role-name turul-a2a-demo-lambda-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+aws iam attach-role-policy --role-name turul-a2a-demo-lambda-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+
+cat > /tmp/sqs-producer-policy.json <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["sqs:SendMessage", "sqs:GetQueueAttributes"],
+    "Resource": "arn:aws:sqs:*:*:turul-a2a-durable-executor-demo*"
+  }]
+}
+EOF
+aws iam put-role-policy --role-name turul-a2a-demo-lambda-role \
+  --policy-name SqsProducer \
+  --policy-document file:///tmp/sqs-producer-policy.json
+
+ROLE_ARN=$(aws iam get-role --role-name turul-a2a-demo-lambda-role --query 'Role.Arn' --output text)
+echo "ROLE_ARN=$ROLE_ARN"
+
+# IAM can take a few seconds to propagate before Lambda accepts the role.
+sleep 10
+```
+
+### 4. Create the **request** Lambda function (HTTP)
+
+```bash
 aws lambda create-function \
   --function-name turul-a2a-durable-agent \
   --runtime provided.al2023 \
@@ -105,7 +148,7 @@ echo "FN_URL=$FN_URL"
 
 `auth-type NONE` is for the demo. Production: put API Gateway + an authoriser in front.
 
-### 4. Create the **worker** Lambda function (SQS)
+### 5. Create the **worker** Lambda function (SQS)
 
 ```bash
 aws lambda create-function \
@@ -120,7 +163,7 @@ aws lambda create-function \
   --memory-size 256
 ```
 
-### 5. Wire the SQS event source mapping → worker
+### 6. Wire the SQS event source mapping → worker
 
 This is the bit that ties it all together. `ReportBatchItemFailures` is required so the worker's `SqsBatchResponse { batch_item_failures }` is honoured — without it, Lambda retries the entire batch on any failure.
 
@@ -132,9 +175,9 @@ aws lambda create-event-source-mapping \
   --function-response-types ReportBatchItemFailures
 ```
 
-### 6. IAM policy for the shared execution role
+### Reference: full IAM policy
 
-Minimum perms for both Lambdas (scope to specific queue ARNs in production):
+Step 3's ephemeral role attaches the `AWSLambdaBasicExecutionRole` + `AWSLambdaSQSQueueExecutionRole` AWS-managed policies plus a narrow SQS producer inline policy. The worker reads from SQS (covered by `AWSLambdaSQSQueueExecutionRole`); the agent writes to SQS (covered by the inline producer policy). If you're wiring a production role by hand, this is the full shape:
 
 ```json
 {
@@ -168,7 +211,7 @@ Minimum perms for both Lambdas (scope to specific queue ARNs in production):
 }
 ```
 
-Plus the standard `AWSLambdaBasicExecutionRole` managed policy for CloudWatch Logs.
+Plus `AWSLambdaBasicExecutionRole` for CloudWatch Logs.
 
 ## Try it
 
@@ -188,16 +231,70 @@ curl -sS -X POST "$FN_URL/message:send" \
 
 Expected: `task.status.state == "TASK_STATE_WORKING"`, task id echoed back, HTTP 200.
 
-A few seconds later, CloudWatch Logs for `turul-a2a-durable-worker` shows an invocation with an SQS event payload. The task is now `TASK_STATE_COMPLETED` — the SQS-invoked executor attached the echo artifact and terminated.
+A few seconds later, the SQS event source mapping fires the worker Lambda:
 
-Verify via GetTask (note: only works on the same backend both Lambdas point at — the demo's in-memory storage is per-container, so this verification only works in production with a shared backend):
+```bash
+aws logs tail /aws/lambda/turul-a2a-durable-worker --since 3m --format short
+```
+
+### Expected demo behavior (important)
+
+**On this in-memory demo**, the worker log will contain a single line like:
+
+```
+ERROR ... task not found on SQS dequeue item=<uuid> tenant= task_id=<task id from the HTTP response>
+```
+
+**This is correct and is what the storage caveat below warns about.** The pipeline is wired end-to-end — the HTTP Lambda enqueued, the SQS event source mapping delivered, the worker deserialised the envelope, decoded the `tenant` + `task_id` correctly, and tried to load the task. The task was written into the **agent Lambda's** `InMemoryA2aStorage`, which lives in a different container; the worker's in-memory storage has no record of it, so `get_task` returns `None` and the worker reports the record as a batch-item failure. SQS retries three times (per our `RedrivePolicy`), then the record lands in the DLQ. Everything the framework is responsible for — envelope serialisation, size preflight, event source mapping, partial-batch response, terminal-no-op detection — is working.
+
+In **production** with a shared DynamoDB backend (see `examples/lambda-infra/cloudformation.yaml`), the worker's `get_task` finds the task, runs the executor, and commits the terminal. GetTask then shows the task is `TASK_STATE_COMPLETED`:
 
 ```bash
 TASK_ID=<task id from the first response>
 curl -sS "$FN_URL/tasks/$TASK_ID" -H 'a2a-version: 1.0' | jq .task.status.state
-# → "TASK_STATE_COMPLETED"  (production with shared DynamoDB)
-# → "TASK_STATE_WORKING"    (demo with in-memory — container doesn't see the worker's commit)
+# production with shared DynamoDB: "TASK_STATE_COMPLETED"
+# demo with in-memory:             "TASK_STATE_WORKING" (agent's container never sees worker's commit)
 ```
+
+## Tear down
+
+```bash
+# 1. Delete the SQS event source mapping.
+MAPPING_UUID=$(aws lambda list-event-source-mappings \
+  --function-name turul-a2a-durable-worker \
+  --query 'EventSourceMappings[0].UUID' --output text)
+aws lambda delete-event-source-mapping --uuid "$MAPPING_UUID"
+
+# 2. Delete both Lambda functions (also auto-deletes the Function URL).
+aws lambda delete-function --function-name turul-a2a-durable-agent
+aws lambda delete-function --function-name turul-a2a-durable-worker
+
+# 3. Delete CloudWatch log groups (optional but tidy).
+aws logs delete-log-group --log-group-name /aws/lambda/turul-a2a-durable-agent
+aws logs delete-log-group --log-group-name /aws/lambda/turul-a2a-durable-worker
+
+# 4. Delete both SQS queues.
+aws sqs delete-queue --queue-url "$QUEUE_URL"
+aws sqs delete-queue --queue-url "$(aws sqs get-queue-url \
+  --queue-name turul-a2a-durable-executor-demo-dlq --query QueueUrl --output text)"
+
+# 5. Delete the demo IAM role.
+aws iam detach-role-policy --role-name turul-a2a-demo-lambda-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+aws iam detach-role-policy --role-name turul-a2a-demo-lambda-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+aws iam delete-role-policy --role-name turul-a2a-demo-lambda-role --policy-name SqsProducer
+aws iam delete-role --role-name turul-a2a-demo-lambda-role
+```
+
+Verify everything is gone:
+
+```bash
+aws lambda list-functions \
+  --query 'Functions[?contains(FunctionName, `turul-a2a-durable`)].FunctionName'
+aws sqs list-queues --queue-name-prefix turul-a2a
+aws iam get-role --role-name turul-a2a-demo-lambda-role 2>&1 | tail -1
+# → empty; empty; NoSuchEntity
 
 ## Storage caveat (again, because it matters)
 

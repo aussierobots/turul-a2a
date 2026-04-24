@@ -116,7 +116,11 @@ async fn main() -> Result<(), Error> {
 
     let handler = LambdaA2aServerBuilder::new()
         .executor(DurableEchoExecutor)
-        .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
+        // Same storage shape as `lambda-durable-agent` — no push
+        // dispatch in the demo (no push_delivery_store wired). In
+        // production, share a backend (DynamoDB) and wire push
+        // delivery on both Lambdas.
+        .storage(InMemoryA2aStorage::new())
         .with_sqs_return_immediately(queue_url, sqs)
         .build()
         .map_err(|e| Error::from(format!("builder error: {e}")))?;

@@ -108,7 +108,15 @@ async fn main() -> Result<(), lambda_http::Error> {
         // deployments MUST use a shared backend — the worker Lambda
         // runs in a different container and can't see this one's
         // in-memory state. Swap for `DynamoDbA2aStorage`.
-        .storage(InMemoryA2aStorage::new().with_push_dispatch_enabled(true))
+        //
+        // Note: `with_push_dispatch_enabled(true)` is omitted on
+        // purpose — this demo does not register push configs, so
+        // the builder correctly rejects the inconsistent pairing
+        // of push_dispatch_enabled + no push_delivery_store. In a
+        // real deployment that needs push delivery, wire
+        // `.push_delivery_store(storage.clone())` and flip
+        // `with_push_dispatch_enabled(true)` in tandem.
+        .storage(InMemoryA2aStorage::new())
         // ADR-018: wire the SQS durable executor queue. Re-enables
         // `supports_return_immediately` on the RuntimeConfig as a
         // side effect of supplying the queue (capability, not intent).
