@@ -132,6 +132,7 @@ fighting. See the Lambda example READMEs for the execution-role shape.
 - `crates/turul-a2a/src/storage/dynamodb.rs` — the production
   backend; attribute shapes are authoritative here.
 - `examples/lambda-agent` — request Lambda.
+- `examples/lambda-durable-agent` + `examples/lambda-durable-worker` — ADR-018 durable executor continuation via SQS (needs these DynamoDB tables in production; their in-memory demo storage doesn't survive the request/worker Lambda handoff).
 - `examples/lambda-stream-worker` — stream trigger for push fan-out.
 - `examples/lambda-scheduled-worker` — EventBridge backstop.
 - ADR-009 (durable event coordination), ADR-011 (push delivery),

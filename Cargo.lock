@@ -1854,6 +1854,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "lambda-durable-agent"
+version = "0.1.14"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-sqs",
+ "lambda_http",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "turul-a2a",
+ "turul-a2a-aws-lambda",
+ "turul-a2a-proto",
+ "turul-a2a-types",
+]
+
+[[package]]
+name = "lambda-durable-worker"
+version = "0.1.14"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-sqs",
+ "aws_lambda_events",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "turul-a2a",
+ "turul-a2a-aws-lambda",
+ "turul-a2a-proto",
+ "turul-a2a-types",
+]
+
+[[package]]
 name = "lambda-scheduled-worker"
 version = "0.1.14"
 dependencies = [
