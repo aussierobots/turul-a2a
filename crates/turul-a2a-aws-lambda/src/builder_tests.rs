@@ -491,3 +491,137 @@ fn lambda_builder_rejects_retry_horizon_violation() {
         "lambda error must cite the retry horizon: {err}"
     );
 }
+
+// --------------------------------------------------------------------------
+// strip_path_prefix — API Gateway stage + resource tree prefix stripping
+// --------------------------------------------------------------------------
+
+fn agent_card_request(path: &str) -> lambda_http::Request {
+    http::Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("accept", "application/json")
+        .header("a2a-version", "1.0")
+        .body(lambda_http::Body::Empty)
+        .unwrap()
+}
+
+async fn response_status(
+    handler: &LambdaA2aHandler,
+    req: lambda_http::Request,
+) -> http::StatusCode {
+    let resp = handler.handle(req).await.expect("handle() must not error");
+    resp.status()
+}
+
+/// Agent card request under an API-Gateway stage-prefixed path routes
+/// through to the A2A router when `strip_path_prefix` is configured.
+#[tokio::test]
+async fn strip_path_prefix_routes_agent_card_under_apigw_stage_prefix() {
+    let handler = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .storage(InMemoryA2aStorage::new())
+        .strip_path_prefix("/stage/agent")
+        .build()
+        .expect("builder must accept a valid strip_path_prefix");
+    let req = agent_card_request("/stage/agent/.well-known/agent-card.json");
+    assert_eq!(
+        response_status(&handler, req).await,
+        http::StatusCode::OK,
+        "prefixed agent-card path must reach the router after strip"
+    );
+}
+
+/// Without `strip_path_prefix`, the same prefixed path 404s —
+/// demonstrates the failure mode the builder method fixes.
+#[tokio::test]
+async fn without_strip_path_prefix_apigw_stage_prefixed_path_is_404() {
+    let handler = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .storage(InMemoryA2aStorage::new())
+        .build()
+        .expect("builder must accept no-prefix config");
+    let req = agent_card_request("/stage/agent/.well-known/agent-card.json");
+    assert_eq!(
+        response_status(&handler, req).await,
+        http::StatusCode::NOT_FOUND,
+        "baseline — without strip, the prefixed path must 404"
+    );
+}
+
+/// With `strip_path_prefix` configured, an un-prefixed request still
+/// falls through unchanged — non-matching paths do not get stripped.
+/// The router therefore sees the genuine path and either serves it
+/// (if it happens to match root-routed paths) or 404s honestly.
+#[tokio::test]
+async fn strip_path_prefix_passes_through_root_routed_request() {
+    let handler = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .storage(InMemoryA2aStorage::new())
+        .strip_path_prefix("/stage/agent")
+        .build()
+        .unwrap();
+    let req = agent_card_request("/.well-known/agent-card.json");
+    assert_eq!(
+        response_status(&handler, req).await,
+        http::StatusCode::OK,
+        "un-prefixed root request must still reach the router"
+    );
+}
+
+/// Invalid prefix shapes are rejected at build time with a message that
+/// names the builder method — no silent acceptance.
+#[test]
+fn strip_path_prefix_rejects_missing_leading_slash() {
+    let result = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .storage(InMemoryA2aStorage::new())
+        .strip_path_prefix("stage/agent")
+        .build();
+    let err = match result {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("must reject a prefix without a leading slash"),
+    };
+    assert!(
+        err.contains("strip_path_prefix"),
+        "error must name strip_path_prefix: {err}"
+    );
+    assert!(
+        err.contains("start with '/'"),
+        "error must explain the rule: {err}"
+    );
+}
+
+#[test]
+fn strip_path_prefix_rejects_trailing_slash() {
+    let result = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .storage(InMemoryA2aStorage::new())
+        .strip_path_prefix("/stage/agent/")
+        .build();
+    let err = match result {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("must reject a prefix ending with a slash"),
+    };
+    assert!(
+        err.contains("strip_path_prefix"),
+        "error must name strip_path_prefix: {err}"
+    );
+    assert!(
+        err.contains("not end with '/'"),
+        "error must explain the rule: {err}"
+    );
+}
+
+#[test]
+fn strip_path_prefix_treats_slash_as_noop() {
+    let handler = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .storage(InMemoryA2aStorage::new())
+        .strip_path_prefix("/")
+        .build();
+    assert!(
+        handler.is_ok(),
+        "single-slash prefix must build — treated as no-op"
+    );
+}

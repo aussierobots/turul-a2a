@@ -35,7 +35,7 @@ impl AgentExecutor for EchoExecutor {
         AgentCardBuilder::new("Echo Agent", "0.1.0")
             .description("Echoes user messages back as artifacts")
             .url("http://localhost:3000/jsonrpc", "JSONRPC", "1.0")
-            .provider("Aussie Robots", "https://github.com/aussierobots/turul-a2a")
+            .provider("Example Org", "https://example.com")
             .streaming(true)
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])

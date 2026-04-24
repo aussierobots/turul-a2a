@@ -87,7 +87,7 @@ impl AgentExecutor for StreamingExecutor {
         AgentCardBuilder::new("Streaming Agent", "0.1.0")
             .description("Streams a canned response token-by-token over SSE")
             .url("http://localhost:3002/jsonrpc", "JSONRPC", "1.0")
-            .provider("Aussie Robots", "https://github.com/aussierobots/turul-a2a")
+            .provider("Example Org", "https://example.com")
             .streaming(true)
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])

@@ -382,7 +382,7 @@ mod tests {
             .description("A fully configured agent")
             .url("https://agent.example.com", "JSONRPC", "1.0")
             .url("https://agent.example.com/grpc", "GRPC", "1.0")
-            .provider("Aussie Robots", "https://aussierobots.com.au")
+            .provider("Example Org", "https://example.com")
             .documentation_url("https://docs.example.com")
             .streaming(true)
             .push_notifications(false)

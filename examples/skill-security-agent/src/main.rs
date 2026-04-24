@@ -92,7 +92,7 @@ impl AgentExecutor for SkillSecurityExecutor {
         AgentCardBuilder::new("Skill-Security Agent", "0.1.0")
             .description("ADR-015 demo: declaration-only skill-level security requirements.")
             .url("http://localhost:3006/jsonrpc", "JSONRPC", "1.0")
-            .provider("Aussie Robots", "https://github.com/aussierobots/turul-a2a")
+            .provider("Example Org", "https://example.com")
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
             .security_scheme("bearer", bearer_scheme)

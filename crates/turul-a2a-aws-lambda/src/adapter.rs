@@ -74,6 +74,55 @@ pub fn lambda_to_axum_request(
     Ok(req)
 }
 
+/// Rewrite `req.uri()` to drop a leading `prefix` from the path, if
+/// present. Preserves query string, scheme, authority. If `prefix` is
+/// `/` or the path does not start with `prefix`, the request is
+/// returned unchanged (callers downstream will 404 on a genuinely
+/// unknown path — that's the correct failure mode).
+///
+/// A path that equals `prefix` exactly becomes `/` so root-routed
+/// handlers reach the router.
+pub(crate) fn strip_request_path_prefix(
+    mut req: http::Request<Body>,
+    prefix: &str,
+) -> http::Request<Body> {
+    if prefix.is_empty() || prefix == "/" {
+        return req;
+    }
+    let uri = req.uri().clone();
+    let path = uri.path();
+    if !path.starts_with(prefix) {
+        return req;
+    }
+    let rest = &path[prefix.len()..];
+    let new_path = if rest.is_empty() || !rest.starts_with('/') {
+        // path == prefix → "/"; or prefix matches mid-segment
+        // (`/devs` vs `/dev`) → do not strip.
+        if rest.is_empty() {
+            "/"
+        } else {
+            return req;
+        }
+    } else {
+        rest
+    };
+
+    let path_and_query = match uri.query() {
+        Some(q) => format!("{new_path}?{q}"),
+        None => new_path.to_string(),
+    };
+
+    let mut parts = uri.into_parts();
+    parts.path_and_query = match http::uri::PathAndQuery::from_maybe_shared(path_and_query) {
+        Ok(pq) => Some(pq),
+        Err(_) => return req,
+    };
+    if let Ok(new_uri) = http::Uri::from_parts(parts) {
+        *req.uri_mut() = new_uri;
+    }
+    req
+}
+
 fn inject_authorizer_header(headers: &mut http::HeaderMap, key: &str, value: &str) {
     let header_name = format!("{AUTHORIZER_HEADER_PREFIX}{}", key.to_lowercase());
     if let Ok(name) = http::header::HeaderName::from_bytes(header_name.as_bytes()) {
@@ -149,5 +198,84 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         inject_authorizer_header(&mut headers, "userId", "user-123");
         assert_eq!(headers.get("x-authorizer-userid").unwrap(), "user-123");
+    }
+
+    fn uri_only(path_and_query: &str) -> http::Request<Body> {
+        http::Request::builder()
+            .method("GET")
+            .uri(path_and_query)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn strip_path_prefix_removes_api_gateway_stage_and_resource_prefix() {
+        let req = uri_only("/stage/agent/message:send");
+        let out = strip_request_path_prefix(req, "/stage/agent");
+        assert_eq!(out.uri().path(), "/message:send");
+    }
+
+    #[test]
+    fn strip_path_prefix_preserves_query_string() {
+        let req = uri_only("/stage/agent/tasks/abc?historyLength=5");
+        let out = strip_request_path_prefix(req, "/stage/agent");
+        assert_eq!(out.uri().path(), "/tasks/abc");
+        assert_eq!(out.uri().query(), Some("historyLength=5"));
+    }
+
+    #[test]
+    fn strip_path_prefix_handles_root_after_strip() {
+        // Path exactly equals prefix (e.g. agent-card at the prefix root).
+        let req = uri_only("/stage/agent");
+        let out = strip_request_path_prefix(req, "/stage/agent");
+        assert_eq!(out.uri().path(), "/");
+    }
+
+    #[test]
+    fn strip_path_prefix_passes_through_when_prefix_absent() {
+        let req = uri_only("/message:send");
+        let out = strip_request_path_prefix(req, "/stage/agent");
+        assert_eq!(
+            out.uri().path(),
+            "/message:send",
+            "non-matching prefix must not mutate path"
+        );
+    }
+
+    #[test]
+    fn strip_path_prefix_rejects_mid_segment_match() {
+        // "/dev" is a prefix of "/devs/foo" as a string, but not as a
+        // path segment — must not strip.
+        let req = uri_only("/devs/foo");
+        let out = strip_request_path_prefix(req, "/dev");
+        assert_eq!(out.uri().path(), "/devs/foo");
+    }
+
+    #[test]
+    fn strip_path_prefix_noop_on_empty_or_slash_config() {
+        let req = uri_only("/message:send");
+        let out = strip_request_path_prefix(req, "/");
+        assert_eq!(out.uri().path(), "/message:send");
+        let req = uri_only("/message:send");
+        let out = strip_request_path_prefix(req, "");
+        assert_eq!(out.uri().path(), "/message:send");
+    }
+
+    #[test]
+    fn strip_path_prefix_well_known_and_jsonrpc() {
+        let prefix = "/stage/agent";
+        for (input, expected) in [
+            (
+                "/stage/agent/.well-known/agent-card.json",
+                "/.well-known/agent-card.json",
+            ),
+            ("/stage/agent/jsonrpc", "/jsonrpc"),
+            ("/stage/agent/tasks/abc:cancel", "/tasks/abc:cancel"),
+            ("/stage/agent/extendedAgentCard", "/extendedAgentCard"),
+        ] {
+            let req = uri_only(input);
+            let out = strip_request_path_prefix(req, prefix);
+            assert_eq!(out.uri().path(), expected, "input: {input}");
+        }
     }
 }

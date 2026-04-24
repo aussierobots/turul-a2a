@@ -28,6 +28,28 @@
 //! handler method when the handler is needed for unit tests or
 //! custom middleware.
 //!
+//! ## API Gateway path prefix
+//!
+//! When Lambda sits behind a REST API Gateway with `AWS_PROXY`
+//! integration, the event carries the full stage + resource tree in
+//! the path (e.g. `/stage/agent/message:send`),
+//! which the root-rooted A2A router would 404. Configure the prefix
+//! to strip via [`LambdaA2aServerBuilder::strip_path_prefix`]:
+//!
+//! ```ignore
+//! LambdaA2aServerBuilder::new()
+//!     .executor(my_executor)
+//!     .storage(my_storage)
+//!     .strip_path_prefix("/stage/agent")  // API GW prefix
+//!     .run()
+//!     .await
+//! ```
+//!
+//! The strip applies to `run_http_only` and `run_http_and_sqs`.
+//! SQS events are unaffected. Non-matching paths pass through
+//! unchanged (router still 404s on genuinely unknown paths —
+//! that's the correct failure mode).
+//!
 //! ```ignore
 //! // HTTP-only Lambda (request Lambda in two-Lambda topology):
 //! LambdaA2aServerBuilder::new()
@@ -190,6 +212,7 @@ pub struct LambdaA2aServerBuilder {
     middleware: Vec<Arc<dyn A2aMiddleware>>,
     runtime_config: RuntimeConfig,
     durable_executor_queue: Option<Arc<dyn turul_a2a::durable_executor::DurableExecutorQueue>>,
+    path_prefix: Option<String>,
 }
 
 impl LambdaA2aServerBuilder {
@@ -205,7 +228,29 @@ impl LambdaA2aServerBuilder {
             middleware: vec![],
             runtime_config: RuntimeConfig::default(),
             durable_executor_queue: None,
+            path_prefix: None,
         }
+    }
+
+    /// Configure an HTTP path prefix to strip before the A2A router
+    /// sees the request. Needed when Lambda sits behind an API Gateway
+    /// whose stage + resource tree is forwarded into the function
+    /// (e.g. REST API `AWS_PROXY` integrations surface
+    /// `/stage/agent/message:send` where the A2A
+    /// router expects `/message:send`).
+    ///
+    /// The prefix must start with `/` and must not end with `/`
+    /// (unless it is exactly `/`, which is a no-op). Segment boundaries
+    /// are respected — a prefix of `/dev` will not strip `/devs/...`.
+    /// Paths that do not start with the prefix pass through unchanged
+    /// (the router will 404 on a genuinely unknown path, which is the
+    /// correct failure mode). Applies to both
+    /// [`LambdaA2aHandler::run_http_only`] and
+    /// [`LambdaA2aHandler::run_http_and_sqs`]. SQS events are
+    /// unaffected.
+    pub fn strip_path_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.path_prefix = Some(prefix.into());
+        self
     }
 
     /// Wire a durable executor queue (ADR-018). When set, the
@@ -528,7 +573,33 @@ impl LambdaA2aServerBuilder {
 
         let router = build_router(state.clone());
 
-        Ok(LambdaA2aHandler { router, state })
+        let path_prefix = match self.path_prefix {
+            None => None,
+            Some(p) if p.is_empty() || p == "/" => None,
+            Some(p) => {
+                if !p.starts_with('/') {
+                    return Err(A2aError::InvalidRequest {
+                        message: format!(
+                            "LambdaA2aServerBuilder::strip_path_prefix: prefix must start with '/'; got {p:?}"
+                        ),
+                    });
+                }
+                if p.ends_with('/') {
+                    return Err(A2aError::InvalidRequest {
+                        message: format!(
+                            "LambdaA2aServerBuilder::strip_path_prefix: prefix must not end with '/' (except '/'); got {p:?}"
+                        ),
+                    });
+                }
+                Some(Arc::from(p))
+            }
+        };
+
+        Ok(LambdaA2aHandler {
+            router,
+            state,
+            path_prefix,
+        })
     }
 }
 
@@ -548,6 +619,10 @@ pub struct LambdaA2aHandler {
     /// reach it for diagnostics or future non-HTTP / non-SQS handlers.
     #[cfg_attr(not(feature = "sqs"), allow(dead_code))]
     state: AppState,
+    /// Leading path segment to strip from each incoming HTTP request
+    /// before the A2A router sees it. `None` = no stripping. Set via
+    /// [`LambdaA2aServerBuilder::strip_path_prefix`].
+    path_prefix: Option<Arc<str>>,
 }
 
 impl LambdaA2aHandler {
@@ -561,6 +636,10 @@ impl LambdaA2aHandler {
         event: lambda_http::Request,
     ) -> Result<lambda_http::Response<lambda_http::Body>, lambda_http::Error> {
         let axum_req = lambda_to_axum_request(event)?;
+        let axum_req = match &self.path_prefix {
+            Some(prefix) => adapter::strip_request_path_prefix(axum_req, prefix),
+            None => axum_req,
+        };
 
         let axum_resp = tower::ServiceExt::oneshot(self.router.clone(), axum_req)
             .await

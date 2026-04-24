@@ -61,7 +61,7 @@ impl AgentExecutor for GrpcEchoExecutor {
         AgentCardBuilder::new("gRPC Echo Agent", "0.1.0")
             .description("A2A v1.0 agent exposed over gRPC via ADR-014")
             .url(format!("grpc://127.0.0.1:{GRPC_PORT}"), "GRPC", "1.0")
-            .provider("Aussie Robots", "https://github.com/aussierobots/turul-a2a")
+            .provider("Example Org", "https://example.com")
             .streaming(true)
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])

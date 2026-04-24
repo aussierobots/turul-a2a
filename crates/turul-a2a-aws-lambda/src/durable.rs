@@ -581,7 +581,11 @@ mod dispatch_http_event_tests {
             durable_executor_queue: None,
         };
         let router = turul_a2a::router::build_router(state.clone());
-        LambdaA2aHandler { router, state }
+        LambdaA2aHandler {
+            router,
+            state,
+            path_prefix: None,
+        }
     }
 
     fn apigw_v2_agent_card_get() -> serde_json::Value {

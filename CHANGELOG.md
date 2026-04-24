@@ -23,6 +23,10 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   let req = MessageBuilder::new().data(req).metadata_json(corrs).build();
   ```
 
+### Added — `LambdaA2aServerBuilder::strip_path_prefix`
+
+- **`strip_path_prefix(impl Into<String>)`** on `LambdaA2aServerBuilder`. Rewrites the incoming HTTP request URI — drops a leading path segment before the A2A router sees the request. Needed when Lambda sits behind a REST API Gateway with `AWS_PROXY` integration, which forwards the full stage + resource tree in the path (e.g. a request to `/stage/agent/message:send` hitting a router that expects `/message:send`). The prefix must start with `/` and must not end with `/`; invalid shapes are rejected at `build()` with an error that names the method. Applies to `run_http_only` and `run_http_and_sqs`; SQS events unaffected. Non-matching paths pass through unchanged (router 404s on genuinely unknown paths — the correct failure mode). Segment-boundary aware: `/dev` will not strip `/devs/...`. 13 new tests across the adapter unit tests and the builder integration tests, covering the prefix variants named in A2A spec (`/.well-known/agent-card.json`, `/message:send`, `/tasks/{id}`, `/jsonrpc`, `/extendedAgentCard`).
+
 ### Added — Lambda runners hide envelope dispatch from adopters
 
 Adopter `main.rs` no longer reaches for `lambda_http::run`,
