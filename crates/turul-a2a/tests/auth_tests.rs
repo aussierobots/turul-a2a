@@ -120,10 +120,9 @@ impl A2aMiddleware for TestAuthMiddleware {
                 };
                 Ok(())
             }
-            _ => Err(MiddlewareError::HttpChallenge {
-                status: 401,
-                www_authenticate: "TestAuth realm=\"test\"".into(),
-            }),
+            _ => Err(MiddlewareError::HttpChallenge(
+                turul_a2a::middleware::AuthFailureKind::InvalidToken,
+            )),
         }
     }
 }
@@ -259,9 +258,11 @@ async fn auth_middleware_rejects_unauthenticated_http() {
         .unwrap();
     let (status, _headers, body) = response_with_headers(router, req).await;
     assert_eq!(status, 401, "Unauthenticated should return 401");
-    assert!(
-        body["error"]["code"].as_u64().is_some(),
-        "Should have AIP-193 error body"
+    // ADR-016 §2.2: body is `{"error": "<kind_string>"}`
+    assert_eq!(
+        body["error"].as_str(),
+        Some("invalid_token"),
+        "Body should be kind-string form per ADR-016: {body}"
     );
 }
 
@@ -280,9 +281,11 @@ async fn auth_middleware_rejects_unauthenticated_jsonrpc() {
         body.get("jsonrpc").is_none(),
         "Auth failure on /jsonrpc must be HTTP 401, not JSON-RPC error: {body}"
     );
-    assert!(
-        body["error"]["code"].as_u64().is_some(),
-        "Should be AIP-193 format"
+    // ADR-016 §2.2: body is `{"error": "<kind_string>"}`
+    assert_eq!(
+        body["error"].as_str(),
+        Some("invalid_token"),
+        "Body should be kind-string form per ADR-016: {body}"
     );
 }
 
@@ -377,8 +380,8 @@ async fn jsonrpc_unauthenticated_is_http_401_not_jsonrpc_error() {
         body.get("jsonrpc").is_none(),
         "Must be HTTP error, not JSON-RPC"
     );
-    // IS AIP-193
-    assert_eq!(body["error"]["code"], 401);
+    // ADR-016 §2.2: body is `{"error": "<kind_string>"}`
+    assert_eq!(body["error"].as_str(), Some("invalid_token"));
 }
 
 #[tokio::test]

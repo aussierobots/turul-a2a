@@ -4,6 +4,99 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.12] — 2026-04-24
+
+### Changed — wire surface tightening (ADR-016)
+
+Transport auth-failure wire surface is now stable and deliberately
+narrower than prior releases. **No public A2A-protocol API changes**;
+the changes below affect only the 401/403 responses produced by
+`turul-a2a-auth` middleware and by any adopter-supplied middleware
+that constructs `MiddlewareError` directly.
+
+- **401/403 JSON body** changed from
+  `{"error": {"code": <status>, "message": "<Debug of internal enum>"}}`
+  to `{"error": "<kind_string>"}` where `<kind_string>` is one of
+  `missing_credential`, `invalid_token`, `invalid_api_key`,
+  `empty_principal`, `insufficient_scope`. The previous body text was
+  `format!("{err:?}")` of an internal enum — not a stable contract.
+  Adopters pattern-matching on the old `message` text need to read the
+  `error` string instead.
+- **Bearer `WWW-Authenticate`** changed from
+  `Bearer realm="a2a", error="invalid_token", error_description="<validator internals>"`
+  to `Bearer realm="a2a", error="<rfc6750_code>"`. The `error=` code
+  derives from `AuthFailureKind` per RFC 6750 §3 and can only be
+  `invalid_request`, `invalid_token`, or `insufficient_scope`.
+  `error_description` is omitted intentionally — it previously leaked
+  validator internals (JWKS URLs, jsonwebtoken errors, token
+  fragments).
+- **API-key failures** never emit `WWW-Authenticate` (no canonical
+  non-Bearer challenge vocabulary).
+- **`RequestContext::Debug`** no longer derives — manual impl redacts
+  `bearer_token`, redacts every `headers` value that isn't in a fixed
+  safe allowlist (`Content-Type`, `Content-Length`, `Accept`,
+  `User-Agent`, `Host`), and prints `extensions` keys only. Header
+  names remain visible. Any adopter using `{:?}` to debug auth state
+  sees less — read `ctx.bearer_token`, `ctx.identity.owner()`, etc.
+  explicitly.
+- **`AuthIdentity::Debug`** no longer derives — `Authenticated` variant
+  shows `owner` but redacts `claims`.
+
+### Changed — error type shape
+
+- **`MiddlewareError`** variants changed to carry `AuthFailureKind`
+  instead of ad-hoc `String` / status + www_authenticate fields:
+  - `Unauthenticated(String)` → `Unauthenticated(AuthFailureKind)`
+  - `HttpChallenge { status, www_authenticate }` → `HttpChallenge(AuthFailureKind)`
+  - `Forbidden(String)` → `Forbidden(AuthFailureKind)`
+  - `Internal(String)` unchanged.
+- Adopter middleware constructing these variants directly needs
+  trivial translation. `matches!(err, MiddlewareError::Unauthenticated(_))`
+  patterns keep working.
+- `AnyOfMiddleware` no longer concatenates child `WWW-Authenticate`
+  values; the highest-precedence selected error's kind drives the
+  single emitted header at the transport layer.
+
+### Added
+
+- **`turul_a2a::middleware::AuthFailureKind`** — new public enum,
+  `#[non_exhaustive]`. Methods: `body_string()` → stable wire string;
+  `bearer_rfc6750_code()` → optional RFC 6750 `error=` code.
+- **`turul_a2a::middleware::MiddlewareError::kind()`** → `Option<AuthFailureKind>`.
+- **`turul_a2a_auth::RedactedApiKeyLookup`** — first-party `ApiKeyLookup`
+  reference implementation with a redacted `Debug` impl that never
+  emits key material. Adopters can use it directly or treat it as a
+  template for backend-specific lookups.
+- **Type-level guard**: compile-fail (via `static_assertions`) that
+  `ApiKeyMiddleware`, `BearerMiddleware`, and `StaticApiKeyLookup` do
+  not implement `Debug`. Guards against accidental
+  `#[derive(Debug)]` leaking credential material.
+- **New test suite** `crates/turul-a2a/tests/auth_wire_tests.rs` —
+  six E2E assertions on body + header shape for every
+  `AuthFailureKind` / variant combination (ADR-016 §4).
+- Unit tests covering `AuthFailureKind` mapping, `RequestContext::Debug`
+  redaction (bearer token, sensitive headers, allowlist passthrough,
+  extensions), and `AuthIdentity::Debug` redaction.
+
+### Migration
+
+For most adopters: no code changes needed. `turul-a2a-auth`'s
+`BearerMiddleware` and `ApiKeyMiddleware` continue to work and now
+emit the cleaner wire shape automatically.
+
+For adopters who wrote their own `A2aMiddleware` impls:
+- Replace `MiddlewareError::Unauthenticated("message")` with
+  `MiddlewareError::Unauthenticated(AuthFailureKind::<appropriate>)`.
+- Replace `MiddlewareError::HttpChallenge { status, www_authenticate }`
+  with `MiddlewareError::HttpChallenge(AuthFailureKind::<appropriate>)`.
+- Replace `MiddlewareError::Forbidden("message")` with
+  `MiddlewareError::Forbidden(AuthFailureKind::InsufficientScope)`
+  (or whatever kind fits).
+- `MiddlewareError::Internal(String)` is unchanged.
+
+For adopters parsing 401/403 response bodies: switch from reading
+`body.error.code` / `body.error.message` to `body.error` (string).
+
 ## [0.1.11] — 2026-04-23
 
 ### Changed

@@ -24,10 +24,9 @@ struct FakeBearerMiddleware;
 #[async_trait::async_trait]
 impl A2aMiddleware for FakeBearerMiddleware {
     async fn before_request(&self, _ctx: &mut RequestContext) -> Result<(), MiddlewareError> {
-        Err(MiddlewareError::HttpChallenge {
-            status: 401,
-            www_authenticate: "Bearer realm=\"a2a\"".into(),
-        })
+        Err(MiddlewareError::HttpChallenge(
+            turul_a2a::middleware::AuthFailureKind::InvalidToken,
+        ))
     }
 
     fn security_contribution(&self) -> turul_a2a::middleware::SecurityContribution {
@@ -78,7 +77,7 @@ async fn anyof_both_fail_returns_highest_precedence() {
 
     // HttpChallenge (from Bearer) beats Unauthenticated (from ApiKey)
     assert!(
-        matches!(err, MiddlewareError::HttpChallenge { .. }),
+        matches!(err, MiddlewareError::HttpChallenge(_)),
         "HttpChallenge should win: {err:?}"
     );
 }

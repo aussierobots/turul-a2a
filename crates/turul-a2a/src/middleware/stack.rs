@@ -84,18 +84,10 @@ impl A2aMiddleware for AnyOfMiddleware {
             }
         }
 
-        // All children failed. Collect all WWW-Authenticate challenges for merging.
-        let challenges: Vec<String> = errors
-            .iter()
-            .filter_map(|e| match e {
-                MiddlewareError::HttpChallenge {
-                    www_authenticate, ..
-                } => Some(www_authenticate.clone()),
-                _ => None,
-            })
-            .collect();
-
-        // Select highest-precedence error, ties by registration order.
+        // All children failed. Select highest-precedence error, ties by
+        // registration order. ADR-016 §2.1 + §2.3: WWW-Authenticate is
+        // built at the transport layer from the selected error's kind —
+        // no manual challenge-string concatenation.
         let selected = errors
             .into_iter()
             .reduce(|champion, challenger| {
@@ -106,16 +98,6 @@ impl A2aMiddleware for AnyOfMiddleware {
                 }
             })
             .expect("AnyOfMiddleware has at least one child");
-
-        // If the selected error is HttpChallenge, merge all collected challenges.
-        if let MiddlewareError::HttpChallenge { status, .. } = &selected {
-            if challenges.len() > 1 {
-                return Err(MiddlewareError::HttpChallenge {
-                    status: *status,
-                    www_authenticate: challenges.join(", "),
-                });
-            }
-        }
 
         Err(selected)
     }
@@ -161,39 +143,56 @@ mod tests {
         }
     }
 
+    use crate::middleware::error::AuthFailureKind;
+
     struct FailUnauthenticated {
-        message: String,
+        kind: AuthFailureKind,
+    }
+
+    impl FailUnauthenticated {
+        fn new(kind: AuthFailureKind) -> Self {
+            Self { kind }
+        }
     }
 
     #[async_trait]
     impl A2aMiddleware for FailUnauthenticated {
         async fn before_request(&self, _ctx: &mut RequestContext) -> Result<(), MiddlewareError> {
-            Err(MiddlewareError::Unauthenticated(self.message.clone()))
+            Err(MiddlewareError::Unauthenticated(self.kind))
         }
     }
 
     struct FailHttpChallenge {
-        www_authenticate: String,
+        kind: AuthFailureKind,
+    }
+
+    impl FailHttpChallenge {
+        fn new(kind: AuthFailureKind) -> Self {
+            Self { kind }
+        }
     }
 
     #[async_trait]
     impl A2aMiddleware for FailHttpChallenge {
         async fn before_request(&self, _ctx: &mut RequestContext) -> Result<(), MiddlewareError> {
-            Err(MiddlewareError::HttpChallenge {
-                status: 401,
-                www_authenticate: self.www_authenticate.clone(),
-            })
+            Err(MiddlewareError::HttpChallenge(self.kind))
         }
     }
 
     struct FailForbidden {
-        message: String,
+        kind: AuthFailureKind,
+    }
+
+    impl FailForbidden {
+        fn new(kind: AuthFailureKind) -> Self {
+            Self { kind }
+        }
     }
 
     #[async_trait]
     impl A2aMiddleware for FailForbidden {
         async fn before_request(&self, _ctx: &mut RequestContext) -> Result<(), MiddlewareError> {
-            Err(MiddlewareError::Forbidden(self.message.clone()))
+            Err(MiddlewareError::Forbidden(self.kind))
         }
     }
 
@@ -238,9 +237,7 @@ mod tests {
     async fn stack_error_halts_chain() {
         let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stack = MiddlewareStack::new(vec![
-            Arc::new(FailUnauthenticated {
-                message: "first".into(),
-            }),
+            Arc::new(FailUnauthenticated::new(AuthFailureKind::MissingCredential)),
             Arc::new(CallTracker {
                 called: called.clone(),
                 inner: Box::new(SucceedingMiddleware {
@@ -263,9 +260,7 @@ mod tests {
     #[tokio::test]
     async fn anyof_first_success_wins() {
         let any = AnyOfMiddleware::new(vec![
-            Arc::new(FailUnauthenticated {
-                message: "no key".into(),
-            }),
+            Arc::new(FailUnauthenticated::new(AuthFailureKind::InvalidApiKey)),
             Arc::new(SucceedingMiddleware {
                 owner: "user-b".into(),
             }),
@@ -329,12 +324,8 @@ mod tests {
     #[tokio::test]
     async fn anyof_forbidden_beats_unauthenticated() {
         let any = AnyOfMiddleware::new(vec![
-            Arc::new(FailUnauthenticated {
-                message: "no auth".into(),
-            }),
-            Arc::new(FailForbidden {
-                message: "no access".into(),
-            }),
+            Arc::new(FailUnauthenticated::new(AuthFailureKind::MissingCredential)),
+            Arc::new(FailForbidden::new(AuthFailureKind::InsufficientScope)),
         ]);
         let mut ctx = RequestContext::new();
         let err = any.before_request(&mut ctx).await.unwrap_err();
@@ -347,12 +338,8 @@ mod tests {
     #[tokio::test]
     async fn anyof_forbidden_beats_http_challenge() {
         let any = AnyOfMiddleware::new(vec![
-            Arc::new(FailHttpChallenge {
-                www_authenticate: "Bearer realm=\"a2a\"".into(),
-            }),
-            Arc::new(FailForbidden {
-                message: "no access".into(),
-            }),
+            Arc::new(FailHttpChallenge::new(AuthFailureKind::InvalidToken)),
+            Arc::new(FailForbidden::new(AuthFailureKind::InsufficientScope)),
         ]);
         let mut ctx = RequestContext::new();
         let err = any.before_request(&mut ctx).await.unwrap_err();
@@ -365,17 +352,13 @@ mod tests {
     #[tokio::test]
     async fn anyof_http_challenge_beats_unauthenticated() {
         let any = AnyOfMiddleware::new(vec![
-            Arc::new(FailUnauthenticated {
-                message: "no key".into(),
-            }),
-            Arc::new(FailHttpChallenge {
-                www_authenticate: "Bearer realm=\"a2a\"".into(),
-            }),
+            Arc::new(FailUnauthenticated::new(AuthFailureKind::InvalidApiKey)),
+            Arc::new(FailHttpChallenge::new(AuthFailureKind::InvalidToken)),
         ]);
         let mut ctx = RequestContext::new();
         let err = any.before_request(&mut ctx).await.unwrap_err();
         assert!(
-            matches!(err, MiddlewareError::HttpChallenge { .. }),
+            matches!(err, MiddlewareError::HttpChallenge(_)),
             "HttpChallenge should win over Unauthenticated"
         );
     }
@@ -386,19 +369,21 @@ mod tests {
 
     #[tokio::test]
     async fn anyof_all_unauthenticated_returns_first() {
+        // First child fails with MissingCredential; second with InvalidApiKey.
+        // Tie on precedence — first-registered wins.
         let any = AnyOfMiddleware::new(vec![
-            Arc::new(FailUnauthenticated {
-                message: "first-registered".into(),
-            }),
-            Arc::new(FailUnauthenticated {
-                message: "second-registered".into(),
-            }),
+            Arc::new(FailUnauthenticated::new(AuthFailureKind::MissingCredential)),
+            Arc::new(FailUnauthenticated::new(AuthFailureKind::InvalidApiKey)),
         ]);
         let mut ctx = RequestContext::new();
         let err = any.before_request(&mut ctx).await.unwrap_err();
         match err {
-            MiddlewareError::Unauthenticated(msg) => {
-                assert_eq!(msg, "first-registered", "Tie should go to first-registered");
+            MiddlewareError::Unauthenticated(kind) => {
+                assert_eq!(
+                    kind,
+                    AuthFailureKind::MissingCredential,
+                    "Tie should go to first-registered"
+                );
             }
             _ => panic!("Expected Unauthenticated"),
         }
@@ -411,18 +396,17 @@ mod tests {
     #[test]
     fn middleware_error_http_status_mapping() {
         assert_eq!(
-            MiddlewareError::Unauthenticated("x".into()).http_status(),
+            MiddlewareError::Unauthenticated(AuthFailureKind::MissingCredential).http_status(),
             401
         );
         assert_eq!(
-            MiddlewareError::HttpChallenge {
-                status: 401,
-                www_authenticate: "Bearer".into()
-            }
-            .http_status(),
+            MiddlewareError::HttpChallenge(AuthFailureKind::InvalidToken).http_status(),
             401
         );
-        assert_eq!(MiddlewareError::Forbidden("x".into()).http_status(), 403);
+        assert_eq!(
+            MiddlewareError::Forbidden(AuthFailureKind::InsufficientScope).http_status(),
+            403
+        );
         assert_eq!(MiddlewareError::Internal("x".into()).http_status(), 500);
     }
 
@@ -431,92 +415,43 @@ mod tests {
     // =========================================================
 
     // =========================================================
-    // AnyOfMiddleware — merged WWW-Authenticate headers
+    // AnyOfMiddleware — challenge selection (ADR-016: no concat).
+    // WWW-Authenticate is built at the transport boundary from the
+    // selected error's kind, not by merging child challenge strings.
     // =========================================================
 
     #[tokio::test]
-    async fn anyof_multiple_http_challenges_merge_www_authenticate() {
+    async fn anyof_multiple_http_challenges_selects_first_by_precedence() {
         let any = AnyOfMiddleware::new(vec![
-            Arc::new(FailHttpChallenge {
-                www_authenticate: "Bearer realm=\"a2a\"".into(),
-            }),
-            Arc::new(FailHttpChallenge {
-                www_authenticate: "Bearer realm=\"oidc\"".into(),
-            }),
+            Arc::new(FailHttpChallenge::new(AuthFailureKind::InvalidToken)),
+            Arc::new(FailHttpChallenge::new(AuthFailureKind::InvalidToken)),
         ]);
         let mut ctx = RequestContext::new();
         let err = any.before_request(&mut ctx).await.unwrap_err();
 
         match err {
-            MiddlewareError::HttpChallenge {
-                status,
-                www_authenticate,
-            } => {
-                assert_eq!(status, 401);
-                // Must contain BOTH challenges, comma-separated per RFC 9110 §11.6.1
-                assert!(
-                    www_authenticate.contains("Bearer realm=\"a2a\""),
-                    "Should include first challenge: {www_authenticate}"
-                );
-                assert!(
-                    www_authenticate.contains("Bearer realm=\"oidc\""),
-                    "Should include second challenge: {www_authenticate}"
-                );
+            MiddlewareError::HttpChallenge(kind) => {
+                assert_eq!(kind, AuthFailureKind::InvalidToken);
             }
-            other => panic!("Expected HttpChallenge with merged headers, got: {other:?}"),
+            other => panic!("Expected HttpChallenge, got: {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn anyof_http_challenge_tie_merges_and_returns_first() {
-        // Two HttpChallenge errors at same precedence — first wins, but headers merge
+    async fn anyof_unauthenticated_and_http_challenge_selects_challenge() {
+        // API key (Unauthenticated) + Bearer (HttpChallenge) — HttpChallenge
+        // wins on precedence; the transport builds the Bearer challenge
+        // header from its kind.
         let any = AnyOfMiddleware::new(vec![
-            Arc::new(FailHttpChallenge {
-                www_authenticate: "ApiKey realm=\"first\"".into(),
-            }),
-            Arc::new(FailHttpChallenge {
-                www_authenticate: "Bearer realm=\"second\"".into(),
-            }),
+            Arc::new(FailUnauthenticated::new(AuthFailureKind::MissingCredential)),
+            Arc::new(FailHttpChallenge::new(AuthFailureKind::InvalidToken)),
         ]);
         let mut ctx = RequestContext::new();
         let err = any.before_request(&mut ctx).await.unwrap_err();
 
         match err {
-            MiddlewareError::HttpChallenge {
-                status,
-                www_authenticate,
-            } => {
-                assert_eq!(status, 401);
-                // Both challenges present
-                assert!(www_authenticate.contains("ApiKey realm=\"first\""));
-                assert!(www_authenticate.contains("Bearer realm=\"second\""));
-            }
-            other => panic!("Expected merged HttpChallenge, got: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn anyof_unauthenticated_and_http_challenge_uses_challenge_with_header() {
-        // API key (Unauthenticated) + Bearer (HttpChallenge) — HttpChallenge wins, its header preserved
-        let any = AnyOfMiddleware::new(vec![
-            Arc::new(FailUnauthenticated {
-                message: "missing X-API-Key".into(),
-            }),
-            Arc::new(FailHttpChallenge {
-                www_authenticate: "Bearer realm=\"a2a\"".into(),
-            }),
-        ]);
-        let mut ctx = RequestContext::new();
-        let err = any.before_request(&mut ctx).await.unwrap_err();
-
-        match err {
-            MiddlewareError::HttpChallenge {
-                www_authenticate, ..
-            } => {
-                assert!(
-                    www_authenticate.contains("Bearer"),
-                    "Bearer challenge should be preserved"
-                );
+            MiddlewareError::HttpChallenge(kind) => {
+                assert_eq!(kind, AuthFailureKind::InvalidToken);
             }
             other => panic!("Expected HttpChallenge, got: {other:?}"),
         }

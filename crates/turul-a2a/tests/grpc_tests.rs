@@ -649,7 +649,7 @@ struct DenyAll;
 impl A2aMiddleware for DenyAll {
     async fn before_request(&self, _ctx: &mut RequestContext) -> Result<(), MiddlewareError> {
         Err(MiddlewareError::Unauthenticated(
-            "test middleware denies all".into(),
+            turul_a2a::middleware::AuthFailureKind::InvalidApiKey,
         ))
     }
 }

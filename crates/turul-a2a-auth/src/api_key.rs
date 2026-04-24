@@ -1,11 +1,13 @@
 //! API Key auth middleware.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use turul_a2a::middleware::{
-    A2aMiddleware, AuthIdentity, MiddlewareError, RequestContext, SecurityContribution,
+    A2aMiddleware, AuthFailureKind, AuthIdentity, MiddlewareError, RequestContext,
+    SecurityContribution,
 };
 
 /// Trait for resolving API key to owner identity.
@@ -28,6 +30,63 @@ impl StaticApiKeyLookup {
 
 #[async_trait]
 impl ApiKeyLookup for StaticApiKeyLookup {
+    async fn lookup(&self, key: &str) -> Option<String> {
+        self.keys.get(key).cloned()
+    }
+}
+
+/// First-party `ApiKeyLookup` reference implementation with a redacted
+/// `Debug` that never exposes key material (ADR-016 §2.5).
+///
+/// Internal storage uses a plain `HashMap<String, String>` — keys remain
+/// in-process strings but are unreachable via `Debug`, `Display`, or
+/// `Serialize`. This is the simplest shape that satisfies the ADR
+/// invariant; adopter implementations may reach for more elaborate
+/// containers (`secrecy::SecretString` with newtype, etc.) if their
+/// deployment requires stronger guarantees.
+///
+/// ```
+/// use std::collections::HashMap;
+/// use turul_a2a_auth::RedactedApiKeyLookup;
+///
+/// let mut keys = HashMap::new();
+/// keys.insert("api-key-abc".to_string(), "owner-alice".to_string());
+/// let lookup = RedactedApiKeyLookup::new(keys);
+///
+/// let dbg = format!("{lookup:?}");
+/// assert!(!dbg.contains("api-key-abc"), "keys must never print: {dbg}");
+/// assert!(dbg.contains("RedactedApiKeyLookup"));
+/// ```
+pub struct RedactedApiKeyLookup {
+    keys: HashMap<String, String>,
+}
+
+impl RedactedApiKeyLookup {
+    pub fn new(keys: HashMap<String, String>) -> Self {
+        Self { keys }
+    }
+
+    /// Number of keys currently registered. Safe to expose — reveals no
+    /// key material.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
+impl fmt::Debug for RedactedApiKeyLookup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RedactedApiKeyLookup")
+            .field("len", &self.keys.len())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl ApiKeyLookup for RedactedApiKeyLookup {
     async fn lookup(&self, key: &str) -> Option<String> {
         self.keys.get(key).cloned()
     }
@@ -63,10 +122,9 @@ impl A2aMiddleware for ApiKeyMiddleware {
         let key = match key {
             Some(k) if !k.is_empty() => k,
             _ => {
-                return Err(MiddlewareError::Unauthenticated(format!(
-                    "Missing {} header",
-                    self.header_name
-                )));
+                return Err(MiddlewareError::Unauthenticated(
+                    AuthFailureKind::MissingCredential,
+                ));
             }
         };
 
@@ -74,12 +132,14 @@ impl A2aMiddleware for ApiKeyMiddleware {
             .lookup
             .lookup(&key)
             .await
-            .ok_or_else(|| MiddlewareError::Unauthenticated("Invalid API key".into()))?;
+            .ok_or(MiddlewareError::Unauthenticated(
+                AuthFailureKind::InvalidApiKey,
+            ))?;
 
         // Reject empty/whitespace owners — symmetrical with Bearer principal extraction
         if owner.trim().is_empty() {
             return Err(MiddlewareError::Unauthenticated(
-                "API key resolved to empty owner".into(),
+                AuthFailureKind::EmptyPrincipal,
             ));
         }
 

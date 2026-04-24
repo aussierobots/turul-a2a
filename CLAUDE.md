@@ -8,7 +8,7 @@ Turul-a2a is a Rust implementation of the A2A (Agent-to-Agent) Protocol v1.0. Li
 
 **Proto-first architecture**: Types are generated from the normative `proto/a2a.proto` (package `lf.a2a.v1`) using `prost` + `pbjson`, then wrapped in ergonomic Rust types.
 
-**Current release**: 0.1.11 — see `CHANGELOG.md` for the per-release contract.
+**Current release**: 0.1.12 — see `CHANGELOG.md` for the per-release contract.
 
 ## Build & Development Commands
 
@@ -154,6 +154,7 @@ Documented under `docs/adr/`:
 - **ADR-013**: Lambda push-delivery parity — atomic pending-dispatch marker, causal no-backfill CAS, stream + scheduled recovery workers. §4.3 errata (0.1.5): `.storage()` does not auto-wire push delivery; explicit `.push_delivery_store(...)` required.
 - **ADR-014**: gRPC transport — third thin adapter via tonic over the shared core handlers (ADR-005 extended). Feature-gated on `turul-a2a-proto/grpc`, `turul-a2a/grpc`, `turul-a2a-client/grpc`; default builds are tonic-free. `grpc-reflection` / `grpc-health` are separate opt-in sub-features. Streaming consumes the ADR-009 durable event store with `a2a-last-event-id` ASCII metadata for replay. Proto `tenant` field wins over `x-tenant-id` metadata (§2.4). Out of scope for `turul-a2a-aws-lambda` (§2.6).
 - **ADR-015**: Skill-level `security_requirements` — declaration-only advertisement. Adopters set `AgentSkillBuilder::security_requirements(...)` and `AgentCardBuilder::security_scheme(...)` / `::security_requirement(...)` to publish richer cards; post-merge validation at `A2aServerBuilder::build()` rejects cards whose public or extended (no-claims) surface references an undeclared scheme. Runtime enforcement deferred pending a normative `skill_id` binding on `Message`.
+- **ADR-016**: Stable auth-failure wire surface. `AuthFailureKind` (`MissingCredential`, `InvalidToken`, `InvalidApiKey`, `EmptyPrincipal`, `InsufficientScope`-reserved) drives both the 401/403 JSON body (`{"error": "<kind>"}`) and — for Bearer challenges only — the RFC 6750 `error=` code on `WWW-Authenticate`. `error_description` intentionally omitted. `RequestContext::Debug` and `AuthIdentity::Debug` redact bearer tokens, sensitive header values, extensions values, and claims. `RedactedApiKeyLookup` ships as a first-party secret-aware lookup; `ApiKeyMiddleware`, `BearerMiddleware`, and `StaticApiKeyLookup` are type-level-guarded against accidental `#[derive(Debug)]`.
 
 For non-trivial architecture changes, the ADR should be accepted before implementation starts.
 

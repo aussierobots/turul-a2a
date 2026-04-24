@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use turul_a2a::middleware::{
-    A2aMiddleware, AuthIdentity, MiddlewareError, RequestContext, SecurityContribution,
+    A2aMiddleware, AuthFailureKind, AuthIdentity, MiddlewareError, RequestContext,
+    SecurityContribution,
 };
 use turul_jwt_validator::JwtValidator;
 
@@ -46,21 +47,19 @@ impl A2aMiddleware for BearerMiddleware {
         let token = ctx
             .bearer_token
             .as_deref()
-            .ok_or_else(|| MiddlewareError::HttpChallenge {
-                status: 401,
-                www_authenticate: "Bearer realm=\"a2a\"".into(),
-            })?;
+            .ok_or(MiddlewareError::HttpChallenge(
+                AuthFailureKind::MissingCredential,
+            ))?;
 
-        let claims =
-            self.validator
-                .validate(token)
-                .await
-                .map_err(|e| MiddlewareError::HttpChallenge {
-                    status: 401,
-                    www_authenticate: format!(
-                        "Bearer realm=\"a2a\", error=\"invalid_token\", error_description=\"{e}\""
-                    ),
-                })?;
+        // ADR-016 §2.1: every validator failure collapses to `InvalidToken`.
+        // The original validator error is intentionally discarded — leaking
+        // it through `error_description` would expose JWKS URLs, jsonwebtoken
+        // internals, or token fragments on the public response header.
+        let claims = self
+            .validator
+            .validate(token)
+            .await
+            .map_err(|_| MiddlewareError::HttpChallenge(AuthFailureKind::InvalidToken))?;
 
         // Extract principal from configured claim
         let owner = if self.principal_claim == "sub" {
@@ -77,7 +76,7 @@ impl A2aMiddleware for BearerMiddleware {
         // Reject empty/whitespace principal
         if owner.trim().is_empty() {
             return Err(MiddlewareError::Unauthenticated(
-                "Token has no usable principal".into(),
+                AuthFailureKind::EmptyPrincipal,
             ));
         }
 

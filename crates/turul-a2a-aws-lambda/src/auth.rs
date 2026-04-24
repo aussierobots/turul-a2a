@@ -1,7 +1,9 @@
 //! Lambda authorizer middleware — reads trusted x-authorizer-* headers.
 
 use async_trait::async_trait;
-use turul_a2a::middleware::{A2aMiddleware, AuthIdentity, MiddlewareError, RequestContext};
+use turul_a2a::middleware::{
+    A2aMiddleware, AuthFailureKind, AuthIdentity, MiddlewareError, RequestContext,
+};
 
 use crate::adapter::AUTHORIZER_HEADER_PREFIX;
 
@@ -58,7 +60,7 @@ impl A2aMiddleware for LambdaAuthorizerMiddleware {
                 Ok(())
             }
             _ => Err(MiddlewareError::Unauthenticated(
-                "Missing authorizer context".into(),
+                AuthFailureKind::MissingCredential,
             )),
         }
     }

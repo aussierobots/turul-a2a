@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 authors = ["Nick Hortovanyi <nick@aussierobots.com.au>"]
 license = "MIT OR Apache-2.0"
@@ -90,11 +90,12 @@ rsa = { version = "0.9", features = ["pem"] }
 rand = "0.10"
 base64 = "0.22"
 wiremock = "0.6"
+static_assertions = "1.1"
 
 # Misc
 bytes = "1"
 
-turul-a2a = { version = "0.1.11", path = "crates/turul-a2a" }
-turul-a2a-proto = { version = "0.1.11", path = "crates/turul-a2a-proto" }
-turul-a2a-types = { version = "0.1.11", path = "crates/turul-a2a-types" }
+turul-a2a = { version = "0.1.12", path = "crates/turul-a2a" }
+turul-a2a-proto = { version = "0.1.12", path = "crates/turul-a2a-proto" }
+turul-a2a-types = { version = "0.1.12", path = "crates/turul-a2a-types" }
 turul-jwt-validator = "0.2"

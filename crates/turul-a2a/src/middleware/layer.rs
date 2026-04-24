@@ -127,28 +127,34 @@ where
 }
 
 /// Convert a MiddlewareError to an HTTP response.
-/// This is the transport-level error path — no A2aError, no JSON-RPC.
+///
+/// Wire surface is governed by ADR-016:
+/// - Body: `{"error": "<kind_wire_string>"}` where the kind string comes
+///   from [`AuthFailureKind::body_string`].
+/// - `WWW-Authenticate`: emitted only on `HttpChallenge` variants, and
+///   only when the kind has a Bearer RFC 6750 mapping. `error_description`
+///   is intentionally omitted to prevent leaking validator internals.
+/// - `Internal` is not auth-failure and uses a fixed `internal_error`
+///   body string.
 fn middleware_error_to_response(err: &MiddlewareError) -> Response<Body> {
     let status = axum::http::StatusCode::from_u16(err.http_status())
         .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
 
-    let body = serde_json::json!({
-        "error": {
-            "code": err.http_status(),
-            "message": format!("{err:?}"),
-        }
-    });
+    let body_str = match err.kind() {
+        Some(kind) => kind.body_string(),
+        None => "internal_error",
+    };
+    let body = serde_json::json!({ "error": body_str });
 
     let mut builder = Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, "application/json");
 
-    // Add WWW-Authenticate header for challenges
-    if let MiddlewareError::HttpChallenge {
-        www_authenticate, ..
-    } = err
-    {
-        builder = builder.header(http::header::WWW_AUTHENTICATE, www_authenticate.as_str());
+    if let MiddlewareError::HttpChallenge(kind) = err {
+        if let Some(code) = kind.bearer_rfc6750_code() {
+            let header = format!("Bearer realm=\"a2a\", error=\"{code}\"");
+            builder = builder.header(http::header::WWW_AUTHENTICATE, header);
+        }
     }
 
     builder
