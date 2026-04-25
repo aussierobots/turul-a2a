@@ -45,7 +45,7 @@
 
 use async_trait::async_trait;
 use lambda_runtime::Error;
-use turul_a2a::card_builder::AgentCardBuilder;
+use turul_a2a::card_builder::{AgentCardBuilder, AgentSkillBuilder};
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
 use turul_a2a::storage::dynamodb::{DynamoDbA2aStorage, DynamoDbConfig};
@@ -101,6 +101,18 @@ impl AgentExecutor for DurableEchoExecutor {
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
             .streaming(false)
+            .skill(
+                AgentSkillBuilder::new(
+                    "durable-echo",
+                    "Durable Echo (worker)",
+                    "Same skill as `lambda-durable-agent::durable-echo` — required \
+                     here only because the agent card schema requires at least one \
+                     skill. This Lambda has no HTTP entry point; clients reach the \
+                     skill via the request Lambda which enqueues onto SQS.",
+                )
+                .tags(vec!["echo", "durable", "sqs", "consumer"])
+                .build(),
+            )
             .build()
             .expect("durable agent card should be valid")
     }

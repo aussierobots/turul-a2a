@@ -3,7 +3,7 @@
 //! Run: cargo lambda watch -p lambda-agent
 //! Test: cargo lambda invoke lambda-agent --data-ascii '{"httpMethod":"GET","path":"/.well-known/agent-card.json"}'
 
-use turul_a2a::card_builder::AgentCardBuilder;
+use turul_a2a::card_builder::{AgentCardBuilder, AgentSkillBuilder};
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
 use turul_a2a::storage::InMemoryA2aStorage;
@@ -33,6 +33,18 @@ impl AgentExecutor for LambdaEchoExecutor {
             .url(self.public_url.as_str(), "JSONRPC", "1.0")
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
+            .skill(
+                AgentSkillBuilder::new(
+                    "lambda-echo",
+                    "Lambda Echo",
+                    "Echoes a fixed greeting back as an artifact. Demonstrates the \
+                     A2A executor + axum router running inside the AWS Lambda \
+                     adapter via a single Function URL invocation.",
+                )
+                .tags(vec!["echo", "lambda", "demo"])
+                .examples(vec!["Send any text — the agent always replies with a fixed greeting."])
+                .build(),
+            )
             .build()
             .expect("Lambda agent card should be valid")
     }

@@ -44,7 +44,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use turul_a2a::card_builder::AgentCardBuilder;
+use turul_a2a::card_builder::{AgentCardBuilder, AgentSkillBuilder};
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
 use turul_a2a::storage::dynamodb::{DynamoDbA2aStorage, DynamoDbConfig};
@@ -101,6 +101,26 @@ impl AgentExecutor for DurableEchoExecutor {
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
             .streaming(false)
+            .skill(
+                AgentSkillBuilder::new(
+                    "durable-echo",
+                    "Durable Echo",
+                    "Echoes the incoming text plus the framework-assigned task id, \
+                     context id, and the *keys* of any client-supplied message \
+                     metadata. Proves the payload survives the HTTP → SQS → \
+                     dequeue → executor hop without alteration.",
+                )
+                .tags(vec!["echo", "durable", "sqs", "diagnostics"])
+                .examples(vec![
+                    "Send `{\"message\":{...,\"parts\":[{\"text\":\"probe-42\"}],\
+                     \"metadata\":{\"trigger_id\":\"trig-x\",\"attempt\":1}},\
+                     \"configuration\":{\"returnImmediately\":true}}`. The \
+                     terminal artifact includes the probe text, both ids, and \
+                     `metadata_keys: [attempt, trigger_id]` (keys only — values \
+                     are not echoed)."
+                ])
+                .build(),
+            )
             .build()
             .expect("durable agent card should be valid")
     }

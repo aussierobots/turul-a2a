@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lambda_runtime::Error;
-use turul_a2a::card_builder::AgentCardBuilder;
+use turul_a2a::card_builder::{AgentCardBuilder, AgentSkillBuilder};
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
 use turul_a2a::storage::InMemoryA2aStorage;
@@ -79,6 +79,27 @@ impl AgentExecutor for DurableEchoExecutor {
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
             .streaming(false)
+            .skill(
+                AgentSkillBuilder::new(
+                    "durable-echo",
+                    "Durable Echo (single Lambda)",
+                    "Echoes the incoming text plus the framework-assigned task id, \
+                     context id, and the *keys* of any client-supplied message \
+                     metadata. The echo runs in the SQS-triggered invocation, not \
+                     the HTTP one — proving the payload survives the HTTP → SQS → \
+                     dequeue → executor hop intact, on a single Lambda function.",
+                )
+                .tags(vec!["echo", "durable", "sqs", "single-lambda"])
+                .examples(vec![
+                    "Send `{\"message\":{...,\"parts\":[{\"text\":\"probe-42\"}],\
+                     \"metadata\":{\"trigger_id\":\"trig-x\",\"attempt\":1}},\
+                     \"configuration\":{\"returnImmediately\":true}}`. After \
+                     ~5 seconds, GET /tasks/{id} shows the terminal artifact \
+                     containing the probe text, both ids, and `metadata_keys: \
+                     [attempt, trigger_id]`."
+                ])
+                .build(),
+            )
             .build()
             .expect("single-lambda agent card should be valid")
     }
