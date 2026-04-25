@@ -42,7 +42,9 @@ impl AgentExecutor for LambdaEchoExecutor {
                      adapter via a single Function URL invocation.",
                 )
                 .tags(vec!["echo", "lambda", "demo"])
-                .examples(vec!["Send any text — the agent always replies with a fixed greeting."])
+                .examples(vec![
+                    "Send any text — the agent always replies with a fixed greeting.",
+                ])
                 .build(),
             )
             .build()

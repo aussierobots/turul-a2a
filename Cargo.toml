@@ -13,6 +13,8 @@ members = [
   "examples/callback-agent",
   "examples/grpc-agent",
   "examples/skill-security-agent",
+  "examples/conversation-agent",
+  "examples/interrupting-agent",
   "examples/lambda-agent",
   "examples/lambda-durable-agent",
   "examples/lambda-durable-single",

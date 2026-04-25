@@ -23,6 +23,7 @@ pub struct MessageBuilder {
     parts: Vec<pb::Part>,
     context_id: String,
     task_id: String,
+    reference_task_ids: Vec<String>,
     metadata: Option<pbjson_types::Struct>,
     // Request-root fields.
     tenant: String,
@@ -44,6 +45,7 @@ impl MessageBuilder {
             parts: vec![],
             context_id: String::new(),
             task_id: String::new(),
+            reference_task_ids: vec![],
             metadata: None,
             tenant: String::new(),
             return_immediately: false,
@@ -104,9 +106,25 @@ impl MessageBuilder {
         self
     }
 
-    /// Set the task ID to continue an existing task.
+    /// Set the task ID to continue an existing task. The framework
+    /// only accepts continuations on tasks in the `INPUT_REQUIRED` or
+    /// `AUTH_REQUIRED` interrupted states (per A2A spec §3.4).
     pub fn task_id(mut self, id: impl Into<String>) -> Self {
         self.task_id = id.into();
+        self
+    }
+
+    /// Mark this message as a refinement of one or more prior tasks
+    /// in the same `contextId`. The serving agent uses these ids as a
+    /// hint to resolve which prior artifacts/results the refinement
+    /// is operating on. Refinement always creates a *new* task — see
+    /// the A2A "Life of a Task" / Task Immutability section.
+    pub fn reference_task_ids<I, S>(mut self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.reference_task_ids = ids.into_iter().map(Into::into).collect();
         self
     }
 
@@ -249,7 +267,7 @@ impl MessageBuilder {
                 task_id: self.task_id,
                 metadata: self.metadata,
                 extensions: vec![],
-                reference_task_ids: vec![],
+                reference_task_ids: self.reference_task_ids,
             }),
             configuration,
             metadata: None,

@@ -117,7 +117,7 @@ impl AgentExecutor for DurableEchoExecutor {
                      \"configuration\":{\"returnImmediately\":true}}`. The \
                      terminal artifact includes the probe text, both ids, and \
                      `metadata_keys: [attempt, trigger_id]` (keys only — values \
-                     are not echoed)."
+                     are not echoed).",
                 ])
                 .build(),
             )

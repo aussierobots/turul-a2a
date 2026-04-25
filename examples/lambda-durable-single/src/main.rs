@@ -96,7 +96,7 @@ impl AgentExecutor for DurableEchoExecutor {
                      \"configuration\":{\"returnImmediately\":true}}`. After \
                      ~5 seconds, GET /tasks/{id} shows the terminal artifact \
                      containing the probe text, both ids, and `metadata_keys: \
-                     [attempt, trigger_id]`."
+                     [attempt, trigger_id]`.",
                 ])
                 .build(),
             )
