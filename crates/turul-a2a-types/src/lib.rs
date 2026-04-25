@@ -20,6 +20,7 @@ pub mod artifact;
 pub mod error;
 pub mod message;
 pub mod pbjson;
+pub mod push_config;
 pub mod state_machine;
 pub mod task;
 pub mod wire;
@@ -32,4 +33,5 @@ pub mod proto {
 pub use artifact::Artifact;
 pub use error::A2aTypeError;
 pub use message::{Message, Part, Role};
+pub use push_config::{PushAuth, PushConfig, PushConfigBuilder, PushConfigPage};
 pub use task::{Task, TaskState, TaskStatus};

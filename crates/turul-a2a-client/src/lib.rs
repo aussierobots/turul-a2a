@@ -335,24 +335,43 @@ impl A2aClient {
     // Push notification config CRUD
     // =========================================================
 
-    /// Create a push notification config for a task.
+    /// Create a push notification config for a task using `url` + `token`
+    /// (the 80% case). For `authentication` or other advanced fields, build
+    /// a [`PushConfig`] via [`PushConfigBuilder`] and call
+    /// [`Self::create_push_config_with`].
     pub async fn create_push_config(
         &self,
         task_id: &str,
-        config: pb::TaskPushNotificationConfig,
-    ) -> Result<pb::TaskPushNotificationConfig, A2aClientError> {
-        let url = self.url(&format!("/tasks/{task_id}/pushNotificationConfigs"));
+        url: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<turul_a2a_types::PushConfig, A2aClientError> {
+        let cfg = turul_a2a_types::PushConfigBuilder::new(url, token)
+            .task_id(task_id)
+            .build();
+        self.create_push_config_with(task_id, cfg).await
+    }
+
+    /// Create a push notification config from a fully-constructed
+    /// [`PushConfig`] — use this when you need `authentication`, a custom
+    /// `tenant`, or any other field beyond `url` + `token`.
+    pub async fn create_push_config_with(
+        &self,
+        task_id: &str,
+        config: turul_a2a_types::PushConfig,
+    ) -> Result<turul_a2a_types::PushConfig, A2aClientError> {
+        let endpoint = self.url(&format!("/tasks/{task_id}/pushNotificationConfigs"));
         let resp = self
-            .request(reqwest::Method::POST, &url)
+            .request(reqwest::Method::POST, &endpoint)
             .header("content-type", "application/json")
-            .json(&config)
+            .json(config.as_proto())
             .send()
             .await?;
 
         if !resp.status().is_success() {
             return Err(self.parse_error_from_status(resp).await);
         }
-        Ok(resp.json().await?)
+        let proto: pb::TaskPushNotificationConfig = resp.json().await?;
+        Ok(proto.into())
     }
 
     /// Get a push notification config by ID.
@@ -360,7 +379,7 @@ impl A2aClient {
         &self,
         task_id: &str,
         config_id: &str,
-    ) -> Result<pb::TaskPushNotificationConfig, A2aClientError> {
+    ) -> Result<turul_a2a_types::PushConfig, A2aClientError> {
         let url = self.url(&format!(
             "/tasks/{task_id}/pushNotificationConfigs/{config_id}"
         ));
@@ -369,7 +388,8 @@ impl A2aClient {
         if !resp.status().is_success() {
             return Err(self.parse_error_from_status(resp).await);
         }
-        Ok(resp.json().await?)
+        let proto: pb::TaskPushNotificationConfig = resp.json().await?;
+        Ok(proto.into())
     }
 
     /// List push notification configs for a task.
@@ -378,7 +398,7 @@ impl A2aClient {
         task_id: &str,
         page_size: Option<i32>,
         page_token: Option<&str>,
-    ) -> Result<pb::ListTaskPushNotificationConfigsResponse, A2aClientError> {
+    ) -> Result<turul_a2a_types::PushConfigPage, A2aClientError> {
         let url = self.url(&format!("/tasks/{task_id}/pushNotificationConfigs"));
         let mut req = self.request(reqwest::Method::GET, &url);
         if let Some(ps) = page_size {
@@ -392,7 +412,11 @@ impl A2aClient {
         if !resp.status().is_success() {
             return Err(self.parse_error_from_status(resp).await);
         }
-        Ok(resp.json().await?)
+        let proto: pb::ListTaskPushNotificationConfigsResponse = resp.json().await?;
+        Ok(turul_a2a_types::PushConfigPage::new(
+            proto.configs.into_iter().map(Into::into).collect(),
+            (!proto.next_page_token.is_empty()).then_some(proto.next_page_token),
+        ))
     }
 
     /// Delete a push notification config.

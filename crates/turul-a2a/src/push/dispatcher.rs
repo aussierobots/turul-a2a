@@ -7,8 +7,7 @@
 //!   registered push config on the task).
 //! - `ArtifactUpdate` events do not trigger delivery (ADR-011
 //!   §13.11).
-//! - Non-terminal status transitions do not trigger delivery
-//!.
+//! - Non-terminal status transitions do not trigger delivery.
 //!
 //! The dispatcher takes ownership of the work of translating a
 //! [`turul_a2a_proto::TaskPushNotificationConfig`] into a

@@ -180,52 +180,79 @@ impl A2aGrpcClient {
 
     // --- Push config CRUD ---------------------------------------------
 
+    /// Create a push notification config from `url` + `token` (the 80%
+    /// case). For `authentication` or other advanced fields, build a
+    /// [`turul_a2a_types::PushConfig`] via
+    /// [`turul_a2a_types::PushConfigBuilder`] and call
+    /// [`Self::create_push_config_with`].
     pub async fn create_push_config(
         &mut self,
-        mut config: pb::TaskPushNotificationConfig,
-    ) -> Result<pb::TaskPushNotificationConfig, A2aClientError> {
-        if config.tenant.is_empty() {
-            config.tenant = self.scoped_tenant();
+        task_id: impl Into<String>,
+        url: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<turul_a2a_types::PushConfig, A2aClientError> {
+        let task_id = task_id.into();
+        let cfg = turul_a2a_types::PushConfigBuilder::new(url, token)
+            .task_id(task_id.clone())
+            .build();
+        self.create_push_config_with(cfg).await
+    }
+
+    /// Create a push notification config from a fully-constructed
+    /// [`turul_a2a_types::PushConfig`].
+    pub async fn create_push_config_with(
+        &mut self,
+        config: turul_a2a_types::PushConfig,
+    ) -> Result<turul_a2a_types::PushConfig, A2aClientError> {
+        let mut proto = config.into_proto();
+        if proto.tenant.is_empty() {
+            proto.tenant = self.scoped_tenant();
         }
-        Ok(self
+        let resp = self
             .inner
-            .create_task_push_notification_config(self.prepare(config))
+            .create_task_push_notification_config(self.prepare(proto))
             .await?
-            .into_inner())
+            .into_inner();
+        Ok(resp.into())
     }
 
     pub async fn get_push_config(
         &mut self,
         task_id: impl Into<String>,
         config_id: impl Into<String>,
-    ) -> Result<pb::TaskPushNotificationConfig, A2aClientError> {
+    ) -> Result<turul_a2a_types::PushConfig, A2aClientError> {
         let req = pb::GetTaskPushNotificationConfigRequest {
             tenant: self.scoped_tenant(),
             task_id: task_id.into(),
             id: config_id.into(),
         };
-        Ok(self
+        let resp = self
             .inner
             .get_task_push_notification_config(self.prepare(req))
             .await?
-            .into_inner())
+            .into_inner();
+        Ok(resp.into())
     }
 
     pub async fn list_push_configs(
         &mut self,
         task_id: impl Into<String>,
-    ) -> Result<pb::ListTaskPushNotificationConfigsResponse, A2aClientError> {
+    ) -> Result<turul_a2a_types::PushConfigPage, A2aClientError> {
         let req = pb::ListTaskPushNotificationConfigsRequest {
             tenant: self.scoped_tenant(),
             task_id: task_id.into(),
             page_size: 0,
             page_token: String::new(),
         };
-        Ok(self
+        let resp = self
             .inner
             .list_task_push_notification_configs(self.prepare(req))
             .await?
-            .into_inner())
+            .into_inner();
+        Ok(turul_a2a_types::PushConfigPage::new(
+            resp.configs.into_iter().map(Into::into).collect(),
+            (!resp.next_page_token.is_empty()).then_some(resp.next_page_token),
+        ))
     }
 
     pub async fn delete_push_config(

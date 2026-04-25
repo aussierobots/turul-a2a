@@ -86,16 +86,12 @@ async fn terminal_fires_webhook_and_token_is_validated() {
 
     // Step 2: register the push config with the CORRECT token. This
     // must land before the executor's 500 ms delay elapses.
-    let config = turul_a2a_proto::TaskPushNotificationConfig {
-        tenant: String::new(),
-        id: String::new(),
-        task_id: task_id.clone(),
-        url: format!("http://127.0.0.1:{receiver_port}/webhook"),
-        token: TEST_TOKEN.to_string(),
-        authentication: None,
-    };
     let _ = client
-        .create_push_config(&task_id, config)
+        .create_push_config(
+            &task_id,
+            format!("http://127.0.0.1:{receiver_port}/webhook"),
+            TEST_TOKEN,
+        )
         .await
         .expect("create_push_config ok");
 

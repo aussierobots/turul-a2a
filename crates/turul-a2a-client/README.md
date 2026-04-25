@@ -54,21 +54,16 @@ an already-terminal task returns `UnsupportedOperationError`; use
 
 ## Push notification config
 
-Register a webhook against an existing task:
+Register a webhook against an existing task — the 80% case takes two
+inputs, no proto types in sight:
 
 ```rust
-use turul_a2a_proto as pb;
-
 let task_id = response.task.unwrap().id;
 client
     .create_push_config(
         &task_id,
-        pb::TaskPushNotificationConfig {
-            task_id: task_id.clone(),
-            url: "https://my-webhook.example/a2a-callback".into(),
-            token: "shared-secret-token".into(),
-            ..Default::default()
-        },
+        "https://my-webhook.example/a2a-callback",
+        "shared-secret-token",
     )
     .await?;
 ```
@@ -85,6 +80,19 @@ let request = MessageBuilder::new()
     )
     .build();
 client.send_message(request).await?;
+```
+
+For configs that need HTTP `Authorization` headers on the webhook
+delivery, build a `PushConfig` and use `create_push_config_with`:
+
+```rust
+use turul_a2a_types::{PushAuth, PushConfigBuilder};
+
+let cfg = PushConfigBuilder::new("https://my-webhook.example/a2a-callback", "secret")
+    .authentication(PushAuth::new("Bearer", "eyJ..."))
+    .build();
+
+client.create_push_config_with(&task_id, cfg).await?;
 ```
 
 The server delivers a POST to the registered URL when the task reaches

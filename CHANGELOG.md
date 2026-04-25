@@ -6,6 +6,19 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.1.15] — 2026-04-25
 
+### Changed — push-config client API hides proto
+
+- **Breaking on the push-config CRUD methods** in both `turul-a2a-client::A2aClient` and `turul-a2a-client::grpc::A2aGrpcClient`:
+  - `create_push_config(&task_id, url, token)` — 3-arg ergonomic call replacing the old `(&task_id, pb::TaskPushNotificationConfig)` shape. No proto types in adopter code.
+  - `create_push_config_with(&task_id, PushConfig)` — escape hatch for configs that need `authentication`, `tenant`, or other advanced fields.
+  - `get_push_config` / `list_push_configs` now return `turul_a2a_types::PushConfig` / `PushConfigPage` instead of the raw proto types. `PushConfigPage` carries `next_page_token: Option<String>` so pagination is preserved.
+- **`turul-a2a-types`** gains:
+  - `PushConfig` — wrapper over `TaskPushNotificationConfig` with `id()` / `task_id()` / `url()` / `token()` / `authentication()` / `tenant()` accessors and `as_proto()` / `into_proto()` escape hatches.
+  - `PushConfigBuilder::new(url, token)` with optional `.task_id(...)` / `.tenant(...)` / `.authentication(PushAuth)` setters.
+  - `PushAuth::new(scheme, credentials)` mirroring `AuthenticationInfo`.
+  - `PushConfigPage::new(configs, next_page_token)` for paginated list responses.
+- Brings push-config into line with `send_message`, `get_task`, etc. — adopter code no longer needs `use turul_a2a_proto as pb` or `..Default::default()` literals.
+
 ### Added — `MessageBuilder::reference_task_ids` + Life-of-a-Task examples
 
 - **`turul-a2a-client::MessageBuilder::reference_task_ids(I)`** — wires `Message.reference_task_ids` for refinement requests. Required by the new `conversation-agent` example; useful for any adopter implementing the A2A spec's task-refinement flow.
