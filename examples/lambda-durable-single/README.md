@@ -43,6 +43,22 @@ Earlier revisions of this example open-coded ~80 lines of `LambdaRequest` → `h
 | **`lambda-durable-single`** *(this crate)* | Quickest demo. One Lambda, `ReservedConcurrency=1`, `InMemoryA2aStorage`. Container-level storage means HTTP and SQS invocations share state. **Not for production** — the concurrency pin caps you at one inflight invocation. |
 | `lambda-durable-agent` + `lambda-durable-worker` | Production shape. Two Lambda functions, shared DynamoDB backend (via `examples/lambda-infra/`), no concurrency limits. What you'd actually deploy. |
 
+## Life-of-a-Task verification (post-deploy)
+
+`scripts/life-of-a-task.sh` drives the deployed Function URL through
+the A2A spec's task-refinement flow:
+
+```bash
+bash examples/lambda-durable-single/scripts/life-of-a-task.sh "$FN_URL"
+```
+
+The script POSTs an originating message, GETs the task, POSTs a
+refinement (`referenceTaskIds=[task1.id]`, same `contextId`), and
+GETs the new task. It asserts the spec invariants — task immutability
+across refinement (different `task_id`s), `contextId` continuity,
+both terminals `COMPLETED`, artifacts echo their own ids and the probe
+text. Eight assertions; exits with the failure count.
+
 ## Local testing
 
 Before deploying to AWS, see `examples/LOCAL_TESTING.md` for the

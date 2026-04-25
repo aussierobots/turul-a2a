@@ -21,6 +21,23 @@ ADR-018's dispatch pattern splits across two Lambda functions that share the sam
 
 This split matches the existing pattern (`lambda-agent` + `lambda-stream-worker` + `lambda-scheduled-worker`). The agent writes the task, the worker reads it — both via `DynamoDbA2aStorage` pointed at the same five tables (ADR-009 same-backend requirement).
 
+## Life-of-a-Task verification (post-deploy)
+
+`scripts/life-of-a-task.sh` drives the deployed two-Lambda topology
+(request Lambda + worker Lambda + shared DynamoDB) through the A2A
+spec's task-refinement flow:
+
+```bash
+bash examples/lambda-durable-agent/scripts/life-of-a-task.sh "$FN_URL"
+```
+
+POSTs an originating message → SQS → worker → DynamoDB. GETs the
+task. POSTs a refinement (`referenceTaskIds=[task1.id]`, same
+`contextId`) → second SQS round. GETs the second task. Asserts task
+immutability, `contextId` continuity, both terminals `COMPLETED`, and
+the artifacts echo their own ids and probe text. Eight assertions;
+exits with the failure count.
+
 ## Local testing
 
 Before deploying to AWS, see `examples/LOCAL_TESTING.md` for the

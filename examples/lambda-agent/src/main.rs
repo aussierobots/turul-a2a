@@ -1,7 +1,12 @@
 //! Lambda A2A agent — for local testing with cargo-lambda.
 //!
-//! Run: cargo lambda watch -p lambda-agent
-//! Test: cargo lambda invoke lambda-agent --data-ascii '{"httpMethod":"GET","path":"/.well-known/agent-card.json"}'
+//! Run:  cargo lambda watch -p lambda-agent
+//! Smoke (against the local watch URL or a deployed Function URL):
+//!   bash examples/lambda-agent/scripts/smoke.sh \
+//!     http://localhost:9000/lambda-url/turul-a2a-lambda-agent
+//!
+//! The smoke script POSTs `/message:send` and GETs `/tasks/{id}`,
+//! asserts terminal=COMPLETED + the fixed greeting artifact arrives.
 
 use turul_a2a::card_builder::{AgentCardBuilder, AgentSkillBuilder};
 use turul_a2a::error::A2aError;
