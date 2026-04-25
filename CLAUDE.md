@@ -88,7 +88,7 @@ Authorize each `cargo publish` call separately. A prior "go ahead" does not auth
 
 - **LICENSE files:** every publish crate has `LICENSE-APACHE` and `LICENSE-MIT` symlinks to `../../LICENSE-*`. When adding a new publish crate, add both symlinks or the `.crate` archive ships with only the SPDX identifier.
 - **Proto location:** `crates/turul-a2a-proto/proto/` is canonical so `cargo package` includes it. The workspace-root `proto/` symlink preserves historical paths — do not replace it with a real directory.
-- **Lambda example `doc = false`:** all three Lambda example crates declare `[[bin]] name = "bootstrap"` (cargo-lambda requirement). Each has `doc = false` on the bin target so `cargo doc --workspace` does not collide on output filenames.
+- **Lambda example `doc = false`:** every Lambda example crate declares `[[bin]] name = "bootstrap"` (cargo-lambda requirement). Each has `doc = false` on the bin target so `cargo doc --workspace` does not collide on output filenames.
 
 ## Architecture
 

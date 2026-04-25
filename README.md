@@ -1,55 +1,43 @@
 # turul-a2a
 
+[![crates.io](https://img.shields.io/crates/v/turul-a2a.svg)](https://crates.io/crates/turul-a2a)
+[![docs.rs](https://docs.rs/turul-a2a/badge.svg)](https://docs.rs/turul-a2a)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 Rust implementation of the [A2A (Agent-to-Agent) Protocol v1.0](https://a2a-protocol.org/).
 
-Proto-first architecture: types generated from the normative `proto/a2a.proto` (package `lf.a2a.v1`) using `prost` + `pbjson`, wrapped in ergonomic Rust types.
+Proto-first: types are generated from the normative `proto/a2a.proto` (package `lf.a2a.v1`) via `prost` + `pbjson`, then wrapped in ergonomic Rust types. Wire format is interop-tested against the official [Go A2A SDK](https://github.com/a2aproject/a2a-go).
 
 ## Crates
 
-| Crate | Description |
-|-------|-------------|
-| `turul-a2a-proto` | Proto-generated types from `a2a.proto` with camelCase JSON via pbjson |
-| `turul-a2a-types` | Ergonomic Rust wrappers, state machine enforcement, `#[non_exhaustive]` |
-| `turul-a2a` | Server framework: HTTP + JSON-RPC + SSE, storage backends, auth middleware |
-| `turul-a2a-auth` | Auth middleware: Bearer JWT (`turul-jwt-validator`), API key |
-| `turul-a2a-client` | Client library: discovery, send, stream, subscribe, push config |
-| `turul-a2a-aws-lambda` | Lambda adapter: same router, streaming via durable event store |
-| `turul-jwt-validator` | Local JWT validator with JWKS caching |
+| Crate | docs.rs | Description |
+|-------|---------|-------------|
+| `turul-a2a-proto` | [📖](https://docs.rs/turul-a2a-proto) | Proto-generated types with camelCase JSON via pbjson |
+| `turul-a2a-types` | [📖](https://docs.rs/turul-a2a-types) | Ergonomic wrappers, state machine, `#[non_exhaustive]` |
+| `turul-a2a` | [📖](https://docs.rs/turul-a2a) | Server framework: HTTP + JSON-RPC + SSE, storage, middleware |
+| `turul-a2a-auth` | [📖](https://docs.rs/turul-a2a-auth) | Bearer JWT and API key middleware |
+| `turul-a2a-client` | [📖](https://docs.rs/turul-a2a-client) | Client library: discovery, send, stream, subscribe |
+| `turul-a2a-aws-lambda` | [📖](https://docs.rs/turul-a2a-aws-lambda) | AWS Lambda adapter |
+| `turul-jwt-validator` | [📖](https://docs.rs/turul-jwt-validator) | Local JWT validator with JWKS caching |
 
-## Quick Start
+## Quick start
+
+```toml
+[dependencies]
+turul-a2a = "0.1"
+turul-a2a-client = "0.1"
+tokio = { version = "1", features = ["full"] }
+```
 
 ```bash
-# Run the echo agent
-cargo run -p echo-agent
+cargo run -p echo-agent     # runs on :3000
 
-# Test it
 curl -X POST http://localhost:3000/message:send \
-  -H 'Content-Type: application/json' \
-  -H 'a2a-version: 1.0' \
+  -H 'Content-Type: application/json' -H 'a2a-version: 1.0' \
   -d '{"message":{"messageId":"1","role":"ROLE_USER","parts":[{"text":"hello"}]}}'
 ```
 
-## Client Usage
-
-```rust
-use turul_a2a_client::{A2aClient, MessageBuilder};
-
-let client = A2aClient::discover("http://localhost:3000").await?;
-
-// Send a message
-let request = MessageBuilder::new().text("hello agent").build();
-let response = client.send_message(request).await?;
-
-// Stream a message (SSE)
-let request = MessageBuilder::new().text("stream this").build();
-let mut stream = client.send_streaming_message(request).await?;
-while let Some(event) = futures::StreamExt::next(&mut stream).await {
-    let event = event?;
-    println!("Event: {:?}", event.data);
-}
-```
-
-## Server Usage
+## Server
 
 ```rust
 use turul_a2a::prelude::*;
@@ -58,202 +46,90 @@ struct MyAgent;
 
 #[async_trait::async_trait]
 impl AgentExecutor for MyAgent {
-    async fn execute(
-        &self,
-        task: &mut Task,
-        message: &Message,
-        _ctx: &ExecutionContext,
-    ) -> Result<(), A2aError> {
-        let input = message.joined_text();
-        task.push_text_artifact("result", "Response", format!("You said: {input}"));
+    async fn execute(&self, task: &mut Task, message: &Message, _ctx: &ExecutionContext)
+        -> Result<(), A2aError>
+    {
+        task.push_text_artifact("result", "Response", format!("You said: {}", message.joined_text()));
         task.complete();
         Ok(())
     }
 
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
-        AgentCardBuilder::new("My Agent", "1.0.0")
-            .description("An example A2A agent")
-            .url("http://localhost:3000/jsonrpc", "JSONRPC", "1.0")
-            .default_input_modes(vec!["text/plain"])
-            .default_output_modes(vec!["text/plain"])
-            .build()
-            .unwrap()
+        AgentCardBuilder::new("My Agent", "1.0.0").build().unwrap()
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    A2aServer::builder()
-        .executor(MyAgent)
-        .bind(([0, 0, 0, 0], 3000))
-        .build()?
-        .run()
-        .await?;
+    A2aServer::builder().executor(MyAgent).bind(([0, 0, 0, 0], 3000)).build()?.run().await?;
     Ok(())
 }
 ```
 
-## Storage Backends
+See [`crates/turul-a2a/README.md`](crates/turul-a2a/README.md) for storage wiring, durable streaming, and feature flags.
 
-Four parity-tested backends, all implementing task storage, push notification storage, event store, and atomic task+event writes:
-
-```bash
-# In-memory (default)
-cargo run -p echo-agent
-
-# SQLite
-cargo test --features sqlite
-
-# PostgreSQL (requires DATABASE_URL)
-cargo test --features postgres --test-threads=1
-
-# DynamoDB (requires AWS credentials)
-cargo test --features dynamodb --test-threads=1
-```
-
-Use `.storage()` on the builder so the four storage traits (task storage, event store, atomic store, push delivery store, cancellation supervisor) are wired from a single backend. Cross-instance correctness for streaming and push delivery requires they all live on the same backend; the builder enforces this.
+## Client
 
 ```rust
-let storage = InMemoryA2aStorage::new(); // or SqliteA2aStorage, PostgresA2aStorage, DynamoDbA2aStorage
-A2aServer::builder()
-    .executor(MyAgent)
-    .storage(storage)  // wires all 4 storage traits from one instance
-    .build()?;
+use turul_a2a_client::{A2aClient, MessageBuilder};
+
+let client = A2aClient::discover("http://localhost:3000").await?;
+let response = client.send_message(MessageBuilder::new().text("hello").build()).await?;
 ```
+
+See [`crates/turul-a2a-client/README.md`](crates/turul-a2a-client/README.md) for streaming, push config, and tenant routing.
+
+## Storage
+
+Four parity-tested backends. Pick one with a feature flag and pass the instance to `.storage()`:
+
+| Backend | Feature | Notes |
+|---|---|---|
+| In-memory | `in-memory` (default) | Volatile, single-process. |
+| SQLite | `sqlite` | File-backed, atomic task + event writes. |
+| PostgreSQL | `postgres` | Multi-instance ready. |
+| DynamoDB | `dynamodb` | TTL-aware, AWS deployments. |
 
 ## Auth
 
 ```rust
 use turul_a2a_auth::{ApiKeyMiddleware, BearerMiddleware};
 
-// API key
 let auth = ApiKeyMiddleware::new(Arc::new(my_lookup), "X-API-Key");
+// or: BearerMiddleware::new(jwt_validator, "sub");
 
-// Bearer JWT
-let auth = BearerMiddleware::new(jwt_validator, "sub");
-
-A2aServer::builder()
-    .executor(MyAgent)
-    .middleware(Arc::new(auth))
-    .build()?;
+A2aServer::builder().executor(MyAgent).middleware(Arc::new(auth)).build()?;
 ```
 
-## Lambda
+## Transports
 
-```rust
-use turul_a2a_aws_lambda::LambdaA2aServerBuilder;
-
-let handler = LambdaA2aServerBuilder::new()
-    .executor(MyAgent)
-    .storage(my_dynamodb_storage)
-    .build()?;
-
-lambda_http::run(lambda_http::service_fn(move |event| {
-    let h = handler.clone();
-    async move { h.handle(event).await }
-})).await?;
-```
-
-### Lambda push-notification recovery
-
-Push-notification delivery on Lambda requires **external triggers**.
-`tokio::spawn` continuations created inside a Lambda invocation are
-opportunistic only: the execution environment may be frozen
-indefinitely between invocations, so the in-process
-`PushDeliveryWorker` reclaim loop the binary server uses has no
-equivalent. Correctness is carried by an atomic pending-dispatch
-marker written inside the request Lambda's commit transaction, plus
-two external workers:
-
-| Worker | Trigger | Role |
+| Transport | Default | Where to read |
 |---|---|---|
-| `LambdaStreamRecoveryHandler` | DynamoDB Stream on `a2a_push_pending_dispatches` (NEW_IMAGE) | Fast path — fires within ~1s of the marker commit. DynamoDB backends only. |
-| `LambdaScheduledRecoveryHandler` | EventBridge Scheduler (e.g. every 5 min) | Mandatory backstop for all backends. For SQLite/Postgres/in-memory this is the **only** recovery path. |
-
-Minimal wiring — see `examples/lambda-stream-worker` and
-`examples/lambda-scheduled-worker`:
-
-```rust
-// Stream worker (DynamoDB only)
-use turul_a2a_aws_lambda::LambdaStreamRecoveryHandler;
-let handler = LambdaStreamRecoveryHandler::new(dispatcher);
-// Lambda input type: aws_lambda_events::dynamodb::Event
-// Response type: aws_lambda_events::streams::DynamoDbEventResponse
-
-// Scheduled worker (all backends)
-use turul_a2a_aws_lambda::{LambdaScheduledRecoveryHandler, LambdaScheduledRecoveryConfig};
-let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery_store)
-    .with_config(LambdaScheduledRecoveryConfig::default());
-// Lambda input type: aws_lambda_events::eventbridge::EventBridgeEvent
-// Response: LambdaScheduledRecoveryResponse (per-stage counts + error sample)
-```
-
-Release-gate invariants (pinned by tests in `turul-a2a-aws-lambda/src/stream_recovery_tests.rs` and `scheduled_recovery_tests.rs`):
-
-- Valid INSERT + successful redispatch → no `BatchItemFailure`, one POST per config.
-- `get_task → Ok(None)` (task deleted) → delete marker, return success.
-- Transient storage error → `BatchItemFailure` with the record's `SequenceNumber`.
-- Unparseable NEW_IMAGE → `BatchItemFailure` (logged).
-- Duplicate stream records → exactly one POST (claim fencing).
-- Scheduled sweep: stale markers recovered, transient errors counted and markers retained, reclaimable claims redispatched, batch limits honoured.
-
-Operator responsibilities (not framework-managed):
-
-1. Provision the DynamoDB Stream (NEW_IMAGE view) on `a2a_push_pending_dispatches` — DynamoDB backends only.
-2. Create an event-source mapping with `FunctionResponseTypes: ["ReportBatchItemFailures"]`, a DLQ, and `MaximumRetryAttempts`.
-3. Create an EventBridge Scheduler schedule (recommended every 5 min) targeting the scheduled worker.
-4. Grant IAM: stream-worker reads the stream, scheduled-worker scans + deletes markers, both read tasks and configs.
-5. Set TTL on `a2a_push_pending_dispatches` to outlast the worst-case scheduler outage.
+| HTTP + JSON | yes | This crate. |
+| JSON-RPC | yes | This crate (`POST /jsonrpc`, 11 methods). |
+| SSE streaming | yes | This crate. |
+| gRPC | feature `grpc` | [`crates/turul-a2a/README.md`](crates/turul-a2a/README.md#grpc) |
+| AWS Lambda | separate crate | [`crates/turul-a2a-aws-lambda/README.md`](crates/turul-a2a-aws-lambda/README.md) |
 
 ## Interoperability
 
 Verified against the official [Go A2A SDK](https://github.com/a2aproject/a2a-go) (v2, spec v1.0):
 
 ```bash
-# Start the echo agent, then:
 cd interop/go-sdk
 TURUL_SERVER_URL=http://localhost:3000 go test -v
 ```
 
-## Development
+## Contributing
 
 ```bash
 cargo build --workspace
-cargo test --workspace                # 377+ tests
+cargo test --workspace
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ```
 
-## gRPC
-
-gRPC is a third transport alongside HTTP+JSON and JSON-RPC, behind
-the `grpc` feature. The default dependency tree does **not** include
-tonic — HTTP-only deployments pay zero tonic weight.
-
-```bash
-# Build with gRPC enabled
-cargo build -p turul-a2a --features grpc
-
-# Run the example server + client
-cargo run -p grpc-agent --bin grpc-agent            # terminal A
-cargo run -p grpc-agent --bin grpc-client -- send "hello"   # terminal B
-cargo run -p grpc-agent --bin grpc-client -- stream "hello"
-```
-
-All 11 `lf.a2a.v1.A2AService` RPCs are served via
-`A2aServer::into_tonic_router()` — the single public entry point,
-which always layers the same Tower auth stack as the HTTP path.
-Streaming consumes the same durable event store as SSE, with
-`a2a-last-event-id` ASCII metadata for resume. `grpc-reflection` and
-`grpc-health` are optional sub-features.
-
-The client wrapper `turul_a2a_client::grpc::A2aGrpcClient` ships
-under the same feature flag. Not available under
-`turul-a2a-aws-lambda` (Lambda lacks persistent HTTP/2).
-
-## Architecture Decision Records
-
-Architecture decisions live under `docs/adr/`. Read those if you're contributing to the framework or want the long-form rationale; the rest of this README and the per-crate READMEs are intentionally ADR-free so the surface stays portable across decision evolution.
+Architecture rationale lives under `docs/adr/`. Per-crate READMEs cover crate-local concerns.
 
 ## License
 
