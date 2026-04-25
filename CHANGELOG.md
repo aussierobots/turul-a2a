@@ -4,9 +4,9 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.1.15] — 2026-04-25
+## [Unreleased]
 
-### Changed — push-config client API hides proto
+### Changed — push-config client API hides proto (breaking)
 
 - **Breaking on the push-config CRUD methods** in both `turul-a2a-client::A2aClient` and `turul-a2a-client::grpc::A2aGrpcClient`:
   - `create_push_config(&task_id, url, token)` — 3-arg ergonomic call replacing the old `(&task_id, pb::TaskPushNotificationConfig)` shape. No proto types in adopter code.
@@ -18,6 +18,8 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - `PushAuth::new(scheme, credentials)` mirroring `AuthenticationInfo`.
   - `PushConfigPage::new(configs, next_page_token)` for paginated list responses.
 - Brings push-config into line with `send_message`, `get_task`, etc. — adopter code no longer needs `use turul_a2a_proto as pb` or `..Default::default()` literals.
+
+## [0.1.15] — 2026-04-25
 
 ### Added — `MessageBuilder::reference_task_ids` + Life-of-a-Task examples
 
