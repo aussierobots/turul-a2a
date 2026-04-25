@@ -6,6 +6,22 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.1.15] — 2026-04-25
 
+### Added — `MessageBuilder::reference_task_ids` + Life-of-a-Task examples
+
+- **`turul-a2a-client::MessageBuilder::reference_task_ids(I)`** — wires `Message.reference_task_ids` for refinement requests. Required by the new `conversation-agent` example; useful for any adopter implementing the A2A spec's task-refinement flow.
+
+- **`examples/conversation-agent`** (port 3007) — demonstrates task refinement within a single `contextId`. Turn 1: originating task with artifact `sailboat_image.png` + `artifactId=sailboat-v1`. Turn 2: refinement message with `referenceTaskIds=[task1.id]` and same `contextId` → new task (task immutability per spec), same artifact name, new `artifactId=sailboat-v2`. Smoke test asserts `task1.id != task2.id`, `contextId` stable, artifact name reused, `artifactId` differs, v2 body references `task1.id`.
+
+- **`examples/interrupting-agent`** (port 3008) — demonstrates the `INPUT_REQUIRED` interrupted state. Turn 1: pauses the task with a question message; no artifact yet. Turn 2: client sends follow-up with the same `taskId` and `contextId` carrying the answer; executor reads history, completes the task, emits booking artifact. Smoke test asserts `task.id` stable across turns, state transitions `INPUT_REQUIRED → COMPLETED`, artifact contains both the original request and the answer.
+
+- **Lambda example skill declarations** — `lambda-agent` (`lambda-echo`), `lambda-durable-agent` / `lambda-durable-worker` / `lambda-durable-single` (`durable-echo`) now declare a skill on the agent card. Discovery clients see what each agent can do.
+
+- **Per-example verification scripts** under `examples/<name>/scripts/` for the three Lambda examples:
+  - `lambda-durable-single/scripts/life-of-a-task.sh` — drives the deployed Function URL through the spec's refinement flow (POST originate → GET → POST refinement → GET), asserts task immutability + `contextId` continuity + both terminals `COMPLETED`. 8 assertions.
+  - `lambda-durable-agent/scripts/life-of-a-task.sh` — same flow against the two-Lambda topology.
+  - `lambda-agent/scripts/smoke.sh` — single POST + GET against an HTTP-only Lambda.
+  - All take `$1` (or `FN_URL` / `A2A_FN_URL` env), exit with the failure count.
+
 ### Added — shared pbjson conversion + `Message.metadata` on the client builder
 
 - **`turul-a2a-types::pbjson`** — new module with `json_to_value`, `value_to_json`, `json_object_to_struct`, and `struct_to_json_object` for conversions between `serde_json::Value` and proto `google.protobuf.Value` / `Struct` (re-exported from `turul_a2a_proto::pbjson_types`). Adopters setting `Message.metadata` or `Part.metadata` no longer need to hand-roll the ~20 lines of recursive conversion. Numeric precision note: proto `NumberValue` is `f64`, so `serde_json` integers collapse to floats through the conversion (documented in the module).
