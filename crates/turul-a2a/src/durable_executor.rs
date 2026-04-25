@@ -1,4 +1,4 @@
-//! Durable executor continuation (ADR-018).
+//! Durable executor continuation.
 //!
 //! Adopters on runtimes that cannot guarantee post-return
 //! `tokio::spawn` continuation (AWS Lambda in particular) can opt in to
@@ -84,7 +84,7 @@ pub enum QueueError {
 }
 
 /// Durable executor queue — the integration point for Pattern B
-/// (framework-managed durable continuation) per ADR-018.
+/// (framework-managed durable continuation).
 ///
 /// **Public extension point, semver-sensitive.** External
 /// implementers should treat method additions (and signature changes)

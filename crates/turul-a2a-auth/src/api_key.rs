@@ -36,7 +36,7 @@ impl ApiKeyLookup for StaticApiKeyLookup {
 }
 
 /// First-party `ApiKeyLookup` reference implementation with a redacted
-/// `Debug` that never exposes key material (ADR-016 §2.5).
+/// `Debug` that never exposes key material.
 ///
 /// Internal storage uses a plain `HashMap<String, String>` — keys remain
 /// in-process strings but are unreachable via `Debug`, `Display`, or

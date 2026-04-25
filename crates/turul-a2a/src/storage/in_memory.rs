@@ -24,9 +24,9 @@ struct StoredTask {
     task: Task,
     /// Last update timestamp (spec §3.1.4: ListTasks sorted by last update time DESC).
     updated_at: String,
-    /// ADR-012 cancel-requested marker. Storage-internal; never on wire.
+    /// cancel-requested marker. Storage-internal; never on wire.
     cancel_requested: bool,
-    /// ADR-013 §6.3 causal floor: monotonic per-task event sequence
+    /// causal floor: monotonic per-task event sequence
     /// maintained UNCONDITIONALLY on every atomic commit (regardless
     /// of `push_dispatch_enabled`). `create_config` reads this value
     /// to stamp the config's `registered_after_event_sequence`; the
@@ -53,7 +53,7 @@ type PushConfigKey = (String, String, String); // (tenant, task_id, config_id)
 type EventKey = (String, String); // (tenant, task_id)
 type PushDeliveryKey = (String, String, u64, String); // (tenant, task_id, event_sequence, config_id)
 
-/// A single push-delivery claim row (ADR-011 §10). Stored values are
+/// A single push-delivery claim row. Stored values are
 /// exactly those required to satisfy the trait contract — no
 /// credentials, no request bodies, no response bodies.
 #[derive(Debug, Clone)]
@@ -112,7 +112,7 @@ pub struct InMemoryA2aStorage {
     event_counters: Arc<RwLock<HashMap<EventKey, u64>>>,
     push_delivery_claims: Arc<RwLock<HashMap<PushDeliveryKey, StoredDeliveryClaim>>>,
     pending_dispatches: Arc<RwLock<HashMap<PendingDispatchKey, StoredPendingDispatch>>>,
-    /// ADR-013 §4.3 opt-in: when true, `update_task_status_with_events`
+    /// opt-in: when true, `update_task_status_with_events`
     /// writes an `a2a_push_pending_dispatches` row atomically with the
     /// task/event commit for terminal `StreamEvent::StatusUpdate` events.
     /// When false (default), the atomic commit is task + events only —
@@ -139,7 +139,7 @@ struct StoredPendingDispatch {
 }
 
 /// Backing row for a push notification config plus the causal-floor
-/// stamp written at CAS time (ADR-013 §6.3). The proto shape is what
+/// stamp written at CAS time. The proto shape is what
 /// the wire format requires; `registered_after_event_sequence` is
 /// storage-internal and used only by the eligibility filter.
 #[derive(Debug, Clone)]
@@ -163,7 +163,7 @@ impl InMemoryA2aStorage {
         }
     }
 
-    /// Opt in to atomic pending-dispatch marker writes (ADR-013 §4.3).
+    /// Opt in to atomic pending-dispatch marker writes.
     ///
     /// Set to `true` when the deployment wires `push_delivery_store`; the
     /// server builder rejects any configuration where the flag and the
@@ -563,7 +563,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         if stored.owner != owner {
             return Err(A2aStorageError::TaskNotFound(task_id.to_string()));
         }
-        // Terminal → reject per ADR-012 contract. Uses TerminalState
+        // Terminal → reject contract. Uses TerminalState
         // (the state-machine-style signal); router maps to 409 at wire.
         let state = stored
             .task
@@ -648,7 +648,7 @@ impl A2aPushNotificationStorage for InMemoryA2aStorage {
             config.id.clone(),
         );
 
-        // ADR-013 §6.4 causal-floor CAS. Two-phase:
+        // -floor CAS. Two-phase:
         //   1. Read `latest_event_sequence` (brief `tasks` read guard).
         //   2. Re-read under a held `tasks` read guard and compare; if
         //      unchanged, insert the config + stamp under a `push_configs`
@@ -950,7 +950,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         }
 
         // latest_event_sequence = max(0, new_seqs). Maintained
-        // UNCONDITIONALLY per ADR-013 §6.3 so the causal floor stays
+        // UNCONDITIONALLY so the causal floor stays
         // valid if push is enabled later.
         let latest_event_sequence = sequences.iter().copied().max().unwrap_or(0);
 
@@ -981,7 +981,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         // tasks → event_counters → events → pending_dispatches.
         // The last guard is held only when the push_dispatch opt-in is on
         // so the non-push path never contends on it.
-        // ADR-018 §Pending-dispatch optimization: acquire a READ guard
+        // §Pending-dispatch optimization: acquire a READ guard
         // on push_configs BEFORE the tasks write, in consistent lock
         // order, so the marker-write loop below can check whether any
         // config exists for the task and skip the marker when zero
@@ -1028,7 +1028,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
 
         let new_state = new_status.state().map_err(A2aStorageError::TypeError)?;
 
-        // Terminal-write CAS contract (ADR-010 §7.1): the state machine
+        // Terminal-write CAS contract: the state machine
         // emits `TerminalState` when `current_state` is terminal, which we
         // translate to `TerminalStateAlreadySet` — the CAS "you lost the
         // race" signal. Non-terminal illegal transitions remain
@@ -1076,11 +1076,11 @@ impl A2aAtomicStore for InMemoryA2aStorage {
 
             if let Some(guard) = pending_dispatches.as_mut() {
                 if event.is_terminal() && matches!(event, StreamEvent::StatusUpdate { .. }) {
-                    // ADR-018 §Pending-dispatch optimization: skip the
+                    // §Pending-dispatch optimization: skip the
                     // marker write if no push configs exist for the
                     // task. Configs registered after terminal are not
                     // eligible for that terminal event anyway
-                    // (ADR-009), so skipping costs zero correctness
+                    //, so skipping costs zero correctness
                     // and avoids steady-state row accumulation for
                     // deployments that terminate tasks without ever
                     // registering a webhook.
@@ -1154,7 +1154,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
             }
         }
 
-        // Terminal-preservation CAS (ADR-010 §7.1 extension): if the
+        // Terminal-preservation CAS: if the
         // persisted task is already terminal, refuse the write and
         // commit nothing — a full-task replacement must not silently
         // overwrite a terminal committed by a concurrent writer.
@@ -1767,7 +1767,7 @@ mod tests {
         parity_tests::test_atomic_update_task_with_events(&s, &s, &s).await;
     }
 
-    // Terminal-write CAS (ADR-010 §7.1) parity tests.
+    // Terminal-write CAS parity tests.
 
     #[tokio::test]
     async fn test_terminal_cas_single_winner_on_concurrent_terminals() {
@@ -1809,7 +1809,7 @@ mod tests {
         parity_tests::test_invalid_transition_distinct_from_terminal_already_set(&s, &s).await;
     }
 
-    // Cancel-marker parity (ADR-012).
+    // Cancel-marker parity.
 
     #[tokio::test]
     async fn test_cancel_marker_roundtrip() {
@@ -1854,7 +1854,7 @@ mod tests {
     }
 
     // =========================================================
-    // A2aPushDeliveryStore parity (ADR-011 §10).
+    // A2aPushDeliveryStore parity.
     // =========================================================
 
     #[tokio::test]
@@ -2009,7 +2009,7 @@ mod tests {
         parity_tests::test_late_create_config_stamps_advanced_sequence(&s, &s, &s).await;
     }
 
-    /// ADR-013 §10.4 — real interleaving race.
+    /// — real interleaving race.
     ///
     /// Uses the `CasHook` instrumentation to force `create_config` to
     /// pause AFTER its initial `latest_event_sequence` read and BEFORE

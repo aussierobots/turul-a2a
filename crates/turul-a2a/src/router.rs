@@ -43,7 +43,7 @@ pub struct AppState {
     /// the server builder.
     pub runtime_config: crate::server::RuntimeConfig,
 
-    /// In-flight task registry (ADR-010 §4.4). Holds one
+    /// In-flight task registry. Holds one
     /// [`crate::server::in_flight::InFlightHandle`] per spawned executor
     /// — keyed by `(tenant, task_id)`. Populated by the executor spawn
     /// path; consumed by the `:cancel` handler to trip the local
@@ -57,7 +57,7 @@ pub struct AppState {
     /// writes (owner-scoped, handler-safe).
     pub cancellation_supervisor: Arc<dyn crate::storage::A2aCancellationSupervisor>,
 
-    /// Push-delivery coordination store (ADR-011 §10). `None` on
+    /// Push-delivery coordination store. `None` on
     /// deployments that do not wire a `PushDeliveryWorker`; the
     /// push config CRUD paths continue to work without it —
     /// configs are stored, just not delivered. Set via
@@ -73,7 +73,7 @@ pub struct AppState {
     /// contract.
     pub push_dispatcher: Option<Arc<crate::push::PushDispatcher>>,
 
-    /// Durable executor queue (ADR-018). When `Some`, the
+    /// Durable executor queue. When `Some`, the
     /// `return_immediately = true` path in
     /// [`core_send_message`] enqueues a
     /// [`crate::durable_executor::QueuedExecutorJob`] instead of
@@ -806,11 +806,11 @@ pub async fn core_send_message(
         .map(|c| c.return_immediately)
         .unwrap_or(false);
 
-    // ADR-017 Bug 1: runtimes that cannot guarantee post-return
+    // Bug 1: runtimes that cannot guarantee post-return
     // execution (e.g., AWS Lambda) refuse `return_immediately = true`
     // here — before any storage write — to avoid silently orphaning
     // the spawned executor. Mapped to HTTP 400 / JSON-RPC -32004 /
-    // gRPC INVALID_ARGUMENT per ADR-004.
+    // gRPC INVALID_ARGUMENT.
     if return_immediately && !state.runtime_config.supports_return_immediately {
         tracing::warn!(
             tenant = tenant,
@@ -828,7 +828,7 @@ pub async fn core_send_message(
         });
     }
 
-    // ADR-017 Bug 3: extract SendMessageConfiguration.history_length
+    // Bug 3: extract SendMessageConfiguration.history_length
     // preserving the proto tri-state — None=unbounded, Some(0)=empty,
     // Some(n>0)=last n (a2a.proto:150-154). Do NOT collapse Some(0) to
     // None; the storage layer's `trim_task` already differentiates
@@ -838,7 +838,7 @@ pub async fn core_send_message(
         .as_ref()
         .and_then(|c| c.history_length);
 
-    // ADR-017 Bug 2 step 1: validate inline push config URL BEFORE any
+    // Bug 2 step 1: validate inline push config URL BEFORE any
     // storage write. A malformed URL returns HTTP 400 / -32602 /
     // INVALID_ARGUMENT with zero task persistence. URL parse mirrors
     // `core_create_push_config` (router.rs:1411) and ADR-011 §R1.
@@ -911,7 +911,7 @@ pub async fn core_send_message(
         (uuid::Uuid::now_v7().to_string(), context_id, false)
     };
 
-    // ADR-018 §HTTP invocation step 3-4: if a durable executor queue
+    // §HTTP invocation step 3-4: if a durable executor queue
     // is wired AND `return_immediately` is requested, build the
     // envelope and run `check_payload_size` BEFORE any storage write.
     // Oversize payloads return `A2aError::InvalidRequest` (HTTP 400 /
@@ -1020,7 +1020,7 @@ pub async fn core_send_message(
         state.event_broker.notify(&task_id).await;
     }
 
-    // ADR-017 Bug 2 steps 4-5: register any inline push config BEFORE
+    // Bug 2 steps 4-5: register any inline push config BEFORE
     // spawning the executor so a pre-terminal failure cannot leave a
     // live executor with no registered callback. URL was parsed up
     // front (step 1), so the remaining failure mode is storage.
@@ -1087,7 +1087,7 @@ pub async fn core_send_message(
         }
     }
 
-    // ADR-018 §HTTP invocation step 7: if the durable executor path
+    // §HTTP invocation step 7: if the durable executor path
     // is active, enqueue the (already-built + size-checked) job and
     // return the Working task. The executor is NOT spawned locally —
     // a separate invocation consumes the queue (SQS Lambda handler)
@@ -1095,7 +1095,7 @@ pub async fn core_send_message(
     // `run_executor_for_existing_task`.
     //
     // Enqueue failure → FAILED compensation in the same shape as
-    // ADR-017 Bug 2 inline-push-config storage-failure compensation.
+    // Bug 2 inline-push-config storage-failure compensation.
     if let (Some(queue), Some(job)) = (durable_queue.as_ref(), durable_job) {
         match queue.enqueue(job).await {
             Ok(()) => {
@@ -1185,7 +1185,7 @@ pub async fn core_send_message(
         // background executor keeps running; the caller polls / streams
         // to observe completion.
         //
-        // ADR-017 Bug 3: `history_length` threaded through so the
+        // Bug 3: `history_length` threaded through so the
         // storage-layer `trim_task` honours the proto tri-state
         // (a2a.proto:150-154).
         drop(spawn.yielded_rx);
@@ -1215,7 +1215,7 @@ pub async fn core_send_message(
     )
     .await?;
 
-    // ADR-017 Bug 3: if the caller supplied `history_length`, re-read
+    // Bug 3: if the caller supplied `history_length`, re-read
     // from storage so the same `trim_task` path that `GetTask` uses
     // applies to the send response. Skipping this when the field is
     // unset avoids an unnecessary storage round-trip on the default
@@ -1236,7 +1236,7 @@ pub async fn core_send_message(
     })))
 }
 
-/// Two-deadline blocking-send timeout (ADR-010 §4.1).
+/// Two-deadline blocking-send timeout.
 ///
 /// 1. **Soft deadline** (`blocking_task_timeout`): wait for the
 ///    executor to emit a terminal or interrupted event. If the deadline
@@ -1335,7 +1335,7 @@ async fn await_yielded_with_two_deadlines(
             // once the abort propagates at the next executor yield
             // point.
             handle.abort();
-            // ADR-011 §13.13: framework-committed terminals fan out
+            // framework-committed terminals fan out
             // to push configs identically to executor-emitted ones.
             // Hard-timeout FAILED lands here.
             if let Some(dispatcher) = &state.push_dispatcher {
@@ -1442,7 +1442,7 @@ pub(crate) async fn core_get_task(
     Ok(Json(serde_json::to_value(&task).unwrap_or_default()))
 }
 
-/// ADR-012 `CancelTask` handler.
+/// `CancelTask` handler.
 ///
 /// Sequence:
 /// 1. Validate existence + ownership (via owner-scoped `get_task`).
@@ -1458,7 +1458,7 @@ pub(crate) async fn core_get_task(
 ///    `TerminalStateAlreadySet`, re-read and return the actual persisted
 ///    terminal (another path won at the CAS layer).
 ///
-/// Framework-committed terminals carry `message = None` (ADR-012 §8) —
+/// Framework-committed terminals carry `message = None` —
 /// the plain `TaskStatus::new(TaskState::Canceled)` constructor produces
 /// exactly that.
 #[doc(hidden)]
@@ -1592,7 +1592,7 @@ pub async fn core_cancel_task(
 
     match result {
         Ok((task, seqs)) => {
-            // ADR-011 §13.13: framework-committed CANCELED must
+            // framework-committed CANCELED must
             // trigger push delivery exactly like an executor-emitted
             // cancel. The :cancel grace-expiry path reaches this
             // arm after the executor failed to react in time.
@@ -1667,7 +1667,7 @@ pub(crate) async fn core_create_push_config(
         })?;
     config.task_id = task_id.to_string();
 
-    // ADR-011 §R1: URL must parse at CRUD time. The dispatcher used
+    // §R1: URL must parse at CRUD time. The dispatcher used
     // to silently skip unparseable URLs with no failed-delivery row,
     // so an operator who mistyped the webhook had no feedback loop.
     // Scheme (http/https) and SSRF checks still happen at delivery

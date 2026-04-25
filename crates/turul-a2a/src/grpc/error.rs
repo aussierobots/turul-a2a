@@ -3,7 +3,7 @@
 //! Normative table in ADR-014 §2.5. Every A2A error MUST carry
 //! `ErrorInfo { reason, domain = "a2a-protocol.org" }` in
 //! `Status.details` (non-A2A errors — `InvalidRequest`, `Internal` —
-//! carry no `ErrorInfo` per ADR-004).
+//! carry no `ErrorInfo`).
 //!
 //! Mapping rationale:
 //!
@@ -18,7 +18,7 @@
 //!   state rejections would be semantically wrong.
 //! - Transport auth failures are produced by the auth layer before
 //!   dispatch and surface as `UNAUTHENTICATED` / `PERMISSION_DENIED`
-//!   without `ErrorInfo` (ADR-007).
+//!   without `ErrorInfo`.
 
 use tonic::{Code, Status};
 use tonic_types::{ErrorDetails, StatusExt};
@@ -65,7 +65,7 @@ pub fn a2a_to_status(err: A2aError) -> Status {
             Code::FailedPrecondition,
             Some(errors::REASON_VERSION_NOT_SUPPORTED),
         ),
-        // Non-A2A errors: no ErrorInfo, no domain (ADR-004).
+        // Non-A2A errors: no ErrorInfo, no domain.
         A2aError::InvalidRequest { .. } => (Code::InvalidArgument, None),
         A2aError::Internal(_) => (Code::Internal, None),
     };

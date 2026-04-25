@@ -22,9 +22,12 @@ storage abstraction with four parity-proven backends.
 Task state and streaming events are written atomically via
 `storage::A2aAtomicStore`. The event store is the source of truth; the
 in-process broker is a local wake-up signal. Terminal replay and
-Last-Event-ID reconnection work across instances when all replicas share a
-backend (PostgreSQL, DynamoDB). See
-[ADR-009](https://github.com/aussierobots/turul-a2a/blob/main/docs/adr/ADR-009-durable-event-coordination.md).
+Last-Event-ID reconnection work across instances when all replicas
+share a backend (PostgreSQL, DynamoDB). Subscribers attached while a
+task is non-terminal receive replay of prior events and then live
+delivery; subscribing to an already-terminal task returns
+`UnsupportedOperationError` per A2A v1.0 §3.1.6 — use `GetTask` to
+retrieve the final state.
 
 ## Examples
 

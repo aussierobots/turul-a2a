@@ -30,7 +30,7 @@
 //! - Single-config, single-event delivery. The dispatcher chooses
 //!   which events trigger which configs; this worker doesn't
 //!   enumerate.
-//! - No redirect following (`Policy::none`), per ADR-011 §R4.
+//! - No redirect following (`Policy::none`), §R4.
 //! - DNS resolved once per attempt via [`PushDnsResolver`]; the
 //!   reqwest client is rebuilt per attempt with a `resolve` override
 //!   pinning the validated IP, so the TCP connect cannot be swapped
@@ -572,7 +572,7 @@ impl PushDeliveryWorker {
                 format!("turul-a2a/{}", env!("CARGO_PKG_VERSION")),
             )
             .header("X-Turul-Event-Sequence", target.event_sequence.to_string());
-        // ADR-011 §4: omit the `Authorization` header entirely when
+        // omit the `Authorization` header entirely when
         // the config has no authentication. Emitting an empty
         // `"{scheme} {creds}"` value — as the earlier implementation
         // did — can be rejected by hardened receivers that refuse

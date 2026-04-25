@@ -31,7 +31,7 @@
 //!   (method name normalization, root POST route, optional `A2A-Version`
 //!   header). Canonical builds are v1.0 strict.
 //!
-//! # Durable event coordination (ADR-009)
+//! # Durable event coordination
 //!
 //! Task state and streaming events are written atomically via
 //! [`storage::A2aAtomicStore`]. The in-process event broker is a local

@@ -16,7 +16,7 @@
 //!
 //! On auth failure the layer produces a gRPC-formatted response carrying
 //! the correct `tonic::Status` code. No `A2aError`, no JSON error body —
-//! transport-level auth failures bypass the A2A error model per ADR-004.
+//! transport-level auth failures bypass the A2A error model.
 
 use std::sync::Arc;
 use std::task::{Context, Poll};

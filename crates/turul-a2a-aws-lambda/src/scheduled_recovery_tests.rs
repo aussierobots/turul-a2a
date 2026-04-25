@@ -1,4 +1,4 @@
-//! ADR-013 §5.3 / §10.9 / §10.10 tests for [`LambdaScheduledRecoveryHandler`].
+//! / §10.9 / §10.10 tests for [`LambdaScheduledRecoveryHandler`].
 //!
 //! The scheduled handler is the mandatory backstop: when DynamoDB
 //! Streams are unavailable (non-DDB backends, stream stalled, poison
@@ -100,7 +100,7 @@ async fn seed_task_with_marker(
 
 #[tokio::test]
 async fn scheduled_sweep_recovers_stale_marker_and_fires_post() {
-    // ADR-013 §5.3 / §10.9: a marker committed before this tick's
+    // / §10.9: a marker committed before this tick's
     // cutoff is picked up by list_stale_pending_dispatches and
     // redispatched → exactly one POST lands; the marker is gone.
     let mock = MockServer::start().await;
@@ -155,7 +155,7 @@ async fn scheduled_sweep_recovers_stale_marker_and_fires_post() {
 
 #[tokio::test]
 async fn scheduled_sweep_counts_transient_error_and_retains_marker() {
-    // ADR-013 §5.3: a marker that hits a transient error on
+    // a marker that hits a transient error on
     // try_redispatch_pending is counted in
     // stale_markers_transient_errors and the marker is retained for
     // the next tick.
@@ -310,7 +310,7 @@ async fn scheduled_sweep_counts_transient_error_and_retains_marker() {
 
 #[tokio::test]
 async fn scheduled_sweep_processes_reclaimable_claims() {
-    // ADR-013 §5.3 / §10.10: reclaimable claim rows are enumerated and
+    // / §10.10: reclaimable claim rows are enumerated and
     // redispatched. Here we seed an expired non-terminal claim row
     // directly, then run a sweep and verify
     // reclaimable_claims_processed reflects the row.
@@ -373,7 +373,7 @@ async fn scheduled_sweep_no_work_returns_zero_counts() {
 
 #[tokio::test]
 async fn scheduled_sweep_respects_stale_markers_limit() {
-    // ADR-013 §5.3: the handler's batch limit MUST cap the number of
+    // the handler's batch limit MUST cap the number of
     // markers processed per tick, so a scheduler outage doesn't
     // produce unbounded work when it recovers.
     let (storage, dispatcher, delivery) = build_stack().await;

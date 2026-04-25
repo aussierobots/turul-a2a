@@ -58,7 +58,7 @@ pub struct RuntimeConfig {
     pub push_max_payload_bytes: usize,
     pub allow_insecure_push_urls: bool,
 
-    /// Interval between reclaim-and-redispatch sweeps (ADR-011 §10.5).
+    /// Interval between reclaim-and-redispatch sweeps.
     /// The server background task enumerates expired-but-non-terminal
     /// claim rows via
     /// [`crate::push::A2aPushDeliveryStore::list_reclaimable_claims`]
@@ -74,7 +74,7 @@ pub struct RuntimeConfig {
     pub push_reclaim_sweep_batch: usize,
 
     /// Whether this runtime can honour
-    /// `SendMessageConfiguration.return_immediately = true` (ADR-017).
+    /// `SendMessageConfiguration.return_immediately = true`.
     ///
     /// `true` (default) — the runtime keeps the process alive after
     /// the HTTP response returns so `tokio::spawn`'d executors run to
@@ -313,11 +313,11 @@ impl A2aServerBuilder {
     /// Set all storage from a single backend instance.
     ///
     /// This is the **preferred** method — a single struct implementing all storage
-    /// traits guarantees the same-backend requirement (ADR-009). Works with any
+    /// traits guarantees the same-backend requirement. Works with any
     /// backend: `InMemoryA2aStorage`, `SqliteA2aStorage`, `PostgresA2aStorage`,
     /// `DynamoDbA2aStorage`, etc.
     ///
-    /// ADR-013 §4.3 errata: `.storage()` wires storage traits only. It does
+    /// errata: `.storage()` wires storage traits only. It does
     /// **not** auto-register the storage as a push-delivery store, even if the
     /// backend happens to implement [`crate::push::A2aPushDeliveryStore`]. To
     /// opt in to push delivery, call [`Self::push_delivery_store`] explicitly
@@ -376,7 +376,7 @@ impl A2aServerBuilder {
         self
     }
 
-    /// Set the push delivery claim store individually (ADR-011 §10).
+    /// Set the push delivery claim store individually.
     ///
     /// Required when push-notification delivery is enabled in the
     /// deployment. `.storage()` wires this automatically from a unified
@@ -427,7 +427,7 @@ impl A2aServerBuilder {
         let push_delivery_store: Option<Arc<dyn crate::push::A2aPushDeliveryStore>> =
             self.push_delivery_store;
 
-        // Same-backend enforcement (ADR-009): all storage traits must share the same backend.
+        // Same-backend enforcement: all storage traits must share the same backend.
         let task_backend = task_storage.backend_name();
         let push_backend = push_storage.backend_name();
         let event_backend = event_store.backend_name();
@@ -446,7 +446,7 @@ impl A2aServerBuilder {
             )));
         }
 
-        // Push-dispatch consistency (ADR-013 §4.3): the atomic store's
+        // Push-dispatch consistency: the atomic store's
         // opt-in flag and the presence of `push_delivery_store` MUST
         // agree. Both-true = push fully wired; both-false = non-push
         // deployment. The mixed cases are build errors — one orphans a
@@ -489,7 +489,7 @@ impl A2aServerBuilder {
                     )));
                 }
 
-                // ADR-011 §10.3: claim expiry must exceed the worst-case
+                // claim expiry must exceed the worst-case
                 // retry horizon so a claim held by a healthy worker is
                 // never mis-classified as stale mid-retry. Upper bound
                 // for the horizon is `max_attempts * backoff_cap`
@@ -555,7 +555,7 @@ impl A2aServerBuilder {
             .collect();
         let merged = merge_stacked_contributions(&contributions)?;
 
-        // ADR-015 §2.3: validate scheme references in every
+        // validate scheme references in every
         // build-materializable advertised card surface. The merge
         // applied here mirrors `SecurityAugmentedExecutor::agent_card()`
         // so validation sees the exact surface clients will receive.
@@ -580,7 +580,7 @@ impl A2aServerBuilder {
                 cancellation_supervisor,
                 push_delivery_store,
                 push_dispatcher,
-                // ADR-018: long-lived binary server never enqueues;
+                // long-lived binary server never enqueues;
                 // `tokio::spawn` is durable in this runtime.
                 durable_executor_queue: None,
             },
@@ -695,7 +695,7 @@ fn apply_security_merge(
     card
 }
 
-/// ADR-015 §2.3: every scheme name referenced by a `SecurityRequirement`
+/// every scheme name referenced by a `SecurityRequirement`
 /// on the card MUST appear in `card.security_schemes`. Runs post-merge
 /// against the final advertised card (public or extended).
 ///
@@ -874,7 +874,7 @@ impl A2aServer {
                 poller_shutdown,
             ));
 
-        // Push-delivery reclaim loop (ADR-011 §10.5). Two
+        // Push-delivery reclaim loop. Two
         // enumerations run per tick:
         //
         // 1. `list_stale_pending_dispatches` — events whose initial
@@ -1196,7 +1196,7 @@ mod tests {
     #[test]
     fn unified_storage_accepted() {
         // Single .storage() call — the preferred path. No push-delivery
-        // wiring implied (ADR-013 §4.3 errata).
+        // wiring implied.
         let result = A2aServer::builder()
             .executor(DummyExecutor)
             .storage(InMemoryA2aStorage::new())
@@ -1280,12 +1280,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Push delivery store wiring (ADR-011 §10)
+    // Push delivery store wiring
     // -----------------------------------------------------------------
 
     #[test]
     fn unified_storage_does_not_auto_wire_push_delivery_store() {
-        // ADR-013 §4.3 errata: `.storage()` wires storage traits only.
+        // `.storage()` wires storage traits only.
         // Implementing the push-delivery trait is not intent to deliver —
         // a non-push deployment must be able to pass any all-in-one
         // backend without opting in to push semantics.
@@ -1420,7 +1420,7 @@ mod tests {
     #[test]
     fn retry_horizon_violation_rejected() {
         // push_claim_expiry <= max_attempts * backoff_cap must fail fast
-        // (ADR-011 §10.3). The in-memory delivery store is required to
+        //. The in-memory delivery store is required to
         // trigger the check — so push must be explicitly wired.
         let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
         let res = A2aServer::builder()

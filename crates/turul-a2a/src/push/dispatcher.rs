@@ -8,7 +8,7 @@
 //! - `ArtifactUpdate` events do not trigger delivery (ADR-011
 //!   §13.11).
 //! - Non-terminal status transitions do not trigger delivery
-//!   (ADR-011 §2).
+//!.
 //!
 //! The dispatcher takes ownership of the work of translating a
 //! [`turul_a2a_proto::TaskPushNotificationConfig`] into a
@@ -140,7 +140,7 @@ impl PushDispatcher {
         task: Task,
         terminal_seqs: Vec<u64>,
     ) -> Result<(), crate::storage::A2aStorageError> {
-        // ADR-013 §4.3: fresh-dispatch markers are written atomically
+        // fresh-dispatch markers are written atomically
         // with the task + event commit when the backend opts in to
         // `push_dispatch_enabled`. The redispatch path refreshes
         // `recorded_at` before calling us (see `redispatch_pending`),
@@ -149,7 +149,7 @@ impl PushDispatcher {
         // handled by the caller (reclaim).
 
         // Serialise the task payload once — every config receives
-        // the same JSON body (ADR-011 §3).
+        // the same JSON body.
         let payload = match serde_json::to_vec(&task) {
             Ok(p) => p,
             Err(e) => {
@@ -159,7 +159,7 @@ impl PushDispatcher {
             }
         };
 
-        // ADR-013 §4.5 / §5.5: fan out per-seq using the eligibility
+        // / §5.5: fan out per-seq using the eligibility
         // filter. Each terminal sequence gets its own eligible config
         // set: configs registered with `registered_after_event_sequence
         // < seq` only. This preserves the no-backfill invariant
@@ -361,7 +361,7 @@ impl PushDispatcher {
         // Refresh `recorded_at` on the marker so a long-running
         // redispatch doesn't have the scheduler re-pick the same
         // marker via `list_stale_pending_dispatches`. The marker
-        // itself was written atomically at commit time (ADR-013 §4.3);
+        // itself was written atomically at commit time;
         // the atomic-store opt-in already guarantees its durable
         // presence. This call is an idempotent upsert solely to
         // advance the staleness clock for the in-progress sweep.
@@ -428,7 +428,7 @@ impl PushDispatcher {
         {
             Ok(Some(task)) => task,
             Ok(None) => {
-                // ADR-013 §4.6: deleted task is a permanent signal —
+                // deleted task is a permanent signal —
                 // delete the marker, return Ok so the caller
                 // acknowledges (no BatchItemFailure).
                 self.push_delivery_store_handle()

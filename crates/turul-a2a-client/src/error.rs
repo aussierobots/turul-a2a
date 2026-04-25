@@ -37,7 +37,7 @@ pub enum A2aClientError {
 
     /// gRPC transport error surfaced as a `tonic::Status`. The error
     /// carries the full status — call `reason()` to retrieve the
-    /// `ErrorInfo.reason` set by the server per ADR-014 §2.5 (or
+    /// `ErrorInfo.reason` set by the server (or
     /// `None` if this is a non-A2A error).
     #[cfg(feature = "grpc")]
     #[error("gRPC error {0:?}: {1}")]
@@ -82,7 +82,7 @@ impl A2aClientError {
 #[cfg(feature = "grpc")]
 impl From<tonic::Status> for A2aClientError {
     fn from(status: tonic::Status) -> Self {
-        // Pull the ErrorInfo reason the server attached per ADR-014 §2.5.
+        // Pull the ErrorInfo reason the server attached
         // Uses tonic_types::StatusExt which is re-exported through tonic.
         let reason = {
             use tonic_types::StatusExt;

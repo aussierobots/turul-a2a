@@ -12,8 +12,7 @@ Provides two Tower-layer middlewares:
 
 Both middlewares integrate with the `AuthIdentity` enum surfaced to
 executors via `ExecutionContext`, and with the `SecurityContribution`
-pattern for agent card security declarations. See
-[ADR-007](https://github.com/aussierobots/turul-a2a/blob/main/docs/adr/ADR-007-auth-middleware.md).
+pattern for agent card security declarations.
 
 See the [workspace README](https://github.com/aussierobots/turul-a2a#readme)
 for the full project overview.

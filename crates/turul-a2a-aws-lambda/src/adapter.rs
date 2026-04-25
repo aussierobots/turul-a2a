@@ -4,7 +4,7 @@ use axum::body::Body;
 use http_body_util::BodyExt;
 
 /// Header prefix for authorizer context. Client-supplied headers with this
-/// prefix are stripped (anti-spoofing per ADR-008).
+/// prefix are stripped (anti-spoofing).
 pub const AUTHORIZER_HEADER_PREFIX: &str = "x-authorizer-";
 
 /// Convert a Lambda HTTP request to an axum request.

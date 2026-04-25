@@ -43,7 +43,7 @@ pub struct DynamoDbConfig {
     pub event_ttl_seconds: u64,
     /// TTL for push-delivery claim items in seconds. 0 = no expiry.
     /// Default: 7 days (604800); GaveUp rows are retained for operator
-    /// inspection within this window per ADR-011 §5b.
+    /// inspection within this windowb.
     pub push_delivery_ttl_seconds: u64,
 }
 
@@ -74,7 +74,7 @@ impl Default for DynamoDbConfig {
 pub struct DynamoDbA2aStorage {
     client: Client,
     config: DynamoDbConfig,
-    /// ADR-013 §4.3 opt-in — see `InMemoryA2aStorage::push_dispatch_enabled`.
+    /// opt-in — see `InMemoryA2aStorage::push_dispatch_enabled`.
     push_dispatch_enabled: bool,
 }
 
@@ -97,7 +97,7 @@ impl DynamoDbA2aStorage {
         }
     }
 
-    /// Opt in to atomic pending-dispatch marker writes (ADR-013 §4.3).
+    /// Opt in to atomic pending-dispatch marker writes.
     pub fn with_push_dispatch_enabled(mut self, enabled: bool) -> Self {
         self.push_dispatch_enabled = enabled;
         self
@@ -796,7 +796,7 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
         let json = serde_json::to_string(&config)
             .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
 
-        // ADR-013 §6.4 causal-floor CAS: read
+        // -floor CAS: read
         // `a2a_tasks[task_pk].latestEventSequence`, then issue
         // `TransactWriteItems { ConditionCheck on latestEventSequence =
         // :seq_read, Put config }`. A concurrent atomic commit that
@@ -1089,7 +1089,7 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
 /// Read the stored `latestEventSequence` attribute for a task row.
 /// Returns 0 for a missing task or missing attribute — the Put/Update
 /// caller then overwrites with `max(0, new_seqs)` which preserves the
-/// ADR-013 §6.3 monotonic invariant.
+/// monotonic invariant.
 async fn query_latest_event_sequence(
     client: &Client,
     tasks_table: &str,
@@ -1297,7 +1297,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let latest_event_sequence = sequences.last().copied().unwrap_or(0);
 
         // Build TransactWriteItems: task put + event puts. The task
-        // put carries `latestEventSequence` directly (ADR-013 §6.3) so
+        // put carries `latestEventSequence` directly so
         // one Put covers the causal-floor maintenance.
         let mut task_put = aws_sdk_dynamodb::types::Put::builder()
             .table_name(&self.config.tasks_table)
@@ -1414,7 +1414,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
 
         // Get current max sequence for event numbering AND the
         // prior latest_event_sequence so the Put preserves it when
-        // events is empty (ADR-013 §6.3 monotonic invariant).
+        // events is empty.
         let max_seq = query_max_sequence(&self.client, &self.config.events_table, &pk).await?;
         let prior_latest =
             query_latest_event_sequence(&self.client, &self.config.tasks_table, &pk).await?;
@@ -1422,7 +1422,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
 
         // Build TransactWriteItems: task update + event puts.
         //
-        // Terminal-write CAS (ADR-010 §7.1): the task Put's
+        // Terminal-write CAS: the task Put's
         // ConditionExpression now ALSO asserts that the existing
         // statusState is NOT any of the four terminal values. Between the
         // get_task read above and this transact_write_items call, another
@@ -1477,11 +1477,11 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
 
         // Append events and, when the push_dispatch opt-in is on,
         // add a Put for the pending-dispatch marker inside the same
-        // TransactWriteItems (ADR-013 §4.3). Terminal `StatusUpdate`
+        // TransactWriteItems. Terminal `StatusUpdate`
         // events only — non-terminal / artifact events do not produce
         // markers.
         //
-        // ADR-018 §Pending-dispatch optimization: if push_dispatch is
+        // §Pending-dispatch optimization: if push_dispatch is
         // on, pre-flight a single Query on the push_configs table
         // scoped to this task. When zero configs exist, skip marker
         // writes for any terminal events in this batch. Configs
@@ -1761,7 +1761,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
 }
 
 // ===========================================================================
-// A2aPushDeliveryStore (ADR-011 §10)
+// A2aPushDeliveryStore
 //
 // Table shape: `pk` (HASH) + `sk` (RANGE). For this table,
 // `pk = "{tenant}#{task_id}#{event_sequence}"` and `sk = config_id`.
@@ -3747,7 +3747,7 @@ mod tests {
         parity_tests::test_atomic_update_task_with_events(&s, &s, &s).await;
     }
 
-    // Terminal-write CAS (ADR-010 §7.1) parity tests.
+    // Terminal-write CAS parity tests.
 
     #[tokio::test]
     async fn test_terminal_cas_single_winner_on_concurrent_terminals() {
@@ -3791,7 +3791,7 @@ mod tests {
         parity_tests::test_invalid_transition_distinct_from_terminal_already_set(&s, &s).await;
     }
 
-    // Cancel-marker parity (ADR-012).
+    // Cancel-marker parity.
 
     #[tokio::test]
     async fn test_cancel_marker_roundtrip() {
@@ -4010,7 +4010,7 @@ mod tests {
     }
 
     // =========================================================
-    // A2aPushDeliveryStore parity (ADR-011 §10). Live-gated via
+    // A2aPushDeliveryStore parity. Live-gated via
     // A2A_DYNAMODB_TESTS; see storage()'s docstring for env vars.
     // =========================================================
 

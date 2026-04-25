@@ -1,4 +1,4 @@
-//! ADR-016 §4 test #5 — type-level guard.
+//! test #5 — type-level guard.
 //!
 //! Static assertion that `ApiKeyMiddleware`, `BearerMiddleware`, and
 //! `StaticApiKeyLookup` do not implement `Debug`. Prevents a drive-by

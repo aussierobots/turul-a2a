@@ -260,11 +260,11 @@ async fn auth_middleware_rejects_unauthenticated_http() {
         .unwrap();
     let (status, _headers, body) = response_with_headers(router, req).await;
     assert_eq!(status, 401, "Unauthenticated should return 401");
-    // ADR-016 §2.2: body is `{"error": "<kind_string>"}`
+    // body is `{"error": "<kind_string>"}`
     assert_eq!(
         body["error"].as_str(),
         Some("invalid_token"),
-        "Body should be kind-string form per ADR-016: {body}"
+        "Body should be kind-string form: {body}"
     );
 }
 
@@ -283,11 +283,11 @@ async fn auth_middleware_rejects_unauthenticated_jsonrpc() {
         body.get("jsonrpc").is_none(),
         "Auth failure on /jsonrpc must be HTTP 401, not JSON-RPC error: {body}"
     );
-    // ADR-016 §2.2: body is `{"error": "<kind_string>"}`
+    // body is `{"error": "<kind_string>"}`
     assert_eq!(
         body["error"].as_str(),
         Some("invalid_token"),
-        "Body should be kind-string form per ADR-016: {body}"
+        "Body should be kind-string form: {body}"
     );
 }
 
@@ -382,7 +382,7 @@ async fn jsonrpc_unauthenticated_is_http_401_not_jsonrpc_error() {
         body.get("jsonrpc").is_none(),
         "Must be HTTP error, not JSON-RPC"
     );
-    // ADR-016 §2.2: body is `{"error": "<kind_string>"}`
+    // body is `{"error": "<kind_string>"}`
     assert_eq!(body["error"].as_str(), Some("invalid_token"));
 }
 

@@ -10,7 +10,7 @@ use crate::event_sink::EventSink;
 /// Context available to the executor during message processing.
 ///
 /// Provides auth identity, tenant/task metadata, cooperative cancellation,
-/// and an [`EventSink`] for durable event emission (ADR-010 §2).
+/// and an [`EventSink`] for durable event emission.
 /// `#[non_exhaustive]` allows adding fields in future versions.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -28,7 +28,7 @@ pub struct ExecutionContext {
     /// Cooperative cancellation token. Check `cancellation.is_cancelled()`
     /// in long-running loops to respect client cancellation.
     pub cancellation: CancellationToken,
-    /// Durable event sink (ADR-010). Executors that want to drive task
+    /// Durable event sink. Executors that want to drive task
     /// lifecycle themselves — progress artifacts, interrupted states,
     /// explicit terminal — call the methods on this sink.
     ///

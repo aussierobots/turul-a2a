@@ -1,4 +1,4 @@
-//! Push notification delivery (ADR-011).
+//! Push notification delivery.
 //!
 //! This module hosts the framework's push-delivery surface: the
 //! delivery-coordination storage contract, the worker that dispatches

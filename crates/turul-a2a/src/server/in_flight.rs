@@ -1,7 +1,7 @@
 //! In-flight task tracking and supervisor-panic cleanup.
 //!
 //! Shared runtime substrate for ADR-010 (long-running tasks + EventSink),
-//! ADR-012 (cancellation propagation), and ADR-011 (push delivery). The
+//! (cancellation propagation), and ADR-011 (push delivery). The
 //! types in this module own the invariants around spawned executors —
 //! cancellation signalling, blocking-send return, abort capability,
 //! cleanup on every exit path.

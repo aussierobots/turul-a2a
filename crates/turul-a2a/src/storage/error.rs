@@ -93,7 +93,7 @@ pub enum A2aStorageError {
         config_id: String,
     },
 
-    /// ADR-013 §4.5 / §6.4: `create_config` exhausted its bounded
+    /// / §6.4: `create_config` exhausted its bounded
     /// retry budget (default 5 attempts with 10/50/250/1000 ms
     /// backoff) while its CAS against `a2a_tasks.latest_event_sequence`
     /// kept losing to concurrent event commits. The operator should

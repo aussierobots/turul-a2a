@@ -137,25 +137,7 @@ The builder rejects inconsistent configurations (ADR-013 §4.3). Non-push adopte
 
 ### Architecture Decision Records
 
-Documented under `docs/adr/`:
-
-- **ADR-001**: Proto-first architecture — prost + pbjson generation with ergonomic wrappers
-- **ADR-002**: Wrapper boundary and validation — TryFrom/Deserialize enforcement of REQUIRED fields
-- **ADR-003**: Storage trait design — tenant/owner scoping, parity tests, push config exception
-- **ADR-004**: Error model — A2A error codes, HTTP/JSON-RPC mapping, google.rpc.ErrorInfo
-- **ADR-005**: Dual transport — shared core handlers for HTTP+JSON and JSON-RPC
-- **ADR-006**: SSE streaming — in-process broker, last_chunk as transport metadata, single-instance limitation
-- **ADR-007**: Auth middleware — transport-level Tower layer, AuthIdentity enum, SecurityContribution, local JWT validator
-- **ADR-008**: Lambda adapter — request/response only, streaming deferred to D3, authorizer anti-spoofing
-- **ADR-009**: Durable event coordination — same-backend transaction atomicity, tenant-scoped, per-task monotonic sequences
-- **ADR-010**: Executor `EventSink` — finer-grained streaming events from inside the executor; proto-only variant surface
-- **ADR-011**: Push notification delivery — claim-based fan-out, retry horizon, SSRF, secret redaction
-- **ADR-012**: Cancellation propagation — cross-instance cancel marker, supervisor sweep, same-backend requirement
-- **ADR-013**: Lambda push-delivery parity — atomic pending-dispatch marker, causal no-backfill CAS, stream + scheduled recovery workers. §4.3 errata (0.1.5): `.storage()` does not auto-wire push delivery; explicit `.push_delivery_store(...)` required.
-- **ADR-014**: gRPC transport — third thin adapter via tonic over the shared core handlers (ADR-005 extended). Feature-gated on `turul-a2a-proto/grpc`, `turul-a2a/grpc`, `turul-a2a-client/grpc`; default builds are tonic-free. `grpc-reflection` / `grpc-health` are separate opt-in sub-features. Streaming consumes the ADR-009 durable event store with `a2a-last-event-id` ASCII metadata for replay. Proto `tenant` field wins over `x-tenant-id` metadata (§2.4). Out of scope for `turul-a2a-aws-lambda` (§2.6).
-- **ADR-015**: Skill-level `security_requirements` — declaration-only advertisement. Adopters set `AgentSkillBuilder::security_requirements(...)` and `AgentCardBuilder::security_scheme(...)` / `::security_requirement(...)` to publish richer cards; post-merge validation at `A2aServerBuilder::build()` rejects cards whose public or extended (no-claims) surface references an undeclared scheme. Runtime enforcement deferred pending a normative `skill_id` binding on `Message`.
-- **ADR-016**: Stable auth-failure wire surface. `AuthFailureKind` (`MissingCredential`, `InvalidToken`, `InvalidApiKey`, `EmptyPrincipal`, `InsufficientScope`-reserved) drives both the 401/403 JSON body (`{"error": "<kind>"}`) and — for Bearer challenges only — the RFC 6750 `error=` code on `WWW-Authenticate`. `error_description` intentionally omitted. `RequestContext::Debug` and `AuthIdentity::Debug` redact bearer tokens, sensitive header values, extensions values, and claims. `RedactedApiKeyLookup` ships as a first-party secret-aware lookup; `ApiKeyMiddleware`, `BearerMiddleware`, and `StaticApiKeyLookup` are type-level-guarded against accidental `#[derive(Debug)]`.
-- **ADR-017**: `SendMessageConfiguration` on `SendMessage` — Lambda gate on `return_immediately=true`, inline `taskPushNotificationConfig` honoured with URL pre-validation and FAILED compensation on storage failure, and `historyLength` tri-state honoured on both send response paths (unset = unbounded, `0` = empty, `n>0` = last n). `RuntimeConfig.supports_return_immediately` is a capability flag (default `true`); `LambdaA2aServerBuilder::build()` sets it to `false`. Lambda override is deferred to a future ADR and MUST take the form of a capability-taking builder method (`with_durable_return_immediately(handler)`), never a public boolean setter. Adopters needing fire-and-forget-style work on Lambda today should invoke Step Functions / SQS / EventBridge from inside the skill handler (Pattern A).
+Long-form rationale lives under `docs/adr/`. ADR refs are durable internal anchors — keep them out of READMEs, crate-level `//!` docs, `pub` item `///` docs, and adopter-visible prose. Cite ADR numbers freely in private/inline source comments and CHANGELOG entries when they help future maintainers.
 
 For non-trivial architecture changes, the ADR should be accepted before implementation starts.
 

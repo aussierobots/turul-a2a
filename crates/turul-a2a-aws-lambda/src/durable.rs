@@ -1,4 +1,4 @@
-//! ADR-018 durable executor continuation for AWS Lambda.
+//! durable executor continuation for AWS Lambda.
 //!
 //! Feature-gated behind `sqs`:
 //!

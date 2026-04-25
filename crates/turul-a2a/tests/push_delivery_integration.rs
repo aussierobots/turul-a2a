@@ -1,5 +1,5 @@
 //! Wiremock integration tests for the push delivery worker
-//! (ADR-011 §13).
+//!.
 //!
 //! Covers a representative subset of the normative scenarios:
 //! - §13.1 Basic delivery on terminal event (happy path)
@@ -17,7 +17,7 @@
 //! fast unit-level tests.
 //!
 //! All tests use `allow_insecure_urls = true` because wiremock listens
-//! on `127.0.0.1`, which is private per ADR-011 SSRF rules. Backoff
+//! on `127.0.0.1`, which is private SSRF rules. Backoff
 //! knobs are shrunk to milliseconds so wall-clock assertions stay
 //! under a second.
 
@@ -329,7 +329,7 @@ async fn secret_sentinel_never_leaks_on_giveup() {
 
     // 2) Stored failed-delivery record is free of secret payloads.
     // The row holds error class + HTTP status + timestamps only —
-    // ADR-011 §5b pins this contract.
+    // b pins this contract.
     let failed = store
         .list_failed_deliveries(&target.tenant, SystemTime::UNIX_EPOCH, 10)
         .await
@@ -449,7 +449,7 @@ async fn reqwest_connects_to_validated_ip_not_system_dns() {
 // the worker reports `TransientStoreError` (caller/sweeper retries)
 // or `ClaimLostOrFinal` on `StaleDeliveryClaim` (another writer
 // already finalised the row — receiver may observe one extra POST,
-// which at-least-once semantics already allow per ADR-011 §5a).
+// which at-least-once semantics already allowa).
 // ---------------------------------------------------------------------------
 
 /// Wrapper that delegates every call to the inner in-memory store
@@ -709,7 +709,7 @@ async fn terminal_persist_failure_becomes_transient_not_succeeded() {
 }
 
 // ---------------------------------------------------------------------------
-// Reclaim-and-redispatch recovery (ADR-011 §10.5).
+// Reclaim-and-redispatch recovery.
 //
 // Truly persistent terminal-write failures — failures that outlast
 // the worker's bounded persist retry — must not leave the claim row
@@ -979,7 +979,7 @@ async fn stale_claim_on_terminal_write_becomes_claim_lost() {
 }
 
 // ---------------------------------------------------------------------------
-// Unauthenticated config: no Authorization header (ADR-011 §4).
+// Unauthenticated config: no Authorization header.
 //
 // Configs with no `authentication` carry empty auth_scheme + empty
 // credentials. Emitting `Authorization: "{scheme} {credentials}"`
@@ -1157,7 +1157,7 @@ impl turul_a2a::storage::A2aPushNotificationStorage for FailingPushStorage {
         page_size: Option<i32>,
     ) -> Result<turul_a2a::storage::PushConfigListPage, A2aStorageError> {
         // Mirror the list_configs outage simulation for the
-        // eligibility path that the dispatcher now calls (ADR-013 §4.5).
+        // eligibility path that the dispatcher now calls.
         *self.list_configs_calls.lock().unwrap() += 1;
         let should_fail = {
             let mut remaining = self.list_configs_failures_remaining.lock().unwrap();
@@ -1320,7 +1320,7 @@ async fn pending_dispatch_marker_recovers_persistent_list_configs_outage() {
         .mount(&server)
         .await;
 
-    // ADR-013 §4.3: opt in to atomic marker writes so the terminal
+    // opt in to atomic marker writes so the terminal
     // transition below records the pending-dispatch marker in the
     // same atomic boundary as the task/event commit.
     let inner = Arc::new(InMemoryA2aStorage::new().with_push_dispatch_enabled(true));
@@ -1356,7 +1356,7 @@ async fn pending_dispatch_marker_recovers_persistent_list_configs_outage() {
     let owner = "anonymous";
     // Seed task as Working, register the config, then transition
     // to Completed via the atomic commit — which is where the
-    // pending-dispatch marker is now written (ADR-013 §4.3).
+    // pending-dispatch marker is now written.
     let working = turul_a2a_types::Task::new(
         task_id,
         turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Working),

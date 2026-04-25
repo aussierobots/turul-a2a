@@ -1,4 +1,4 @@
-//! gRPC integration tests (ADR-014 §2.11).
+//! gRPC integration tests.
 //!
 //! Exercises every `A2AService` RPC over a real tonic server bound to
 //! a random loopback port. The suite uses the raw
@@ -501,7 +501,7 @@ async fn grpc_send_streaming_message_to_terminal() {
 
     assert!(!events.is_empty(), "stream produced no events");
 
-    // ADR-014 §2.3: no synthetic `Task` snapshot precedes persisted
+    // no synthetic `Task` snapshot precedes persisted
     // events on SendStreamingMessage — the stream starts at the first
     // stored event, which is SUBMITTED per the shared core's setup
     // (`router::setup_streaming_send`). Pinning this explicitly so a
@@ -513,7 +513,7 @@ async fn grpc_send_streaming_message_to_terminal() {
             assert_eq!(
                 state,
                 Some(turul_a2a_proto::TaskState::Submitted),
-                "first event must be StatusUpdate(SUBMITTED) per ADR-014 §2.3 / §2.11"
+                "first event must be StatusUpdate(SUBMITTED) / §2.11"
             );
         }
         other => panic!(

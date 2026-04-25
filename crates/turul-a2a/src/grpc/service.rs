@@ -1,4 +1,4 @@
-//! `A2aService` implementation — gRPC transport adapter (ADR-014 §2.1).
+//! `A2aService` implementation — gRPC transport adapter.
 //!
 //! Every RPC dispatches into the same `core_*` function that HTTP and
 //! JSON-RPC call (ADR-005 extended). The adapter does only:
@@ -23,7 +23,7 @@ use crate::middleware::context::RequestContext;
 use crate::router::{self, AppState, ListTasksQuery, PushConfigQuery};
 
 /// Metadata key the adapter reads to scope a request to a tenant.
-/// ADR-014 §2.4 — ASCII, lowercase per HTTP/2 header canonicalisation.
+/// — ASCII, lowercase per HTTP/2 header canonicalisation.
 pub const TENANT_METADATA: &str = "x-tenant-id";
 
 /// gRPC service implementing `lf.a2a.v1.A2AService` by forwarding each
@@ -386,7 +386,7 @@ mod tests {
         req
     }
 
-    // ADR-014 §2.4 test obligations: proto wins over metadata.
+    // proto wins over metadata.
 
     #[test]
     fn proto_tenant_wins_over_metadata() {

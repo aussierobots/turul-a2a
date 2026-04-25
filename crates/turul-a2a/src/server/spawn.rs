@@ -1,4 +1,4 @@
-//! Executor spawn-and-track machinery (ADR-010 §4).
+//! Executor spawn-and-track machinery.
 //!
 //! Single entry point `spawn_tracked_executor` that:
 //!
@@ -16,7 +16,7 @@
 //! 5. Hands back the yielded oneshot receiver to the caller, which
 //!    blocking send awaits with the two-deadline timeout.
 //!
-//! # Post-execute detection rule (ADR-010 §7.2)
+//! # Post-execute detection rule
 //!
 //! After the executor's `execute()` returns, `commit_post_execute`
 //! routes the final outcome through the CAS-guarded atomic store:
@@ -65,7 +65,7 @@ pub struct SpawnDeps {
     pub atomic_store: Arc<dyn A2aAtomicStore>,
     pub event_broker: TaskEventBroker,
     pub in_flight: Arc<InFlightRegistry>,
-    /// Push-delivery dispatcher (ADR-011 §2). Threaded into every
+    /// Push-delivery dispatcher. Threaded into every
     /// sink constructed here so executor-emitted terminal status
     /// commits fan out to registered push configs.
     pub push_dispatcher: Option<Arc<crate::push::PushDispatcher>>,
@@ -185,7 +185,7 @@ pub(crate) fn spawn_tracked_executor(
     })
 }
 
-/// ADR-018 consumer entry: build a fresh EventSink + throwaway
+/// consumer entry: build a fresh EventSink + throwaway
 /// InFlightHandle, run the executor body, apply the §7.2 detection
 /// rule. This is the single function the SQS / durable-continuation
 /// handler calls per record.
@@ -229,7 +229,7 @@ pub async fn run_queued_executor_job(deps: SpawnDeps, scope: SpawnScope) {
 /// rule.
 ///
 /// Threads `scope.claims` into `ExecutionContext.claims`. Prior to
-/// ADR-018 Phase 1 this was hardcoded to `None`, silently dropping
+/// Phase 1 this was hardcoded to `None`, silently dropping
 /// claims from executors even on the blocking-send path.
 pub(crate) async fn run_executor_for_existing_task(
     deps: SpawnDeps,
@@ -310,7 +310,7 @@ pub(crate) async fn run_executor_for_existing_task(
     commit_post_execute(&sink, &task, &start_artifact_sigs, result).await;
 }
 
-/// ADR-010 §7.2 detection rule.
+/// detection rule.
 ///
 /// Routes direct-task-mutation executors through the CAS-guarded
 /// atomic-store paths so every terminal transition is observable

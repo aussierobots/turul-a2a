@@ -110,7 +110,7 @@ fn agent_text(text: &str) -> Message {
 }
 
 // ---------------------------------------------------------------------------
-// ADR-010 §9 test #1 — long-running sink-driven executor completes
+// #1 — long-running sink-driven executor completes
 // ---------------------------------------------------------------------------
 
 struct SinkDrivenCompleter {
@@ -160,7 +160,7 @@ async fn blocking_send_long_running_sink_driven_completes() {
 }
 
 // ---------------------------------------------------------------------------
-// ADR-010 §9 test #9 — direct-task-mutation executor still works
+// #9 — direct-task-mutation executor still works
 // (detection rule routes the terminal through CAS — no
 // update_task_with_events bypass).
 // ---------------------------------------------------------------------------
@@ -274,7 +274,7 @@ async fn blocking_send_direct_task_mutation_still_terminates_via_cas() {
 }
 
 // ---------------------------------------------------------------------------
-// ADR-010 §9 test #10 — executor returning Err → framework FAILED
+// #10 — executor returning Err → framework FAILED
 // ---------------------------------------------------------------------------
 
 struct ErrReturner;
@@ -329,7 +329,7 @@ async fn blocking_send_executor_err_commits_failed() {
 }
 
 // ---------------------------------------------------------------------------
-// ADR-010 §9 test #14 — sink.reject → TASK_STATE_REJECTED (distinct
+// #14 — sink.reject → TASK_STATE_REJECTED (distinct
 // from FAILED on the wire — proto enum value 7, not 4).
 // ---------------------------------------------------------------------------
 
@@ -375,7 +375,7 @@ async fn blocking_send_executor_rejects_via_sink_reject() {
 }
 
 // ---------------------------------------------------------------------------
-// ADR-010 §9 test #11(a) — cooperative two-deadline: executor observes
+// #11(a) — cooperative two-deadline: executor observes
 // cancellation within grace window and emits CANCELED.
 // ---------------------------------------------------------------------------
 
@@ -430,7 +430,7 @@ async fn blocking_send_two_deadline_cooperative_returns_canceled() {
 }
 
 // ---------------------------------------------------------------------------
-// ADR-010 §9 test #11(b) — abort fallback: executor ignores cancellation
+// #11(b) — abort fallback: executor ignores cancellation
 // and would sleep past the hard deadline. Framework force-commits
 // FAILED and aborts the spawned JoinHandle.
 // ---------------------------------------------------------------------------
@@ -572,7 +572,7 @@ async fn blocking_send_hard_timeout_actually_aborts_executor() {
 }
 
 // ---------------------------------------------------------------------------
-// ADR-010 §9 test #11(c) — abort-vs-cooperative race, executor wins
+// #11(c) — abort-vs-cooperative race, executor wins
 // at the last moment via Notify-gated cancelled() call. Persisted
 // terminal is CANCELED (not FAILED); the framework's hard-deadline
 // force-FAILED commit received `TerminalStateAlreadySet` and re-read
@@ -636,7 +636,7 @@ async fn blocking_send_two_deadline_last_moment_executor_wins_cas() {
 }
 
 // ---------------------------------------------------------------------------
-// ADR-010 §9 test #2 — returnImmediately=true returns non-terminal task
+// #2 — returnImmediately=true returns non-terminal task
 // ---------------------------------------------------------------------------
 
 struct SlowCompleter;

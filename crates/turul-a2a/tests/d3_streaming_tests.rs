@@ -1,4 +1,4 @@
-//! D3 durable streaming tests (ADR-009).
+//! D3 durable streaming tests.
 //!
 //! Verifies the core D3 guarantees under the upstream spec contract:
 //! - Subscribe first event is Task object (spec §3.1.6)

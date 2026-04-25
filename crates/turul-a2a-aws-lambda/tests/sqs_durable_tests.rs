@@ -1,4 +1,4 @@
-//! ADR-018 Lambda-crate tests (feature-gated on `sqs`).
+//! Lambda-crate tests (feature-gated on `sqs`).
 //!
 //! Covers:
 //! - `classify_event` routes HTTP / SQS / unknown shapes correctly.

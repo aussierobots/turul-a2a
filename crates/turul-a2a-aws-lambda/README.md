@@ -11,9 +11,11 @@ over the same `axum::Router` used in binary deployments.
   so task state and durable events coordinate across cold starts and
   concurrent invocations.
 
-See
-[ADR-008](https://github.com/aussierobots/turul-a2a/blob/main/docs/adr/ADR-008-aws-lambda-adapter.md)
-for the adapter design and constraints.
+The adapter is request/response-shaped: a single Lambda invocation
+processes one HTTP request or one SQS batch and returns. Streaming
+endpoints are buffered (the entire executor run executes within the
+invocation); persistent SSE / `:subscribe` connections are not
+supported on Lambda by design.
 
 Enable the `dynamodb` feature to propagate DynamoDB support to the
 underlying `turul-a2a` crate:

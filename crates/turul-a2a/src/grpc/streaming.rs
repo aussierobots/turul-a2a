@@ -1,9 +1,9 @@
 //! gRPC streaming adapters for `SendStreamingMessage` and
-//! `SubscribeToTask` (ADR-014 §2.3).
+//! `SubscribeToTask`.
 //!
 //! Both streams are fed from the durable event store + broker wake-up
 //! signal — the same single-source-of-truth path that SSE consumes
-//! (ADR-009). The gRPC adapter does **not** open a parallel event
+//!. The gRPC adapter does **not** open a parallel event
 //! pipeline, subscribe to the broker for data, or assign its own event
 //! sequences. Ordering and `(task_id, event_sequence)` invariants are
 //! inherited verbatim.
@@ -42,7 +42,7 @@ const STORE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const STREAM_CHANNEL_DEPTH: usize = 64;
 
 /// gRPC metadata key carrying the SSE `Last-Event-ID` equivalent
-/// (ADR-014 §2.3). ASCII; value is `"{task_id}:{sequence}"`.
+///. ASCII; value is `"{task_id}:{sequence}"`.
 pub const LAST_EVENT_ID_METADATA: &str = "a2a-last-event-id";
 
 /// Build the streaming response for `SendStreamingMessage`.
@@ -77,7 +77,7 @@ pub async fn handle_send_streaming_message(
 ///
 /// Implements the spec §3.1.6 first-event-is-Task rule, terminal-task
 /// rejection as `UnsupportedOperationError` (mapped to
-/// `FAILED_PRECONDITION` per ADR-014 §2.5), and `a2a-last-event-id`
+/// `FAILED_PRECONDITION`), and `a2a-last-event-id`
 /// resume.
 pub async fn handle_subscribe_to_task(
     state: AppState,
@@ -99,7 +99,7 @@ pub async fn handle_subscribe_to_task(
         })?;
 
     // Terminal-state rejection: shared core raises
-    // UnsupportedOperationError (ADR-014 §2.3); the mapping table in
+    // UnsupportedOperationError; the mapping table in
     // §2.5 turns that into FAILED_PRECONDITION + ErrorInfo.
     if let Some(status) = task.status() {
         if let Ok(s) = status.state() {
@@ -140,7 +140,7 @@ pub async fn handle_subscribe_to_task(
 /// Replay-then-live producer. The shape mirrors `make_store_sse_response`
 /// in `router.rs` — only the output encoding differs (`pb::StreamResponse`
 /// for gRPC vs. SSE for HTTP). All sequence + terminal invariants of
-/// ADR-009 are inherited.
+/// are inherited.
 fn make_store_grpc_stream(
     event_store: Arc<dyn A2aEventStore>,
     tenant: String,

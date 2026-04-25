@@ -51,7 +51,7 @@ impl A2aMiddleware for BearerMiddleware {
                 AuthFailureKind::MissingCredential,
             ))?;
 
-        // ADR-016 §2.1: every validator failure collapses to `InvalidToken`.
+        // every validator failure collapses to `InvalidToken`.
         // The original validator error is intentionally discarded — leaking
         // it through `error_description` would expose JWKS URLs, jsonwebtoken
         // internals, or token fragments on the public response header.

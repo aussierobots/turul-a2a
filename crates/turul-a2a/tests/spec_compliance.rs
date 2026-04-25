@@ -40,7 +40,7 @@
 //! - error paths carry the spec-mandated HTTP status and JSON-RPC
 //!   code, plus a `google.rpc.ErrorInfo` under `error.details`
 //!   (HTTP, AIP-193) or `error.data` (JSON-RPC 2.0) — spec §5.4 /
-//!   ADR-004.
+//!   .
 //!
 //! The tests stand up a single `A2aServer` router via `into_router()`
 //! so the compliance harness is hermetic — no external ports, no
@@ -396,7 +396,7 @@ async fn get_task_not_found_maps_to_404_and_minus_32001() {
     // HTTP.
     let (status, _, http_err) =
         http_call(router.clone(), Method::GET, "/tasks/does-not-exist", None).await;
-    assert_eq!(status, 404, "TaskNotFoundError HTTP status per ADR-004");
+    assert_eq!(status, 404, "TaskNotFoundError HTTP status");
     assert_has_error_info(&http_err, "TASK_NOT_FOUND");
 
     // JSON-RPC.
@@ -476,10 +476,7 @@ async fn cancel_terminal_task_returns_409_and_task_not_cancelable_error() {
         None,
     )
     .await;
-    assert_eq!(
-        status, 409,
-        "TaskNotCancelableError HTTP status per ADR-004"
-    );
+    assert_eq!(status, 409, "TaskNotCancelableError HTTP status");
     assert_has_error_info(&http_err, "TASK_NOT_CANCELABLE");
 
     // JSON-RPC.
@@ -653,10 +650,7 @@ async fn subscribe_to_task_terminal_returns_unsupported_operation() {
         None,
     )
     .await;
-    assert_eq!(
-        status, 400,
-        "UnsupportedOperationError HTTP status per ADR-004"
-    );
+    assert_eq!(status, 400, "UnsupportedOperationError HTTP status");
     assert_has_error_info(&err, "UNSUPPORTED_OPERATION");
 }
 
@@ -750,7 +744,7 @@ async fn push_config_crud_roundtrip_over_http() {
 }
 
 // ---------------------------------------------------------------------------
-// A2A-Version header contract (ADR-004)
+// A2A-Version header contract
 //
 // Two explicit tests, each pinning one behaviour so a regression
 // flips exactly one assertion:
@@ -842,7 +836,7 @@ async fn jsonrpc_unknown_method_returns_method_not_found() {
 }
 
 // ---------------------------------------------------------------------------
-// ADR-015 §4.3 test 8 — skill-level security_requirements round-trip
+// — skill-level security_requirements round-trip
 // across every build-materializable card transport.
 //
 // The A2A proto has exactly one public-card RPC: HTTP discovery at
@@ -1169,7 +1163,7 @@ async fn send_streaming_message_returns_text_event_stream() {
 }
 
 // =========================================================
-// gRPC transport parity (ADR-014 §2.11)
+// gRPC transport parity
 // =========================================================
 //
 // These tests extend the compliance matrix from
@@ -1178,7 +1172,7 @@ async fn send_streaming_message_returns_text_event_stream() {
 //
 //   1. Storage parity: a task created via HTTP+JSON is visible to a
 //      gRPC client on the same underlying storage — "storage is the
-//      source of truth" (ADR-009) crosses transports.
+//      source of truth" crosses transports.
 //   2. Error parity: `A2aError` variants surface with identical
 //      `ErrorInfo.reason` strings and the canonical
 //      `a2a-protocol.org` domain on all three transports. A bug in a

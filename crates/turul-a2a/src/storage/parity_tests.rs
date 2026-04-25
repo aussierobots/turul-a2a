@@ -1016,7 +1016,7 @@ pub async fn test_event_empty_task(storage: &dyn A2aEventStore) {
 }
 
 // =========================================================
-// Atomic store parity tests (ADR-009 §10)
+// Atomic store parity tests
 // =========================================================
 
 /// Helper to create a status event for atomic tests.
@@ -1610,7 +1610,7 @@ where
 }
 
 // =========================================================
-// Terminal-write CAS (ADR-010 §7.1): single-terminal-writer parity
+// Terminal-write CAS: single-terminal-writer parity
 // =========================================================
 //
 // For each backend, `A2aAtomicStore::update_task_status_with_events` MUST:
@@ -2103,7 +2103,7 @@ pub async fn test_update_task_with_events_rejects_terminal_already_set(
 }
 
 // =========================================================
-// ADR-012 cancel-marker parity
+// cancel-marker parity
 // =========================================================
 
 /// CS-001: `set_cancel_requested` + `supervisor_get_cancel_requested`
@@ -2279,7 +2279,7 @@ pub async fn test_invalid_transition_distinct_from_terminal_already_set(
 }
 
 // =========================================================
-// A2aPushDeliveryStore parity tests (ADR-011 §10)
+// A2aPushDeliveryStore parity tests
 //
 // Executable helpers every backend wires into its own test module.
 // The invariants in each docstring are normative for all backends;
@@ -3665,7 +3665,7 @@ pub async fn test_atomic_marker_written_for_terminal_status(
     // MUST be registered for the marker to be written. Without a
     // registered config the framework skips the marker write — a
     // config registered after terminal is not eligible for that
-    // terminal event anyway (ADR-009), so skipping is
+    // terminal event anyway, so skipping is
     // correctness-neutral.
     let config = turul_a2a_proto::TaskPushNotificationConfig {
         tenant: "default".into(),
@@ -3845,7 +3845,7 @@ pub async fn test_atomic_marker_absent_when_opt_in_off(
 // a config registered AT seq N is not eligible for event seq N.
 // =========================================================
 
-/// PEF-001 (ADR-013 §10.3): commit two non-terminal events, register
+/// PEF-001: commit two non-terminal events, register
 /// config C1, commit terminal event (seq=3), register config C2.
 /// `list_configs_eligible_at_event(3)` returns C1 only.
 pub async fn test_config_registered_at_or_after_event_not_eligible(

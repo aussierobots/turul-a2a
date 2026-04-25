@@ -212,7 +212,7 @@ impl Task {
     /// - `append = false`: append unconditionally (new entry or caller
     ///   tolerates duplicate ids).
     ///
-    /// The `last_chunk` flag is transport-only metadata (ADR-006 / ADR-009)
+    /// The `last_chunk` flag is transport-only metadata
     /// — it is not persisted on the task. It is accepted here so callers
     /// can keep the signature symmetric with the streaming wire event
     /// payload and not drop the parameter separately.

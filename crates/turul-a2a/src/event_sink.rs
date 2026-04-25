@@ -5,7 +5,7 @@
 //!
 //! - Status transitions (working / interrupted / terminal) go through
 //!   [`A2aAtomicStore::update_task_status_with_events`] — CAS-guarded per
-//!   ADR-010 §7.1 so concurrent terminal writes resolve to exactly one
+//!   so concurrent terminal writes resolve to exactly one
 //!   winner.
 //! - Artifact emits go through [`A2aAtomicStore::update_task_with_events`].
 //!   An artifact append is not a state transition, so it does not contend
@@ -93,7 +93,7 @@ struct EventSinkInner {
     /// other's merges. The lock is per-sink; sinks for different
     /// tasks do not contend.
     commit_lock: AsyncMutex<()>,
-    /// Push-delivery dispatcher (ADR-011 §2). `None` on deployments
+    /// Push-delivery dispatcher. `None` on deployments
     /// that don't run push delivery. When set, the sink calls
     /// `dispatch` after every successful status commit — terminal
     /// events fan out to registered push configs; non-terminal events
@@ -216,7 +216,7 @@ impl EventSink {
     }
 
     /// Emit terminal `REJECTED` (policy refusal / guardrail) with a reason.
-    /// Distinct from `FAILED` on the wire per ADR-010 §1.
+    /// Distinct from `FAILED` on the wire
     pub async fn reject(&self, reason: Option<String>) -> Result<u64, A2aError> {
         let message = reason.map(text_message_from_agent);
         self.inner()?
@@ -325,7 +325,7 @@ impl EventSinkInner {
                 let is_interrupted =
                     matches!(state, TaskState::InputRequired | TaskState::AuthRequired);
 
-                // Push delivery fan-out (ADR-011 §2). The dispatcher
+                // Push delivery fan-out. The dispatcher
                 // filters for terminal status events internally; we
                 // can call it on every status commit without worrying
                 // about misfires on non-terminals.
@@ -388,7 +388,7 @@ impl EventSinkInner {
 
         // Read-mutate-write: pull current task, merge the artifact, commit
         // via update_task_with_events. The atomic store enforces the
-        // terminal-preservation CAS (ADR-010 §7.1 extension) — if a
+        // terminal-preservation CAS — if a
         // concurrent writer committed a terminal between the read and
         // this write, the commit rejects with `TerminalStateAlreadySet`
         // and no state is mutated. Lost-update safety against

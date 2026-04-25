@@ -22,7 +22,7 @@ pub use pbjson_types;
 
 /// Tonic-generated gRPC service + client stubs for `lf.a2a.v1.A2AService`.
 ///
-/// Enabled by the `grpc` Cargo feature (ADR-014 §2.2). Default HTTP+JSON
+/// Enabled by the `grpc` Cargo feature. Default HTTP+JSON
 /// builds do not pull in tonic.
 #[cfg(feature = "grpc")]
 pub mod grpc {

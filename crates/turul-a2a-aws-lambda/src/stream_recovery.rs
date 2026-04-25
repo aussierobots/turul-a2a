@@ -23,7 +23,7 @@
 //! | Record with no SequenceNumber             | logged + skipped (cannot be retried) |
 //!
 //! Duplicate records are safe: [`PushDispatcher::try_redispatch_pending`]
-//! is idempotent under claim fencing (ADR-011 §10). Two invocations
+//! is idempotent under claim fencing. Two invocations
 //! targeting the same `(tenant, task_id, event_sequence)` resolve to
 //! at most one terminal claim row and at most one POST per config.
 

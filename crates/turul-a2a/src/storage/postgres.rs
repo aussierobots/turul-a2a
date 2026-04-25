@@ -35,7 +35,7 @@ impl Default for PostgresConfig {
 #[derive(Clone)]
 pub struct PostgresA2aStorage {
     pool: PgPool,
-    /// ADR-013 §4.3 opt-in — see `InMemoryA2aStorage::push_dispatch_enabled`.
+    /// opt-in — see `InMemoryA2aStorage::push_dispatch_enabled`.
     push_dispatch_enabled: bool,
 }
 
@@ -55,7 +55,7 @@ impl PostgresA2aStorage {
         Ok(storage)
     }
 
-    /// Opt in to atomic pending-dispatch marker writes (ADR-013 §4.3).
+    /// Opt in to atomic pending-dispatch marker writes.
     pub fn with_push_dispatch_enabled(mut self, enabled: bool) -> Self {
         self.push_dispatch_enabled = enabled;
         self
@@ -87,14 +87,14 @@ impl PostgresA2aStorage {
         .execute(&self.pool)
         .await;
 
-        // Migration: add cancel_requested column if not present (ADR-012).
+        // Migration: add cancel_requested column if not present.
         let _ = sqlx::query(
             "ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT FALSE",
         )
         .execute(&self.pool)
         .await;
 
-        // ADR-013 §6.3: unconditional latest_event_sequence column.
+        // unconditional latest_event_sequence column.
         let _ = sqlx::query(
             "ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS latest_event_sequence BIGINT NOT NULL DEFAULT 0",
         )
@@ -115,7 +115,7 @@ impl PostgresA2aStorage {
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        // ADR-013 §6.3: additive migration; default 0 is permissive
+        // additive migration; default 0 is permissive
         // for legacy configs by design.
         let _ = sqlx::query(
             "ALTER TABLE a2a_push_configs \
@@ -145,7 +145,7 @@ impl PostgresA2aStorage {
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        // Push-delivery claim table (ADR-011 §10). Same shape as
+        // Push-delivery claim table. Same shape as
         // SQLite's backend; BIGINT for epoch micros preserves
         // ordering without timezone ambiguity.
         sqlx::query(
@@ -665,7 +665,7 @@ impl A2aPushNotificationStorage for PostgresA2aStorage {
         let json = serde_json::to_value(&config)
             .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
 
-        // ADR-013 §6.4 causal-floor CAS: SERIALIZABLE tx reading
+        // -floor CAS: SERIALIZABLE tx reading
         // `latest_event_sequence` and inserting the config with
         // `registered_after_event_sequence = seq_read`. A concurrent
         // `update_task_status_with_events` committing between our
@@ -1078,7 +1078,7 @@ impl A2aAtomicStore for PostgresA2aStorage {
             sequences.push(seq as u64);
         }
 
-        // ADR-013 §6.3: maintain latest_event_sequence UNCONDITIONALLY.
+        // maintain latest_event_sequence UNCONDITIONALLY.
         if let Some(&max_seq) = sequences.iter().max() {
             sqlx::query(
                 "UPDATE a2a_tasks SET latest_event_sequence = $1
@@ -1158,7 +1158,7 @@ impl A2aAtomicStore for PostgresA2aStorage {
         let task_json = Self::task_to_json(&updated_task)?;
         let state_str = Self::status_state_str(&updated_task);
 
-        // Terminal-write CAS (ADR-010 §7.1). Under PostgreSQL default
+        // Terminal-write CAS. Under PostgreSQL default
         // isolation (READ COMMITTED), two transactions can both read a
         // non-terminal state from the SELECT above, both pass the state
         // machine check, and both reach the UPDATE. The WHERE clause
@@ -1205,7 +1205,7 @@ impl A2aAtomicStore for PostgresA2aStorage {
 
         // Append events and, when the push_dispatch opt-in is on,
         // insert a pending-dispatch marker row for each terminal
-        // StatusUpdate in the SAME transaction (ADR-013 §4.3).
+        // StatusUpdate in the SAME transaction.
         let mut sequences = Vec::with_capacity(events.len());
         for event in &events {
             let seq: Option<i64> = sqlx::query_scalar(
@@ -1238,7 +1238,7 @@ impl A2aAtomicStore for PostgresA2aStorage {
                 && event.is_terminal()
                 && matches!(event, StreamEvent::StatusUpdate { .. })
             {
-                // ADR-018 §Pending-dispatch optimization: skip the
+                // §Pending-dispatch optimization: skip the
                 // marker write if no push configs exist for the task.
                 // Post-terminal config registrations are not eligible
                 // for this event anyway (ADR-009
@@ -1278,7 +1278,7 @@ impl A2aAtomicStore for PostgresA2aStorage {
             sequences.push(seq as u64);
         }
 
-        // ADR-013 §6.3: maintain latest_event_sequence UNCONDITIONALLY.
+        // maintain latest_event_sequence UNCONDITIONALLY.
         if let Some(&max_seq) = sequences.iter().max() {
             sqlx::query(
                 "UPDATE a2a_tasks SET latest_event_sequence = $1
@@ -1315,7 +1315,7 @@ impl A2aAtomicStore for PostgresA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        // Terminal-preservation CAS (ADR-010 §7.1 extension): exclude
+        // Terminal-preservation CAS: exclude
         // terminal status_state values. If the persisted row is
         // terminal the update matches zero rows; a follow-up SELECT
         // disambiguates "task missing" vs "already terminal".
@@ -1387,7 +1387,7 @@ impl A2aAtomicStore for PostgresA2aStorage {
             sequences.push(seq as u64);
         }
 
-        // ADR-013 §6.3: maintain latest_event_sequence UNCONDITIONALLY.
+        // maintain latest_event_sequence UNCONDITIONALLY.
         if let Some(&max_seq) = sequences.iter().max() {
             sqlx::query(
                 "UPDATE a2a_tasks SET latest_event_sequence = $1
@@ -1410,7 +1410,7 @@ impl A2aAtomicStore for PostgresA2aStorage {
 }
 
 // ===========================================================================
-// A2aPushDeliveryStore (ADR-011 §10)
+// A2aPushDeliveryStore
 //
 // Shape mirrors the SQLite backend. Epoch micros stored as BIGINT so
 // ordering is deterministic and timezone-independent. ClaimStatus,
@@ -2245,7 +2245,7 @@ mod tests {
         parity_tests::test_atomic_update_task_with_events(&s, &s, &s).await;
     }
 
-    // Terminal-write CAS (ADR-010 §7.1) parity tests.
+    // Terminal-write CAS parity tests.
 
     #[tokio::test]
     async fn test_terminal_cas_single_winner_on_concurrent_terminals() {
@@ -2287,7 +2287,7 @@ mod tests {
         parity_tests::test_invalid_transition_distinct_from_terminal_already_set(&s, &s).await;
     }
 
-    // Cancel-marker parity (ADR-012).
+    // Cancel-marker parity.
 
     #[tokio::test]
     async fn test_cancel_marker_roundtrip() {
@@ -2326,7 +2326,7 @@ mod tests {
     }
 
     // =========================================================
-    // A2aPushDeliveryStore parity (ADR-011 §10).
+    // A2aPushDeliveryStore parity.
     // =========================================================
 
     #[tokio::test]

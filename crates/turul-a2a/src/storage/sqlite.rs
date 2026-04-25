@@ -35,7 +35,7 @@ impl Default for SqliteConfig {
 #[derive(Clone)]
 pub struct SqliteA2aStorage {
     pool: SqlitePool,
-    /// ADR-013 §4.3 opt-in — see `InMemoryA2aStorage::push_dispatch_enabled`.
+    /// opt-in — see `InMemoryA2aStorage::push_dispatch_enabled`.
     push_dispatch_enabled: bool,
 }
 
@@ -55,7 +55,7 @@ impl SqliteA2aStorage {
         Ok(storage)
     }
 
-    /// Opt in to atomic pending-dispatch marker writes (ADR-013 §4.3).
+    /// Opt in to atomic pending-dispatch marker writes.
     pub fn with_push_dispatch_enabled(mut self, enabled: bool) -> Self {
         self.push_dispatch_enabled = enabled;
         self
@@ -98,7 +98,7 @@ impl SqliteA2aStorage {
             Err(e) => return Err(A2aStorageError::DatabaseError(e.to_string())),
         }
 
-        // ADR-013 §6.3: unconditional latest_event_sequence column.
+        // unconditional latest_event_sequence column.
         // Legacy rows default to 0; the first post-migration commit
         // extends it monotonically via MAX(existing, new).
         let alter_latest = sqlx::query(
@@ -126,7 +126,7 @@ impl SqliteA2aStorage {
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        // ADR-013 §6.3: additive migration for pre-0.1.4 push config
+        // additive migration for pre-0.1.4 push config
         // rows — default 0 is permissive by design (legacy configs
         // become eligible for any event with seq > 0).
         let alter_registered = sqlx::query(
@@ -141,7 +141,7 @@ impl SqliteA2aStorage {
             Err(e) => return Err(A2aStorageError::DatabaseError(e.to_string())),
         }
 
-        // Index to make eligibility scans cheap (ADR-013 §6.3).
+        // Index to make eligibility scans cheap.
         let _ = sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_a2a_push_configs_eligibility \
              ON a2a_push_configs (tenant, task_id, registered_after_event_sequence)",
@@ -163,7 +163,7 @@ impl SqliteA2aStorage {
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        // Push-delivery claim table (ADR-011 §10). One row per
+        // Push-delivery claim table. One row per
         // `(tenant, task_id, event_sequence, config_id)` tuple. The
         // status column is the enum Debug form; timestamps are
         // epoch micros for deterministic ordering without TZ ambiguity.
@@ -701,7 +701,7 @@ impl A2aPushNotificationStorage for SqliteA2aStorage {
         let json = serde_json::to_string(&config)
             .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
 
-        // ADR-013 §6.4 causal-floor CAS: read `latest_event_sequence`
+        // -floor CAS: read `latest_event_sequence`
         // and INSERT the config row with
         // `registered_after_event_sequence = seq_read` in the SAME
         // transaction, conditional on `latest_event_sequence` still
@@ -1129,7 +1129,7 @@ impl A2aAtomicStore for SqliteA2aStorage {
             sequences.push(seq.0 as u64);
         }
 
-        // ADR-013 §6.3: maintain latest_event_sequence UNCONDITIONALLY.
+        // maintain latest_event_sequence UNCONDITIONALLY.
         if let Some(&max_seq) = sequences.iter().max() {
             sqlx::query(
                 "UPDATE a2a_tasks SET latest_event_sequence = ?
@@ -1214,7 +1214,7 @@ impl A2aAtomicStore for SqliteA2aStorage {
         let task_json = Self::task_to_json(&updated_task)?;
         let state_str = Self::status_state_str(&updated_task);
 
-        // Terminal-write CAS (ADR-010 §7.1): the UPDATE's WHERE clause
+        // Terminal-write CAS: the UPDATE's WHERE clause
         // rejects a row whose status_state is already terminal. If rows
         // affected == 0 AFTER we established existence + owner above, a
         // concurrent transaction raced us to commit a terminal first —
@@ -1258,7 +1258,7 @@ impl A2aAtomicStore for SqliteA2aStorage {
 
         // Append events and, when the push_dispatch opt-in is on,
         // insert a pending-dispatch marker row for each terminal
-        // StatusUpdate in the SAME transaction (ADR-013 §4.3).
+        // StatusUpdate in the SAME transaction.
         let mut sequences = Vec::with_capacity(events.len());
         for event in &events {
             let seq: (i64,) = sqlx::query_as(
@@ -1290,7 +1290,7 @@ impl A2aAtomicStore for SqliteA2aStorage {
                 && event.is_terminal()
                 && matches!(event, StreamEvent::StatusUpdate { .. })
             {
-                // ADR-018 §Pending-dispatch optimization: skip the
+                // §Pending-dispatch optimization: skip the
                 // marker write if no push configs exist for the task.
                 // A config registered after terminal is not eligible
                 // for that terminal event anyway (ADR-009
@@ -1332,7 +1332,7 @@ impl A2aAtomicStore for SqliteA2aStorage {
             sequences.push(seq.0 as u64);
         }
 
-        // ADR-013 §6.3: maintain latest_event_sequence UNCONDITIONALLY.
+        // maintain latest_event_sequence UNCONDITIONALLY.
         if let Some(&max_seq) = sequences.iter().max() {
             sqlx::query(
                 "UPDATE a2a_tasks SET latest_event_sequence = ?
@@ -1370,7 +1370,7 @@ impl A2aAtomicStore for SqliteA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        // Terminal-preservation CAS (ADR-010 §7.1 extension): the UPDATE's
+        // Terminal-preservation CAS: the UPDATE's
         // WHERE clause excludes terminal status_state values. If the
         // persisted row is terminal the update matches zero rows;
         // a follow-up SELECT disambiguates "task missing" vs "already
@@ -1443,7 +1443,7 @@ impl A2aAtomicStore for SqliteA2aStorage {
             sequences.push(seq.0 as u64);
         }
 
-        // ADR-013 §6.3: maintain latest_event_sequence UNCONDITIONALLY.
+        // maintain latest_event_sequence UNCONDITIONALLY.
         if let Some(&max_seq) = sequences.iter().max() {
             sqlx::query(
                 "UPDATE a2a_tasks SET latest_event_sequence = ?
@@ -1467,7 +1467,7 @@ impl A2aAtomicStore for SqliteA2aStorage {
 }
 
 // ===========================================================================
-// A2aPushDeliveryStore (ADR-011 §10)
+// A2aPushDeliveryStore
 // ===========================================================================
 
 /// Convert `SystemTime` to epoch micros; stored as `INTEGER` so
@@ -2349,7 +2349,7 @@ mod tests {
         parity_tests::test_atomic_update_task_with_events(&s, &s, &s).await;
     }
 
-    // Terminal-write CAS (ADR-010 §7.1) parity tests.
+    // Terminal-write CAS parity tests.
 
     #[tokio::test]
     async fn test_terminal_cas_single_winner_on_concurrent_terminals() {
@@ -2391,7 +2391,7 @@ mod tests {
         parity_tests::test_invalid_transition_distinct_from_terminal_already_set(&s, &s).await;
     }
 
-    // Cancel-marker parity (ADR-012).
+    // Cancel-marker parity.
 
     #[tokio::test]
     async fn test_cancel_marker_roundtrip() {
@@ -2430,7 +2430,7 @@ mod tests {
     }
 
     // =========================================================
-    // A2aPushDeliveryStore parity (ADR-011 §10).
+    // A2aPushDeliveryStore parity.
     // =========================================================
 
     #[tokio::test]

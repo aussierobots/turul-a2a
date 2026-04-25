@@ -1,4 +1,4 @@
-//! gRPC transport (ADR-014).
+//! gRPC transport.
 //!
 //! Third thin adapter over the shared core handlers (ADR-005 extended).
 //! All 11 `lf.a2a.v1.A2AService` RPCs dispatch into the same `core_*`
@@ -27,16 +27,16 @@ use crate::router::AppState;
 /// Build a fully-wired tonic router with auth layered and the
 /// [`GrpcService`] registered.
 ///
-/// Auth wraps the entire tonic server (ADR-014 §2.4): every RPC runs
+/// Auth wraps the entire tonic server: every RPC runs
 /// `MiddlewareStack::before_request` before dispatch and receives a
 /// populated [`crate::middleware::context::RequestContext`] in the
 /// request extensions. Failures surface as `tonic::Status::unauthenticated`
 /// / `tonic::Status::permission_denied` — no A2A error model, no HTTP
-/// JSON body (ADR-004).
+/// JSON body.
 ///
 /// This is the only public entry point to the gRPC surface. Returning
 /// the raw service without the auth layer would permit adopters to
-/// silently bypass authentication (ADR-014 §2.2).
+/// silently bypass authentication.
 pub fn make_grpc_router(
     state: AppState,
     middleware_stack: Arc<MiddlewareStack>,

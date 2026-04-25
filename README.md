@@ -111,7 +111,7 @@ cargo test --features postgres --test-threads=1
 cargo test --features dynamodb --test-threads=1
 ```
 
-Use `.storage()` on the builder for unified same-backend enforcement (ADR-009):
+Use `.storage()` on the builder so the four storage traits (task storage, event store, atomic store, push delivery store, cancellation supervisor) are wired from a single backend. Cross-instance correctness for streaming and push delivery requires they all live on the same backend; the builder enforces this.
 
 ```rust
 let storage = InMemoryA2aStorage::new(); // or SqliteA2aStorage, PostgresA2aStorage, DynamoDbA2aStorage
@@ -154,15 +154,16 @@ lambda_http::run(lambda_http::service_fn(move |event| {
 })).await?;
 ```
 
-### Lambda push-notification recovery (ADR-013)
+### Lambda push-notification recovery
 
 Push-notification delivery on Lambda requires **external triggers**.
 `tokio::spawn` continuations created inside a Lambda invocation are
 opportunistic only: the execution environment may be frozen
 indefinitely between invocations, so the in-process
-`PushDeliveryWorker` reclaim loop from the binary server (ADR-011)
-has no equivalent. Correctness is carried by an atomic pending-dispatch
-marker (ADR-013 §4.3) plus two external workers:
+`PushDeliveryWorker` reclaim loop the binary server uses has no
+equivalent. Correctness is carried by an atomic pending-dispatch
+marker written inside the request Lambda's commit transaction, plus
+two external workers:
 
 | Worker | Trigger | Role |
 |---|---|---|
@@ -223,7 +224,7 @@ cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ```
 
-## gRPC (ADR-014)
+## gRPC
 
 gRPC is a third transport alongside HTTP+JSON and JSON-RPC, behind
 the `grpc` feature. The default dependency tree does **not** include
@@ -241,10 +242,10 @@ cargo run -p grpc-agent --bin grpc-client -- stream "hello"
 
 All 11 `lf.a2a.v1.A2AService` RPCs are served via
 `A2aServer::into_tonic_router()` — the single public entry point,
-which always layers the same Tower auth stack as the HTTP path
-(ADR-014 §2.4). Streaming consumes the same durable event store
-as SSE (ADR-009), with `a2a-last-event-id` ASCII metadata for
-resume. `grpc-reflection` and `grpc-health` are optional sub-features.
+which always layers the same Tower auth stack as the HTTP path.
+Streaming consumes the same durable event store as SSE, with
+`a2a-last-event-id` ASCII metadata for resume. `grpc-reflection` and
+`grpc-health` are optional sub-features.
 
 The client wrapper `turul_a2a_client::grpc::A2aGrpcClient` ships
 under the same feature flag. Not available under
@@ -252,7 +253,7 @@ under the same feature flag. Not available under
 
 ## Architecture Decision Records
 
-Documented under `docs/adr/`. Key decisions: proto-first types (ADR-001), storage traits (ADR-003), dual transport (ADR-005), SSE streaming (ADR-006), auth middleware (ADR-007), Lambda adapter (ADR-008), durable event coordination (ADR-009), gRPC transport (ADR-014).
+Architecture decisions live under `docs/adr/`. Read those if you're contributing to the framework or want the long-form rationale; the rest of this README and the per-crate READMEs are intentionally ADR-free so the surface stays portable across decision evolution.
 
 ## License
 

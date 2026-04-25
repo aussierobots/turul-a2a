@@ -10,7 +10,7 @@
 //!   PostgreSQL / in-memory deployments this scheduler IS the
 //!   recovery path.
 //! - `tokio::spawn`ed dispatch continuations created inside a Lambda
-//!   invocation are opportunistic at best (ADR-013 §4.4): the
+//!   invocation are opportunistic at best: the
 //!   execution environment MAY be frozen between invocations.
 //!   Correctness cannot depend on post-return completion.
 //!

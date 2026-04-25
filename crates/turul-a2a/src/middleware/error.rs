@@ -8,13 +8,13 @@
 
 /// Stable classification of an auth failure.
 ///
-/// Deliberately coarse (ADR-016 §2.1). Fine-grained validator discriminants
+/// Deliberately coarse. Fine-grained validator discriminants
 /// (expired / wrong audience / wrong issuer / unsupported alg / JWKS fetch
 /// / key not found / malformed) collapse to [`InvalidToken`](Self::InvalidToken)
 /// — RFC 6750 §3.1 conflates these under `invalid_token` on the wire.
 ///
 /// Richer per-reason observability is an adopter-scoped concern handled via
-/// a future hook (ADR-016 §2.6); it is not exposed on the transport wire.
+/// a future hook; it is not exposed on the transport wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AuthFailureKind {

@@ -1,4 +1,4 @@
-//! Delivery coordination trait and types (ADR-011 §10).
+//! Delivery coordination trait and types.
 //!
 //! [`A2aPushDeliveryStore`] is the contract every backend must
 //! implement so a multi-instance deployment can share the "who is
@@ -486,7 +486,7 @@ pub enum ClaimStatus {
 #[non_exhaustive]
 pub enum DeliveryOutcome {
     /// Delivery confirmed. `http_status` is typically 2xx or 3xx
-    /// (3xx is treated as success per ADR-011 §5; redirects are NOT
+    /// (3xx is treated as success; redirects are NOT
     /// followed).
     Succeeded { http_status: u16 },
 

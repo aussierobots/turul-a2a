@@ -1,4 +1,4 @@
-//! ADR-013 §5.2 / §10 tests for [`LambdaStreamRecoveryHandler`].
+//! / §10 tests for [`LambdaStreamRecoveryHandler`].
 //!
 //! The release-gate contract (ADR §10.5, §10.6, §10.7):
 //!
@@ -195,7 +195,7 @@ fn event_with_records(records: Vec<EventRecord>) -> DynamoDbEvent {
 
 #[tokio::test]
 async fn stream_success_path_fires_one_post_and_no_batch_failures() {
-    // ADR-013 §5.2: a valid INSERT triggers redispatch; dispatcher
+    // a valid INSERT triggers redispatch; dispatcher
     // fans out to the registered config; exactly one POST fires; no
     // BatchItemFailure surfaces.
     let mock = MockServer::start().await;
@@ -225,7 +225,7 @@ async fn stream_success_path_fires_one_post_and_no_batch_failures() {
 
 #[tokio::test]
 async fn stream_deleted_task_returns_success_and_deletes_marker() {
-    // ADR-013 §4.6 / §10.5: task deleted between marker write and
+    // / §10.5: task deleted between marker write and
     // stream delivery → delete marker, return success (NO
     // BatchItemFailure).
     let (storage, dispatcher, delivery) = build_stack().await;
@@ -265,7 +265,7 @@ async fn stream_deleted_task_returns_success_and_deletes_marker() {
 
 #[tokio::test]
 async fn stream_transient_storage_error_surfaces_batch_item_failure() {
-    // ADR-013 §10.6: transient storage error → BatchItemFailure
+    // transient storage error → BatchItemFailure
     // identified by the record's SequenceNumber.
     //
     // We wrap the in-memory task storage in a failing-once variant.
@@ -402,7 +402,7 @@ async fn stream_transient_storage_error_surfaces_batch_item_failure() {
 
 #[tokio::test]
 async fn stream_unparseable_new_image_surfaces_batch_item_failure() {
-    // ADR-013 §5.2: malformed NEW_IMAGE → BatchItemFailure.
+    // malformed NEW_IMAGE → BatchItemFailure.
     let (_storage, dispatcher, _delivery) = build_stack().await;
     let handler = LambdaStreamRecoveryHandler::new(dispatcher);
     let event = event_with_records(vec![make_malformed_record("seq-malformed")]);
@@ -417,7 +417,7 @@ async fn stream_unparseable_new_image_surfaces_batch_item_failure() {
 
 #[tokio::test]
 async fn stream_non_insert_records_are_skipped() {
-    // ADR-013 §5.2: MODIFY / REMOVE records are skipped silently.
+    // MODIFY / REMOVE records are skipped silently.
     let (storage, dispatcher, _delivery) = build_stack().await;
     let (tenant, task_id, owner, seq) =
         seed_task_with_marker(&storage, "http://unused.invalid/webhook", "t-mod").await;
@@ -440,7 +440,7 @@ async fn stream_non_insert_records_are_skipped() {
 
 #[tokio::test]
 async fn stream_duplicate_inserts_produce_exactly_one_post() {
-    // ADR-013 §5.4 / §10.7: duplicate stream records for the same
+    // / §10.7: duplicate stream records for the same
     // (tenant, task_id, event_sequence) — claim fencing yields
     // exactly one POST.
     let mock = MockServer::start().await;

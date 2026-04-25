@@ -11,7 +11,7 @@
 //! Without these guarantees a production Lambda deployment would write
 //! cancel markers to DynamoDB/Postgres while the supervisor reads from
 //! an unrelated in-memory store, silently breaking cross-instance
-//! cancellation (ADR-012).
+//! cancellation.
 
 use async_trait::async_trait;
 
@@ -374,7 +374,7 @@ fn build_succeeds_with_explicit_cancellation_supervisor_same_backend() {
 }
 
 // ---------------------------------------------------------------------
-// ADR-013 §7 / §10.2 Lambda builder mirror of main-server consistency.
+// / §10.2 Lambda builder mirror of main-server consistency.
 // ---------------------------------------------------------------------
 
 #[test]
@@ -428,7 +428,7 @@ fn lambda_builder_rejects_push_dispatch_without_consumer() {
 
 #[test]
 fn lambda_builder_accepts_push_fully_wired() {
-    // ADR-013 §4.3 errata: `.storage()` wires storage traits only; push
+    // `.storage()` wires storage traits only; push
     // delivery is an explicit opt-in via `.push_delivery_store()`. The
     // storage instance itself must also opt in via
     // `with_push_dispatch_enabled(true)` so atomic commits write markers.
@@ -466,7 +466,7 @@ fn lambda_builder_accepts_non_push_deployment() {
 #[test]
 fn lambda_builder_rejects_retry_horizon_violation() {
     // push_claim_expiry <= max_attempts * backoff_cap must fail fast
-    // (ADR-011 §10.3). Mirror of the main server's pinning test.
+    //. Mirror of the main server's pinning test.
     use std::time::Duration;
     use turul_a2a::server::RuntimeConfig;
 

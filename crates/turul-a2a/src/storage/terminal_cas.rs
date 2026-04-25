@@ -1,4 +1,4 @@
-//! Shared helpers for the single-terminal-writer CAS (ADR-010 §7.1).
+//! Shared helpers for the single-terminal-writer CAS.
 //!
 //! Each backend's `update_task_status_with_events` uses one of two
 //! conditional-write mechanisms to enforce the terminal-CAS:

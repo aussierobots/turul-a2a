@@ -42,7 +42,7 @@ impl AuthIdentity {
 
 /// `Debug` is manually implemented to redact `claims` — JWT claims can
 /// carry PII-class data (email, roles, custom fields) and must not leak
-/// through default-derived Debug output (ADR-016 §2.4).
+/// through default-derived Debug output.
 impl fmt::Debug for AuthIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -88,7 +88,7 @@ impl Default for RequestContext {
     }
 }
 
-/// Default-deny Debug redaction (ADR-016 §2.4).
+/// Default-deny Debug redaction.
 ///
 /// - `bearer_token`: `Some(<redacted>)` when present.
 /// - `headers`: header names always printed; values printed only for a

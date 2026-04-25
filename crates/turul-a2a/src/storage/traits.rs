@@ -134,7 +134,7 @@ pub trait A2aTaskStorage: Send + Sync {
     ///
     /// The marker is idempotent: setting it on a task where it is already
     /// `true` is a successful no-op. Storage-internal only; the marker
-    /// never appears on the wire (ADR-012 §1).
+    /// never appears on the wire.
     ///
     /// Consumers: the `CancelTask` handler and direct cancel paths in
     /// cross-instance deployments. Once set, the in-flight supervisor

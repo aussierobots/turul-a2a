@@ -424,7 +424,7 @@ mod tests {
         assert!(json.get("defaultOutputModes").is_some());
     }
 
-    // ADR-015 §4.1 test 1: builder does NOT reject a skill-level
+    // builder does NOT reject a skill-level
     // `SecurityRequirement` whose scheme name is absent from the
     // adopter-supplied `security_schemes` map on the agent card.
     //
@@ -432,7 +432,7 @@ mod tests {
     // middleware at server-build time, so validating at builder time
     // would false-reject legitimate configurations. Cross-field
     // consistency is enforced post-merge in `A2aServerBuilder::build()`
-    // per ADR-015 §2.3, not here.
+    //, not here.
     #[test]
     fn builder_permits_requirement_with_scheme_to_be_merged_later() {
         let mut bearer_ref = std::collections::HashMap::new();

@@ -1,4 +1,4 @@
-//! Atomic task+event write boundary (ADR-009 §10).
+//! Atomic task+event write boundary.
 //!
 //! Guarantees that task mutations and event appends happen in a single
 //! backend-owned consistency boundary. No partial commits.
@@ -54,7 +54,7 @@ pub trait A2aAtomicStore: Send + Sync {
     /// and Lambda builders reject inconsistent wiring in both directions:
     /// `push_delivery_store` present with the flag off is a build error;
     /// the flag on with no `push_delivery_store` is also a build error
-    /// (ADR-013 §4.3) — pending-dispatch markers are never written without
+    /// — pending-dispatch markers are never written without
     /// a consumer.
     fn push_dispatch_enabled(&self) -> bool {
         false

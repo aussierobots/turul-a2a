@@ -1,4 +1,4 @@
-//! Cancellation propagation (ADR-012) tests.
+//! Cancellation propagation tests.
 //!
 //! Covers router and storage-level cancel behaviour: same-instance
 //! token trip, owner-scoped marker writes, cross-instance marker
@@ -293,7 +293,7 @@ async fn cancel_on_orphaned_task_resolves_via_grace_fallback() {
         "orphan resolved to CANCELED"
     );
 
-    // Framework-committed terminal has message = None per ADR-012 §8.
+    // Framework-committed terminal has message = None
     let message = result.get("status").and_then(|s| s.get("message"));
     assert!(
         message.is_none() || message == Some(&serde_json::Value::Null),
@@ -574,7 +574,7 @@ async fn streaming_subscriber_sees_terminal_canceled() {
     );
 
     // Kick off a body-reader task that collects SSE frames until the
-    // stream closes (terminal delivery closes it cleanly per ADR-009 §4).
+    // stream closes (terminal delivery closes it cleanly).
     // Use an upper-bound timeout so a bug doesn't hang the test forever.
     let body = subscribe_resp.into_body();
     let collect = async move {

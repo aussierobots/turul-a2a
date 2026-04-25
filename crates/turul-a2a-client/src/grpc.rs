@@ -1,4 +1,4 @@
-//! gRPC client wrapper (ADR-014 §2.7).
+//! gRPC client wrapper.
 //!
 //! Thin ergonomic layer over the tonic-generated
 //! `turul_a2a_proto::grpc::A2aServiceClient`. Purpose: offer the same
@@ -13,7 +13,7 @@
 //! the server prefers proto field anyway, and emitting metadata
 //! alongside the proto field would be redundant.
 //!
-//! Auth metadata per ADR-014 §2.4: `authorization: Bearer ...` /
+//! Auth metadata: `authorization: Bearer ...` /
 //! `x-api-key: ...`. All ASCII; no `-bin`.
 
 use std::pin::Pin;
@@ -266,7 +266,7 @@ impl A2aGrpcClient {
 
     /// Subscribe to a task. `last_event_id` is optional — when set,
     /// the server replays events after that `(task_id, sequence)`
-    /// marker per ADR-014 §2.3.
+    /// marker
     pub async fn subscribe_to_task(
         &mut self,
         task_id: impl Into<String>,

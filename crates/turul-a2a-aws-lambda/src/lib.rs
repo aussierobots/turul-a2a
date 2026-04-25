@@ -117,34 +117,35 @@
 //!
 //! # Adapter internals
 //!
-//! Thin wrapper: converts Lambda events to axum requests, delegates to the
-//! same Router, converts responses back. Per ADR-008/ADR-009:
-//! - Authorizer context mapped via synthetic headers with anti-spoofing
-//! - Streaming supported via durable event store (D3)
-//! - SSE responses are buffered: task executes, events are collected, returned as one response
-//! - `POST /message:stream` executes the task within the Lambda invocation and returns all events
-//! - `GET /tasks/{id}:subscribe` is for tasks that are **not** in a terminal
-//!   state. Within one invocation it emits the initial `Task` snapshot,
-//!   replays stored events via `Last-Event-ID`, and closes when the task
-//!   reaches a terminal state. Subscribing to an already-terminal task
-//!   returns `UnsupportedOperationError` per A2A v1.0 §3.1.6 / ADR-010
-//!   §4.3. For retrieving a terminal task's final state use `GetTask`.
+//! Thin wrapper: converts Lambda events to axum requests, delegates to
+//! the same Router, converts responses back. Adapter contract:
+//! - Authorizer context mapped via synthetic headers with anti-spoofing.
+//! - SSE responses are buffered: task executes, events are collected,
+//!   returned as one response.
+//! - `POST /message:stream` executes the task within the Lambda
+//!   invocation and returns all events.
+//! - `GET /tasks/{id}:subscribe` is for tasks that are **not** in a
+//!   terminal state. Within one invocation it emits the initial `Task`
+//!   snapshot, replays stored events via `Last-Event-ID`, and closes
+//!   when the task reaches a terminal state. Subscribing to an
+//!   already-terminal task returns `UnsupportedOperationError` per
+//!   A2A v1.0 §3.1.6. For retrieving a terminal task's final state
+//!   use `GetTask`.
 //!
 //! # Push-notification delivery — external triggers are mandatory
 //!
-//! Push delivery on Lambda (ADR-013) is architecturally different
-//! from the binary server. The request Lambda installed via
+//! Push delivery on Lambda is architecturally different from the
+//! binary server. The request Lambda installed via
 //! [`LambdaA2aServerBuilder`] still constructs a `PushDispatcher`
 //! when `push_delivery_store` is wired, but any `tokio::spawn`
 //! continuation it emits post-return is **opportunistic only** — the
 //! Lambda execution environment may be frozen indefinitely between
-//! invocations, so nothing can depend on that continuation completing
-//! (ADR-013 §4.4).
+//! invocations, so nothing can depend on that continuation completing.
 //!
 //! Correctness for push delivery on Lambda is carried by:
 //!
 //! 1. The atomic pending-dispatch marker written inside the request
-//!    Lambda's commit transaction (ADR-013 §4.3 — opt in via
+//!    Lambda's commit transaction (opt in via
 //!    `StorageImpl::with_push_dispatch_enabled(true)`).
 //! 2. [`LambdaStreamRecoveryHandler`] — DynamoDB Streams trigger on
 //!    `a2a_push_pending_dispatches`. DynamoDB backends only.
@@ -233,12 +234,12 @@ use turul_a2a::streaming::TaskEventBroker;
 /// Builder for Lambda A2A handler.
 ///
 /// Use `.storage(my_storage)` to supply a single backend implementing all storage traits.
-/// This satisfies ADR-009's same-backend requirement and enables streaming via durable
-/// event store.
+/// All four storage traits must share the same backend so streaming, push delivery,
+/// and cross-instance cancellation coordinate correctly.
 ///
 /// For push-notification delivery, wire `.storage()` with a backend that implements
 /// [`A2aPushDeliveryStore`] (all four first-party backends do). The atomic store
-/// must also opt in via `with_push_dispatch_enabled(true)` (ADR-013 §4.3); the
+/// must also opt in via `with_push_dispatch_enabled(true)`; the
 /// builder rejects configurations where the flag and the delivery store disagree.
 pub struct LambdaA2aServerBuilder {
     executor: Option<Arc<dyn AgentExecutor>>,
@@ -292,7 +293,7 @@ impl LambdaA2aServerBuilder {
         self
     }
 
-    /// Wire a durable executor queue (ADR-018). When set, the
+    /// Wire a durable executor queue. When set, the
     /// `return_immediately = true` path in `core_send_message` enqueues
     /// a [`turul_a2a::durable_executor::QueuedExecutorJob`] on this
     /// queue instead of spawning the executor locally, and the
@@ -314,7 +315,7 @@ impl LambdaA2aServerBuilder {
         self
     }
 
-    /// Wire the AWS SQS durable executor queue (ADR-018). Ergonomic
+    /// Wire the AWS SQS durable executor queue. Ergonomic
     /// helper over [`Self::with_durable_executor`] that constructs a
     /// [`SqsDurableExecutorQueue`] from a `queue_url` + shared SQS
     /// client. Requires the `sqs` feature.
@@ -336,13 +337,13 @@ impl LambdaA2aServerBuilder {
     /// Set all storage from a single backend instance.
     ///
     /// This is the **preferred** method — a single struct implementing all
-    /// storage traits guarantees the same-backend requirement (ADR-009)
+    /// storage traits guarantees the same-backend requirement
     /// AND ensures the cancellation supervisor reads the same backend
     /// the cancel marker is written to. A mismatch here (e.g., DynamoDB
     /// task storage + in-memory cancellation supervisor) silently
     /// breaks cross-instance cancellation.
     ///
-    /// ADR-013 §4.3 errata: `.storage()` wires storage traits only. It does
+    /// errata: `.storage()` wires storage traits only. It does
     /// **not** auto-register the storage as a push-delivery store, even if
     /// the backend happens to implement [`A2aPushDeliveryStore`]. To opt in
     /// to push delivery, call [`Self::push_delivery_store`] explicitly and
@@ -395,19 +396,19 @@ impl LambdaA2aServerBuilder {
     /// task_storage backend — otherwise `:cancel` writes the marker to
     /// one backend and the supervisor reads from another, silently
     /// breaking cross-instance cancellation. Prefer `.storage()` for
-    /// unified wiring. Consumed by `core_cancel_task` (ADR-012).
+    /// unified wiring. Consumed by `core_cancel_task`.
     pub fn cancellation_supervisor(mut self, s: impl A2aCancellationSupervisor + 'static) -> Self {
         self.cancellation_supervisor = Some(Arc::new(s));
         self
     }
 
-    /// Set the push delivery store individually (ADR-011 §10 / ADR-013).
+    /// Set the push delivery store individually.
     ///
     /// Prefer `.storage()` for unified wiring. The delivery store MUST
     /// be on the same backend as `.task_storage(...)` — the builder
     /// rejects mismatches. Passing a delivery store also requires the
     /// atomic store to have opted in via `with_push_dispatch_enabled(true)`
-    /// (ADR-013 §4.3).
+    ///.
     pub fn push_delivery_store(mut self, store: impl A2aPushDeliveryStore + 'static) -> Self {
         self.push_delivery_store = Some(Arc::new(store));
         self
@@ -416,7 +417,7 @@ impl LambdaA2aServerBuilder {
     /// Override the runtime configuration (timeouts, retry budgets,
     /// push tuning). Defaults to [`RuntimeConfig::default()`]. The
     /// builder validates push settings (claim expiry vs retry horizon,
-    /// ADR-011 §10.3) when `.push_delivery_store(...)` is wired.
+    /// ) when `.push_delivery_store(...)` is wired.
     pub fn runtime_config(mut self, cfg: RuntimeConfig) -> Self {
         self.runtime_config = cfg;
         self
@@ -443,7 +444,7 @@ impl LambdaA2aServerBuilder {
         let atomic_store: Arc<dyn A2aAtomicStore> = self.atomic_store.ok_or(A2aError::Internal(
             "atomic_store is required for Lambda (use .storage() for unified backend)".into(),
         ))?;
-        // ADR-012: the cancellation supervisor MUST be supplied. No
+        // the cancellation supervisor MUST be supplied. No
         // InMemoryA2aStorage fallback: that would silently break
         // cross-instance cancellation by reading markers from a
         // different backend than they were written to.
@@ -451,12 +452,12 @@ impl LambdaA2aServerBuilder {
             self.cancellation_supervisor.ok_or(A2aError::Internal(
                 "cancellation_supervisor is required for Lambda. Use .storage() for unified \
                  backend wiring, or .cancellation_supervisor(...) alongside the individual \
-                 storage setters. Omitting it would silently break cross-instance \
-                 cancellation in ADR-012."
+                 storage setters. Omitting it silently breaks cross-instance cancellation."
                     .into(),
             ))?;
 
-        // Same-backend enforcement (ADR-009 + ADR-012).
+        // Same-backend enforcement: all storage traits + the
+        // cancellation supervisor must report the same `backend_name`.
         let task_backend = task_storage.backend_name();
         let push_backend = push_storage.backend_name();
         let event_backend = event_store.backend_name();
@@ -471,8 +472,8 @@ impl LambdaA2aServerBuilder {
                 "Storage backend mismatch: task={task_backend}, push={push_backend}, \
                  event={event_backend}, atomic={atomic_backend}, \
                  cancellation_supervisor={supervisor_backend}. \
-                 ADR-009 requires all storage traits to share the same backend. \
-                 ADR-012 requires the cancellation supervisor on the same backend \
+  requires all storage traits to share the same backend. \
+  requires the cancellation supervisor on the same backend \
                  so cross-instance cancel markers are observable. \
                  Use .storage() for unified backend."
             )));
@@ -480,7 +481,7 @@ impl LambdaA2aServerBuilder {
 
         let push_delivery_store = self.push_delivery_store;
 
-        // Push-dispatch consistency (ADR-013 §4.3): the atomic store's
+        // Push-dispatch consistency: the atomic store's
         // opt-in flag and the presence of `push_delivery_store` MUST
         // agree. Both-true = push fully wired; both-false = non-push
         // deployment. Mixed cases are build errors — this mirrors the
@@ -511,14 +512,14 @@ impl LambdaA2aServerBuilder {
             }
         }
 
-        // ADR-017 §Decision Bug 1: the Lambda execution environment
+        // §Decision Bug 1: the Lambda execution environment
         // freezes after the HTTP response is flushed, so any
         // `tokio::spawn`'d executor continuation is opportunistic only
-        // (ADR-013 §4.4). Refuse `SendMessageConfiguration.return_immediately
+        //. Refuse `SendMessageConfiguration.return_immediately
         // = true` at the `core_send_message` entry point via this
         // capability flag instead of silently orphaning the executor.
         //
-        // ADR-018: if a durable executor queue is wired via
+        // if a durable executor queue is wired via
         // [`Self::with_durable_executor`] (or the SQS helper), the
         // capability is re-enabled because enqueueing is durable
         // across the Lambda freeze. The explicit re-enable lives in
@@ -529,11 +530,11 @@ impl LambdaA2aServerBuilder {
             runtime_config.supports_return_immediately = false;
         }
 
-        // Push dispatcher wiring (ADR-011 §10 / ADR-013 §7). When
+        // Push dispatcher wiring. When
         // `push_delivery_store` is present, validate its backend matches,
         // validate the retry-horizon invariant, and construct the
         // `PushDispatcher`. Under Lambda the dispatcher runs
-        // opportunistically post-return (ADR-013 §4.4); correctness
+        // opportunistically post-return; correctness
         // comes from the atomic marker + stream/scheduler recovery.
         let push_dispatcher: Option<Arc<turul_a2a::push::PushDispatcher>> =
             if let Some(delivery) = push_delivery_store.as_ref() {
@@ -542,11 +543,11 @@ impl LambdaA2aServerBuilder {
                     return Err(A2aError::Internal(format!(
                         "Storage backend mismatch: task={task_backend}, \
                          push_delivery={push_delivery_backend}. \
-                         ADR-009 requires all storage traits to share the same backend."
+  requires all storage traits to share the same backend."
                     )));
                 }
 
-                // ADR-011 §10.3: claim expiry must exceed the worst-case
+                // claim expiry must exceed the worst-case
                 // retry horizon so a live claim is not mis-classified as
                 // stale mid-retry.
                 let retry_horizon = runtime_config
@@ -652,7 +653,7 @@ impl Default for LambdaA2aServerBuilder {
 #[derive(Clone)]
 pub struct LambdaA2aHandler {
     router: axum::Router,
-    /// Held for ADR-018 SQS-event dispatch (`handle_sqs`). Always
+    /// Held for SQS-event dispatch (`handle_sqs`). Always
     /// populated — the SQS handler method is gated behind the `sqs`
     /// feature but the state is carried unconditionally so callers can
     /// reach it for diagnostics or future non-HTTP / non-SQS handlers.
@@ -845,7 +846,7 @@ enum HttpEventShape {
 }
 
 impl LambdaA2aHandler {
-    /// Handle an SQS batch from the durable executor queue (ADR-018).
+    /// Handle an SQS batch from the durable executor queue.
     ///
     /// Returns `SqsBatchResponse` whose `batch_item_failures` list
     /// tells the event source mapping which records to retry.

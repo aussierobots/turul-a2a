@@ -1,8 +1,8 @@
-//! ADR-016 §4 wire-surface E2E tests.
+//! wire-surface E2E tests.
 //!
 //! Covers body + WWW-Authenticate contract for Bearer and API-key auth
 //! failure paths. Complements `auth_tests.rs` by asserting on the
-//! ADR-016-locked wire shape end-to-end.
+//! -locked wire shape end-to-end.
 
 use std::sync::Arc;
 
@@ -75,10 +75,10 @@ async fn bearer_invalid_token_emits_kind_body_and_rfc6750_challenge() {
         .unwrap();
     assert_eq!(www, "Bearer realm=\"a2a\", error=\"invalid_token\"");
 
-    // ADR-016 §1.2: error_description MUST NOT leak validator internals
+    // error_description MUST NOT leak validator internals
     assert!(
         !www.contains("error_description"),
-        "error_description must be omitted per ADR-016: {www}"
+        "error_description must be omitted: {www}"
     );
 }
 
@@ -155,7 +155,7 @@ async fn empty_principal_via_unauthenticated_body_only() {
 
 #[tokio::test]
 async fn charset_safety_no_quote_or_backslash_in_www_authenticate() {
-    // ADR-016 §1.2 / §2.3: RFC 6750 §3 restricts error_description charset.
+    // / §2.3: RFC 6750 §3 restricts error_description charset.
     // Since we emit error= from a closed enum and omit error_description,
     // the header value can never contain `"` or `\` from dynamic sources.
     // Exercise every kind that emits a Bearer challenge and assert.
