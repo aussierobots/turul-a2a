@@ -116,7 +116,7 @@ Google well-known types (`google.protobuf.Struct`, `Value`, `Timestamp`) mapped 
 
 ### Known Exceptions
 
-- **Push notification configs** use raw `turul_a2a_proto::TaskPushNotificationConfig` in storage traits and handler signatures. This is an intentional exception — push configs are simple CRUD with no state machine or invariants that warrant a wrapper. Keep this leakage isolated; do not let raw proto types spread into general handler/router code.
+- **Push notification configs** use raw `turul_a2a_proto::TaskPushNotificationConfig` in storage traits and handler signatures. Adopter-facing surfaces (the `turul-a2a-client` push-config methods and the `turul-a2a-types::PushConfig` / `PushAuth` / `PushConfigPage` wrappers) are wrapper-first; the proto leakage is bounded to the storage/handler boundary, where the symmetry with the proto is the simpler contract. Keep this leakage isolated; do not let raw proto types spread into general handler/router code or back out into adopter call sites.
 - **`last_chunk` on `append_artifact`** is transport metadata for SSE streaming. Storage does not persist completion state; the server layer forwards `last_chunk` to streaming subscribers.
 
 ### Server Wiring: Push Delivery Is Strict Opt-In (0.1.5+)

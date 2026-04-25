@@ -337,7 +337,8 @@ impl A2aClient {
 
     /// Create a push notification config for a task using `url` + `token`
     /// (the 80% case). For `authentication` or other advanced fields, build
-    /// a [`PushConfig`] via [`PushConfigBuilder`] and call
+    /// a [`turul_a2a_types::PushConfig`] via
+    /// [`turul_a2a_types::PushConfigBuilder`] and call
     /// [`Self::create_push_config_with`].
     pub async fn create_push_config(
         &self,
@@ -352,8 +353,9 @@ impl A2aClient {
     }
 
     /// Create a push notification config from a fully-constructed
-    /// [`PushConfig`] — use this when you need `authentication`, a custom
-    /// `tenant`, or any other field beyond `url` + `token`.
+    /// [`turul_a2a_types::PushConfig`] — use this when you need
+    /// `authentication`, a custom `tenant`, or any other field beyond
+    /// `url` + `token`.
     pub async fn create_push_config_with(
         &self,
         task_id: &str,
