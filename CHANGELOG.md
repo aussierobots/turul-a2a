@@ -4,6 +4,32 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.17] — 2026-05-10
+
+### Changed — JSON-RPC `id: null` rejection (small wire tightening)
+
+- Explicit `"id": null` on a JSON-RPC request is now rejected with `-32600 Invalid Request`. The rejection response carries `id: null` per JSON-RPC 2.0 §5.1 (id MUST be Null when the request id cannot be detected/used).
+- Notifications continue to be signalled by the **absence** of the `id` key (→ HTTP 204, no body) per §4.1. Only the explicit-null shape is affected.
+- First-party clients are unaffected: `turul-a2a-client` does not construct JSON-RPC envelopes (HTTP+JSON / gRPC only), so no client-side guard is required. Third-party callers that previously sent `id: null` must omit the key (notification semantics) or send a string/number id.
+
+### Changed — internal JSON-RPC dispatch via `turul-rpc 0.1`
+
+- The inner non-streaming dispatch table for `/jsonrpc` now routes through `turul-rpc 0.1`. A2A still owns the full outer wire boundary: parse error, envelope validation, `id: null` rejection, notification handling, params-shape validation (`-32602` on array/scalar), `compat-v03` normalization, method-not-found wording (`"Method not found"`, no method name), and streaming.
+- `turul-rpc` only sees a `JsonRpcRequest` constructed from already-validated state with a `RequestId` proven to be `String|Number(i64)` and a `RequestParams::Object` — never `Array`. Unknown methods, exotic numeric ids (non-i64), and other edge cases fall back to the legacy direct path so wire bytes are unchanged.
+- `impl turul_rpc::r#async::ToJsonRpcError for A2aError` adapts our existing error model (code, message, `google.rpc.ErrorInfo` carried in `data`) onto turul-rpc's error-object trait. The full error envelope shape (including `ErrorInfo`) is unchanged on the wire.
+
+### Added — runtime dependency
+
+- `turul-rpc = "0.1"` (default-features off, `async` feature) added as a runtime dependency of `turul-a2a`. No new crate published, no new public API exposed.
+
+### Unchanged in this release
+
+- **Streaming** (`SendStreamingMessage`, `SubscribeToTask`): SSE wire format and dispatch path are untouched. `turul-rpc::StreamingJsonRpcDispatcher` is not used.
+- **Batch**: A2A does not currently advertise a JSON-RPC batch surface; that is unchanged.
+- **`compat-v03`**: method/param/response normalization is unchanged.
+- **JSON-RPC error envelopes** (success and error response shapes, including `data: google.rpc.ErrorInfo`): byte-identical to 0.1.16 except for the new `id: null` rejection above.
+- **All 11 JSON-RPC method names**, HTTP routes, and proto-driven wire shapes: unchanged.
+
 ## [0.1.16] — 2026-04-25
 
 ### Changed — push-config client API hides proto (breaking)
