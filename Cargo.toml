@@ -105,3 +105,9 @@ turul-a2a = { version = "0.1.16", path = "crates/turul-a2a" }
 turul-a2a-proto = { version = "0.1.16", path = "crates/turul-a2a-proto" }
 turul-a2a-types = { version = "0.1.16", path = "crates/turul-a2a-types" }
 turul-jwt-validator = "0.2"
+
+# Generic JSON-RPC 2.0 framework. We use the dispatcher + handler trait for
+# the inner non-streaming dispatch table; the outer wire boundary stays in
+# turul-a2a (parse, envelope validation, notifications, params shape, compat-
+# v03, method-not-found wording, streaming, batch).
+turul-rpc = { version = "0.1", default-features = false, features = ["async"] }

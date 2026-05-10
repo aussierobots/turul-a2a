@@ -156,6 +156,19 @@ impl A2aError {
     }
 }
 
+/// Map A2aError onto turul-rpc's `JsonRpcErrorObject` (code/message/data only).
+/// The full JSON-RPC envelope (`jsonrpc`/`id`/`error`) is built by the
+/// dispatcher or by `to_jsonrpc_error` above for non-dispatcher paths.
+impl turul_rpc::r#async::ToJsonRpcError for A2aError {
+    fn to_error_object(&self) -> turul_rpc::error::JsonRpcErrorObject {
+        turul_rpc::error::JsonRpcErrorObject {
+            code: self.jsonrpc_code() as i64,
+            message: self.to_string(),
+            data: self.error_info(),
+        }
+    }
+}
+
 impl From<crate::storage::A2aStorageError> for A2aError {
     fn from(err: crate::storage::A2aStorageError) -> Self {
         use crate::storage::A2aStorageError;

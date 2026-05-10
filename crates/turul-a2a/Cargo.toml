@@ -33,6 +33,7 @@ grpc-health = ["grpc", "dep:tonic-health"]
 [dependencies]
 turul-a2a-types = { workspace = true }
 turul-a2a-proto = { workspace = true }
+turul-rpc = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

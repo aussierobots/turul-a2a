@@ -178,20 +178,92 @@ pub async fn jsonrpc_dispatch_handler(
         };
     }
 
-    // 7. Non-streaming dispatch
-    let result = dispatch(state, &method, &tenant, &owner, claims, params).await;
-
-    // 8. Notifications: suppress response entirely
+    // 7. Non-streaming dispatch.
+    //
+    // Notifications run dispatch for side effects, then drop the response.
     if is_notification {
+        let _ = dispatch(state, &method, &tenant, &owner, claims, params).await;
         return axum::http::StatusCode::NO_CONTENT.into_response();
     }
 
-    // 9. Build response
+    // Route known non-streaming methods through turul-rpc when the id and
+    // params are representable as turul-rpc types. Unknown methods, exotic
+    // numeric ids (non-i64), and any other edge cases fall back to the
+    // legacy direct path so wire behavior stays unchanged.
+    let representable_id = match &id {
+        Value::String(s) => Some(turul_rpc::RequestId::String(s.clone())),
+        Value::Number(n) => n.as_i64().map(turul_rpc::RequestId::Number),
+        _ => None,
+    };
+    let method_is_known_non_streaming = matches!(
+        method.as_str(),
+        methods::SEND_MESSAGE
+            | methods::GET_TASK
+            | methods::LIST_TASKS
+            | methods::CANCEL_TASK
+            | methods::GET_EXTENDED_AGENT_CARD
+            | methods::CREATE_TASK_PUSH_NOTIFICATION_CONFIG
+            | methods::GET_TASK_PUSH_NOTIFICATION_CONFIG
+            | methods::LIST_TASK_PUSH_NOTIFICATION_CONFIGS
+            | methods::DELETE_TASK_PUSH_NOTIFICATION_CONFIG
+    );
+
+    if let (Some(rid), true) = (representable_id, method_is_known_non_streaming) {
+        let params_obj: std::collections::HashMap<String, Value> = match &params {
+            Value::Object(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            _ => std::collections::HashMap::new(),
+        };
+        let request = turul_rpc::JsonRpcRequest::new(
+            rid,
+            method.clone(),
+            Some(turul_rpc::RequestParams::Object(params_obj)),
+        );
+        let mut session_ctx = turul_rpc::SessionContext {
+            session_id: String::new(),
+            metadata: std::collections::HashMap::new(),
+            broadcaster: None,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            extensions: std::collections::HashMap::new(),
+        };
+        session_ctx
+            .extensions
+            .insert("tenant".to_string(), Value::String(tenant.clone()));
+        session_ctx
+            .extensions
+            .insert("owner".to_string(), Value::String(owner.clone()));
+        if let Some(c) = claims.clone() {
+            session_ctx.extensions.insert("claims".to_string(), c);
+        }
+
+        let mut dispatcher = turul_rpc::JsonRpcDispatcher::<A2aError>::new();
+        dispatcher.set_default_handler(A2aJsonRpcHandler {
+            state: state.clone(),
+        });
+        let msg = dispatcher
+            .handle_request_with_context(request, session_ctx)
+            .await;
+
+        #[cfg_attr(not(feature = "compat-v03"), allow(unused_mut))]
+        let mut response = serde_json::to_value(&msg)
+            .expect("JsonRpcMessage serialization is infallible for in-memory values");
+        #[cfg(feature = "compat-v03")]
+        {
+            let mode = crate::compat_v03::detect_compat_mode(raw_method, &headers);
+            crate::compat_v03::maybe_normalize_response(&mut response, mode);
+        }
+        return Json(response).into_response();
+    }
+
+    // Fallback: direct dispatch for unknown methods and non-i64 numeric ids.
+    let result = dispatch(state, &method, &tenant, &owner, claims, params).await;
+
     match result {
         Ok(value) => {
             #[cfg_attr(not(feature = "compat-v03"), allow(unused_mut))]
             let mut response = jsonrpc_success(id, value);
-            // A2A v0.3 compat: normalize response envelope + enums
             #[cfg(feature = "compat-v03")]
             {
                 let mode = crate::compat_v03::detect_compat_mode(raw_method, &headers);
@@ -203,6 +275,57 @@ pub async fn jsonrpc_dispatch_handler(
             Json(jsonrpc_error(id, -32601, "Method not found", None)).into_response()
         }
         Err(e) => Json(e.to_jsonrpc_error(Some(&id))).into_response(),
+    }
+}
+
+/// Adapter from turul-rpc's typed handler trait into A2A's existing dispatch
+/// table. The outer handler (`jsonrpc_dispatch_handler`) guarantees by
+/// construction that `method` is a known non-streaming A2A method, that
+/// `params` is `RequestParams::Object`, and that `session_context` carries
+/// tenant/owner/claims under those keys.
+struct A2aJsonRpcHandler {
+    state: AppState,
+}
+
+#[async_trait::async_trait]
+impl turul_rpc::JsonRpcHandler for A2aJsonRpcHandler {
+    type Error = A2aError;
+
+    async fn handle(
+        &self,
+        method: &str,
+        params: Option<turul_rpc::RequestParams>,
+        session_context: Option<turul_rpc::SessionContext>,
+    ) -> Result<Value, Self::Error> {
+        let ctx = session_context.expect("outer A2A handler always populates SessionContext");
+        let tenant = ctx
+            .extensions
+            .get("tenant")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let owner = ctx
+            .extensions
+            .get("owner")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let claims = ctx.extensions.get("claims").cloned();
+
+        let params_value = match params {
+            Some(turul_rpc::RequestParams::Object(map)) => Value::Object(map.into_iter().collect()),
+            _ => json!({}),
+        };
+
+        dispatch(
+            self.state.clone(),
+            method,
+            &tenant,
+            &owner,
+            claims,
+            params_value,
+        )
+        .await
     }
 }
 
