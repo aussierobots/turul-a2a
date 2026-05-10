@@ -4,7 +4,8 @@
 //! before any internal dispatch refactor. Each assertion targets a specific
 //! representational quirk that diverges from generic JSON-RPC 2.0 frameworks:
 //!
-//! - `id: null` literal preservation (parse error and explicit-null request)
+//! - `id: null` literal preservation in parse-error and rejection replies
+//! - explicit `id: null` rejected as -32600 Invalid Request (0.1.17+)
 //! - `id: 0` numeric (zero is a valid id, must not be coerced to null)
 //! - `id: "abc"` string preservation
 //! - missing `id` key → notification → 204 No Content (NOT `id: null`)
@@ -140,20 +141,27 @@ async fn parse_error_emits_literal_id_null() {
 }
 
 #[tokio::test]
-async fn explicit_id_null_is_a_request_not_a_notification() {
-    // A request with `id: null` (key present) is a request, not a notification.
-    // We currently echo `id: null` back rather than 204 or coerce-to-zero.
-    // Pinned before turul-rpc::RequestId (which has no Null variant) enters the path.
-    let body_str = r#"{"jsonrpc":"2.0","method":"NoSuchMethod","params":{},"id":null}"#.to_string();
+async fn explicit_id_null_is_rejected_as_invalid_request() {
+    // 0.1.17+ wire tightening: explicit `id: null` (key present, value null)
+    // is rejected as -32600 Invalid Request. Notifications (id key absent)
+    // are unaffected. The rejection response echoes `id: null` per
+    // JSON-RPC 2.0 §5.1 ("MUST be Null when id cannot be detected/used").
+    let body_str = r#"{"jsonrpc":"2.0","method":"GetTask","params":{},"id":null}"#.to_string();
     let (status, bytes, body) = call(&body_str).await;
-    assert_eq!(status, 200, "explicit id:null is a request, must reply");
+    assert_eq!(
+        status, 200,
+        "rejection uses 200 with JSON-RPC error envelope"
+    );
     assert_eq!(body["jsonrpc"], "2.0");
-    assert_eq!(body["error"]["code"], -32601);
-    assert!(body["id"].is_null(), "echoed id must be null Value");
+    assert_eq!(body["error"]["code"], -32600);
+    assert!(
+        body["id"].is_null(),
+        "rejection response must carry id: null"
+    );
     let raw = std::str::from_utf8(&bytes).unwrap();
     assert!(
         raw.contains("\"id\":null"),
-        "raw body must echo literal \"id\":null, got: {raw}"
+        "raw body must contain literal \"id\":null, got: {raw}"
     );
 }
 

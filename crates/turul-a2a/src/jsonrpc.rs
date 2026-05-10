@@ -97,6 +97,21 @@ pub async fn jsonrpc_dispatch_handler(
     let is_notification = !value.as_object().is_some_and(|o| o.contains_key("id"));
     let id = value.get("id").cloned().unwrap_or(Value::Null);
 
+    // Reject explicit `id: null`. Notifications are signalled by the absence
+    // of the `id` key, not by `id: null`. Aligning with that reading lets the
+    // server use a String|Number id type internally with no Null variant.
+    // The rejection response carries `id: null` per JSON-RPC 2.0 §5.1
+    // (id MUST be Null when the request id cannot be detected/used).
+    if !is_notification && id.is_null() {
+        return Json(jsonrpc_error(
+            Value::Null,
+            -32600,
+            "Invalid Request: id must be a string or number",
+            None,
+        ))
+        .into_response();
+    }
+
     // 4. Validate params: must be object, null, or absent. Arrays/scalars are -32602.
     #[cfg_attr(not(feature = "compat-v03"), allow(unused_mut))]
     let mut params = match value.get("params") {
