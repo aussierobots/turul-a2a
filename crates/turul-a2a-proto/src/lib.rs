@@ -9,7 +9,9 @@ pub mod lf {
         // on newer clippy versions inside generated `Visitor::expecting`
         // bodies. The code is generated, not hand-written; suppressing
         // the lint at the module boundary is the standard escape hatch.
-        #[allow(clippy::useless_borrows_in_formatting)]
+        // `unknown_lints` covers older toolchains that don't know the lint
+        // name yet, so `-D warnings` stays green on both.
+        #[allow(unknown_lints, clippy::useless_borrows_in_formatting)]
         pub mod v1 {
             include!(concat!(env!("OUT_DIR"), "/lf.a2a.v1.rs"));
             include!(concat!(env!("OUT_DIR"), "/lf.a2a.v1.serde.rs"));

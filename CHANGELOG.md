@@ -4,6 +4,14 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.19] — 2026-05-18
+
+### Fixed — publish gate compatible with older clippy
+
+- The 0.1.18 suppression `#[allow(clippy::useless_borrows_in_formatting)]` on the pbjson-generated module raised `unknown_lints` on toolchains where that lint name does not yet exist. Combined with `-D warnings` in the publish gate, this aborted `cargo clippy` before any crate could be packaged.
+- Suppression now reads `#[allow(unknown_lints, clippy::useless_borrows_in_formatting)]` so the same source compiles cleanly on both older and newer clippy.
+- No runtime, wire, or contract change. Library behavior is identical to 0.1.18.
+
 ## [0.1.18] — 2026-05-18
 
 ### Added — opt-in least-privilege bootstrap for SQL backends (ADR-019)
