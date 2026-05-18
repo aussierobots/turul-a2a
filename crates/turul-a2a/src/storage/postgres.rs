@@ -20,6 +20,13 @@ use crate::streaming::StreamEvent;
 pub struct PostgresConfig {
     pub database_url: String,
     pub max_connections: u32,
+    /// ADR-019: when true, [`PostgresA2aStorage::new`] skips DDL
+    /// bootstrap (no `CREATE TABLE`, no `ALTER TABLE`, no `CREATE
+    /// INDEX`) and trusts the operator-provisioned schema. Default
+    /// `false` preserves the auto-bootstrap behavior. Adopters who
+    /// set this flag own forward migrations on every release that
+    /// changes the schema (see CHANGELOG).
+    pub assume_schema_initialized: bool,
 }
 
 impl Default for PostgresConfig {
@@ -27,6 +34,7 @@ impl Default for PostgresConfig {
         Self {
             database_url: "postgres://localhost/a2a".into(),
             max_connections: 10,
+            assume_schema_initialized: false,
         }
     }
 }
@@ -51,7 +59,9 @@ impl PostgresA2aStorage {
             pool,
             push_dispatch_enabled: false,
         };
-        storage.create_tables().await?;
+        if !config.assume_schema_initialized {
+            storage.create_tables().await?;
+        }
         Ok(storage)
     }
 
@@ -2070,6 +2080,7 @@ mod tests {
         let storage = PostgresA2aStorage::new(PostgresConfig {
             database_url: url,
             max_connections: 5,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -2479,5 +2490,68 @@ mod tests {
     async fn test_late_create_config_stamps_advanced_sequence() {
         let s = storage().await;
         parity_tests::test_late_create_config_stamps_advanced_sequence(&s, &s, &s).await;
+    }
+
+    // ADR-019: opt-in least-privilege bootstrap. When the flag is set,
+    // new() MUST NOT run any DDL. Isolation strategy: provision a
+    // throwaway schema and pin the connection's search_path to it via
+    // the libpq `options` URL parameter, so the `a2a_*` table names
+    // resolve into an empty namespace and the first INSERT fails with
+    // "relation does not exist" — proof that create_tables() did not
+    // run.
+    #[tokio::test]
+    async fn test_assume_schema_initialized_skips_ddl() {
+        let base_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost/a2a_test".into());
+
+        let schema = format!(
+            "a2a_no_ddl_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&base_url)
+            .await
+            .unwrap();
+        sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+            .execute(&admin)
+            .await
+            .unwrap();
+
+        let sep = if base_url.contains('?') { '&' } else { '?' };
+        let scoped_url = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
+
+        let storage = PostgresA2aStorage::new(PostgresConfig {
+            database_url: scoped_url,
+            max_connections: 1,
+            assume_schema_initialized: true,
+        })
+        .await
+        .expect("new() must succeed even when DDL is skipped");
+
+        let task = Task::new("t1", TaskStatus::new(TaskState::Submitted));
+        let err = storage
+            .create_task("default", "owner-a", task)
+            .await
+            .expect_err("create_task must fail when a2a_tasks does not exist");
+        match err {
+            A2aStorageError::DatabaseError(msg) => {
+                assert!(
+                    msg.contains("does not exist")
+                        || msg.contains("a2a_tasks")
+                        || msg.contains("relation"),
+                    "expected missing-relation error, got: {msg}"
+                );
+            }
+            other => panic!("expected DatabaseError, got: {other:?}"),
+        }
+
+        let _ = sqlx::query(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+            .execute(&admin)
+            .await;
     }
 }

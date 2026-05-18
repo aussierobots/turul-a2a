@@ -4,6 +4,20 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.18] — 2026-05-18
+
+### Added — opt-in least-privilege bootstrap for SQL backends (ADR-019)
+
+- `PostgresConfig` and `SqliteConfig` gain a new field `assume_schema_initialized: bool` (default `false`). When set to `true`, `PostgresA2aStorage::new()` and `SqliteA2aStorage::new()` skip DDL entirely — no `CREATE TABLE`, no `ALTER TABLE`, no `CREATE INDEX`. The runtime then trusts that the operator has provisioned the schema out-of-band (Terraform, sqlx-migrate, hand-rolled SQL).
+- Motivation: a deployed agent that uses Postgres should be able to run with `INSERT/UPDATE/DELETE/SELECT` grants on the six `a2a_*` tables only — no `CREATE`/`ALTER` on the schema. Today the framework demands schema-create privilege on every boot, which is more privilege than steady-state operation requires.
+- Default is `false`, so existing adopters see zero behavior change. Setting the flag is an explicit transfer of forward-migration responsibility to the operator: future releases that change the schema will document the delta in this CHANGELOG, and adopters running with the flag MUST apply the delta with a higher-privilege role before rolling the new binary.
+- DynamoDB is unchanged. `DynamoDbA2aStorage::new()` already does no DDL — tables are provisioned out-of-band, and the runtime IAM principal can omit `dynamodb:CreateTable` / `UpdateTable` / `DeleteTable` today. No flag needed.
+- See [ADR-019](docs/adr/ADR-019-least-privilege-storage-bootstrap.md) for the full rationale, including rejected alternatives (separate constructor, transparent detection, default-on) and follow-ups (shipping canonical migration files).
+
+### Schema delta from 0.1.17
+
+None. The schema produced by `create_tables()` is unchanged from 0.1.17. Operators upgrading with `assume_schema_initialized: true` have no migration to apply on this release.
+
 ## [0.1.17] — 2026-05-10
 
 ### Changed — JSON-RPC `id: null` rejection (small wire tightening)

@@ -20,6 +20,12 @@ use crate::streaming::StreamEvent;
 pub struct SqliteConfig {
     pub database_url: String,
     pub max_connections: u32,
+    /// ADR-019: when true, [`SqliteA2aStorage::new`] skips DDL bootstrap
+    /// and trusts the operator-provisioned schema. Default `false`
+    /// preserves the auto-bootstrap behavior. Adopters who set this
+    /// flag own forward migrations on every release that changes the
+    /// schema (see CHANGELOG).
+    pub assume_schema_initialized: bool,
 }
 
 impl Default for SqliteConfig {
@@ -27,6 +33,7 @@ impl Default for SqliteConfig {
         Self {
             database_url: "sqlite::memory:".into(),
             max_connections: 5,
+            assume_schema_initialized: false,
         }
     }
 }
@@ -51,7 +58,9 @@ impl SqliteA2aStorage {
             pool,
             push_dispatch_enabled: false,
         };
-        storage.create_tables().await?;
+        if !config.assume_schema_initialized {
+            storage.create_tables().await?;
+        }
         Ok(storage)
     }
 
@@ -2190,6 +2199,7 @@ mod tests {
         SqliteA2aStorage::new(SqliteConfig {
             database_url: "sqlite::memory:".into(),
             max_connections: 1,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -2583,5 +2593,53 @@ mod tests {
     async fn test_late_create_config_stamps_advanced_sequence() {
         let s = storage().await;
         parity_tests::test_late_create_config_stamps_advanced_sequence(&s, &s, &s).await;
+    }
+
+    // ADR-019: opt-in least-privilege bootstrap. When the flag is set,
+    // new() MUST NOT run any DDL. Steady-state ops then fail loudly
+    // because the operator-provisioned schema is absent in this test.
+    #[tokio::test]
+    async fn test_assume_schema_initialized_skips_ddl() {
+        let storage = SqliteA2aStorage::new(SqliteConfig {
+            database_url: "sqlite::memory:".into(),
+            max_connections: 1,
+            assume_schema_initialized: true,
+        })
+        .await
+        .expect("new() must succeed even when DDL is skipped");
+
+        let task = Task::new("t1", TaskStatus::new(TaskState::Submitted));
+        let err = storage
+            .create_task("default", "owner-a", task)
+            .await
+            .expect_err("create_task must fail when a2a_tasks does not exist");
+        match err {
+            A2aStorageError::DatabaseError(msg) => {
+                assert!(
+                    msg.contains("a2a_tasks") || msg.contains("no such table"),
+                    "expected missing-table error, got: {msg}"
+                );
+            }
+            other => panic!("expected DatabaseError, got: {other:?}"),
+        }
+    }
+
+    // ADR-019: default (flag unset) preserves the auto-bootstrap path.
+    // Same in-memory URL — proves the only difference is the flag.
+    #[tokio::test]
+    async fn test_default_still_creates_schema() {
+        let storage = SqliteA2aStorage::new(SqliteConfig {
+            database_url: "sqlite::memory:".into(),
+            max_connections: 1,
+            assume_schema_initialized: false,
+        })
+        .await
+        .unwrap();
+
+        let task = Task::new("t1", TaskStatus::new(TaskState::Submitted));
+        storage
+            .create_task("default", "owner-a", task)
+            .await
+            .expect("default path must auto-create tables");
     }
 }

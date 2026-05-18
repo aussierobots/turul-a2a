@@ -5,6 +5,11 @@
 /// enforcement and builder patterns.
 pub mod lf {
     pub mod a2a {
+        // pbjson-build output triggers `clippy::useless_borrows_in_formatting`
+        // on newer clippy versions inside generated `Visitor::expecting`
+        // bodies. The code is generated, not hand-written; suppressing
+        // the lint at the module boundary is the standard escape hatch.
+        #[allow(clippy::useless_borrows_in_formatting)]
         pub mod v1 {
             include!(concat!(env!("OUT_DIR"), "/lf.a2a.v1.rs"));
             include!(concat!(env!("OUT_DIR"), "/lf.a2a.v1.serde.rs"));
