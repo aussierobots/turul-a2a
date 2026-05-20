@@ -13,7 +13,7 @@ Turul-a2a is a Rust implementation of the A2A (Agent-to-Agent) Protocol v1.0. Li
 
 **Proto-first architecture**: Types are generated from the normative `proto/a2a.proto` (package `lf.a2a.v1`) using `prost` + `pbjson`, then wrapped in ergonomic Rust types.
 
-**Current release**: 0.1.15 — see `CHANGELOG.md` for the per-release contract.
+**Current release**: see `CHANGELOG.md` for the version-by-version contract.
 
 ## Build & Development Commands
 
@@ -56,7 +56,7 @@ cargo lambda watch -p lambda-agent         # Lambda agent via cargo-lambda
 
 - Commit messages: succinct, no Co-Authored-By attribution
 - Do not push unless explicitly asked
-- Version bumps: minor = 0.0.x (e.g., 0.1.0 → 0.1.1), major = 0.x.0
+- Version bumps follow SemVer per the user's global versioning rule (patch = compatible runtime, minor = contract change, major = breaking architecture). See `CHANGELOG.md` for per-release classification.
 
 ## Release & Publish (crates.io)
 
@@ -133,12 +133,12 @@ Google well-known types (`google.protobuf.Struct`, `Value`, `Timestamp`) mapped 
 
 The builder rejects inconsistent configurations (ADR-013 §4.3). Non-push adopters need neither call.
 
-### Multi-Instance Streaming Limitation
+### Multi-Instance Streaming
 
-- The in-process event broker (`TaskEventBroker`) provides local fanout for attached clients on the **same instance only**.
-- This is not a Lambda-specific limitation — it affects any multi-instance deployment: Lambda, load-balanced binaries, ECS/Fargate, Kubernetes, rolling deploys.
-- Shared task storage (DynamoDB, PostgreSQL) solves request/response correctness across instances but does NOT solve streaming coordination.
-- D3 (future): durable event store with monotonic IDs + replay semantics. The in-process broker becomes a local optimization, not the source of truth. See ADR-008.
+- Cross-instance streaming subscription works via the shared event store: the `:subscribe` handler reads events from the durable store, polling at `STORE_POLL_INTERVAL` (`crates/turul-a2a/src/router.rs:622`) when no same-instance broker wake-up arrives. Verified by `tests/distributed_tests.rs` and `tests/d3_streaming_tests.rs`.
+- The in-process `TaskEventBroker` is a same-instance fanout optimization, not the source of truth — it short-circuits the poll loop when the subscriber happens to land on the instance that committed the event.
+- Lambda exception: the adapter does not run the persistent cross-instance cancel-marker poller, so cross-instance cancellation propagation to a live executor on a different warm Lambda invocation is not currently supported (see `crates/turul-a2a-aws-lambda/src/lib.rs` module docs). Streaming subscription itself works.
+- See ADR-008 for the durable event coordination contract.
 
 ### Architecture Decision Records
 
