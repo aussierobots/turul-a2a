@@ -673,3 +673,95 @@ async fn grpc_auth_middleware_rejects_with_unauthenticated() {
         "auth failure must surface as UNAUTHENTICATED (ADR-014 §2.4 / §2.5)"
     );
 }
+
+// =========================================================
+// Wire-surface parity with HTTP transport: tonic::Status::message()
+// must carry the same stable snake_case strings the HTTP body uses,
+// and Internal(msg) must NEVER leak the inner String.
+// =========================================================
+
+/// Middleware that returns a fixed `MiddlewareError` per invocation.
+/// The error is cloned for every request so the layer sees a fresh value.
+struct FixedReject {
+    err: MiddlewareError,
+}
+
+#[async_trait]
+impl A2aMiddleware for FixedReject {
+    async fn before_request(&self, _ctx: &mut RequestContext) -> Result<(), MiddlewareError> {
+        Err(self.err.clone())
+    }
+}
+
+async fn drive_get_task_err(err: MiddlewareError) -> Status {
+    let h = Harness::start_with_middleware(CompletingExecutor, vec![Arc::new(FixedReject { err })])
+        .await;
+    let mut client = h.client().await;
+    client
+        .get_task(Request::new(turul_a2a_proto::GetTaskRequest {
+            tenant: String::new(),
+            id: "any-id".into(),
+            history_length: None,
+        }))
+        .await
+        .expect_err("auth denied")
+}
+
+#[tokio::test]
+async fn grpc_auth_message_invalid_api_key() {
+    let s = drive_get_task_err(MiddlewareError::Unauthenticated(
+        turul_a2a::middleware::AuthFailureKind::InvalidApiKey,
+    ))
+    .await;
+    assert_eq!(s.code(), tonic::Code::Unauthenticated);
+    assert_eq!(
+        s.message(),
+        "invalid_api_key",
+        "gRPC message must match HTTP body string"
+    );
+}
+
+#[tokio::test]
+async fn grpc_auth_message_invalid_token() {
+    let s = drive_get_task_err(MiddlewareError::HttpChallenge(
+        turul_a2a::middleware::AuthFailureKind::InvalidToken,
+    ))
+    .await;
+    assert_eq!(s.code(), tonic::Code::Unauthenticated);
+    assert_eq!(s.message(), "invalid_token");
+}
+
+#[tokio::test]
+async fn grpc_auth_message_insufficient_scope_is_permission_denied() {
+    // HTTP returns 403 here per RFC 6750 §3. gRPC has no direct 403 — the
+    // closest code is PERMISSION_DENIED (same as Forbidden(*)). The body
+    // string stays parity with HTTP.
+    let s = drive_get_task_err(MiddlewareError::HttpChallenge(
+        turul_a2a::middleware::AuthFailureKind::InsufficientScope,
+    ))
+    .await;
+    assert_eq!(s.code(), tonic::Code::PermissionDenied);
+    assert_eq!(s.message(), "insufficient_scope");
+}
+
+#[tokio::test]
+async fn grpc_auth_internal_never_leaks_inner_string() {
+    // This is the original ADR-016 motivating regression: the inner
+    // String on Internal(_) MUST NOT reach the wire. Previously the
+    // gRPC layer used format!("{err:?}"), which surfaced "secret-..."
+    // text on grpc-message. Now it collapses to "internal_error".
+    let secret = "secret-jwks-fetch-failed-https://internal.example/jwks";
+    let s = drive_get_task_err(MiddlewareError::Internal(secret.into())).await;
+    assert_eq!(s.code(), tonic::Code::Internal);
+    assert_eq!(s.message(), "internal_error");
+    assert!(
+        !s.message().contains("secret"),
+        "Internal payload must never leak: got {:?}",
+        s.message()
+    );
+    assert!(
+        !s.message().contains("Internal"),
+        "Debug-formatted variant name must not leak: got {:?}",
+        s.message()
+    );
+}

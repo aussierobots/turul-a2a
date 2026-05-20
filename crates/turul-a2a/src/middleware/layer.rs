@@ -140,11 +140,7 @@ fn middleware_error_to_response(err: &MiddlewareError) -> Response<Body> {
     let status = axum::http::StatusCode::from_u16(err.http_status())
         .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
 
-    let body_str = match err.kind() {
-        Some(kind) => kind.body_string(),
-        None => "internal_error",
-    };
-    let body = serde_json::json!({ "error": body_str });
+    let body = serde_json::json!({ "error": err.wire_body_string() });
 
     let mut builder = Response::builder()
         .status(status)

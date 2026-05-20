@@ -126,10 +126,28 @@ where
 /// Uses `tonic::Status::into_http()` so the response carries proper
 /// gRPC trailers (`grpc-status`, `grpc-message`) — `tonic::Status` is
 /// the canonical encoding for transport-level auth failure.
+///
+/// Wire surface parity with the HTTP path: the `grpc-message` value is
+/// the same stable snake_case string the HTTP body uses, sourced from
+/// [`MiddlewareError::wire_body_string`]. `Internal(msg)` deliberately
+/// collapses to `"internal_error"` — the inner String payload is never
+/// exposed on the wire.
+///
+/// Status-code mapping:
+/// - `Unauthenticated` / `HttpChallenge(*)` → `UNAUTHENTICATED`
+/// - `HttpChallenge(InsufficientScope)` → `PERMISSION_DENIED`
+///   (HTTP returns 403 here per RFC 6750 §3; gRPC has no 403 equivalent
+///   under `UNAUTHENTICATED`, so the closest match is `PERMISSION_DENIED`
+///   — the same code used for `Forbidden(*)`.)
+/// - `Forbidden(*)` → `PERMISSION_DENIED`
+/// - `Internal(_)` → `INTERNAL`
 fn middleware_error_to_grpc_response(err: &MiddlewareError) -> Response<Body> {
-    let message = format!("{err:?}");
+    let message = err.wire_body_string();
     let status = match err {
-        MiddlewareError::Unauthenticated(_) | MiddlewareError::HttpChallenge { .. } => {
+        MiddlewareError::HttpChallenge(crate::middleware::AuthFailureKind::InsufficientScope) => {
+            tonic::Status::permission_denied(message)
+        }
+        MiddlewareError::Unauthenticated(_) | MiddlewareError::HttpChallenge(_) => {
             tonic::Status::unauthenticated(message)
         }
         MiddlewareError::Forbidden(_) => tonic::Status::permission_denied(message),

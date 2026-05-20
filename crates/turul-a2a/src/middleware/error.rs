@@ -112,6 +112,21 @@ impl MiddlewareError {
             Self::Internal(_) => None,
         }
     }
+
+    /// Stable wire string for the error body / message. Single source of
+    /// truth for the snake_case identifier surfaced to clients across both
+    /// HTTP (JSON body `error` field) and gRPC (`Status::message()`)
+    /// transports.
+    ///
+    /// `Internal` collapses to the fixed `"internal_error"` literal —
+    /// the inner `String` payload is intentionally NOT exposed on the
+    /// wire (would leak validator internals, DB errors, etc.).
+    pub fn wire_body_string(&self) -> &'static str {
+        match self.kind() {
+            Some(kind) => kind.body_string(),
+            None => "internal_error",
+        }
+    }
 }
 
 #[cfg(test)]
