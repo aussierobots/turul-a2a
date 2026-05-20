@@ -172,7 +172,13 @@ async fn charset_safety_no_quote_or_backslash_in_www_authenticate() {
         let req = Request::post("/message:send").body(Body::empty()).unwrap();
         let resp = router.oneshot(req).await.unwrap();
         let (status, headers, _body) = drain_body(resp).await;
-        assert_eq!(status, 401);
+        // RFC 6750 §3: scope rejection is 403 with a Bearer challenge.
+        // All other Bearer challenges are 401.
+        let expected_status = match kind {
+            AuthFailureKind::InsufficientScope => 403,
+            _ => 401,
+        };
+        assert_eq!(status, expected_status, "status for {kind:?}");
 
         let www = headers
             .get(http::header::WWW_AUTHENTICATE)

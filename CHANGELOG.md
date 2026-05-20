@@ -4,6 +4,23 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.20] — 2026-05-21
+
+### Fixed — `BearerMiddleware::with_required_scopes` now enforced at runtime
+
+- `turul-a2a-auth`: `BearerMiddleware` previously accepted required scopes via `with_required_scopes(...)` and advertised them on the `AgentCard` via `SecurityContribution`, but never checked them at request time. The `turul-a2a-auth` README documented a "Required scope missing (Bearer) → 403 / `error="insufficient_scope"`" failure mode that did not exist. Adopters relying on the documented contract were authenticating callers whose tokens did not carry the required scopes.
+- Enforcement now runs after JWT validation and principal extraction: every entry in `required_scopes` must appear as an exact SP-delimited token in the OAuth 2.0 `scope` claim, per the RFC 6749 §3.3 ABNF `scope = scope-token *( SP scope-token )`. Tabs and other whitespace are NOT delimiters; substring matches do not count.
+- Failure surfaces as `MiddlewareError::HttpChallenge(AuthFailureKind::InsufficientScope)`, which now resolves to **HTTP 403** with a `WWW-Authenticate: Bearer realm="a2a", error="insufficient_scope"` header per RFC 6750 §3. All other `HttpChallenge` kinds continue to resolve to 401. This is the only special case in `MiddlewareError::http_status`.
+- Documentation alignment: the `turul-a2a-auth` README's "Reading identity in your executor" example previously referenced `ctx.identity` and `AuthIdentity::Authenticated { .. }`; `ExecutionContext` exposes `owner` and `claims` as direct fields and never had an `identity` field. The example now reads `ctx.owner` and `ctx.claims` directly.
+
+### Known limitation
+
+- The `scp` claim (array form, used by some IdPs including Microsoft Entra) is not consulted. Only the OAuth 2.0 `scope` claim (single space-delimited string) is recognised. Adopters whose IdP emits `scp` instead of `scope` should either configure the IdP to emit `scope`, or layer their own scope check in `AgentExecutor`. A future release may add explicit `scp` support behind an opt-in.
+
+### Compatibility
+
+- Patch release per project versioning rule ("Patch bumps cover compatible runtime changes"). The wire contract for scope rejection was already advertised in 0.1.x; this release aligns runtime behavior with that advertised contract. Adopters that called `with_required_scopes(...)` without realising it was inert will now see 403 responses for tokens that previously authenticated successfully. Adopters that never called `with_required_scopes(...)` see no behavioral change.
+
 ## [0.1.19] — 2026-05-18
 
 ### Fixed — publish gate compatible with older clippy

@@ -88,8 +88,17 @@ impl MiddlewareError {
         }
     }
 
+    /// HTTP status for the failure.
+    ///
+    /// `HttpChallenge(InsufficientScope)` returns 403, not 401, per
+    /// RFC 6750 §3 ("the resource server SHOULD respond with the HTTP
+    /// 403 (Forbidden) status code"). The variant remains `HttpChallenge`
+    /// so the transport layer still emits the `WWW-Authenticate: Bearer …
+    /// error="insufficient_scope"` header that RFC 6750 requires for
+    /// scope rejection. All other `HttpChallenge` kinds stay 401.
     pub fn http_status(&self) -> u16 {
         match self {
+            Self::HttpChallenge(AuthFailureKind::InsufficientScope) => 403,
             Self::Unauthenticated(_) | Self::HttpChallenge(_) => 401,
             Self::Forbidden(_) => 403,
             Self::Internal(_) => 500,
@@ -166,5 +175,14 @@ mod tests {
             403
         );
         assert_eq!(MiddlewareError::Internal("x".into()).http_status(), 500);
+    }
+
+    #[test]
+    fn http_challenge_insufficient_scope_returns_403() {
+        // RFC 6750 §3: scope rejection must be 403 with a Bearer challenge.
+        assert_eq!(
+            MiddlewareError::HttpChallenge(AuthFailureKind::InsufficientScope).http_status(),
+            403
+        );
     }
 }

@@ -90,17 +90,13 @@ URLs or token fragments via `error_description`.
 
 ```rust
 use turul_a2a::prelude::*;
-use turul_a2a::middleware::AuthIdentity;
 
 #[async_trait::async_trait]
 impl AgentExecutor for MyAgent {
     async fn execute(&self, task: &mut Task, message: &Message, ctx: &ExecutionContext)
         -> Result<(), A2aError>
     {
-        let owner = match &ctx.identity {
-            AuthIdentity::Authenticated { owner, .. } => owner.as_str(),
-            AuthIdentity::Anonymous => "anonymous",
-        };
+        let owner = ctx.owner.as_str();
         task.push_text_artifact("ok", "Reply", format!("hi {owner}"));
         task.complete();
         Ok(())
@@ -112,8 +108,9 @@ impl AgentExecutor for MyAgent {
 }
 ```
 
-For Bearer, the full claims set is also available as
-`AuthIdentity::Authenticated { claims, .. }` (a `serde_json::Value`).
+`ExecutionContext` exposes `owner: String` and `claims: Option<serde_json::Value>`
+directly. `owner` is `"anonymous"` when no auth middleware ran. For Bearer,
+`ctx.claims` holds the full JWT claims set as JSON.
 
 ## Security declarations on the agent card
 
