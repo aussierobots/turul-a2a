@@ -13,13 +13,27 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Failure surfaces as `MiddlewareError::HttpChallenge(AuthFailureKind::InsufficientScope)`, which now resolves to **HTTP 403** with a `WWW-Authenticate: Bearer realm="a2a", error="insufficient_scope"` header per RFC 6750 §3. All other `HttpChallenge` kinds continue to resolve to 401. This is the only special case in `MiddlewareError::http_status`.
 - Documentation alignment: the `turul-a2a-auth` README's "Reading identity in your executor" example previously referenced `ctx.identity` and `AuthIdentity::Authenticated { .. }`; `ExecutionContext` exposes `owner` and `claims` as direct fields and never had an `identity` field. The example now reads `ctx.owner` and `ctx.claims` directly.
 
+### Fixed — gRPC auth failure wire surface matches HTTP
+
+- The gRPC auth Tower layer was emitting `format!("{err:?}")` into `grpc-message`, which leaked Debug-formatted variant names (`Unauthenticated(InvalidApiKey)`) and — for `MiddlewareError::Internal(String)` — the inner payload itself (e.g. JWKS URLs, validator internals). This reproduced the original ADR-016 motivating regression on the gRPC transport even though the HTTP path had been fixed.
+- Both transports now route the wire string through a new `MiddlewareError::wire_body_string()` helper, the single source of truth for the snake_case identifier. `Internal(_)` always collapses to `"internal_error"` on both transports; the inner String is never exposed.
+- Status-code mapping addendum: `HttpChallenge(InsufficientScope)` is HTTP 403 (RFC 6750 §3) on the HTTP path and `PERMISSION_DENIED` on gRPC (gRPC has no 403 equivalent under `UNAUTHENTICATED`; `PERMISSION_DENIED` is the closest match, same code used for `Forbidden(_)`).
+- New gRPC parity tests pin both `Status::code()` and `Status::message()` for `invalid_api_key`, `invalid_token`, `insufficient_scope`, and `internal_error`, including a regression assertion that `Internal`'s inner String never reaches the wire.
+
+### Added — non-breaking middleware ergonomics
+
+- `RequestContext::from_headers(headers: HeaderMap) -> Self` consolidates the four previously-duplicated struct-literal builders in the HTTP and gRPC auth layers. Adopter middleware that needs to synthesise a context (e.g. for replay, tests) gets a single entry point instead of a five-field literal.
+- `MiddlewareStack::empty()` replaces `MiddlewareStack::new(vec![])` boilerplate. Convenience for test harnesses and Lambda adapters wiring `AppState` without auth.
+- `PUBLIC_PATHS` / `VERSION_EXEMPT_PATHS` constants in `layer.rs` and `transport.rs` consolidated into one `BYPASS_PATHS` const + `is_bypass_path` helper in `middleware/mod.rs`. Internal refactor; behaviour unchanged.
+- Trait and module documentation on `A2aMiddleware` clarified to describe the auth / authorisation / inbound credential forwarding contract. Non-auth interception (metrics, rate-limiting, tracing) should be a separate Tower layer composed outside this trait.
+
 ### Known limitation
 
 - The `scp` claim (array form, used by some IdPs including Microsoft Entra) is not consulted. Only the OAuth 2.0 `scope` claim (single space-delimited string) is recognised. Adopters whose IdP emits `scp` instead of `scope` should either configure the IdP to emit `scope`, or layer their own scope check in `AgentExecutor`. A future release may add explicit `scp` support behind an opt-in.
 
 ### Compatibility
 
-- Patch release per project versioning rule ("Patch bumps cover compatible runtime changes"). The wire contract for scope rejection was already advertised in 0.1.x; this release aligns runtime behavior with that advertised contract. Adopters that called `with_required_scopes(...)` without realising it was inert will now see 403 responses for tokens that previously authenticated successfully. Adopters that never called `with_required_scopes(...)` see no behavioral change.
+- Patch release per project versioning rule ("Patch bumps cover compatible runtime changes"). The wire contracts for both scope rejection (HTTP) and gRPC `Status::message()` were already advertised — for HTTP via the documented failure-modes table, for gRPC implicitly via the HTTP parity contract this release makes explicit. Adopters that called `with_required_scopes(...)` without realising it was inert will now see 403 responses for tokens that previously authenticated successfully. Adopters reading `tonic::Status::message()` for assertions will need to update from Debug-formatted strings (`"Unauthenticated(InvalidApiKey)"`) to the canonical snake_case (`"invalid_api_key"`). The added ergonomics methods are additive — no removals or signature changes.
 
 ## [0.1.19] — 2026-05-18
 

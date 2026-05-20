@@ -10,17 +10,9 @@ use axum::body::Body;
 use http::{Request, Response};
 use tower::{Layer, Service};
 
-use super::bearer::extract_bearer_token;
-use super::context::{AuthIdentity, RequestContext};
+use super::context::RequestContext;
 use super::error::MiddlewareError;
 use super::stack::MiddlewareStack;
-
-/// Paths excluded from auth (always public).
-const PUBLIC_PATHS: &[&str] = &["/.well-known/agent-card.json"];
-
-fn is_public_path(path: &str) -> bool {
-    PUBLIC_PATHS.contains(&path)
-}
 
 /// Tower Layer that wraps a service with auth middleware.
 #[derive(Clone)]
@@ -75,42 +67,16 @@ where
             let path = req.uri().path().to_string();
             let headers = req.headers().clone();
 
-            // Public paths bypass auth entirely
-            if is_public_path(&path) {
-                req.extensions_mut().insert(RequestContext {
-                    bearer_token: None,
-                    headers,
-                    identity: AuthIdentity::Anonymous,
-                    extensions: Default::default(),
-                });
+            // Public paths or no-middleware short-circuit: install an
+            // anonymous context and pass through.
+            if super::is_bypass_path(&path) || stack.is_empty() {
+                req.extensions_mut()
+                    .insert(RequestContext::from_headers(headers));
                 return inner.call(req).await;
             }
 
-            // Skip auth if no middleware configured (backward compat)
-            if stack.is_empty() {
-                req.extensions_mut().insert(RequestContext {
-                    bearer_token: None,
-                    headers,
-                    identity: AuthIdentity::Anonymous,
-                    extensions: Default::default(),
-                });
-                return inner.call(req).await;
-            }
-
-            // Build request context
-            let bearer_token = headers
-                .get(http::header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(extract_bearer_token);
-
-            let mut ctx = RequestContext {
-                bearer_token,
-                headers: headers.clone(),
-                identity: AuthIdentity::Anonymous,
-                extensions: Default::default(),
-            };
-
-            // Run middleware stack
+            // Run middleware stack against a fresh context.
+            let mut ctx = RequestContext::from_headers(headers);
             match stack.before_request(&mut ctx).await {
                 Ok(()) => {
                     // Auth passed — inject context into request extensions

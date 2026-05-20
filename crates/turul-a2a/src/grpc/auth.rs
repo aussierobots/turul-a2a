@@ -25,8 +25,7 @@ use http::{Request, Response};
 use tonic::body::Body;
 use tower::{Layer, Service};
 
-use crate::middleware::bearer::extract_bearer_token;
-use crate::middleware::context::{AuthIdentity, RequestContext};
+use crate::middleware::context::RequestContext;
 use crate::middleware::error::MiddlewareError;
 use crate::middleware::stack::MiddlewareStack;
 
@@ -83,33 +82,15 @@ where
             let headers = req.headers().clone();
 
             // Matches the HTTP layer's "no middleware configured" short
-            // circuit — still inject a default RequestContext so handlers
+            // circuit — install an anonymous RequestContext so handlers
             // can read `identity.owner()` without conditional access.
             if stack.is_empty() {
-                req.extensions_mut().insert(RequestContext {
-                    bearer_token: None,
-                    headers,
-                    identity: AuthIdentity::Anonymous,
-                    extensions: Default::default(),
-                });
+                req.extensions_mut()
+                    .insert(RequestContext::from_headers(headers));
                 return inner.call(req).await;
             }
 
-            // Same header extraction as the HTTP AuthLayer — tonic
-            // metadata surfaces as `http::HeaderMap`, so `authorization`
-            // + `x-api-key` arrive at the same keys.
-            let bearer_token = headers
-                .get(http::header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(extract_bearer_token);
-
-            let mut ctx = RequestContext {
-                bearer_token,
-                headers: headers.clone(),
-                identity: AuthIdentity::Anonymous,
-                extensions: Default::default(),
-            };
-
+            let mut ctx = RequestContext::from_headers(headers);
             match stack.before_request(&mut ctx).await {
                 Ok(()) => {
                     req.extensions_mut().insert(ctx);

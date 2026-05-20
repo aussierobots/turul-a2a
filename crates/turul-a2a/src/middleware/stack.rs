@@ -19,6 +19,13 @@ impl MiddlewareStack {
         Self { middleware }
     }
 
+    /// Build an empty stack. Equivalent to `MiddlewareStack::new(vec![])`.
+    /// Convenience for test harnesses and Lambda adapters that wire an
+    /// `AppState` without auth.
+    pub fn empty() -> Self {
+        Self::new(vec![])
+    }
+
     pub fn is_empty(&self) -> bool {
         self.middleware.is_empty()
     }

@@ -5,9 +5,20 @@ use async_trait::async_trait;
 use super::context::RequestContext;
 use super::error::MiddlewareError;
 
-/// Trait that auth middleware implements.
+/// Trait implemented by request-scoped middleware that participates in
+/// the framework's auth / authorisation / credential-forwarding plane.
 ///
 /// Runs at the Tower layer before any handler or JSON-RPC dispatch.
+/// Typical implementations:
+/// - Authentication (e.g. `BearerMiddleware`, `ApiKeyMiddleware` in `turul-a2a-auth`)
+/// - Trusted-header authorisation (e.g. `LambdaAuthorizerMiddleware` in `turul-a2a-aws-lambda`)
+/// - Inbound credential forwarding (e.g. stashing an upstream API key or Bearer token
+///   onto `ctx.identity.claims` for downstream MCP / A2A calls to consume)
+///
+/// Non-auth interception (metrics, rate-limiting, tracing) should be a
+/// separate Tower layer composed outside this trait — implementations
+/// here only get a `before_request` callback and the failure surface is
+/// shaped for auth errors (401/403 + `WWW-Authenticate`).
 #[async_trait]
 pub trait A2aMiddleware: Send + Sync {
     /// Validate the request and populate identity on the context.

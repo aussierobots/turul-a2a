@@ -80,6 +80,24 @@ impl RequestContext {
             extensions: HashMap::new(),
         }
     }
+
+    /// Build a `RequestContext` from an inbound `HeaderMap`. Extracts
+    /// the Bearer token from the `Authorization` header (case-insensitive,
+    /// hardened parser) and leaves identity as `Anonymous`. Transport
+    /// layers (HTTP, gRPC) call this once per request so the four
+    /// previously-duplicated struct-literal builders share one entry point.
+    pub fn from_headers(headers: http::HeaderMap) -> Self {
+        let bearer_token = headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(super::bearer::extract_bearer_token);
+        Self {
+            bearer_token,
+            headers,
+            identity: AuthIdentity::Anonymous,
+            extensions: HashMap::new(),
+        }
+    }
 }
 
 impl Default for RequestContext {

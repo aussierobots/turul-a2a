@@ -14,13 +14,6 @@ use crate::error::A2aError;
 /// Supported A2A protocol version.
 const SUPPORTED_VERSION: &str = "1.0";
 
-/// Paths excluded from version validation (public discovery).
-const VERSION_EXEMPT_PATHS: &[&str] = &["/.well-known/agent-card.json"];
-
-fn is_version_exempt(path: &str) -> bool {
-    VERSION_EXEMPT_PATHS.contains(&path)
-}
-
 /// Tower Layer for A2A transport compliance.
 #[derive(Clone)]
 pub struct TransportComplianceLayer;
@@ -61,7 +54,7 @@ where
             let method = req.method().clone();
 
             // 1. A2A-Version validation (skip for discovery)
-            if !is_version_exempt(&path) {
+            if !super::is_bypass_path(&path) {
                 match req
                     .headers()
                     .get("a2a-version")
