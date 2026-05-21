@@ -35,6 +35,10 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Patch release per project versioning rule ("Patch bumps cover compatible runtime changes"). The wire contracts for both scope rejection (HTTP) and gRPC `Status::message()` were already advertised — for HTTP via the documented failure-modes table, for gRPC implicitly via the HTTP parity contract this release makes explicit. Adopters that called `with_required_scopes(...)` without realising it was inert will now see 403 responses for tokens that previously authenticated successfully. Adopters reading `tonic::Status::message()` for assertions will need to update from Debug-formatted strings (`"Unauthenticated(InvalidApiKey)"`) to the canonical snake_case (`"invalid_api_key"`). The added ergonomics methods are additive — no removals or signature changes.
 
+### Deferred to 0.2.0 (no work scheduled)
+
+- `RequestContext::bearer_token` and `RequestContext::extensions` field removal, and `MiddlewareError::Internal(String)` reshape to `Internal(Box<dyn std::error::Error + Send + Sync>)`. See [ADR-020](docs/adr/ADR-020-auth-middleware-contract-cleanup.md) for the full plan, downstream impact survey, and migration guidance. The `A2aMiddleware` trait rename and the `compat-v03` feature-to-runtime promotion are explicitly off the table per the same ADR.
+
 ## [0.1.19] — 2026-05-18
 
 ### Fixed — publish gate compatible with older clippy
