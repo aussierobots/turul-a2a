@@ -1,0 +1,24 @@
+[package]
+name = "post-task-hook-agent"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Generic A2A agent demonstrating a post-task TerminalHook firing after a skill returns."
+
+[dependencies]
+turul-a2a = { workspace = true }
+turul-a2a-types = { workspace = true }
+turul-a2a-proto = { workspace = true }
+turul-a2a-patterns = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

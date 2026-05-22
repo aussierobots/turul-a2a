@@ -1,0 +1,28 @@
+[package]
+name = "turul-a2a-patterns"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Reusable A2A skill-authoring patterns (ADR-021). Path-only until §4 gates clear."
+
+[dependencies]
+turul-a2a-proto = { workspace = true }
+turul-a2a-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+static_assertions = { workspace = true }
+serde_yaml = { workspace = true }
+jsonschema = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

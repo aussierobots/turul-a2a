@@ -7,12 +7,17 @@ members = [
   "crates/turul-a2a-auth",
   "crates/turul-a2a-client",
   "crates/turul-a2a-aws-lambda",
+  "crates/turul-a2a-patterns",
   "examples/echo-agent",
   "examples/auth-agent",
   "examples/streaming-agent",
   "examples/callback-agent",
   "examples/grpc-agent",
   "examples/skill-security-agent",
+  "examples/skill-manifest-ollama-agent",
+  "examples/agent-role-planner-router-agent",
+  "examples/agent-role-critic-agent",
+  "examples/post-task-hook-agent",
   "examples/conversation-agent",
   "examples/interrupting-agent",
   "examples/lambda-agent",
@@ -21,6 +26,10 @@ members = [
   "examples/lambda-durable-worker",
   "examples/lambda-stream-worker",
   "examples/lambda-scheduled-worker",
+  "examples/interop-clients/skill-manifest-ollama/rust",
+  "examples/interop-clients/agent-role-planner-router/rust",
+  "examples/interop-clients/agent-role-critic/rust",
+  "examples/interop-clients/post-task-hook/rust",
 ]
 
 [workspace.package]
@@ -77,6 +86,9 @@ jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 
+# Local-environment loading for example agents — opt-in per crate
+dotenvy = "0.15"
+
 # Secrets — kept out of turul-a2a-types so the protocol/types crate stays lightweight
 secrecy = "0.10"
 
@@ -101,9 +113,20 @@ static_assertions = "1.1"
 # Misc
 bytes = "1"
 
+# turul-a2a-patterns (publish = false) — YAML frontmatter + JSON Schema 2020-12 validation.
+# Confined to the internal patterns crate; not pulled in by any publishable crate (ADR-021 §2.1).
+# serde_yaml is upstream-deprecated but remains the most-tested YAML/Serde option; switching to
+# a fork would add risk without offsetting value while this crate stays publish = false.
+# jsonschema supports Draft 2020-12 and is the most widely used Rust validator.
+serde_yaml = "0.9"
+jsonschema = "0.30"
+
 turul-a2a = { version = "0.1.20", path = "crates/turul-a2a" }
 turul-a2a-proto = { version = "0.1.20", path = "crates/turul-a2a-proto" }
 turul-a2a-types = { version = "0.1.20", path = "crates/turul-a2a-types" }
+turul-a2a-client = { path = "crates/turul-a2a-client" }
+# Path-only per ADR-021 §2.1 — not publishable, not a [dependencies] of any publishable crate.
+turul-a2a-patterns = { path = "crates/turul-a2a-patterns" }
 turul-jwt-validator = "0.2"
 
 # Generic JSON-RPC 2.0 framework. We use the dispatcher + handler trait for
