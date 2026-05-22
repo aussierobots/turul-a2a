@@ -22,8 +22,8 @@ impl AgentExecutor for ConversationExecutor {
         _ctx: &turul_a2a::executor::ExecutionContext,
     ) -> Result<(), A2aError> {
         let prompt = message.joined_text();
-        let reference_task_ids = &message.as_proto().reference_task_ids;
-        let task_id = task.as_proto().id.clone();
+        let reference_task_ids = message.reference_task_ids();
+        let task_id = task.id().to_string();
 
         let body = if reference_task_ids.is_empty() {
             format!(

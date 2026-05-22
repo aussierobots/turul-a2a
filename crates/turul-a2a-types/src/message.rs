@@ -228,6 +228,12 @@ impl Message {
         &self.inner.task_id
     }
 
+    /// Reference-task ids the message declares (continuation chains).
+    /// Empty slice if the message stands alone.
+    pub fn reference_task_ids(&self) -> &[String] {
+        &self.inner.reference_task_ids
+    }
+
     /// Borrow the raw `Message.metadata` proto struct. Prefer
     /// [`Self::metadata_keys`] for the common "which correlation fields
     /// arrived" check; drop to this accessor when you need to read
