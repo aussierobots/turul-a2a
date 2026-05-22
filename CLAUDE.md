@@ -154,7 +154,37 @@ For non-trivial architecture changes, the ADR should be accepted before implemen
 
 ### Comment and Docstring Style
 
-Do not reference internal task or phase names (e.g. "phase A", "D.2", task numbers, issue identifiers) in code comments, docstrings, or committed artifacts. Those labels are planning scaffolding — they rot once the phase ships and leak implementation history into the public surface. Write comments that describe the invariant, the contract, or the "why" in timeless terms. References to ADRs and to upstream specs (A2A spec sections, proto line numbers) are fine and encouraged — they are durable external anchors. If a constraint is only meaningful relative to an in-flight refactor, put it in the plan or PR description, not in source.
+**Comments are human-facing documentation.** They must add value to a reader who has the code in front of them and no access to planning history, ADR section numbering, or internal review threads. The bar: a reader six months from now, with no project context, can act on the comment.
+
+**Do not reference in code (comments, docstrings, rustdoc):**
+
+- **ADR numbers or sections** (e.g. `ADR-021 §2.3`, `per §9 Q5`, `(§2.2 item 4)`). ADR section numbering shifts; a reader doesn't have the ADR open; even if they did, the section may have been renumbered.
+- **Phase / slice / wave / step labels** (`phase A`, `Wave 8`, `D.2`, `step 6`, `Phase C`). Planning scaffolding that rots once the work ships.
+- **Issue / PR / task numbers** (`fixes #123`, `per task #45`). Belongs in commit messages and PR descriptions, not source.
+- **Internal review history** (`per codex review`, `per round 12`, `was YELLOW`). Even shorter half-life than ADR refs.
+
+These labels mean something to whoever wrote them this week and **nothing** to a reader later. They leak planning artefacts into the public surface and corrode the codebase's signal-to-noise ratio.
+
+**Do write:**
+
+- **The invariant**: "Terminal states are not constructible through this trait — the `ProgressState` enum is non-exhaustive and excludes Completed/Failed/Canceled/Rejected by enumeration."
+- **The contract**: "Hook implementations must be best-effort: a failure here MUST NOT abort the surrounding execution."
+- **The "why" in timeless terms**: "Newtype required because Rust's orphan rule forbids implementing an external trait on an external type from a third crate."
+- **Upstream-spec citations** (A2A spec section text + URL, proto line numbers). These have stable URLs and durable semantics; they're external anchors, not internal scaffolding. *Cite them sparingly and only when the comment would be incomplete without them.*
+
+**Where ADR / phase / planning references DO belong:**
+
+- Commit messages (cite ADR sections freely; they help future maintainers find the rationale).
+- PR descriptions.
+- `CHANGELOG.md` entries.
+- ADR cross-reference sections within other ADRs (durable internal anchors between ADRs).
+- The `README.md` of a crate or example (explicit human-facing documentation; ADR links here are useful navigation).
+
+**Litmus test before writing a comment:**
+
+1. Would this comment make sense to a reader who has never seen the project's planning docs? If no, rewrite.
+2. Is the comment describing **what the code does** (redundant — the code already says that) or **why it exists / what invariant it preserves** (valuable)?
+3. Does the comment reference a label (ADR section, phase, wave, task) that will rot? If yes, restate the underlying constraint in timeless terms.
 
 ### TDD Discipline
 
