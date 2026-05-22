@@ -266,8 +266,10 @@ cargo fmt --all -- --check
 - Keep `CLAUDE.md` concise and operational.
 - If both files exist and conflict, `AGENTS.md` wins.
 - Do not document speculative endpoints or field names as if implemented.
-- Code comments and rustdoc must describe the stable behavior, invariant, or public contract of the code as it exists. Do not mention internal implementation phases, task numbers, review cycles, temporary branch state, or agent workflow labels in code comments or doc strings.
-- If a behavior is temporary while a feature is being built, keep that explanation in planning docs, ADR amendments, issues, or commit messages. In source comments, state the current contract plainly and add a TODO only when it names the concrete missing behavior, not the internal phase that will deliver it.
+- Code comments, rustdoc, and test comments must describe the stable behavior, invariant, or public contract of the code as it exists. They must be useful to a framework adopter or maintainer reading the code in isolation.
+- Do not add ADR numbers, section symbols, implementation phases, task numbers, review cycles, temporary branch state, or agent workflow labels to source comments, rustdoc, or test comments. If historical context is needed, put it in ADRs, READMEs, changelogs, issues, or commit messages instead.
+- Spec references in comments are allowed only when they clarify a live protocol invariant that cannot be stated clearly in plain language; prefer naming the invariant directly over citing a section number.
+- If a behavior is temporary while a feature is being built, keep that explanation in planning docs, ADR amendments, issues, or commit messages. In source comments, state the current contract plainly and add a TODO only when it names the concrete missing behavior and removal trigger, not the internal phase that will deliver it.
 - Architectural decisions made during planning or implementation should be captured later as ADRs under `docs/adr/`.
 - For meaningful architecture changes, require the ADR to be written and accepted before implementation proceeds.
 
