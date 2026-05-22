@@ -4,6 +4,50 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.21] — 2026-05-23
+
+### Added — `turul-a2a-patterns` skill-pattern crate (ADR-021 Phase C)
+
+- New **path-only** workspace crate `crates/turul-a2a-patterns/` (`publish = false`, `version.workspace = true`) hosting reusable A2A skill-authoring abstractions. Per ADR-021 §2.1 / §4.1, the crate is intentionally NOT published until §4 gates clear (two real adopters + dispatcher decision + test coverage + downstream impact survey). The crate is consumed today by example agents via workspace path.
+- Public surface (six primary + one Q5-resolved additive):
+  - `SkillHandler` — `#[async_trait]` async trait; impls write plain `async fn run(&self, params, sink) -> Result<Value, SkillError>`.
+  - `SkillProgressSink` + `ProgressState` (non-terminal states only, `#[non_exhaustive]`) + `SinkError` (`Closed` / `Backend`) — `#[async_trait]` per Wave 8 ergonomics pass.
+  - `SkillRegistry` trait + `InMemorySkillRegistry` impl; `register_manifest(card, handler)` is the canonical path.
+  - `SkillCard` + SKILL.md manifest parser (camelCase frontmatter, JSON Schema 2020-12 strict-reject-unknown-keywords, `{{ var }}` template grammar with dotted paths, missing-variable structured error). Three-section frontmatter: discovery / provider-neutral execution metadata / opaque `providerConfig`.
+  - `SkillDescriptor` — single source of truth for `params_schema` (derived from manifest input schema for manifest-backed skills; supplied once at registration for programmatic skills; never adopter-fillable independently).
+  - `SkillError` — two variants only (`InvalidRequest`, `Internal`).
+  - `TerminalHook` + `SkillOutcome` — Q5-resolved minimal generic variant. `#[async_trait]`. No framework-level isolation/timeout semantics in v1 (richer extractor-registry variant remains deferred pending the dispatcher ADR).
+  - `validate_json(schema, instance) -> Result<(), ValidationError>` — public free function for arbitrary schema validation.
+- 26 tests across 8 test files; full §7.4 gate clean.
+
+### Added — showcase example agents (ADR-021 §7.3 step 6 + §9 Q3/Q5)
+
+- `examples/skill-manifest-ollama-agent/` — primary SKILL.md reference example. LLM-backed `greet` skill. Offline-by-default; live Ollama opt-in via `OLLAMA_BASE_URL` / `RUN_OLLAMA_SMOKE` env vars. `dotenvy` autoload of local `.env` (gitignored); `.env.example` committed with `OLLAMA_BASE_URL=http://localhost:11434` placeholder.
+- `examples/agent-role-planner-router-agent/` — deterministic planner + router idiom example (no LLM). Skills `add`, `concat` are manifest-backed.
+- `examples/agent-role-critic-agent/` — deterministic critic/evaluator idiom example (no LLM). Skills `validate_against_schema` (uses `turul_a2a_patterns::validate_json`) and `check_invariants` (four invariant kinds) are manifest-backed.
+- `examples/post-task-hook-agent/` — `TerminalHook` demonstration. Skills `count`, `metrics` are manifest-backed; the hook is example-level code per ADR-021 §9 Q5.
+- Every callable showcase skill is manifest-backed via `SKILL.md`. The role/hook patterns (planner, router, critic, terminal hook) stay code-first because they're orchestration/observation idioms, not skills — each example's README explains why.
+- All examples carry novice-focused READMEs (architecture sketch, per-client run commands, expected I/O, troubleshooting, ADR cross-references).
+
+### Added — cross-language interop client matrix (ADR-021 §7.3 step 8)
+
+- `examples/interop-clients/<agent>/<language>/` — 12 client paths (4 agents × 3 languages). Each subdir is a self-contained client crate/script with novice-focused README. No shared abstraction module — duplication is preferred over cleverness for adopter readability.
+  - Python: `a2a-sdk==1.0.2` (PyPI). Selects JSON-RPC transport at `/jsonrpc`; sends `SendStreamingMessage` (SSE). Uses `ClientFactory(ClientConfig(...)).create(card)` constructor.
+  - Go: `github.com/a2aproject/a2a-go/v2 v2.3.1`. Selects JSON-RPC transport at `/jsonrpc`; sends `SendMessage` (non-streaming). Uses `agentcard.DefaultResolver.Resolve(...)` + `a2aclient.NewFromCard(...)`.
+  - Rust: `turul-a2a-client` (in-workspace). Uses REST `/message:send` per the proto's `google.api.http` annotation.
+- `examples/interop-clients/CLIENT_MATRIX.md` — agent-rows × language-columns matrix. All 12 cells manually smoke-tested. The framework's `A2aServer` serves both REST and JSON-RPC simultaneously; clients differ only in which surface their SDK selects.
+
+### Added — ADR-022 (Proposed) + ADR-023 (Proposed)
+
+- ADR-022 — Skill-invocation dispatcher profile extension. Specifies the four-point profile contract (declaration via `AgentCapabilities.extensions`, activation via `A2A-Extensions` header, request shape via `Message.metadata`, rejection via `UnsupportedOperationError`). Implementation gated on ADR-022 acceptance.
+- ADR-023 — LlmClient abstraction. Recommends Option C (separate trait-only crate, no provider adapters in framework). No code shipped; decision pending.
+
+### Internal
+
+- Workspace deps added: `async-trait = "0.1"`, `dotenvy = "0.15"`, `jsonschema = "0.30"`, `serde_yaml = "0.9"`.
+- `examples/clients/` (the earlier generic-client layout) removed; replaced by per-agent `examples/interop-clients/<agent>/<language>/` structure.
+- ADR-021 amended through Phase C to reflect: orphan-rule-safe newtype bridge in examples (§2.3), `async_trait` adopter ergonomics (§2.3, §9 Q5), reduced-expressivity `securityRequirements` in v1 SKILL.md (§2.2 item 3), explicit "patterns crate ships zero role abstractions; planner/router/critic/post-task-hook are examples only" (§9 Q3), `a2aproject/a2a-go/v2 v2.3.1` Go SDK research result (§7.3 step 8).
+
 ## [0.1.20] — 2026-05-21
 
 ### Fixed — `BearerMiddleware::with_required_scopes` now enforced at runtime
