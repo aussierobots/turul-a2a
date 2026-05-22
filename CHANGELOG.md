@@ -40,7 +40,7 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added — ADR-022 (Proposed) + ADR-023 (Proposed)
 
 - ADR-022 — Skill-invocation dispatcher profile extension. Specifies the four-point profile contract (declaration via `AgentCapabilities.extensions`, activation via `A2A-Extensions` header, request shape via `Message.metadata`, rejection via `UnsupportedOperationError`). Implementation gated on ADR-022 acceptance.
-- ADR-023 — LlmClient abstraction. Recommends Option C (separate trait-only crate, no provider adapters in framework). No code shipped; decision pending.
+- ADR-023 — LlmClient abstraction. **Decision (2026-05-23):** the LLM-client abstraction lives in a separate `turul-llm` GitHub repository, not in this workspace. `turul-a2a` stays provider-neutral; examples may optionally consume `turul-llm` crates once that repo ships its first stable releases. Until then, provider calls stay example-local. See ADR-023.
 
 ### Internal
 

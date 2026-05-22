@@ -1,65 +1,129 @@
 # ADR-023: LlmClient Abstraction Decision
 
-- **Status:** Rejected
+- **Status:** Accepted (revised disposition — see "Decision: cross-repo abstraction" below)
 - **Date:** 2026-05-22
-- **Rejected:** 2026-05-23
+- **Revised:** 2026-05-23
 - **Depends on:** ADR-021
 
-## Rejection rationale (2026-05-23)
+## Decision: cross-repo abstraction (2026-05-23)
 
-The ADR is **Rejected**. The framework will not ship a
-`turul-llm-client` crate. Adopters needing an LLM-backed skill copy
-the `examples/skill-manifest-ollama-agent` pattern — the provider
-call lives in adopter / example code; the framework crate stays
-provider-neutral via the manifest's opaque `providerConfig:` block
-(per ADR-021 §2.2 item 3).
+The LLM-client abstraction **will exist**, but **not inside the
+`turul-a2a` workspace**. It lives in a separate GitHub repository
+named **`turul-llm`** with its own workspace, cadence, releases, and
+test suite.
 
-**Why rejected rather than left Proposed:**
+| Component | Lives in |
+|---|---|
+| Provider-neutral LLM trait (`LlmClient` or similar) | `turul-llm` repo (separate) |
+| Provider adapters (Ollama / OpenAI / Anthropic / Vertex / etc.) | `turul-llm` repo (separate workspace crates per adapter) |
+| `turul-a2a` server / proto / types / patterns / client / auth / aws-lambda | This repo. Provider-neutral. |
+| `turul-a2a` example agents | This repo. **Provider calls stay example-local** until `turul-llm` ships its first release. |
 
-1. **No demand signal exists.** Zero external adopters have
-   requested a unified LLM-client surface. Zero community provider
-   adapters using a common shape exist. The Phase C
-   `skill-manifest-ollama-agent` proves the provider call works
-   fine in adopter code without a framework abstraction.
+`turul-a2a` examples MAY take a dependency on `turul-llm` crates
+**only after** `turul-llm` exists with its own published tests and
+releases. Until then, every provider call in a `turul-a2a` example
+(such as the Ollama call in `examples/skill-manifest-ollama-agent`)
+lives in the example crate's own source — provider-neutral framework
+remains provider-neutral at the dep-graph level.
 
-2. **Trait shape cannot be validated without provider diversity.**
-   Ollama fits the §4 sketch cleanly. OpenAI, Anthropic, and Vertex
-   differ meaningfully on system-vs-user prompt distinction, tool
-   calls, content blocks, streaming-first APIs, and
-   structured-output formats. A trait shape locked in with only
-   Ollama in scope would be near-certain to mis-fit a second
-   provider — the cost of "Accepted-prematurely-and-needs-revision"
-   is much higher than "Rejected."
+This supersedes both the original "Recommended: Option C" framing
+and the 2026-05-23 morning Rejected disposition. The original Option
+C correctly identified that a trait-only crate is the right shape;
+the Rejected disposition correctly identified that this crate must
+not live inside `turul-a2a`. The cross-repo decision combines both
+into the architecturally cleaner outcome: yes to the trait, no to
+the workspace coupling.
 
-3. **Provider-API churn outpaces A2A spec cadence.** Framework
-   maintenance of a trait whose underlying providers shift quarterly
-   is a misalignment of cadence. The patterns crate's stability
-   (driven by A2A v1.x) would be tied to provider releases that
-   don't share that stability.
+## Why cross-repo (and not a workspace crate, in-repo private trait, or rejection)
 
-4. **Crates.io name registration is irreversible.** Reserving
-   `turul-llm-client` without an implementation commits the name
-   permanently (yank only hides). Rejecting closes that risk
-   cleanly.
+1. **Different cadence.** LLM provider APIs change quarterly
+   (model deprecations, new structured-output shapes, tool-call
+   schema shifts). The A2A spec changes annually at most. A trait
+   pinned to provider semantics inside the `turul-a2a` release
+   schedule would either pull `turul-a2a` releases forward
+   unnecessarily, or hold provider compatibility back.
 
-5. **Option A (no LLM client crate, ever) is the operational
-   default already.** Every Phase C example demonstrates that the
-   provider call belongs in adopter code. Formalising that as a
-   rejection of the LLM-client-crate idea preserves the framework's
-   actual posture rather than leaving the question pseudo-open.
+2. **Different audience.** LLM-client abstractions are useful for
+   any Rust project that calls LLMs — not just A2A agents. Putting
+   the trait under `turul-a2a/crates/` would gate adoption on
+   awareness of A2A, narrowing the audience to a fraction of the
+   potential users.
 
-**Reopening path:** if a future external adopter (or significant
-in-tree duplication across multiple LLM-backed example agents)
-surfaces real demand for a unified surface, a **new ADR** (not a
-revival of this one) is the right vehicle. The new ADR would carry
-fresh trait validation against at least Ollama + one second
-provider, real adopter requirements, and answers to the questions
-§7 listed below. Until then, the framework's position is final: no
-`turul-llm-client` crate.
+3. **Different dependency risk.** Provider SDKs pull in HTTP
+   clients, auth crates, model option types, streaming runtimes,
+   and (for some) protobuf compilers. Keeping that dep surface in
+   a separate workspace prevents accidental dep bleed into
+   `turul-a2a-types` / `turul-a2a-proto` / `turul-a2a` — crates
+   that should stay minimal.
 
-**What stays valid:** the §4 trait sketch and §7 open questions
-remain useful raw material for that hypothetical successor ADR.
-This document is preserved as historical record.
+4. **Protocol-first discipline.** `turul-a2a` is the A2A v1.x
+   protocol implementation. Mixing protocol concerns with provider
+   concerns blurs the value proposition. The cross-repo split
+   enforces "this crate is the A2A wire; that crate is the LLM
+   wire" at the org boundary.
+
+5. **No feature creep.** Future asks like "add streaming support to
+   `LlmClient`", "add Anthropic content blocks", "add tool-call
+   schema" stay out of `turul-a2a`'s issue tracker. The framework's
+   focus stays on A2A spec compliance + adopter ergonomics.
+
+## What this changes about the rest of the ADR
+
+- **§2 Decision options A/B/C/D** are now historical. The decision
+  is option E: separate repo, neither A nor B nor C nor D as
+  workspace-internal choices. The trait sketch in §4 and the open
+  questions in §7 are not framework decisions; they're **seed
+  material** for the future design ADRs that will live inside
+  `turul-llm` (not here).
+- **§3 Non-Goals** is reinforced: `turul-a2a` will not host
+  model-specific code, will not compete with `ollama-rs` /
+  `async-openai`, and now explicitly will not host any LLM-client
+  abstraction either.
+- **§5 Adoption path** for the in-repo crate is obsolete. The
+  adoption path is now: `turul-llm` ships → its first stable
+  release goes to crates.io → `turul-a2a` examples optionally
+  start depending on it.
+
+## Boundary the framework now defends
+
+- `turul-a2a` workspace MUST NOT add an LLM-client crate, trait, or
+  provider adapter. Any future PR proposing one is rejected on
+  scope.
+- `turul-a2a-patterns` `SkillCard` keeps its **opaque
+  `providerConfig`** block — the patterns crate does not interpret
+  provider config and never will. That's the seam where adopter
+  code (or a future `turul-llm` adapter) reads provider-specific
+  options.
+- `turul-a2a` example agents read `provider_config` themselves and
+  call the provider directly. When `turul-llm` ships, examples MAY
+  optionally migrate to consume it; the framework crates do not.
+
+## Reopening / scope changes
+
+This ADR does not reopen. Future ADRs about the LLM-client trait,
+provider adapters, streaming, retries, observability, token
+budgeting, etc. live in `turul-llm`'s own `docs/adr/` directory
+(once that repo exists). They are governed by `turul-llm`'s
+maintainers and cadence, not by this workspace.
+
+If the cross-repo split ever needs revisiting — for example, if
+`turul-llm` is abandoned or never ships and a successor solution
+needs to land — a **new ADR in this repo** (ADR-NNN) is the right
+vehicle. This ADR stays Accepted as the historical record of the
+cross-repo decision.
+
+## What stays valid as seed material
+
+The original §4 trait sketch and §7 open questions are **not framework
+decisions** here, but they remain useful raw material for the LLM
+design discussion that will happen in the `turul-llm` repo:
+
+- The trait shape (`async fn complete(rendered_prompt, output_schema, provider_config) -> Result<Value, LlmError>`) is a defensible starting point for a provider-neutral surface.
+- The open questions (streaming, retries, token budgeting,
+  observability, system-prompt-vs-user-prompt distinction) are real
+  design problems that `turul-llm`'s own ADRs must answer.
+
+Preserved below as historical record; not normative here.
 
 ## 1. Context
 
