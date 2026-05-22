@@ -106,6 +106,7 @@ pub struct AgentCardBuilder {
     icon_url: Option<String>,
     security_schemes: std::collections::HashMap<String, turul_a2a_proto::SecurityScheme>,
     security_requirements: Vec<turul_a2a_proto::SecurityRequirement>,
+    extensions: Vec<turul_a2a_proto::AgentExtension>,
 }
 
 impl AgentCardBuilder {
@@ -126,6 +127,7 @@ impl AgentCardBuilder {
             icon_url: None,
             security_schemes: std::collections::HashMap::new(),
             security_requirements: vec![],
+            extensions: vec![],
         }
     }
 
@@ -213,6 +215,17 @@ impl AgentCardBuilder {
         self
     }
 
+    /// Advertise a protocol extension on the agent card. The extension
+    /// URI is published in `AgentCapabilities.extensions` so clients
+    /// can discover the contract and activate it via the
+    /// `A2A-Extensions` request header. When `required = true`, every
+    /// inbound request must activate the URI or the transport layer
+    /// rejects it with `UnsupportedOperationError`.
+    pub fn extension(mut self, extension: turul_a2a_proto::AgentExtension) -> Self {
+        self.extensions.push(extension);
+        self
+    }
+
     /// Advertise an agent-level security requirement not derived from
     /// middleware (e.g., mTLS enforced at a reverse proxy).
     ///
@@ -268,7 +281,7 @@ impl AgentCardBuilder {
             capabilities: Some(turul_a2a_proto::AgentCapabilities {
                 streaming: self.streaming,
                 push_notifications: self.push_notifications,
-                extensions: vec![],
+                extensions: self.extensions,
                 extended_agent_card: self.extended_agent_card,
             }),
             security_schemes: self.security_schemes,

@@ -243,11 +243,14 @@ async fn task_delete_dispatch(
 async fn tenant_send_message_handler(
     State(state): State<AppState>,
     axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
+    headers: axum::http::HeaderMap,
     Path(tenant): Path<String>,
     body: String,
-) -> Result<Json<serde_json::Value>, A2aError> {
+) -> Result<axum::response::Response, A2aError> {
     let claims = ctx.identity.claims().cloned();
-    core_send_message(state, &tenant, ctx.identity.owner(), claims, body).await
+    let echoed = negotiate_profile_extensions(&state, &headers)?;
+    let Json(value) = core_send_message(state, &tenant, ctx.identity.owner(), claims, body).await?;
+    Ok(attach_extension_echo(Json(value).into_response(), &echoed))
 }
 
 async fn tenant_list_tasks_handler(
@@ -418,20 +421,29 @@ async fn extended_agent_card_handler(
 async fn send_streaming_message_handler(
     State(state): State<AppState>,
     axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
+    headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<axum::response::Response, A2aError> {
     let claims = ctx.identity.claims().cloned();
-    core_send_streaming_message(state, DEFAULT_TENANT, ctx.identity.owner(), claims, body).await
+    let echoed = negotiate_profile_extensions(&state, &headers)?;
+    let response =
+        core_send_streaming_message(state, DEFAULT_TENANT, ctx.identity.owner(), claims, body)
+            .await?;
+    Ok(attach_extension_echo(response, &echoed))
 }
 
 async fn tenant_send_streaming_message_handler(
     State(state): State<AppState>,
     axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
+    headers: axum::http::HeaderMap,
     Path(tenant): Path<String>,
     body: String,
 ) -> Result<axum::response::Response, A2aError> {
     let claims = ctx.identity.claims().cloned();
-    core_send_streaming_message(state, &tenant, ctx.identity.owner(), claims, body).await
+    let echoed = negotiate_profile_extensions(&state, &headers)?;
+    let response =
+        core_send_streaming_message(state, &tenant, ctx.identity.owner(), claims, body).await?;
+    Ok(attach_extension_echo(response, &echoed))
 }
 
 /// Task-side setup for streaming send: parse request, create task,
@@ -716,10 +728,14 @@ const DEFAULT_TENANT: &str = "";
 async fn send_message_handler(
     State(state): State<AppState>,
     axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
+    headers: axum::http::HeaderMap,
     body: String,
-) -> Result<Json<serde_json::Value>, A2aError> {
+) -> Result<axum::response::Response, A2aError> {
     let claims = ctx.identity.claims().cloned();
-    core_send_message(state, DEFAULT_TENANT, ctx.identity.owner(), claims, body).await
+    let echoed = negotiate_profile_extensions(&state, &headers)?;
+    let Json(value) =
+        core_send_message(state, DEFAULT_TENANT, ctx.identity.owner(), claims, body).await?;
+    Ok(attach_extension_echo(Json(value).into_response(), &echoed))
 }
 
 async fn list_tasks_handler(
@@ -1758,6 +1774,48 @@ pub(crate) async fn core_delete_push_config(
         .map_err(A2aError::from)?;
 
     Ok(Json(serde_json::json!({})))
+}
+
+// =========================================================
+// Profile-extension negotiation (skill-invocation dispatcher etc.)
+// =========================================================
+
+/// Parse the inbound `A2A-Extensions` header, validate against the
+/// agent card's advertised extensions, and return the negotiated set
+/// for echo on the response. Returns `UnsupportedOperationError` when
+/// the server advertises a `required = true` extension the client
+/// did not activate.
+pub(crate) fn negotiate_profile_extensions(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<std::collections::HashSet<String>, A2aError> {
+    let activated = crate::profile_dispatch::activated_from_headers(headers);
+    let card = state.executor.agent_card();
+    let advertised: &[turul_a2a_proto::AgentExtension] = card
+        .capabilities
+        .as_ref()
+        .map(|c| c.extensions.as_slice())
+        .unwrap_or(&[]);
+    crate::profile_dispatch::validate_activation(&activated, advertised)
+}
+
+/// Attach the `A2A-Extensions` echo header to a response when the
+/// negotiated set is non-empty. The header is set unconditionally
+/// when non-empty so streaming and non-streaming responses both carry
+/// the activation echo.
+pub(crate) fn attach_extension_echo(
+    mut response: axum::response::Response,
+    echoed: &std::collections::HashSet<String>,
+) -> axum::response::Response {
+    if let Some(value) = crate::profile_dispatch::response_header_value(echoed) {
+        if let Ok(header_value) = axum::http::HeaderValue::from_str(&value) {
+            response.headers_mut().insert(
+                axum::http::HeaderName::from_static(crate::profile_dispatch::A2A_EXTENSIONS_HEADER),
+                header_value,
+            );
+        }
+    }
+    response
 }
 
 // IntoResponse for A2aError — returns AIP-193 HTTP error body

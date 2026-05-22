@@ -84,6 +84,44 @@ fn internal_from_json(err: serde_json::Error) -> Status {
     Status::internal(format!("grpc adapter: proto/json mismatch: {err}"))
 }
 
+/// Parse the `a2a-extensions` gRPC metadata key, validate against the
+/// agent card's advertised extensions, and return the negotiated set
+/// for echo on the response trailers. Mirrors the HTTP path's
+/// [`crate::router::negotiate_profile_extensions`].
+fn negotiate_profile_extensions_grpc(
+    state: &AppState,
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<std::collections::HashSet<String>, crate::error::A2aError> {
+    let raw = metadata
+        .get(crate::profile_dispatch::A2A_EXTENSIONS_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let activated = crate::profile_dispatch::parse_a2a_extensions(raw);
+    let card = state.executor.agent_card();
+    let advertised: &[turul_a2a_proto::AgentExtension] = card
+        .capabilities
+        .as_ref()
+        .map(|c| c.extensions.as_slice())
+        .unwrap_or(&[]);
+    crate::profile_dispatch::validate_activation(&activated, advertised)
+}
+
+/// Attach the `a2a-extensions` echo metadata to a gRPC response.
+/// Metadata is set on initial response metadata (not trailers) so the
+/// client observes it before the first streaming frame.
+fn attach_extension_echo_grpc<T>(
+    response: &mut Response<T>,
+    echoed: &std::collections::HashSet<String>,
+) {
+    if let Some(value) = crate::profile_dispatch::response_header_value(echoed) {
+        if let Ok(metadata_value) = tonic::metadata::MetadataValue::try_from(value.as_str()) {
+            response.metadata_mut().insert(
+                crate::profile_dispatch::A2A_EXTENSIONS_HEADER,
+                metadata_value,
+            );
+        }
+    }
+}
+
 /// Boxed stream type used by both streaming RPCs. Keeps the `A2aService`
 /// associated types stable between the placeholder implementations here
 /// and the real streaming module that lands in the next commit.
@@ -100,6 +138,8 @@ impl pb::grpc::A2aService for GrpcService {
     ) -> Result<Response<pb::SendMessageResponse>, Status> {
         let owner = owner_from(&request);
         let tenant = tenant_from(&request, &request.get_ref().tenant);
+        let echoed = negotiate_profile_extensions_grpc(&self.state, request.metadata())
+            .map_err(a2a_to_status)?;
 
         // core_send_message wants the JSON body the HTTP handler would have
         // received — serialize the proto request back to JSON to reuse the
@@ -115,7 +155,9 @@ impl pb::grpc::A2aService for GrpcService {
 
         let response: pb::SendMessageResponse =
             serde_json::from_value(value).map_err(internal_from_json)?;
-        Ok(Response::new(response))
+        let mut wrapped = Response::new(response);
+        attach_extension_echo_grpc(&mut wrapped, &echoed);
+        Ok(wrapped)
     }
 
     // --- GetTask --------------------------------------------------------
@@ -323,6 +365,8 @@ impl pb::grpc::A2aService for GrpcService {
     ) -> Result<Response<Self::SendStreamingMessageStream>, Status> {
         let owner = owner_from(&request);
         let tenant = tenant_from(&request, &request.get_ref().tenant);
+        let echoed = negotiate_profile_extensions_grpc(&self.state, request.metadata())
+            .map_err(a2a_to_status)?;
         let body = serde_json::to_string(request.get_ref()).map_err(internal_from_json)?;
 
         let stream = crate::grpc::streaming::handle_send_streaming_message(
@@ -332,7 +376,9 @@ impl pb::grpc::A2aService for GrpcService {
             body,
         )
         .await?;
-        Ok(Response::new(stream))
+        let mut wrapped = Response::new(stream);
+        attach_extension_echo_grpc(&mut wrapped, &echoed);
+        Ok(wrapped)
     }
 
     type SubscribeToTaskStream = BoxedStreamResponseStream;

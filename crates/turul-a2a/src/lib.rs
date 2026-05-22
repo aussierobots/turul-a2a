@@ -62,6 +62,8 @@ pub mod grpc;
 pub mod jsonrpc;
 pub mod middleware;
 pub mod prelude;
+#[doc(hidden)]
+pub mod profile_dispatch;
 pub mod push;
 pub mod router;
 pub mod server;

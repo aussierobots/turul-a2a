@@ -31,7 +31,37 @@ use crate::streaming::{self, StreamEvent, replay};
 /// JSON-RPC 2.0 dispatch handler.
 ///
 /// POST /jsonrpc — accepts JSON-RPC 2.0 requests and dispatches to core handlers.
+///
+/// Wraps the inner dispatcher with profile-extension activation:
+/// the `A2A-Extensions` request header is parsed up front, a
+/// `required = true` advertised extension that the client did not
+/// activate trips an `UnsupportedOperationError` response without
+/// dispatching, and on success the activated URIs are echoed back in
+/// the same response header.
 pub async fn jsonrpc_dispatch_handler(
+    State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> axum::response::Response {
+    let echoed = match crate::router::negotiate_profile_extensions(&state, &headers) {
+        Ok(set) => set,
+        Err(err) => {
+            // The request id is not yet known here; passing `None`
+            // produces a JSON-RPC error envelope with `id: null` per
+            // §5.1, which is the right shape when the rejection is
+            // pre-dispatch.
+            return crate::router::attach_extension_echo(
+                Json(err.to_jsonrpc_error(None)).into_response(),
+                &std::collections::HashSet::new(),
+            );
+        }
+    };
+    let response = jsonrpc_dispatch_inner(State(state), axum::Extension(ctx), headers, body).await;
+    crate::router::attach_extension_echo(response, &echoed)
+}
+
+async fn jsonrpc_dispatch_inner(
     State(state): State<AppState>,
     axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
     headers: axum::http::HeaderMap,
