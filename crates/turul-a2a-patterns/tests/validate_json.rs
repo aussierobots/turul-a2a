@@ -1,4 +1,4 @@
-//! ADR-021 §2.2 item 3 — public `validate_json` free function.
+//! Public `validate_json` free function.
 //!
 //! `SkillCard` is `#[non_exhaustive]` with no public constructor, so
 //! adopters cannot validate arbitrary `(schema, instance)` pairs

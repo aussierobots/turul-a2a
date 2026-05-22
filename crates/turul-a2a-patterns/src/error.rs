@@ -8,7 +8,8 @@
 
 use thiserror::Error;
 
-/// Skill error surface. Exactly two variants per ADR-021 §2.2 item 5.
+/// Skill error surface. Exactly two variants; richer error shapes are
+/// the adopter's concern at the call site.
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum SkillError {
@@ -42,7 +43,7 @@ pub enum ManifestError {
     Schema { location: String, reason: String },
 }
 
-/// Structured template render error (§2.2 item 3).
+/// Structured template render error.
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum RenderError {
@@ -52,7 +53,7 @@ pub enum RenderError {
     Syntax { offset: usize, reason: String },
 }
 
-/// Structured I/O schema validation error (§2.2 item 3).
+/// Structured I/O schema validation error.
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ValidationError {

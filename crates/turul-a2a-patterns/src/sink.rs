@@ -1,6 +1,6 @@
 //! Progress sink trait used by handlers to emit non-terminal status updates
 //! and streaming artifacts. Terminal task states remain framework-owned and
-//! are deliberately not constructible through this surface (§2.3).
+//! are deliberately not constructible through this surface.
 
 use async_trait::async_trait;
 
@@ -44,7 +44,8 @@ pub trait SkillProgressSink: Send + Sync {
     }
 }
 
-// Compile-time object-safety assertion (§2.3 contract).
+// Compile-time object-safety assertion: `SkillProgressSink` must remain
+// usable behind `dyn`.
 const _: fn() = || {
     fn assert<T: ?Sized + SkillProgressSink>() {}
     assert::<dyn SkillProgressSink>();

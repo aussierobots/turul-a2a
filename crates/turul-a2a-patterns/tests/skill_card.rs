@@ -1,9 +1,8 @@
-//! ADR-021 §2.2 item 3 — SKILL.md manifest support.
+//! SKILL.md manifest support.
 //!
 //! Covers all four helpers (parsing, AgentSkill generation, prompt
 //! rendering, schema validation) with one positive and one negative
-//! case each. Phase A: every helper is `unimplemented!()`, so each
-//! test reaches the panic.
+//! case each.
 
 use serde_json::json;
 
@@ -47,7 +46,7 @@ fn parse_valid_manifest_yields_typed_card() {
 }
 
 /// Helper 1 — parsing: negative. Snake_case frontmatter must NOT be
-/// silently accepted (§2.2 item 3 — camelCase only).
+/// silently accepted (camelCase only).
 #[test]
 fn parse_rejects_snake_case_frontmatter() {
     let snake = r#"---
@@ -84,10 +83,9 @@ fn to_agent_skill_carries_all_eight_discovery_fields() {
 
 /// Helper 2 — AgentSkill projection: negative. The wire-discoverable
 /// projection MUST NOT include `params_schema` (that field is
-/// Turul-local; §2.2 item 4). Compile-by-name: the proto's
-/// `AgentSkill` has no schema field. This test asserts there's no
-/// runtime back-channel either: schemas live on `SkillCard`, never on
-/// `AgentSkill`.
+/// Turul-local). Compile-by-name: the proto's `AgentSkill` has no
+/// schema field. This test asserts there's no runtime back-channel
+/// either: schemas live on `SkillCard`, never on `AgentSkill`.
 #[test]
 fn to_agent_skill_does_not_advertise_input_schema() {
     let card = SkillCard::parse(VALID_MANIFEST).unwrap();
@@ -120,7 +118,7 @@ fn render_prompt_substitutes_dotted_path() {
 
 /// Helper 3 — prompt rendering: negative. Missing variables produce
 /// a structured `MissingVariable` error — never a silent empty
-/// substitution (§2.2 item 3 contract).
+/// substitution.
 #[test]
 fn render_prompt_missing_variable_is_structured_error() {
     use turul_a2a_patterns::RenderError;

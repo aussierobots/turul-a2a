@@ -1,10 +1,9 @@
 //! A2A agent that exposes a manifest-backed skill end-to-end.
 //!
-//! - Parses `skills/demo/SKILL.md` at startup (ADR-021 §2.2 item 3).
+//! - Parses `skills/demo/SKILL.md` at startup.
 //! - Registers a `SkillHandler` in an `InMemorySkillRegistry`.
 //! - Routes every inbound `execute()` call to that handler — this is the
-//!   **example-owned dispatcher**; ADR-021 §2.4 defers a framework-level
-//!   one.
+//!   **example-owned dispatcher**; the framework does not ship one.
 //! - Offline by default: the handler returns a deterministic stub that
 //!   satisfies the manifest's output schema, so `cargo test` is hermetic.
 //! - Live Ollama: enabled by setting `OLLAMA_BASE_URL` (or
@@ -40,7 +39,9 @@ const SKILL_MANIFEST: &str = include_str!("../skills/demo/SKILL.md");
 
 // ---------------------------------------------------------------------------
 // Bridge: orphan-rule-safe newtype around the framework's EventSink so we
-// can `impl SkillProgressSink for ExampleProgressSink`. See ADR-021 §2.3.
+// can `impl SkillProgressSink for ExampleProgressSink`. (Rust orphan rules
+// forbid implementing an external trait on an external type from a third
+// crate.)
 // ---------------------------------------------------------------------------
 
 struct ExampleProgressSink(EventSink);
@@ -94,10 +95,9 @@ impl SkillProgressSink for ExampleProgressSink {
 /// "EventSink is closed" prefix is the least-bad way to detect the
 /// closed-sink race today.
 ///
-/// TODO: when §4 gates clear and `turul-a2a-patterns` becomes
-/// publishable (per ADR-021 §4.1), `turul-a2a` gains a direct
-/// `impl SkillProgressSink for EventSink` and adopters no longer need
-/// this mapper. Until then, every newtype bridge across the
+/// TODO: once `turul-a2a-patterns` is published, `turul-a2a` gains a
+/// direct `impl SkillProgressSink for EventSink` and adopters no longer
+/// need this mapper. Until then, every newtype bridge across the
 /// `examples/` tree carries its own copy. The framework-side fix is
 /// also tracked: expose a typed close-state on `A2aError` (or a
 /// dedicated `EventSinkError`) so adapters don't need to string-match
@@ -337,7 +337,7 @@ impl AgentExecutor for ManifestExecutor {
         })?;
 
         // Bridge the framework EventSink through our newtype to satisfy
-        // the trait the handler expects (ADR-021 §2.3).
+        // the trait the handler expects.
         let sink = ExampleProgressSink(ctx.events.clone());
 
         match handler.run(params, &sink).await {

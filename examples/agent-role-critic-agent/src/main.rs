@@ -43,8 +43,8 @@ const VALIDATE_AGAINST_SCHEMA_MANIFEST: &str =
 const CHECK_INVARIANTS_MANIFEST: &str = include_str!("../skills/check_invariants/SKILL.md");
 
 // ---------------------------------------------------------------------------
-// EventSink bridge (ADR-021 §2.3). Local newtype so we can `impl
-// SkillProgressSink` without violating Rust's orphan rule.
+// EventSink bridge. Local newtype so we can `impl SkillProgressSink`
+// without violating Rust's orphan rule.
 // ---------------------------------------------------------------------------
 
 struct ExampleProgressSink(EventSink);
@@ -286,8 +286,7 @@ impl CriticExecutor {
         let registry = Arc::new(InMemorySkillRegistry::new());
 
         // Manifest-backed registration. The manifest is the single source of
-        // truth for the AgentSkill projection and the params schema
-        // (ADR-021 §2.2 item 3 + item 4).
+        // truth for the AgentSkill projection and the params schema.
         let validate_card = SkillCard::parse(VALIDATE_AGAINST_SCHEMA_MANIFEST)
             .map_err(|e| format!("parse validate_against_schema SKILL.md: {e}"))?;
         let validate_skill = validate_card.to_agent_skill();

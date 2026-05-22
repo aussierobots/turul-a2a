@@ -14,7 +14,7 @@
 //!    skill response would still surface to the caller. Adopters wanting
 //!    timeout / panic isolation should wrap the call in
 //!    `tokio::time::timeout` or `tokio::task::spawn` — those framework-side
-//!    semantics are deferred (see README and ADR-022).
+//!    semantics are deferred (see README).
 //! 4. The `metrics` skill exposes the counter so callers can observe that
 //!    the hook actually fired.
 //!
@@ -55,8 +55,8 @@ const COUNT_MANIFEST: &str = include_str!("../skills/count/SKILL.md");
 const METRICS_MANIFEST: &str = include_str!("../skills/metrics/SKILL.md");
 
 // ---------------------------------------------------------------------------
-// EventSink bridge (ADR-021 §2.3). Local newtype so we can `impl
-// SkillProgressSink` without violating the orphan rule.
+// EventSink bridge. Local newtype so we can `impl SkillProgressSink`
+// without violating the orphan rule.
 // ---------------------------------------------------------------------------
 
 struct ExampleProgressSink(EventSink);

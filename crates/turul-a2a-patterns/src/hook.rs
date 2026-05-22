@@ -1,6 +1,6 @@
 //! Terminal observer hook fired after `SkillHandler::run` returns. Hooks
 //! are best-effort observers — failures MUST NOT abort the surrounding
-//! execution (ADR-021 §9 Q5).
+//! execution.
 
 use async_trait::async_trait;
 
@@ -22,9 +22,9 @@ pub enum SkillOutcome<'a> {
 /// MUST NOT abort the surrounding execution. Hook implementations
 /// SHOULD bound their own work (timeouts, panic isolation) on the
 /// adopter side. The patterns crate does NOT impose framework-side
-/// timeout or isolation semantics in this initial version (per
-/// ADR-021 §9 Q5: extractor-registry semantics with isolation are
-/// dispatcher-dependent and remain parked).
+/// timeout or isolation semantics in this initial version: extractor /
+/// registry semantics with isolation are dispatcher-dependent and remain
+/// out of scope for the patterns crate.
 ///
 /// Implemented with `#[async_trait]` so adopter impls write standard
 /// `async fn` instead of hand-rolled `Pin<Box<dyn Future>>`. The macro

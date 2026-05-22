@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::error::ValidationError;
 
 /// Recognised JSON Schema 2020-12 keywords. Anything outside this set in a
-/// manifest's input/output schema is a strict-reject error (§2.2 item 3).
+/// manifest's input/output schema is a strict-reject error.
 pub(crate) const DRAFT_2020_12_KEYWORDS: &[&str] = &[
     // Core
     "$schema",
@@ -129,7 +129,7 @@ pub(crate) fn strict_keyword_check(schema: &Value, pointer: &str) -> Result<(), 
 ///
 /// Schema keywords outside the 2020-12 dialect are rejected at this
 /// call site via the same `strict_keyword_check` used by SKILL.md
-/// manifest validation. See ADR-021 §2.2 item 3.
+/// manifest validation.
 pub fn validate_json(
     schema: &serde_json::Value,
     instance: &serde_json::Value,

@@ -1,6 +1,8 @@
 //! `SkillRegistry` trait, `SkillDescriptor`, and the default in-memory
-//! implementation. Registry entries enforce the §2.2 item 4
-//! single-source-of-truth invariant on `params_schema`.
+//! implementation. Registry entries enforce a single-source-of-truth
+//! invariant on `params_schema`: for manifest-backed skills it is derived
+//! from the manifest's input schema; for programmatic skills it is supplied
+//! once at registration time. There is no second authoritative surface.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -17,10 +19,10 @@ use crate::manifest::SkillCard;
 /// Returned by `SkillRegistry::describe`.
 ///
 /// `params_schema` is **Turul-local runtime-planning metadata** — never on
-/// the wire. Per §2.2 item 4 single-source-of-truth invariant: for
-/// manifest-backed skills, derived from the manifest input schema; for
-/// programmatic skills, supplied once at registration. There is no second
-/// authoritative surface.
+/// the wire. Single-source-of-truth invariant: for manifest-backed skills
+/// it is derived from the manifest input schema; for programmatic skills
+/// it is supplied once at registration. There is no second authoritative
+/// surface.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct SkillDescriptor {
@@ -33,8 +35,8 @@ pub struct SkillDescriptor {
 #[async_trait]
 pub trait SkillRegistry: Send + Sync {
     /// Register a manifest-backed skill. The `params_schema` field of the
-    /// returned descriptor is derived from `card.input_schema` per
-    /// §2.2 item 4 (single source of truth).
+    /// returned descriptor is derived from `card.input_schema` (single
+    /// source of truth).
     async fn register_manifest(
         &self,
         card: SkillCard,
@@ -85,8 +87,8 @@ impl SkillRegistry for InMemorySkillRegistry {
         card: SkillCard,
         handler: Arc<dyn SkillHandler>,
     ) -> Result<(), SkillError> {
-        // §2.2 item 4 single source of truth: params_schema IS the
-        // manifest's input_schema, by construction.
+        // Single source of truth: params_schema IS the manifest's
+        // input_schema, by construction.
         let agent_skill = card.to_agent_skill();
         let descriptor = SkillDescriptor {
             id: card.id.clone(),

@@ -1,4 +1,4 @@
-//! `SkillCard` (SKILL.md) parsing and projection helpers (§2.2 item 3).
+//! `SkillCard` (SKILL.md) parsing and projection helpers.
 //!
 //! Hosts the `SkillCard` struct, `ExecutionHints`, the YAML→JSON
 //! frontmatter shim, and the `to_agent_skill` / `render_prompt` /
@@ -46,7 +46,8 @@ pub struct SkillCard {
     #[serde(default)]
     pub execution_hints: Option<ExecutionHints>,
 
-    // Opaque per §2.2 item 3 — patterns crate does not interpret.
+    // Opaque to this crate — the patterns layer does not interpret
+    // provider-specific configuration; that is the adopter's concern.
     #[serde(default)]
     pub provider_config: Option<Value>,
 
@@ -55,7 +56,7 @@ pub struct SkillCard {
     pub body: String,
 }
 
-/// Provider-neutral execution hints (§2.2 item 3).
+/// Provider-neutral execution hints.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
@@ -141,7 +142,8 @@ impl SkillCard {
             })?;
         card.body = body.to_string();
 
-        // Strict keyword check on declared input/output schemas (§2.2 item 3).
+        // Strict keyword check on declared input/output schemas: unknown
+        // JSON Schema keywords are rejected at parse time.
         if let Some(schema) = &card.input_schema {
             strict_keyword_check(schema, "/inputSchema").map_err(|e| match e {
                 ValidationError::UnsupportedKeyword { keyword } => ManifestError::Schema {
@@ -170,8 +172,10 @@ impl SkillCard {
     /// Project the eight A2A discovery fields onto an `AgentSkill`.
     ///
     /// Schemas, execution hints, and provider config are intentionally NOT
-    /// projected — they are Turul-local planning metadata, not wire fields
-    /// (§2.2 item 4 single-source-of-truth invariant).
+    /// projected — they are Turul-local planning metadata, not wire fields.
+    /// For manifest-backed skills, `params_schema` is derived from the
+    /// manifest's input schema, ensuring there is exactly one schema per
+    /// skill.
     pub fn to_agent_skill(&self) -> AgentSkill {
         AgentSkill {
             id: self.id.clone(),
@@ -181,10 +185,10 @@ impl SkillCard {
             examples: self.examples.clone(),
             input_modes: self.input_modes.clone(),
             output_modes: self.output_modes.clone(),
-            // ADR-021 §2.2 item 3 keeps the manifest representation of
-            // `securityRequirements` as a list of scheme names. Mapping to
-            // the proto's richer `SecurityRequirement` (scheme -> scopes)
-            // is empty-scope-by-default; empty list -> empty Vec.
+            // The manifest representation of `securityRequirements` is a
+            // list of scheme names. Mapping to the proto's richer
+            // `SecurityRequirement` (scheme -> scopes) is
+            // empty-scope-by-default; empty list -> empty Vec.
             security_requirements: self
                 .security_requirements
                 .iter()

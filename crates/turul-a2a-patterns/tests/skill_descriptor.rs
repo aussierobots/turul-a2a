@@ -1,7 +1,7 @@
-//! ADR-021 §2.2 item 4 — `SkillDescriptor.params_schema` is the single
-//! source of truth: derived from the manifest's input schema for
-//! manifest-backed skills, supplied once at registration for
-//! programmatic skills. There is no second authoritative surface.
+//! `SkillDescriptor.params_schema` is the single source of truth:
+//! derived from the manifest's input schema for manifest-backed skills,
+//! supplied once at registration for programmatic skills. There is no
+//! second authoritative surface.
 
 use std::sync::Arc;
 

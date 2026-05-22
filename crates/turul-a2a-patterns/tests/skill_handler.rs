@@ -1,6 +1,5 @@
-//! ADR-021 §2.2 item 1 — `SkillHandler` is an async, object-safe trait
-//! that takes structured input + a `&dyn SkillProgressSink` and returns
-//! a typed result.
+//! `SkillHandler` is an async, object-safe trait that takes structured
+//! input + a `&dyn SkillProgressSink` and returns a typed result.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -36,10 +35,7 @@ impl SkillProgressSink for StubSink {
 }
 
 /// Positive: a hand-written `SkillHandler` is dispatchable through
-/// `&dyn SkillHandler` and reaches the sink. Phase A: this fails
-/// because no first-party handler has been built yet, so we drive a
-/// stub through the framework-supplied glue once it lands. Today the
-/// glue does not exist, so we explicitly assert presence.
+/// `&dyn SkillHandler` and reaches the sink.
 #[tokio::test]
 async fn skill_handler_trait_is_dyn_dispatchable() {
     struct Echo {
@@ -67,7 +63,7 @@ async fn skill_handler_trait_is_dyn_dispatchable() {
 }
 
 /// Negative: `SkillHandler::run` returning `Err(SkillError::InvalidRequest)`
-/// propagates as the typed error variant (§2.2 item 5 maps to A2A
+/// propagates as the typed error variant (which maps to A2A
 /// InvalidRequest).
 #[tokio::test]
 async fn skill_handler_invalid_request_propagates_as_typed_error() {

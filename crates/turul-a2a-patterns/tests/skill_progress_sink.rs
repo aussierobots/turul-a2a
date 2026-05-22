@@ -1,4 +1,4 @@
-//! ADR-021 §2.3 — `SkillProgressSink` binding contract:
+//! `SkillProgressSink` binding contract:
 //! - object-safe (`dyn SkillProgressSink` is a valid type),
 //! - `ProgressState` enum has Working/InputRequired/AuthRequired and
 //!   no terminal states (Completed/Failed/Canceled/Rejected),
@@ -87,8 +87,9 @@ fn progress_state_excludes_terminal_states() {
     //     let _ = ProgressState::Completed;   // would fail to compile
     //     let _ = ProgressState::Failed;      // would fail to compile
     //
-    // If a future change adds any of these variants, that change is an
-    // ADR-021 §2.3 violation.
+    // Adding any of these variants would break the contract that
+    // terminal task states remain framework-owned and are not
+    // constructible through the sink surface.
 }
 
 #[test]

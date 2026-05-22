@@ -1,4 +1,4 @@
-//! ADR-021 §9 Q5 — terminal-hook trait (simpler-generic variant).
+//! Terminal-hook trait (simpler-generic variant).
 //!
 //! The trait is dispatcher-independent: adopters invoke `on_terminal`
 //! from their own dispatch code after `SkillHandler::run` returns.

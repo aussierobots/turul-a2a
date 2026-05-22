@@ -1,5 +1,5 @@
-//! ADR-021 §2.2 item 5 — `SkillError` has exactly two variants:
-//! `InvalidRequest(String)` and `Internal(String)`.
+//! `SkillError` has exactly two variants: `InvalidRequest(String)` and
+//! `Internal(String)`.
 
 use turul_a2a_patterns::SkillError;
 

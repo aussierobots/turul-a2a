@@ -3,8 +3,7 @@
 //!
 //! Shape:
 //! 1. Two manifest-backed skills are registered in an
-//!    `InMemorySkillRegistry` via `SkillCard::parse` + `register_manifest`
-//!    (ADR-021 §2.2 item 3):
+//!    `InMemorySkillRegistry` via `SkillCard::parse` + `register_manifest`:
 //!    - `add` — sums two numbers (`skills/add/SKILL.md`).
 //!    - `concat` — joins an array of strings (`skills/concat/SKILL.md`).
 //! 2. A small **planner** inspects inbound text and decomposes it into a
@@ -13,7 +12,7 @@
 //!    manifest is the wrong shape for it (see README).
 //! 3. A **router** invokes the chosen skill via the registry, bridging the
 //!    framework `EventSink` through an example-owned newtype that
-//!    implements `SkillProgressSink` (ADR-021 §2.3).
+//!    implements `SkillProgressSink`.
 //! 4. The skill's structured JSON output is emitted as an artifact.
 //!
 //! No LLM, no network egress, no proprietary surfaces. Offline by default
@@ -46,8 +45,8 @@ const ADD_MANIFEST: &str = include_str!("../skills/add/SKILL.md");
 const CONCAT_MANIFEST: &str = include_str!("../skills/concat/SKILL.md");
 
 // ---------------------------------------------------------------------------
-// EventSink bridge (ADR-021 §2.3). Local newtype so we can `impl
-// SkillProgressSink` without violating Rust's orphan rule.
+// EventSink bridge. Local newtype so we can `impl SkillProgressSink`
+// without violating Rust's orphan rule.
 // ---------------------------------------------------------------------------
 
 struct ExampleProgressSink(EventSink);
@@ -302,8 +301,8 @@ impl PlannerRouterExecutor {
         let concat_card =
             SkillCard::parse(CONCAT_MANIFEST).map_err(|e| format!("parse concat SKILL.md: {e}"))?;
 
-        // Project the discovery surfaces (eight AgentSkill fields per
-        // §2.2 item 4) BEFORE registration consumes the cards.
+        // Project the discovery surfaces (eight AgentSkill fields) BEFORE
+        // registration consumes the cards.
         let add_agent_skill = add_card.to_agent_skill();
         let concat_agent_skill = concat_card.to_agent_skill();
 

@@ -1,5 +1,5 @@
-//! ADR-021 §2.2 item 2 — `SkillRegistry` trait + `InMemorySkillRegistry`
-//! default impl maps `AgentSkill.id` → registered `SkillHandler`.
+//! `SkillRegistry` trait + `InMemorySkillRegistry` default impl maps
+//! `AgentSkill.id` → registered `SkillHandler`.
 
 use std::sync::Arc;
 
@@ -90,7 +90,6 @@ async fn describe_unknown_returns_none() {
 }
 
 /// Surface check: dispatch a handler through the registry's lookup.
-/// Phase A: `handler()` is `unimplemented!()`, so this panics.
 #[tokio::test]
 async fn handler_lookup_dispatches_through_dyn() {
     let reg = InMemorySkillRegistry::new();
