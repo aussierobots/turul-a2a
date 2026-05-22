@@ -1,4 +1,4 @@
-//! Server-level dispatcher integration tests (ADR-011 §13.1, §13.13).
+//! Server-level dispatcher integration tests.
 //!
 //! Unlike `push_delivery_integration.rs`, which exercises
 //! `PushDeliveryWorker::deliver` in isolation, these tests stand up a
@@ -183,7 +183,8 @@ async fn framework_cancel_triggers_push_delivery_with_canceled_state() {
     // --- Drive the task to CANCELED via :cancel (framework-committed)
     // Nothing is in-flight on this instance, so the cancel handler
     // writes the marker, polls grace (50ms), and force-commits
-    // CANCELED via the atomic store — exactly the path §13.13 pins.
+    // CANCELED via the atomic store — the framework-committed
+    // terminal path that push delivery must fan out from.
     let cancel_req = Request::builder()
         .method(Method::POST)
         .uri(format!("/tasks/{task_id}:cancel"))
@@ -313,9 +314,8 @@ impl turul_a2a::storage::A2aPushNotificationStorage for TinyPageStorage {
         _page_size: Option<i32>,
     ) -> Result<turul_a2a::storage::PushConfigListPage, turul_a2a::storage::A2aStorageError> {
         // Force page_size=1 on the eligibility path too, so the
-        // dispatcher-pagination regression test still exercises the
-        // multi-page traversal after ADR-013's list_configs → eligible
-        // switch.
+        // dispatcher-pagination regression test exercises multi-page
+        // traversal through the `list_configs_eligible_at_event` API.
         self.inner
             .list_configs_eligible_at_event(tenant, task_id, event_sequence, page_token, Some(1))
             .await
@@ -426,7 +426,7 @@ async fn dispatcher_paginates_through_all_push_configs() {
 }
 
 // ---------------------------------------------------------------------------
-// push-config create rejects unparseable URL (ADR-011 §R1).
+// push-config create rejects unparseable URL.
 //
 // The create-time URL-parse check gives operators an immediate 400
 // when the webhook URL is malformed. Without it the dispatcher would

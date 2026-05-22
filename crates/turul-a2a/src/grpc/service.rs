@@ -1,7 +1,7 @@
 //! `A2aService` implementation — gRPC transport adapter.
 //!
 //! Every RPC dispatches into the same `core_*` function that HTTP and
-//! JSON-RPC call (ADR-005 extended). The adapter does only:
+//! JSON-RPC call. The adapter does only:
 //!   1. tenant + owner extraction (metadata → fallback to proto → fallback "")
 //!   2. serialize incoming proto to JSON for the core body argument
 //!   3. deserialize core JSON response back to the proto response type
@@ -38,17 +38,15 @@ impl GrpcService {
     }
 }
 
-/// Pull the tenant ID for this request. Precedence (ADR-014 §2.4,
-/// normative):
+/// Pull the tenant ID for this request. Precedence (normative):
 ///   1. Proto `tenant` field on the request, when non-empty.
 ///   2. `x-tenant-id` ASCII metadata, when the proto field is empty.
 ///   3. Empty string (= DEFAULT_TENANT, matches the HTTP default route).
 ///
 /// When both are set and differ, the proto field wins — the metadata is
-/// ignored rather than raising an error. Rationale is in the ADR:
-/// every A2AService request proto carries `tenant` explicitly, and
-/// HTTP/JSON-RPC also bind tenant via explicit wire fields (URL path /
-/// JSON-RPC param).
+/// ignored rather than raising an error. Every A2AService request proto
+/// carries `tenant` explicitly, and HTTP/JSON-RPC also bind tenant via
+/// explicit wire fields (URL path / JSON-RPC param).
 pub(crate) fn tenant_from<T>(req: &Request<T>, proto_tenant: &str) -> String {
     if !proto_tenant.is_empty() {
         return proto_tenant.to_string();
@@ -108,9 +106,8 @@ impl pb::grpc::A2aService for GrpcService {
         // existing input path (including `configuration.returnImmediately`).
         let body = serde_json::to_string(request.get_ref()).map_err(internal_from_json)?;
 
-        // gRPC auth claims are not yet wired (future ADR). Pass None for now;
-        // matches the pre-ADR-018 runtime behaviour where executors observed
-        // `ctx.claims = None` on this path.
+        // gRPC auth claims are not yet wired. Pass None for now; executors
+        // observe `ctx.claims = None` on this path.
         let value = router::core_send_message(self.state.clone(), &tenant, &owner, None, body)
             .await
             .map_err(a2a_to_status)?
@@ -304,10 +301,10 @@ impl pb::grpc::A2aService for GrpcService {
         &self,
         _request: Request<pb::GetExtendedAgentCardRequest>,
     ) -> Result<Response<pb::AgentCard>, Status> {
-        // No core_* helper — the HTTP handler calls the executor directly
-        // (`router.rs:391-402`). Mirror that path verbatim: claims are
-        // `None` for now (the HTTP GET endpoint passes `None` too; ADR-007
-        // §7 extension to pass JWT claims through is future work).
+        // No core_* helper — the HTTP handler calls the executor directly.
+        // Mirror that path verbatim: claims are `None` for now (the HTTP
+        // GET endpoint passes `None` too; passing JWT claims through is
+        // future work).
         match self.state.executor.extended_agent_card(None) {
             Some(card) => Ok(Response::new(card)),
             None => Err(a2a_to_status(

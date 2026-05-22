@@ -1,4 +1,4 @@
-//! DynamoDB Stream-triggered push recovery handler (ADR-013 §5.2 / §8).
+//! DynamoDB Stream-triggered push recovery handler.
 //!
 //! When a DynamoDB Stream is configured on the
 //! `a2a_push_pending_dispatches` table with `StreamViewType::NEW_IMAGE`,
@@ -134,7 +134,7 @@ fn push_failure(failures: &mut Vec<DynamoDbBatchItemFailure>, seq: Option<String
 /// Reconstruct a [`PendingDispatch`] from a DynamoDB Stream NEW_IMAGE.
 ///
 /// Expects the attributes the backend writes via
-/// `A2aAtomicStore::update_task_status_with_events` (ADR-013 §4.3 /
+/// `A2aAtomicStore::update_task_status_with_events` (the
 /// `dynamodb::DynamoDbA2aStorage` marker Put):
 ///
 /// - `tenant` (S)

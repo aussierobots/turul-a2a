@@ -1,4 +1,4 @@
-//! / §10.9 / §10.10 tests for [`LambdaScheduledRecoveryHandler`].
+//! Tests for [`LambdaScheduledRecoveryHandler`].
 //!
 //! The scheduled handler is the mandatory backstop: when DynamoDB
 //! Streams are unavailable (non-DDB backends, stream stalled, poison
@@ -100,9 +100,9 @@ async fn seed_task_with_marker(
 
 #[tokio::test]
 async fn scheduled_sweep_recovers_stale_marker_and_fires_post() {
-    // / §10.9: a marker committed before this tick's
-    // cutoff is picked up by list_stale_pending_dispatches and
-    // redispatched → exactly one POST lands; the marker is gone.
+    // A marker committed before this tick's cutoff is picked up by
+    // list_stale_pending_dispatches and redispatched → exactly one
+    // POST lands; the marker is gone.
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/webhook"))
@@ -310,10 +310,9 @@ async fn scheduled_sweep_counts_transient_error_and_retains_marker() {
 
 #[tokio::test]
 async fn scheduled_sweep_processes_reclaimable_claims() {
-    // / §10.10: reclaimable claim rows are enumerated and
-    // redispatched. Here we seed an expired non-terminal claim row
-    // directly, then run a sweep and verify
-    // reclaimable_claims_processed reflects the row.
+    // Reclaimable claim rows are enumerated and redispatched. Here
+    // we seed an expired non-terminal claim row directly, then run a
+    // sweep and verify reclaimable_claims_processed reflects the row.
     let (storage, dispatcher, delivery) = build_stack().await;
     let (tenant, task_id, _owner, seq) =
         seed_task_with_marker(&storage, "http://unused.invalid/webhook", "t-reclaim").await;

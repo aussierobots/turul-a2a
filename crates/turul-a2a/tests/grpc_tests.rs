@@ -6,7 +6,7 @@
 //! `A2aGrpcClient` wrapper lands in a later commit and will piggy-back
 //! on the same server helper.
 //!
-//! Normative obligations covered (see ADR-014 §2.11):
+//! Normative obligations covered:
 //!   * 9 unary + 2 streaming RPCs each exercised at least once.
 //!   * Error mapping: canonical gRPC codes + `ErrorInfo` with reason
 //!     strings from `turul_a2a_types::wire::errors::REASON_*` and
@@ -746,10 +746,10 @@ async fn grpc_auth_message_insufficient_scope_is_permission_denied() {
 
 #[tokio::test]
 async fn grpc_auth_internal_never_leaks_inner_string() {
-    // This is the original ADR-016 motivating regression: the inner
-    // String on Internal(_) MUST NOT reach the wire. Previously the
-    // gRPC layer used format!("{err:?}"), which surfaced "secret-..."
-    // text on grpc-message. Now it collapses to "internal_error".
+    // Regression: the inner String on `MiddlewareError::Internal(_)`
+    // MUST NOT reach the wire. The gRPC layer must collapse it to the
+    // fixed body string "internal_error" rather than formatting the
+    // Debug-form of the error.
     let secret = "secret-jwks-fetch-failed-https://internal.example/jwks";
     let s = drive_get_task_err(MiddlewareError::Internal(secret.into())).await;
     assert_eq!(s.code(), tonic::Code::Internal);

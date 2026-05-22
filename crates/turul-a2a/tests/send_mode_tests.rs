@@ -1,4 +1,4 @@
-//! Send-mode coverage for ADR-010 §9.
+//! Send-mode coverage.
 //!
 //! These tests drive `core_send_message` end-to-end against an
 //! in-memory backend with a live EventSink and the spawn-and-track
@@ -7,9 +7,9 @@
 //! - A long-running sink-driven executor completes correctly through
 //!   the blocking send path.
 //! - Direct-task-mutation executors that never touch `ctx.events`
-//!   still reach a durable terminal via the framework's §7.2
-//!   detection rule — and that terminal goes through the CAS-guarded
-//!   `update_task_status_with_events`, NOT the old
+//!   still reach a durable terminal via the framework's
+//!   post-execute detection rule — and that terminal goes through
+//!   the CAS-guarded `update_task_status_with_events`, NOT the old
 //!   `update_task_with_events` bypass.
 //! - An executor returning `Err` yields a `FAILED` task with the error
 //!   text, not a silently-stuck task.

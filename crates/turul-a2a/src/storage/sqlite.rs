@@ -20,8 +20,8 @@ use crate::streaming::StreamEvent;
 pub struct SqliteConfig {
     pub database_url: String,
     pub max_connections: u32,
-    /// ADR-019: when true, [`SqliteA2aStorage::new`] skips DDL bootstrap
-    /// and trusts the operator-provisioned schema. Default `false`
+    /// When true, [`SqliteA2aStorage::new`] skips DDL bootstrap and
+    /// trusts the operator-provisioned schema. Default `false`
     /// preserves the auto-bootstrap behavior. Adopters who set this
     /// flag own forward migrations on every release that changes the
     /// schema (see CHANGELOG).
@@ -89,11 +89,11 @@ impl SqliteA2aStorage {
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        // Additive migration for pre-0.1.4 deployments: add the ADR-012
-        // cancel_requested column if the table already exists without it.
-        // SQLite has no conditional ADD COLUMN, so we attempt the ALTER
-        // and ignore the duplicate-column error. This is the standard
-        // idempotent migration pattern for SQLite.
+        // Additive migration for pre-0.1.4 deployments: add the
+        // cancel_requested column if the table already exists without
+        // it. SQLite has no conditional ADD COLUMN, so we attempt the
+        // ALTER and ignore the duplicate-column error. This is the
+        // standard idempotent migration pattern for SQLite.
         let alter_result = sqlx::query(
             "ALTER TABLE a2a_tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
         )
@@ -1299,14 +1299,14 @@ impl A2aAtomicStore for SqliteA2aStorage {
                 && event.is_terminal()
                 && matches!(event, StreamEvent::StatusUpdate { .. })
             {
-                // §Pending-dispatch optimization: skip the
-                // marker write if no push configs exist for the task.
-                // A config registered after terminal is not eligible
-                // for that terminal event anyway (ADR-009
-                // `registered_after_event_sequence`), so skipping is
-                // correctness-neutral and avoids steady-state row
-                // accumulation on deployments that never register
-                // webhooks.
+                // Pending-dispatch optimization: skip the marker write
+                // if no push configs exist for the task. A config
+                // registered after terminal is not eligible for that
+                // terminal event anyway (the
+                // `registered_after_event_sequence` eligibility filter
+                // excludes it), so skipping is correctness-neutral and
+                // avoids steady-state row accumulation on deployments
+                // that never register webhooks.
                 let config_count: i64 = sqlx::query_scalar(
                     "SELECT COUNT(*) FROM a2a_push_configs \
                      WHERE tenant = ?1 AND task_id = ?2",
@@ -2551,7 +2551,7 @@ mod tests {
         parity_tests::test_push_concurrent_claim_race(s).await;
     }
 
-    // Atomic pending-dispatch marker parity (ADR-013 §4.3 / §10.1).
+    // Atomic pending-dispatch marker parity.
 
     async fn opted_in_storage() -> SqliteA2aStorage {
         storage().await.with_push_dispatch_enabled(true)
@@ -2581,7 +2581,7 @@ mod tests {
         parity_tests::test_atomic_marker_absent_when_opt_in_off(&s, &s, &s).await;
     }
 
-    // Causal-floor eligibility parity (ADR-013 §4.5 / §10.3 / §10.4).
+    // Causal-floor eligibility parity.
 
     #[tokio::test]
     async fn test_config_registered_at_or_after_event_not_eligible() {
@@ -2595,9 +2595,10 @@ mod tests {
         parity_tests::test_late_create_config_stamps_advanced_sequence(&s, &s, &s).await;
     }
 
-    // ADR-019: opt-in least-privilege bootstrap. When the flag is set,
-    // new() MUST NOT run any DDL. Steady-state ops then fail loudly
-    // because the operator-provisioned schema is absent in this test.
+    // Opt-in least-privilege bootstrap. When `assume_schema_initialized`
+    // is set, new() MUST NOT run any DDL. Steady-state ops then fail
+    // loudly because the operator-provisioned schema is absent in this
+    // test.
     #[tokio::test]
     async fn test_assume_schema_initialized_skips_ddl() {
         let storage = SqliteA2aStorage::new(SqliteConfig {
@@ -2624,8 +2625,8 @@ mod tests {
         }
     }
 
-    // ADR-019: default (flag unset) preserves the auto-bootstrap path.
-    // Same in-memory URL — proves the only difference is the flag.
+    // Default (flag unset) preserves the auto-bootstrap path. Same
+    // in-memory URL — proves the only difference is the flag.
     #[tokio::test]
     async fn test_default_still_creates_schema() {
         let storage = SqliteA2aStorage::new(SqliteConfig {

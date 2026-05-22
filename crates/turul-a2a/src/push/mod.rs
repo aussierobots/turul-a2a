@@ -13,10 +13,9 @@
 //! not need to implement the new trait — configs remain stored, just
 //! not delivered (the current framework behaviour).
 //!
-//! See ADR-011 for the full design. The trait docstrings carry the
-//! normative contract; backend parity tests in
-//! `crates/turul-a2a/src/storage/parity_tests.rs` gate per-backend
-//! acceptance.
+//! The trait docstrings carry the normative contract; backend parity
+//! tests in `crates/turul-a2a/src/storage/parity_tests.rs` gate
+//! per-backend acceptance.
 
 pub mod claim;
 pub mod delivery;

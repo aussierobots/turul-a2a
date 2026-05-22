@@ -1,7 +1,7 @@
 //! NoStreamingLayer — rejects streaming paths with UnsupportedOperationError.
 //!
-//! Per ADR-008: streaming on Lambda uses the existing A2A error contract,
-//! not a Lambda-specific 501.
+//! Streaming on Lambda surfaces via the A2A error contract (UnsupportedOperationError),
+//! not a Lambda-specific 501. Adopters get a single normative error surface across transports.
 
 use std::task::{Context, Poll};
 

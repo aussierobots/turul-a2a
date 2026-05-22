@@ -93,13 +93,12 @@ pub enum A2aStorageError {
         config_id: String,
     },
 
-    /// / §6.4: `create_config` exhausted its bounded
-    /// retry budget (default 5 attempts with 10/50/250/1000 ms
-    /// backoff) while its CAS against `a2a_tasks.latest_event_sequence`
-    /// kept losing to concurrent event commits. The operator should
-    /// retry the create from the handler; in practice this surfaces
-    /// only under pathological event-burst workloads against a single
-    /// task.
+    /// `create_config` exhausted its bounded retry budget (default 5
+    /// attempts with 10/50/250/1000 ms backoff) while its CAS against
+    /// `a2a_tasks.latest_event_sequence` kept losing to concurrent
+    /// event commits. The operator should retry the create from the
+    /// handler; in practice this surfaces only under pathological
+    /// event-burst workloads against a single task.
     #[error(
         "create_config CAS exhausted retries for tenant={tenant} task_id={task_id}: \
          concurrent event commits kept advancing latest_event_sequence"

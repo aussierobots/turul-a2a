@@ -1,12 +1,12 @@
-//! Push-notification delivery dispatcher (ADR-011 §2, §13.1, §13.13).
+//! Push-notification delivery dispatcher.
 //!
 //! When a durable status event is committed to storage, this
 //! dispatcher fans out per-config deliveries:
 //!
 //! - Terminal `StatusUpdate` events trigger delivery (one POST per
 //!   registered push config on the task).
-//! - `ArtifactUpdate` events do not trigger delivery (ADR-011
-//!   §13.11).
+//! - `ArtifactUpdate` events do not trigger delivery (push is a
+//!   terminal-only signal).
 //! - Non-terminal status transitions do not trigger delivery.
 //!
 //! The dispatcher takes ownership of the work of translating a
@@ -18,8 +18,8 @@
 //!
 //! The framework-committed terminal paths (CancelTask force-commit,
 //! blocking-send hard-timeout FAILED) both route through this
-//! dispatcher so ADR-011 §13.13 — "framework-committed CANCELED
-//! triggers delivery" — is satisfied by construction.
+//! dispatcher so framework-committed terminals (CANCELED, FAILED)
+//! trigger delivery by construction.
 //!
 //! # Transient-store-error handling
 //!
@@ -158,12 +158,12 @@ impl PushDispatcher {
             }
         };
 
-        // / §5.5: fan out per-seq using the eligibility
-        // filter. Each terminal sequence gets its own eligible config
-        // set: configs registered with `registered_after_event_sequence
-        // < seq` only. This preserves the no-backfill invariant
-        // against any late-config registration that landed between
-        // the marker commit and this dispatch.
+        // Fan out per-seq using the eligibility filter. Each terminal
+        // sequence gets its own eligible config set: configs registered
+        // with `registered_after_event_sequence < seq` only. This
+        // preserves the no-backfill invariant against any late-config
+        // registration that landed between the marker commit and this
+        // dispatch.
         const LIST_MAX_ATTEMPTS: u32 = 3;
         let backoffs = [
             std::time::Duration::from_millis(50),
@@ -387,16 +387,15 @@ impl PushDispatcher {
             .await;
     }
 
-    /// Recovery-path variant of [`Self::redispatch_pending`] (ADR-013
-    /// §5.2 / §5.3). Returns `Ok(())` when the marker has been
-    /// consumed — either fan-out completed or the task was deleted
-    /// — so the caller (Lambda stream worker or scheduled worker)
-    /// can acknowledge the work. Returns `Err(_)` on a transient
-    /// storage error; the marker is retained for the next tick and
-    /// the caller should surface a retryable signal (e.g.
-    /// BatchItemFailure on the stream handler).
+    /// Recovery-path variant of [`Self::redispatch_pending`]. Returns
+    /// `Ok(())` when the marker has been consumed — either fan-out
+    /// completed or the task was deleted — so the caller (Lambda stream
+    /// worker or scheduled worker) can acknowledge the work. Returns
+    /// `Err(_)` on a transient storage error; the marker is retained
+    /// for the next tick and the caller should surface a retryable
+    /// signal (e.g. BatchItemFailure on the stream handler).
     ///
-    /// Semantics match ADR-013 §4.6:
+    /// Recovery semantics:
     ///
     /// - `get_task → Ok(Some(task))` → refresh recorded_at, run
     ///   fan-out, delete marker → `Ok(())`.
@@ -601,8 +600,8 @@ impl PushDispatcher {
     }
 }
 
-/// Deliver only on terminal status events (ADR-011 §2 + §13.11).
-/// Artifact events are out of scope for push delivery.
+/// Deliver only on terminal status events. Artifact events are out of
+/// scope for push delivery.
 fn dispatch_eligible(ev: &StreamEvent) -> bool {
     matches!(ev, StreamEvent::StatusUpdate { .. }) && ev.is_terminal()
 }

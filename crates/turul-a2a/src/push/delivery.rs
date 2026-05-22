@@ -1,4 +1,4 @@
-//! Push delivery worker (ADR-011 §4, §5).
+//! Push delivery worker.
 //!
 //! [`PushDeliveryWorker::deliver`] is the per-(event, config) entry
 //! point: it claims, POSTs with retries, and records the final
@@ -53,9 +53,10 @@ use crate::push::ssrf::{
 };
 use crate::storage::A2aStorageError;
 
-/// Runtime-configurable delivery parameters (ADR-011 §5, §R3).
+/// Runtime-configurable delivery parameters.
 ///
-/// Defaults match ADR-011's recommended ~3-minute retry horizon.
+/// Defaults give a ~3-minute retry horizon (5 attempts with exponential
+/// backoff capped at 30s).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct PushDeliveryConfig {
@@ -157,10 +158,10 @@ impl PushDeliveryWorker {
     /// risk cross-target DNS cache pollution when the worker handles
     /// deliveries to different hosts back-to-back.
     ///
-    /// Per-attempt client config matches ADR-011 §5 / §R3:
+    /// Per-attempt client config:
     /// - Connect timeout: `connect_timeout`.
     /// - Read / total timeout: `request_timeout`.
-    /// - Redirects: none (§R4).
+    /// - Redirects: none (HTTP redirects are SSRF risk on push delivery).
     pub fn new(
         push_delivery_store: Arc<dyn A2aPushDeliveryStore>,
         config: PushDeliveryConfig,
@@ -189,9 +190,8 @@ impl PushDeliveryWorker {
     /// tokio task so other (event, config) pairs can proceed in
     /// parallel.
     pub async fn deliver(&self, target: &PushTarget, payload: &[u8]) -> DeliveryReport {
-        // Payload size cap — ADR-011 §R5. Skip the POST entirely;
-        // GaveUp with PayloadTooLarge so operators see it in the
-        // failed-delivery list.
+        // Payload size cap. Skip the POST entirely; GaveUp with
+        // PayloadTooLarge so operators see it in the failed-delivery list.
         if payload.len() > self.config.max_payload_bytes {
             let claim = match self.claim(target).await {
                 Ok(c) => c,
@@ -411,8 +411,7 @@ impl PushDeliveryWorker {
     ///   writer finalised the row under our fencing token, so the
     ///   terminal state IS durable cluster-wide — just not from our
     ///   perspective. Receivers may observe one extra POST in this
-    ///   race, which at-least-once semantics already allow
-    ///   (ADR-011 §5a).
+    ///   race, which at-least-once delivery semantics already allow.
     /// - `Err(_)` → `TransientStoreError`. The POST happened but the
     ///   row is still non-terminal; operator intervention (or a
     ///   future reclaim-and-redispatch sweeper) is required. The

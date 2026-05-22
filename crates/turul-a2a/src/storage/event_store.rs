@@ -1,7 +1,8 @@
 //! Durable event store trait for cross-instance streaming coordination.
 //!
-//! Per ADR-009: event store and task store MUST share the same backend.
-//! A single storage instance implements both `A2aTaskStorage` and `A2aEventStore`.
+//! Event store and task store MUST share the same backend: a single
+//! storage instance implements both `A2aTaskStorage` and
+//! `A2aEventStore`. The builder rejects split configurations.
 
 use async_trait::async_trait;
 

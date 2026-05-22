@@ -1095,10 +1095,10 @@ async fn query_latest_event_sequence(
     tasks_table: &str,
     pk: &str,
 ) -> Result<u64, A2aStorageError> {
-    // Strongly-consistent read: this value feeds the ADR-013 §6.3
-    // monotonic `latestEventSequence` invariant in the next
-    // TransactWriteItems — a stale read would under-compute the new
-    // sequence and risk a condition failure or monotonicity violation.
+    // Strongly-consistent read: this value feeds the monotonic
+    // `latestEventSequence` invariant in the next TransactWriteItems —
+    // a stale read would under-compute the new sequence and risk a
+    // condition failure or monotonicity violation.
     let result = client
         .get_item()
         .consistent_read(true)
@@ -1481,15 +1481,15 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         // events only — non-terminal / artifact events do not produce
         // markers.
         //
-        // §Pending-dispatch optimization: if push_dispatch is
-        // on, pre-flight a single Query on the push_configs table
-        // scoped to this task. When zero configs exist, skip marker
-        // writes for any terminal events in this batch. Configs
-        // registered after terminal are not eligible for that
-        // terminal event anyway (ADR-009
-        // `registered_after_event_sequence`), so this is
-        // correctness-neutral and avoids steady-state row
-        // accumulation on deployments that never register webhooks.
+        // Pending-dispatch optimization: if push_dispatch is on,
+        // pre-flight a single Query on the push_configs table scoped
+        // to this task. When zero configs exist, skip marker writes
+        // for any terminal events in this batch. Configs registered
+        // after terminal are not eligible for that terminal event
+        // anyway (the `registered_after_event_sequence` eligibility
+        // filter excludes them), so this is correctness-neutral and
+        // avoids steady-state row accumulation on deployments that
+        // never register webhooks.
         let has_push_configs = if self.push_dispatch_enabled {
             let query = self
                 .client
@@ -1632,18 +1632,18 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let task_json = Self::task_to_json(&task)?;
         let state_str = Self::status_state_str(&task);
 
-        // Get current max sequence AND prior latest_event_sequence
-        // (ADR-013 §6.3: full-replacement Put must not regress the
-        // causal floor when events is empty).
+        // Get current max sequence AND prior latest_event_sequence:
+        // a full-replacement Put must not regress the causal floor
+        // when events is empty.
         let max_seq = query_max_sequence(&self.client, &self.config.events_table, &pk).await?;
         let prior_latest =
             query_latest_event_sequence(&self.client, &self.config.tasks_table, &pk).await?;
         let new_latest_event_sequence = prior_latest.max(max_seq + events.len() as u64);
 
-        // Build TransactWriteItems: task put (with owner check + terminal
-        // CAS) + event puts. ADR-010 §7.1 extension: the ConditionExpression
-        // rejects writes against a task whose persisted statusState is
-        // already terminal, protecting against full-task replacement
+        // Build TransactWriteItems: task put (with owner check +
+        // terminal CAS) + event puts. The ConditionExpression rejects
+        // writes against a task whose persisted statusState is already
+        // terminal, protecting against full-task replacement
         // clobbering a concurrent terminal commit.
         let mut task_put = aws_sdk_dynamodb::types::Put::builder()
             .table_name(&self.config.tasks_table)
@@ -2384,9 +2384,8 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
     async fn sweep_expired_claims(&self) -> Result<u64, A2aStorageError> {
         // Table-level Scan with FilterExpression. This is coarse; a
         // production deployment that needs more efficient sweep
-        // should add a GSI on (expiresAtMicros, status). For ADR-011
-        // correctness, the contract is the return count — not
-        // throughput.
+        // should add a GSI on (expiresAtMicros, status). The trait
+        // contract is the return count — not throughput.
         let now_micros = ddb_systime_to_micros(std::time::SystemTime::now());
         let mut count: u64 = 0;
         let mut last_key = None;
@@ -4122,7 +4121,7 @@ mod tests {
         parity_tests::test_push_concurrent_claim_race(std::sync::Arc::new(s)).await;
     }
 
-    // Atomic pending-dispatch marker parity (ADR-013 §4.3 / §10.1).
+    // Atomic pending-dispatch marker parity.
 
     #[tokio::test]
     async fn test_atomic_marker_written_for_terminal_status() {
@@ -4152,7 +4151,7 @@ mod tests {
         parity_tests::test_atomic_marker_absent_when_opt_in_off(&s, &s, &s).await;
     }
 
-    // Causal-floor eligibility parity (ADR-013 §4.5 / §10.3 / §10.4).
+    // Causal-floor eligibility parity.
 
     #[tokio::test]
     async fn test_config_registered_at_or_after_event_not_eligible() {

@@ -1,5 +1,4 @@
-//! EventBridge Scheduler-triggered push recovery handler
-//! (ADR-013 §4.2 / §5.3).
+//! EventBridge Scheduler-triggered push recovery handler.
 //!
 //! The scheduled worker is the **mandatory** backstop for Lambda push
 //! recovery across all four backends. It exists because:

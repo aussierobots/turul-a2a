@@ -1,6 +1,6 @@
 //! End-to-end smoke test for the push-notification flow.
 //!
-//! Asserts the ADR-011 invariants the example exists to teach:
+//! Asserts the push-notification invariants the example exists to teach:
 //!
 //! 1. Push delivery actually fires when a task terminates.
 //! 2. The framework echoes the configured `token` in the

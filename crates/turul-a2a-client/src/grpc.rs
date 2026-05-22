@@ -6,12 +6,11 @@
 //! subscribe, and push-config CRUD) while injecting auth + tenant
 //! metadata uniformly per call.
 //!
-//! Tenant handling matches ADR-014 §2.4 normative precedence: when
-//! the caller passes a `with_tenant(...)` value, the client writes it
-//! to the proto request's `tenant` field (the normative wire
-//! location). `x-tenant-id` metadata is NOT emitted by this client —
-//! the server prefers proto field anyway, and emitting metadata
-//! alongside the proto field would be redundant.
+//! Tenant handling: when the caller passes a `with_tenant(...)` value,
+//! the client writes it to the proto request's `tenant` field (the
+//! normative wire location). `x-tenant-id` metadata is NOT emitted by
+//! this client — the server prefers the proto field anyway, so
+//! emitting metadata alongside it would be redundant.
 //!
 //! Auth metadata: `authorization: Bearer ...` /
 //! `x-api-key: ...`. All ASCII; no `-bin`.

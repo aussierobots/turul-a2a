@@ -15,9 +15,6 @@
 //! backends (Kinesis, SNS+queue, Step Functions task token, etc.) by
 //! implementing this trait directly.
 //!
-//! See also: ADR-017 (`RuntimeConfig::supports_return_immediately`
-//! capability gate) and ADR-013 (Lambda push-delivery parity).
-
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -77,8 +74,7 @@ pub enum QueueError {
 
     /// Transport-level failure (SQS API error, network, IAM,
     /// throttling). Caller typically responds with FAILED-compensation
-    /// on the already-created task (ADR-018 §Decision HTTP-enqueue
-    /// step 7).
+    /// on the already-created task.
     #[error("queue transport error: {0}")]
     Transport(String),
 }
@@ -114,8 +110,7 @@ pub trait DurableExecutorQueue: Send + Sync {
     /// native encoding differs from `serde_json`).
     ///
     /// Called by `core_send_message` BEFORE task creation so oversize
-    /// payloads never persist a task row (ADR-018 §Decision HTTP-enqueue
-    /// step 4).
+    /// payloads never persist a task row.
     fn check_payload_size(&self, job: &QueuedExecutorJob) -> Result<usize, QueueError> {
         let encoded = serde_json::to_vec(job)?;
         let max = self.max_payload_bytes();

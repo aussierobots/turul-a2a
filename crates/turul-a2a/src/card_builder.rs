@@ -60,9 +60,9 @@ impl AgentSkillBuilder {
     /// turul-a2a does NOT enforce these at request time in 0.1.x — they
     /// are published as-is for discovery and out-of-band tooling. Any
     /// runtime gatekeeping for a specific skill is the adopter's
-    /// responsibility inside `AgentExecutor`. See ADR-015 for the
-    /// rationale and the post-merge truthfulness invariant validated at
-    /// server build.
+    /// responsibility inside `AgentExecutor`. A post-merge truthfulness
+    /// check at server build ensures every advertised scheme name resolves
+    /// to an installed middleware contribution.
     pub fn security_requirements(
         mut self,
         requirements: Vec<turul_a2a_proto::SecurityRequirement>,
@@ -203,7 +203,7 @@ impl AgentCardBuilder {
     /// Adopter-supplied schemes are merged with any schemes contributed
     /// by installed middleware at server build; collisions between an
     /// adopter scheme and a middleware scheme with the same name are
-    /// rejected at build time. See ADR-015.
+    /// rejected at build time.
     pub fn security_scheme(
         mut self,
         name: impl Into<String>,
@@ -219,7 +219,7 @@ impl AgentCardBuilder {
     /// turul-a2a does not install a runtime gatekeeper for
     /// adopter-supplied agent-level requirements; they are declarative
     /// only. Authorization at the framework layer is governed solely by
-    /// installed middleware. See ADR-015.
+    /// installed middleware.
     pub fn security_requirement(
         mut self,
         requirement: turul_a2a_proto::SecurityRequirement,
@@ -444,12 +444,10 @@ mod tests {
             schemes: bearer_ref,
         };
 
-        // AgentSkillBuilder::security_requirements does not exist on
-        // current main — this call is the load-bearing red-phase
-        // compile-error assertion for ADR-015. After the ADR §5.5
-        // implementation lands, the builder exposes this setter and
-        // the body below becomes the regression assertion that the
-        // requirement survives `build()` without a cross-field check.
+        // Regression: a skill-level `security_requirement` set on the
+        // builder must survive `build()` with its scheme name intact and
+        // without any cross-field validation against the agent-level
+        // schemes (that check runs at server build, not skill build).
         let skill = AgentSkillBuilder::new("echo", "Echo", "Echoes input")
             .tags(vec!["echo"])
             .security_requirements(vec![req])

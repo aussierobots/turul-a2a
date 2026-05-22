@@ -54,7 +54,7 @@ use crate::streaming::TaskEventBroker;
 /// Shared spawn-path dependencies pulled out of `AppState` to keep the
 /// call sites in `router.rs` / `jsonrpc.rs` ergonomic.
 ///
-/// Public so ADR-018 consumers outside the core crate (e.g.,
+/// Public so durable-queue consumers outside the core crate (e.g.,
 /// `turul-a2a-aws-lambda`'s SQS handler) can construct it from an
 /// [`crate::router::AppState`] reference before calling
 /// [`run_queued_executor_job`].
@@ -75,11 +75,9 @@ pub struct SpawnDeps {
 /// and the message that triggered it.
 ///
 /// `claims` carries the authenticated JWT claims from the transport
-/// layer through to the executor's `ExecutionContext`. Before ADR-018
-/// Phase 1 this field did not exist and `ExecutionContext.claims` was
-/// hardcoded to `None`, silently dropping claims even on blocking send.
-/// All three transports (HTTP, JSON-RPC, gRPC) now populate this where
-/// they have claims; gRPC passes `None` until gRPC auth is wired.
+/// layer through to the executor's `ExecutionContext`. All three
+/// transports (HTTP, JSON-RPC, gRPC) populate this where they have
+/// claims; gRPC passes `None` until gRPC auth is wired.
 pub struct SpawnScope {
     pub tenant: String,
     pub owner: String,
@@ -185,10 +183,10 @@ pub(crate) fn spawn_tracked_executor(
     })
 }
 
-/// consumer entry: build a fresh EventSink + throwaway
-/// InFlightHandle, run the executor body, apply the §7.2 detection
-/// rule. This is the single function the SQS / durable-continuation
-/// handler calls per record.
+/// Durable-queue consumer entry: build a fresh EventSink + throwaway
+/// InFlightHandle, run the executor body, then apply the post-execute
+/// terminal-detection rule. This is the single function the SQS /
+/// durable-continuation handler calls per record.
 ///
 /// Creates a local `CancellationToken` the executor observes through
 /// `ExecutionContext.cancellation`. There is no registry entry (the
@@ -220,17 +218,15 @@ pub async fn run_queued_executor_job(deps: SpawnDeps, scope: SpawnScope) {
 
 /// Run the executor body for an already-created task.
 ///
-/// Extracted from the former inline `run_executor_body` so both the
-/// tokio-spawn path (`spawn_tracked_executor`) and the SQS-dispatch
-/// path (ADR-018 `LambdaA2aHandler::handle_sqs`) share the same load →
-/// execute → post-execute-detection flow. The caller owns constructing
-/// `sink` and `cancellation`; this function loads the task, builds the
-/// `ExecutionContext`, drives `execute`, and applies the §7.2 detection
-/// rule.
+/// Shared by the tokio-spawn path (`spawn_tracked_executor`) and the
+/// SQS-dispatch path (`LambdaA2aHandler::handle_sqs`) so both share the
+/// same load → execute → post-execute-detection flow. The caller owns
+/// constructing `sink` and `cancellation`; this function loads the
+/// task, builds the `ExecutionContext`, drives `execute`, and applies
+/// the post-execute terminal-detection rule.
 ///
-/// Threads `scope.claims` into `ExecutionContext.claims`. Prior to
-/// Phase 1 this was hardcoded to `None`, silently dropping
-/// claims from executors even on the blocking-send path.
+/// Threads `scope.claims` into `ExecutionContext.claims` so executors
+/// observe the authenticated JWT claims on every transport path.
 pub(crate) async fn run_executor_for_existing_task(
     deps: SpawnDeps,
     scope: SpawnScope,

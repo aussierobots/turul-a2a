@@ -5,7 +5,8 @@ use std::fmt;
 
 /// Authentication identity — type-level distinction, not a sentinel string.
 ///
-/// Per ADR-007: auth state is an enum, not `owner != "anonymous"`.
+/// Auth state is an enum (not `owner != "anonymous"`), so a principal
+/// literally named "anonymous" is still `Authenticated`.
 #[derive(Clone, Default)]
 pub enum AuthIdentity {
     /// No auth middleware configured or no credentials provided.

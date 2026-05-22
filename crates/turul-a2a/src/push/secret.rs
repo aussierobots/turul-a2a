@@ -1,4 +1,4 @@
-//! Secret-string handling for push delivery (ADR-011 §4a).
+//! Secret-string handling for push delivery.
 //!
 //! Two values flow through the push pipeline that are secrets:
 //! - `AuthenticationInfo.credentials` — the material after the HTTP

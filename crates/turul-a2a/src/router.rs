@@ -51,10 +51,10 @@ pub struct AppState {
     /// empty when no executor has been spawned through the registry yet.
     pub in_flight: Arc<crate::server::in_flight::InFlightRegistry>,
 
-    /// Supervisor-only cancel-marker reads (ADR-012 §3 / §10). Separate
-    /// from `task_storage` so handler code cannot reach the unscoped
-    /// reads. Use `set_cancel_requested` on `task_storage` for marker
-    /// writes (owner-scoped, handler-safe).
+    /// Supervisor-only cancel-marker reads. Separate from `task_storage`
+    /// so handler code cannot reach the unscoped reads. Use
+    /// `set_cancel_requested` on `task_storage` for marker writes
+    /// (owner-scoped, handler-safe).
     pub cancellation_supervisor: Arc<dyn crate::storage::A2aCancellationSupervisor>,
 
     /// Push-delivery coordination store. `None` on
@@ -64,13 +64,12 @@ pub struct AppState {
     /// [`crate::server::A2aServerBuilder::push_delivery_store`].
     pub push_delivery_store: Option<Arc<dyn crate::push::A2aPushDeliveryStore>>,
 
-    /// Push-delivery dispatcher (ADR-011 §2, §13.13). Populated by the
-    /// server builder iff `push_delivery_store` is wired. Handler and
-    /// executor commit paths call [`crate::push::PushDispatcher::dispatch`] after a
-    /// successful terminal atomic-store write so every terminal —
-    /// executor-driven, framework-forced CANCEL, or hard-timeout
-    /// FAILED — fans out to registered push configs by the same
-    /// contract.
+    /// Push-delivery dispatcher. Populated by the server builder iff
+    /// `push_delivery_store` is wired. Handler and executor commit paths
+    /// call [`crate::push::PushDispatcher::dispatch`] after a successful
+    /// terminal atomic-store write so every terminal — executor-driven,
+    /// framework-forced CANCEL, or hard-timeout FAILED — fans out to
+    /// registered push configs by the same contract.
     pub push_dispatcher: Option<Arc<crate::push::PushDispatcher>>,
 
     /// Durable executor queue. When `Some`, the
@@ -440,9 +439,8 @@ async fn tenant_send_streaming_message_handler(
 /// executor. Returns the `task_id` and a broker wake-up receiver.
 ///
 /// Shared by the HTTP SSE path (`core_send_streaming_message`) and the
-/// gRPC streaming adapter. Keeping both transports on this single entry
-/// point is the ADR-005 invariant extended to three transports — no
-/// behaviour fork between SSE and gRPC streaming.
+/// gRPC streaming adapter. Both transports dispatch into this single
+/// entry point so SSE and gRPC streaming cannot diverge.
 pub(crate) async fn setup_streaming_send(
     state: AppState,
     tenant: &str,
@@ -838,10 +836,9 @@ pub async fn core_send_message(
         .as_ref()
         .and_then(|c| c.history_length);
 
-    // Bug 2 step 1: validate inline push config URL BEFORE any
-    // storage write. A malformed URL returns HTTP 400 / -32602 /
-    // INVALID_ARGUMENT with zero task persistence. URL parse mirrors
-    // `core_create_push_config` (router.rs:1411) and ADR-011 §R1.
+    // Validate inline push config URL BEFORE any storage write. A
+    // malformed URL returns HTTP 400 / -32602 / INVALID_ARGUMENT with
+    // zero task persistence. URL parse mirrors `core_create_push_config`.
     let inline_push_config: Option<turul_a2a_proto::TaskPushNotificationConfig> = request
         .configuration
         .as_ref()
@@ -1567,9 +1564,9 @@ pub async fn core_cancel_task(
     }
 
     // Step 6: grace expired. Force-commit CANCELED via atomic store.
-    // Per ADR-012 §8, framework-committed terminals use `message = None`
-    // so history / SSE consumers can distinguish from executor-authored
-    // cancels without conflating framework telemetry with agent output.
+    // Framework-committed terminals use `message = None` so history /
+    // SSE consumers can distinguish them from executor-authored cancels
+    // without conflating framework telemetry with agent output.
     let cancel_event = StreamEvent::StatusUpdate {
         status_update: crate::streaming::StatusUpdatePayload {
             task_id: task_id.to_string(),

@@ -1,4 +1,4 @@
-//! Executor-facing `EventSink` — ADR-010 §2.
+//! Executor-facing `EventSink`.
 //!
 //! The sink is the **sole executor-side write boundary** for task lifecycle
 //! events. Every call routes through [`crate::storage::A2aAtomicStore`]:
@@ -176,7 +176,8 @@ impl EventSink {
 
     /// Emit an artifact. `append=true` appends to an existing artifact's
     /// parts; `append=false` creates or replaces. `last_chunk=true` signals
-    /// the final chunk for streaming transports (ADR-006 transport-level).
+    /// the final chunk for streaming transports (transport-level metadata —
+    /// storage does not persist completion state).
     pub async fn emit_artifact(
         &self,
         artifact: Artifact,
@@ -196,9 +197,10 @@ impl EventSink {
     }
 
     /// Emit terminal `FAILED` with an optional reason. The reason, if any,
-    /// is wrapped as an agent-authored text message on the task status
-    /// (framework telemetry is distinct from `fail` triggered by framework
-    /// timeout — see ADR-010 §4.1 and ADR-012 §8).
+    /// is wrapped as an agent-authored text message on the task status —
+    /// distinct from framework-forced FAILED on timeout (which writes
+    /// `message = None` so consumers can tell agent-authored failure from
+    /// framework telemetry).
     pub async fn fail(&self, reason: Option<String>) -> Result<u64, A2aError> {
         let message = reason.map(text_message_from_agent);
         self.inner()?

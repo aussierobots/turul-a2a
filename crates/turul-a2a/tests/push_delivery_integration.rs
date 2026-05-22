@@ -2,19 +2,19 @@
 //!.
 //!
 //! Covers a representative subset of the normative scenarios:
-//! - §13.1 Basic delivery on terminal event (happy path)
-//! - §13.3 Retry on 5xx with backoff
-//! - §13.5 No retry on 4xx (non-408/429)
-//! - §13.4 Giveup after max attempts
-//! - §13.16 Secret redaction coverage
+//! - Basic delivery on terminal event (happy path)
+//! - Retry on 5xx with backoff
+//! - No retry on 4xx (non-408/429)
+//! - Giveup after max attempts
+//! - Secret redaction coverage
 //!
 //! These tests drive `PushDeliveryWorker::deliver` directly against a
 //! wiremock `MockServer`. The dispatcher (event → configs fan-out) is
 //! not exercised here — its scope is the server integration. Keeping
-//! the worker's contract wiremock-verifiable is an explicit ADR-011
-//! goal: the delivery module must be exerciseable without standing up
-//! the full server, so the redaction + retry properties stay pinned to
-//! fast unit-level tests.
+//! the worker's contract wiremock-verifiable is intentional: the
+//! delivery module must be exerciseable without standing up the full
+//! server, so the redaction + retry properties stay pinned to fast
+//! unit-level tests.
 //!
 //! All tests use `allow_insecure_urls = true` because wiremock listens
 //! on `127.0.0.1`, which is private SSRF rules. Backoff
@@ -91,7 +91,7 @@ fn sentinel_target(base_url: &str) -> PushTarget {
 }
 
 // ---------------------------------------------------------------------------
-// §13.1 — Happy path: single POST arrives, claim ends Succeeded.
+// Happy path: single POST arrives, claim ends Succeeded.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -124,7 +124,7 @@ async fn happy_path_single_post_succeeds() {
 }
 
 // ---------------------------------------------------------------------------
-// §13.3 — Retry on 5xx: 503 twice then 200, exactly 3 POSTs, Succeeded.
+// Retry on 5xx: 503 twice then 200, exactly 3 POSTs, Succeeded.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -175,7 +175,7 @@ async fn retry_on_5xx_then_success() {
 }
 
 // ---------------------------------------------------------------------------
-// §13.5 — No retry on 4xx (non-408/429): exactly 1 POST, GaveUp.
+// No retry on 4xx (non-408/429): exactly 1 POST, GaveUp.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -217,7 +217,7 @@ async fn no_retry_on_4xx() {
 }
 
 // ---------------------------------------------------------------------------
-// §13.4 — Giveup after max_attempts on sustained 500s.
+// Giveup after max_attempts on sustained 500s.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -276,7 +276,7 @@ async fn giveup_after_max_attempts_on_sustained_5xx() {
 }
 
 // ---------------------------------------------------------------------------
-// §13.16 — Secret redaction coverage.
+// Secret redaction coverage.
 //
 // The worker must never surface the raw credential or push token in
 // any observable form (Debug, Display, stored failed-delivery
@@ -347,7 +347,7 @@ async fn secret_sentinel_never_leaks_on_giveup() {
 }
 
 // ---------------------------------------------------------------------------
-// §13.18 — DNS rebinding defence.
+// DNS rebinding defence.
 //
 // The worker must connect to the IP that passed SSRF validation, not
 // whatever a subsequent DNS lookup would return. We prove this by:
@@ -427,7 +427,9 @@ async fn reqwest_connects_to_validated_ip_not_system_dns() {
         "pinned resolver must let the POST reach wiremock despite .invalid hostname"
     );
 
-    // DNS is resolved exactly once per attempt (ADR-011 §5, §R4).
+    // DNS is resolved exactly once per attempt — the pinned resolver
+    // is consulted before each POST so a TOCTOU rebind cannot land an
+    // attempt against a different IP than the SSRF validator approved.
     assert_eq!(
         *call_count.lock().unwrap(),
         1,
@@ -753,9 +755,9 @@ async fn reclaim_sweep_redispatches_after_persistent_terminal_failure() {
     // reclaimable quickly, short backoffs to keep the test fast.
     // `max_attempts=2` leaves the redispatched deliver enough retry
     // budget to issue the second POST — the budget is cluster-wide
-    // (ADR-011 §10 — `delivery_attempt_count` is NOT reset on
-    // re-claim, so count=1 after the first deliver's POST and the
-    // redispatch can do exactly one more).
+    // (`delivery_attempt_count` is NOT reset on re-claim, so count=1
+    // after the first deliver's POST and the redispatch can do
+    // exactly one more).
     let mut cfg = PushDeliveryConfig::default();
     cfg.max_attempts = 2;
     cfg.backoff_base = Duration::from_millis(1);

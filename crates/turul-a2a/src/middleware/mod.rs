@@ -12,9 +12,6 @@
 //! logging — should be a separate Tower layer composed outside this
 //! module. This trait's surface (`before_request` only, failure shaped
 //! for 401 / 403 + `WWW-Authenticate`) is deliberately auth-oriented.
-//!
-//! See ADR-007 (auth middleware architecture) and ADR-016 (stable auth
-//! failure wire surface) for the design rationale.
 
 pub mod bearer;
 pub mod context;

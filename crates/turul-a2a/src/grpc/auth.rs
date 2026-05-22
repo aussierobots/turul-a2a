@@ -1,5 +1,4 @@
-//! Tower layer that runs the shared `MiddlewareStack` against a tonic
-//! server (ADR-007 §3, ADR-014 §2.4).
+//! Tower layer that runs the shared `MiddlewareStack` against a tonic server.
 //!
 //! This is a transport adapter only — the authentication *business logic*
 //! lives in `crate::middleware::stack::MiddlewareStack` and is shared

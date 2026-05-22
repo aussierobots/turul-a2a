@@ -1,18 +1,18 @@
-//! ADR-018 durable executor continuation tests.
+//! Durable executor continuation tests.
 //!
 //! Core-crate coverage (no Lambda feature required):
 //!
 //! - Envelope round-trip preserves all fields including `claims`.
 //! - Claims thread through to the executor on BOTH the blocking-send
-//!   path (Phase 1 pre-existing bug fix) and the durable-queue path.
+//!   path and the durable-queue path.
 //! - Oversize payload does not create a task (preflight).
 //! - Enqueue-failure compensates to FAILED with reason message.
 //! - Cancelled queued task: `supervisor_get_cancel_requested == true`
 //!   → CANCELED committed directly, executor never invoked.
 //! - Concurrent cancel + terminal race: `TerminalStateAlreadySet`
 //!   returned as success (the record is deleted, no retry).
-//! - Task 45: pending-dispatch marker write is skipped when zero
-//!   push configs are registered for the task.
+//! - Pending-dispatch marker write is skipped when zero push configs
+//!   are registered for the task.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

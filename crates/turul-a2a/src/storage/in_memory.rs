@@ -102,8 +102,8 @@ type EventLog = Vec<(u64, StreamEvent)>;
 
 /// In-memory A2A storage backend.
 /// Implements A2aTaskStorage, A2aPushNotificationStorage, A2aEventStore,
-/// and A2aPushDeliveryStore on the same struct — enforcing the
-/// same-backend requirement from ADR-009.
+/// and A2aPushDeliveryStore on the same struct — every storage trait
+/// the server consumes is backed by one concrete instance.
 #[derive(Clone)]
 pub struct InMemoryA2aStorage {
     tasks: Arc<RwLock<HashMap<TaskKey, StoredTask>>>,
@@ -460,7 +460,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         let updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
 
         // Preserve cancel_requested (monotonic) and latest_event_sequence
-        // (ADR-013 §6.3 — monotonic, maintained by atomic commits only).
+        // (monotonic, maintained by atomic commits only).
         let cancel_requested = stored.cancel_requested;
         let latest_event_sequence = stored.latest_event_sequence;
         tasks.insert(
@@ -981,15 +981,16 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         // tasks → event_counters → events → pending_dispatches.
         // The last guard is held only when the push_dispatch opt-in is on
         // so the non-push path never contends on it.
-        // §Pending-dispatch optimization: acquire a READ guard
-        // on push_configs BEFORE the tasks write, in consistent lock
+        // Pending-dispatch optimization: acquire a READ guard on
+        // push_configs BEFORE the tasks write, in consistent lock
         // order, so the marker-write loop below can check whether any
         // config exists for the task and skip the marker when zero
         // configs are registered. A config registered after terminal
-        // is not eligible for that terminal event anyway (ADR-009
-        // `registered_after_event_sequence` filter), so the check is
-        // safe without adding read-modify-write atomicity against
-        // concurrent config registration.
+        // is not eligible for that terminal event anyway (the
+        // `registered_after_event_sequence` eligibility filter
+        // excludes it), so the check is safe without adding
+        // read-modify-write atomicity against concurrent config
+        // registration.
         let push_configs_snapshot = if self.push_dispatch_enabled {
             Some(self.push_configs.read().await)
         } else {
@@ -1064,7 +1065,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         // Append events with atomic sequence assignment. When the
         // push_dispatch opt-in is on, also write a pending-dispatch
         // marker for each terminal StatusUpdate in the same atomic
-        // boundary (ADR-013 §4.3 / §5.1).
+        // boundary.
         let mut sequences = Vec::with_capacity(events.len());
         let task_events = event_map.entry(event_key.clone()).or_default();
         let counter = counters.entry(event_key).or_insert(0);
@@ -1103,7 +1104,8 @@ impl A2aAtomicStore for InMemoryA2aStorage {
             task_events.push((seq, event));
         }
 
-        // Maintain latest_event_sequence UNCONDITIONALLY — ADR-013 §6.3.
+        // Maintain latest_event_sequence UNCONDITIONALLY: monotonic
+        // and maintained by atomic commits only.
         let new_latest = sequences
             .iter()
             .copied()
@@ -1194,7 +1196,8 @@ impl A2aAtomicStore for InMemoryA2aStorage {
             task_events.push((seq, event));
         }
 
-        // Maintain latest_event_sequence UNCONDITIONALLY — ADR-013 §6.3.
+        // Maintain latest_event_sequence UNCONDITIONALLY: monotonic
+        // and maintained by atomic commits only.
         let new_latest = sequences
             .iter()
             .copied()
@@ -1965,7 +1968,7 @@ mod tests {
         parity_tests::test_push_concurrent_claim_race(s).await;
     }
 
-    // Atomic pending-dispatch marker parity (ADR-013 §4.3 / §10.1).
+    // Atomic pending-dispatch marker parity.
 
     fn opted_in_storage() -> InMemoryA2aStorage {
         InMemoryA2aStorage::new().with_push_dispatch_enabled(true)
@@ -1995,7 +1998,7 @@ mod tests {
         parity_tests::test_atomic_marker_absent_when_opt_in_off(&s, &s, &s).await;
     }
 
-    // Causal-floor eligibility parity (ADR-013 §4.5 / §10.3 / §10.4).
+    // Causal-floor eligibility parity.
 
     #[tokio::test]
     async fn test_config_registered_at_or_after_event_not_eligible() {

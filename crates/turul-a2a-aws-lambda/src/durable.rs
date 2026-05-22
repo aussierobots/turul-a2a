@@ -92,7 +92,7 @@ impl DurableExecutorQueue for SqsDurableExecutorQueue {
 /// Public so `LambdaA2aHandler::handle_sqs` can delegate; adopters
 /// should not call this directly — use the handler wrapper.
 ///
-/// Per ADR-018 §SQS invocation:
+/// SQS invocation contract:
 ///
 /// 1. Deserialize body; unknown envelope version → batch-item failure.
 /// 2. Load task; not found → batch-item failure.

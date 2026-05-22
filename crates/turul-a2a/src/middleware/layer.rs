@@ -94,7 +94,7 @@ where
 
 /// Convert a MiddlewareError to an HTTP response.
 ///
-/// Wire surface is governed by ADR-016:
+/// Wire surface:
 /// - Body: `{"error": "<kind_wire_string>"}` where the kind string comes
 ///   from [`AuthFailureKind::body_string`].
 /// - `WWW-Authenticate`: emitted only on `HttpChallenge` variants, and

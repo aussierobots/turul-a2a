@@ -1,5 +1,4 @@
-//! SSRF (Server-Side Request Forgery) defence for push delivery
-//! (ADR-011 §R3).
+//! SSRF (Server-Side Request Forgery) defence for push delivery.
 //!
 //! Push delivery is an outbound HTTP request whose destination is
 //! client-controlled — the `url` field of a push config. Without
@@ -367,7 +366,7 @@ mod tests {
     fn decide_prefers_first_public_ip_when_mixed() {
         // DNS answer with a private IP first, a public IP second.
         // The guard should pick the public one rather than block
-        // outright — matches the ADR-011 §R3 "first passing IP" rule.
+        // outright — "first passing IP" rule.
         let url = Url::parse("https://webhook.example.com/").unwrap();
         let ips = vec![ipv4(10, 0, 0, 5), ipv4(203, 0, 113, 10)];
         match decide(&url, &ips, false, None) {

@@ -20,12 +20,12 @@ use crate::streaming::StreamEvent;
 pub struct PostgresConfig {
     pub database_url: String,
     pub max_connections: u32,
-    /// ADR-019: when true, [`PostgresA2aStorage::new`] skips DDL
-    /// bootstrap (no `CREATE TABLE`, no `ALTER TABLE`, no `CREATE
-    /// INDEX`) and trusts the operator-provisioned schema. Default
-    /// `false` preserves the auto-bootstrap behavior. Adopters who
-    /// set this flag own forward migrations on every release that
-    /// changes the schema (see CHANGELOG).
+    /// When true, [`PostgresA2aStorage::new`] skips DDL bootstrap (no
+    /// `CREATE TABLE`, no `ALTER TABLE`, no `CREATE INDEX`) and trusts
+    /// the operator-provisioned schema. Default `false` preserves the
+    /// auto-bootstrap behavior. Adopters who set this flag own forward
+    /// migrations on every release that changes the schema (see
+    /// CHANGELOG).
     pub assume_schema_initialized: bool,
 }
 
@@ -1248,11 +1248,11 @@ impl A2aAtomicStore for PostgresA2aStorage {
                 && event.is_terminal()
                 && matches!(event, StreamEvent::StatusUpdate { .. })
             {
-                // §Pending-dispatch optimization: skip the
-                // marker write if no push configs exist for the task.
-                // Post-terminal config registrations are not eligible
-                // for this event anyway (ADR-009
-                // `registered_after_event_sequence`), so the read is
+                // Pending-dispatch optimization: skip the marker write
+                // if no push configs exist for the task. Post-terminal
+                // config registrations are not eligible for this event
+                // anyway (the `registered_after_event_sequence`
+                // eligibility filter excludes them), so the read is
                 // correctness-neutral.
                 let config_count: i64 = sqlx::query_scalar(
                     "SELECT COUNT(*) FROM a2a_push_configs \
@@ -2448,7 +2448,7 @@ mod tests {
         parity_tests::test_push_concurrent_claim_race(s).await;
     }
 
-    // Atomic pending-dispatch marker parity (ADR-013 §4.3 / §10.1).
+    // Atomic pending-dispatch marker parity.
 
     async fn opted_in_storage() -> PostgresA2aStorage {
         storage().await.with_push_dispatch_enabled(true)
@@ -2478,7 +2478,7 @@ mod tests {
         parity_tests::test_atomic_marker_absent_when_opt_in_off(&s, &s, &s).await;
     }
 
-    // Causal-floor eligibility parity (ADR-013 §4.5 / §10.3 / §10.4).
+    // Causal-floor eligibility parity.
 
     #[tokio::test]
     async fn test_config_registered_at_or_after_event_not_eligible() {
@@ -2492,9 +2492,9 @@ mod tests {
         parity_tests::test_late_create_config_stamps_advanced_sequence(&s, &s, &s).await;
     }
 
-    // ADR-019: opt-in least-privilege bootstrap. When the flag is set,
-    // new() MUST NOT run any DDL. Isolation strategy: provision a
-    // throwaway schema and pin the connection's search_path to it via
+    // Opt-in least-privilege bootstrap. When `assume_schema_initialized`
+    // is set, new() MUST NOT run any DDL. Isolation strategy: provision
+    // a throwaway schema and pin the connection's search_path to it via
     // the libpq `options` URL parameter, so the `a2a_*` table names
     // resolve into an empty namespace and the first INSERT fails with
     // "relation does not exist" — proof that create_tables() did not

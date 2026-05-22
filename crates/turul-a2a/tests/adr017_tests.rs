@@ -1,6 +1,6 @@
-//! ADR-017 wire-surface tests.
+//! Wire-surface tests for `core_send_message` invariants.
 //!
-//! Covers three bugs closed by ADR-017 against `core_send_message`:
+//! Covers three behaviours:
 //!
 //! 1. `SendMessageConfiguration.return_immediately = true` rejected on
 //!    runtimes whose `RuntimeConfig::supports_return_immediately` is
@@ -93,7 +93,7 @@ fn base_state() -> AppState {
 }
 
 /// AppState with `supports_return_immediately = false`, matching the
-/// Lambda adapter's configuration (ADR-017 §Decision Bug 1).
+/// Lambda adapter's configuration.
 fn lambda_like_state() -> AppState {
     let mut state = base_state();
     state.runtime_config.supports_return_immediately = false;
@@ -144,7 +144,9 @@ async fn send_message_return_immediately_rejected_http() {
         status, 400,
         "Lambda-like runtime must refuse returnImmediately=true"
     );
-    // google.rpc.ErrorInfo reason is the normative signal per ADR-004.
+    // google.rpc.ErrorInfo reason is the normative signal — A2A
+    // errors carry `ErrorInfo { reason, domain = "a2a-protocol.org" }`
+    // on every transport.
     let reason = body
         .pointer("/error/details/0/reason")
         .and_then(|v| v.as_str());
@@ -182,14 +184,14 @@ async fn send_message_return_immediately_rejected_jsonrpc() {
     assert_eq!(
         err_code,
         Some(-32004),
-        "JSON-RPC error code must be -32004 UnsupportedOperation (ADR-004); got body: {body}"
+        "JSON-RPC error code must be -32004 UnsupportedOperation; got body: {body}"
     );
 }
 
 #[tokio::test]
 async fn send_message_return_immediately_rejected_persists_no_task() {
-    // ADR-017 Bug 1 invariant: the Lambda reject path must abort BEFORE
-    // any storage write — no task row created.
+    // The Lambda reject path must abort BEFORE any storage write — no
+    // task row created.
     let state = lambda_like_state();
     let task_storage = state.task_storage.clone();
     let router = build_router(state);
@@ -306,7 +308,7 @@ async fn send_message_inline_push_config_jsonrpc() {
 
 #[tokio::test]
 async fn send_message_inline_push_config_invalid_url() {
-    // ADR-017 Bug 2 invariant (P1 anchor): malformed URL returns 400
+    // Inline push config URL validation: malformed URL returns 400
     // BEFORE any storage write. No task persisted on this path.
     let state = base_state();
     let task_storage = state.task_storage.clone();
@@ -374,7 +376,8 @@ async fn send_message_inline_push_config_missing_url() {
 
 /// Push storage stub that delegates everything to an inner in-memory
 /// backend EXCEPT `create_config`, which always fails. Exercises the
-/// ADR-017 §Decision Bug 2 step 5 compensation path.
+/// storage-failure compensation path: the task transitions to FAILED
+/// with an agent message naming the reason; the executor never runs.
 struct FailingCreatePushStorage {
     inner: Arc<InMemoryA2aStorage>,
 }
@@ -474,7 +477,8 @@ async fn send_message_inline_push_config_storage_failure_compensates() {
         .unwrap();
     let (status, resp_body) = json_response(router, req).await;
 
-    // ADR-017 §Decision Bug 2 step 5 — caller sees the registration error.
+    // The caller sees the registration error rather than a silent
+    // success after compensation.
     assert!(
         status >= 400,
         "storage failure must surface to the caller, got {status}: {resp_body}"

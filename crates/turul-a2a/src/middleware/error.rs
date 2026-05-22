@@ -1,10 +1,10 @@
 //! Middleware error types — transport-level only, never in A2aError.
 //!
-//! Wire surface governed by ADR-016. Every auth-failure variant carries an
-//! [`AuthFailureKind`]; the transport boundary maps that kind to both the
-//! JSON body string and (for Bearer challenges) the RFC 6750 `error=` code
-//! in `WWW-Authenticate`. No validator internals, no Debug-formatted
-//! enum names, no `error_description`.
+//! Every auth-failure variant carries an [`AuthFailureKind`]; the transport
+//! boundary maps that kind to both the JSON body string and (for Bearer
+//! challenges) the RFC 6750 `error=` code in `WWW-Authenticate`. No
+//! validator internals, no Debug-formatted enum names, no
+//! `error_description`.
 
 /// Stable classification of an auth failure.
 ///

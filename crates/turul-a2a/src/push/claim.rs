@@ -59,7 +59,7 @@
 //! (`Succeeded`, `GaveUp`, `Abandoned`) or stays open for the next
 //! retry (`Retry`).
 //!
-//! # Secret redaction (ADR-011 §4a)
+//! # Secret redaction
 //!
 //! Neither this trait surface nor its persisted row shape carries
 //! credentials, tokens, request bodies, or receiver response bodies.
@@ -76,9 +76,8 @@
 //!
 //! `claim_delivery` is called once per (event, config) pair. Callers
 //! are expected to emit `framework.push_claim_attempts` /
-//! `_conflicts` tracing events around the call (see ADR-011 §9). The
-//! store does not emit telemetry itself — it only provides the
-//! race-free primitive.
+//! `_conflicts` tracing events around the call. The store does not
+//! emit telemetry itself — it only provides the race-free primitive.
 //!
 //! # Expiry sweep
 //!
@@ -477,11 +476,10 @@ pub enum ClaimStatus {
 
 /// Outcome reported via [`A2aPushDeliveryStore::record_delivery_outcome`].
 ///
-/// Secret-safety invariant (ADR-011 §4a): no variant carries
-/// free-text derived from user input, receiver responses, or
-/// credential material. Retry diagnostics use
-/// [`DeliveryErrorClass`]; terminal reasons use framework-owned
-/// enums ([`GaveUpReason`], [`AbandonedReason`]).
+/// Secret-safety invariant: no variant carries free-text derived from
+/// user input, receiver responses, or credential material. Retry
+/// diagnostics use [`DeliveryErrorClass`]; terminal reasons use
+/// framework-owned enums ([`GaveUpReason`], [`AbandonedReason`]).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum DeliveryOutcome {

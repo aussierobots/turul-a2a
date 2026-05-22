@@ -1,9 +1,8 @@
 //! `A2aError` → `tonic::Status` mapping with `google.rpc.ErrorInfo`.
 //!
-//! Normative table in ADR-014 §2.5. Every A2A error MUST carry
-//! `ErrorInfo { reason, domain = "a2a-protocol.org" }` in
-//! `Status.details` (non-A2A errors — `InvalidRequest`, `Internal` —
-//! carry no `ErrorInfo`).
+//! Every A2A error MUST carry `ErrorInfo { reason, domain =
+//! "a2a-protocol.org" }` in `Status.details` (non-A2A errors —
+//! `InvalidRequest`, `Internal` — carry no `ErrorInfo`).
 //!
 //! Mapping rationale:
 //!

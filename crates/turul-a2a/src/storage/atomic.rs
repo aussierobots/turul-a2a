@@ -37,7 +37,7 @@ pub trait A2aAtomicStore: Send + Sync {
     fn backend_name(&self) -> &'static str;
 
     /// Does this atomic store also write pending-dispatch markers atomically
-    /// with terminal status commits? (ADR-013 §4.3, §6.1 — normative)
+    /// with terminal status commits?
     ///
     /// `false` (default): task + event rows only. Non-push deployments never
     /// touch `a2a_push_pending_dispatches`; no marker writes, no IAM, no
@@ -73,7 +73,7 @@ pub trait A2aAtomicStore: Send + Sync {
     /// Update a task's status and append events atomically.
     /// Validates state machine transition. Returns updated task and sequences.
     ///
-    /// # Terminal-write CAS contract (ADR-010 §7.1 — normative)
+    /// # Terminal-write CAS contract (normative)
     ///
     /// If the persisted task is already in a terminal state
     /// (`COMPLETED`, `FAILED`, `CANCELED`, `REJECTED`) at the time this
@@ -134,7 +134,7 @@ pub trait A2aAtomicStore: Send + Sync {
     /// Full replacement update of a task and append events atomically.
     /// Returns assigned event sequences.
     ///
-    /// # Terminal-preservation CAS contract (ADR-010 §7.1 extension — normative)
+    /// # Terminal-preservation CAS contract (normative)
     ///
     /// If the **persisted** task is already in a terminal state
     /// (`COMPLETED`, `FAILED`, `CANCELED`, `REJECTED`) at the time this

@@ -1986,10 +1986,10 @@ pub async fn test_terminal_cas_rejects_sequential_second_terminal(
     );
 }
 
-/// Terminal-preservation CAS on `update_task_with_events` (ADR-010 §7.1
-/// extension): once the persisted task is terminal, any subsequent
-/// full-task replacement MUST be rejected with
-/// `TerminalStateAlreadySet` and MUST NOT append any events.
+/// Terminal-preservation CAS on `update_task_with_events`: once the
+/// persisted task is terminal, any subsequent full-task replacement
+/// MUST be rejected with `TerminalStateAlreadySet` and MUST NOT
+/// append any events.
 ///
 /// This protects [`crate::event_sink::EventSink::emit_artifact`]'s
 /// read-mutate-write path from silently overwriting a concurrently
@@ -3198,8 +3198,8 @@ pub async fn test_push_list_failed_is_tenant_scoped(store: &dyn A2aPushDeliveryS
 /// that the diagnostics populated on `GaveUp` round-trip correctly:
 /// `last_error_class`, `last_http_status`, `first_attempted_at`,
 /// `last_attempted_at`, `gave_up_at`, `delivery_attempt_count`.
-/// Regression-guards the §4a invariant that failed-delivery records
-/// are secret-free by construction.
+/// Regression-guards the invariant that failed-delivery records are
+/// secret-free by construction.
 pub async fn test_push_failed_delivery_diagnostics_roundtrip(store: &dyn A2aPushDeliveryStore) {
     let (tenant, task_id, seq, config_id) = push_tuple("list-003");
     let long = Duration::from_secs(60);
@@ -3631,7 +3631,7 @@ where
 }
 
 // =========================================================
-// Atomic pending-dispatch marker parity (ADR-013 §4.3 / §10.1)
+// Atomic pending-dispatch marker parity
 //
 // When the atomic store opts into `push_dispatch_enabled`, a
 // terminal `StatusUpdate` commit MUST also insert a row into
@@ -3639,8 +3639,8 @@ where
 // non-terminal status commits and artifact-only commits MUST NOT.
 // =========================================================
 
-/// PDM-001: a terminal `StatusUpdate` commit writes a marker row
-/// in the same transaction.
+/// A terminal `StatusUpdate` commit writes a marker row in the same
+/// transaction.
 pub async fn test_atomic_marker_written_for_terminal_status(
     atomic: &dyn A2aAtomicStore,
     tasks: &dyn A2aTaskStorage,
@@ -3661,12 +3661,11 @@ pub async fn test_atomic_marker_written_for_terminal_status(
         .await
         .expect("seed task");
 
-    // Task 45 (ADR-018 §Pending-dispatch optimization): a push config
-    // MUST be registered for the marker to be written. Without a
-    // registered config the framework skips the marker write — a
-    // config registered after terminal is not eligible for that
-    // terminal event anyway, so skipping is
-    // correctness-neutral.
+    // Pending-dispatch optimization: a push config MUST be registered
+    // for the marker to be written. Without a registered config the
+    // framework skips the marker write — a config registered after
+    // terminal is not eligible for that terminal event anyway, so
+    // skipping is correctness-neutral.
     let config = turul_a2a_proto::TaskPushNotificationConfig {
         tenant: "default".into(),
         id: "cfg-pdm-001".into(),
@@ -3838,15 +3837,15 @@ pub async fn test_atomic_marker_absent_when_opt_in_off(
 }
 
 // =========================================================
-// Causal eligibility parity (ADR-013 §4.5 / §10.3)
+// Causal eligibility parity
 //
 // `list_configs_eligible_at_event(seq)` filters configs whose
 // `registered_after_event_sequence < seq`. STRICT less-than:
 // a config registered AT seq N is not eligible for event seq N.
 // =========================================================
 
-/// PEF-001: commit two non-terminal events, register
-/// config C1, commit terminal event (seq=3), register config C2.
+/// Commit two non-terminal events, register config C1, commit
+/// terminal event (seq=3), register config C2.
 /// `list_configs_eligible_at_event(3)` returns C1 only.
 pub async fn test_config_registered_at_or_after_event_not_eligible(
     atomic: &dyn A2aAtomicStore,
@@ -3868,7 +3867,7 @@ pub async fn test_config_registered_at_or_after_event_not_eligible(
     // Commit two artifact events via `update_task_with_events` —
     // this bumps `latest_event_sequence` to 2 without altering the
     // state machine. Artifact events exercise the same unconditional
-    // latest_event_sequence maintenance that ADR-013 §6.3 requires.
+    // latest_event_sequence maintenance that backend parity requires.
     let artifact_evt = |n: u32| StreamEvent::ArtifactUpdate {
         artifact_update: crate::streaming::ArtifactUpdatePayload {
             task_id: task_id.into(),
@@ -3959,11 +3958,11 @@ pub async fn test_config_registered_at_or_after_event_not_eligible(
     );
 }
 
-/// PEF-002 (ADR-013 §10.4 — sequential half): a `create_config`
-/// call that runs AFTER a terminal commit sees the advanced
-/// `latest_event_sequence` and stamps its config accordingly —
-/// so the stamped config is excluded from fan-out for the event
-/// that advanced the floor.
+/// Sequential half of the late-registration eligibility property: a
+/// `create_config` call that runs AFTER a terminal commit sees the
+/// advanced `latest_event_sequence` and stamps its config accordingly
+/// — so the stamped config is excluded from fan-out for the event that
+/// advanced the floor.
 ///
 /// NOTE: this test covers only the simple sequential ordering and
 /// does NOT exercise the interleaving race between `create_config`'s

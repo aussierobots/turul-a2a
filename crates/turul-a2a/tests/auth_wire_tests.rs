@@ -155,7 +155,7 @@ async fn empty_principal_via_unauthenticated_body_only() {
 
 #[tokio::test]
 async fn charset_safety_no_quote_or_backslash_in_www_authenticate() {
-    // / §2.3: RFC 6750 §3 restricts error_description charset.
+    // RFC 6750 §3 restricts error_description charset.
     // Since we emit error= from a closed enum and omit error_description,
     // the header value can never contain `"` or `\` from dynamic sources.
     // Exercise every kind that emits a Bearer challenge and assert.

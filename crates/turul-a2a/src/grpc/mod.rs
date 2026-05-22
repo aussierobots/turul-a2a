@@ -1,7 +1,7 @@
 //! gRPC transport.
 //!
-//! Third thin adapter over the shared core handlers (ADR-005 extended).
-//! All 11 `lf.a2a.v1.A2AService` RPCs dispatch into the same `core_*`
+//! Third thin adapter over the shared core handlers. All 11
+//! `lf.a2a.v1.A2AService` RPCs dispatch into the same `core_*`
 //! functions that HTTP and JSON-RPC call; this module contains only
 //! transport-level adaptation (error mapping, metadata, streaming
 //! serialization).

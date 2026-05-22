@@ -1,17 +1,21 @@
-//! ADR-015 skill-level `security_requirements` — advertisement vs.
-//! enforcement.
+//! Skill-level `security_requirements` — advertisement vs. enforcement.
 //!
-//! These tests pin the post-merge truthfulness invariants defined in
-//! ADR-015 §2.3 and the declaration-only runtime invariant in §4.2.
-//! All tests that need to populate `AgentSkill.security_requirements`
-//! use raw `turul_a2a_proto::AgentSkill` construction today; once
-//! ADR-015 §5.5 lands the builder path
-//! (`AgentSkillBuilder::security_requirements(...)` +
-//! `AgentCardBuilder::security_schemes(...)` /
-//! `::security_requirements(...)`) becomes the canonical adopter API
-//! and these tests should migrate. Using raw proto here keeps the
-//! test file compilable against current `main` so the post-merge
-//! validator can be observed in its red phase.
+//! These tests pin two invariants:
+//!
+//! - Post-merge truthfulness: every scheme name advertised on the
+//!   built card (agent-level or skill-level, public or extended) must
+//!   resolve to an installed middleware contribution. The server
+//!   builder rejects mismatches.
+//! - Declaration-only runtime: advertising a skill-level
+//!   `security_requirement` does NOT install runtime enforcement —
+//!   the framework publishes the requirement on the card and trusts
+//!   the executor to gate.
+//!
+//! Builder paths (`AgentSkillBuilder::security_requirements(...)`,
+//! `AgentCardBuilder::security_schemes(...)`,
+//! `AgentCardBuilder::security_requirements(...)`) are the canonical
+//! adopter API; tests use them where available and fall back to raw
+//! `turul_a2a_proto::AgentSkill` construction otherwise.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -167,12 +171,12 @@ impl A2aMiddleware for BearerContributingMiddleware {
 }
 
 // ---------------------------------------------------------------------------
-// §4.1 test 2 — public card agent-level path rejected (Red-B)
+// Post-merge truthfulness — agent-level path
 // ---------------------------------------------------------------------------
 
-/// ADR-015 §4.1 test 3: agent-level `SecurityRequirement` naming a
-/// scheme that is not in the merged `security_schemes` map causes
-/// server build to fail with `InvalidRequest` citing the offending
+/// Agent-level `SecurityRequirement` naming a scheme that is not in
+/// the merged `security_schemes` map causes server build to fail with
+/// `InvalidRequest` citing the offending
 /// scheme and "agent-level".
 #[test]
 fn server_build_rejects_agent_requirement_with_undeclared_scheme() {
@@ -215,10 +219,10 @@ fn server_build_rejects_agent_requirement_with_undeclared_scheme() {
     );
 }
 
-/// ADR-015 §4.1 test 2: public-card skill-level `SecurityRequirement`
-/// naming a scheme that is not in the merged `security_schemes` map
-/// causes server build to fail with `InvalidRequest` citing the
-/// offending scheme AND the skill id.
+/// Public-card skill-level `SecurityRequirement` naming a scheme that
+/// is not in the merged `security_schemes` map causes server build to
+/// fail with `InvalidRequest` citing the offending scheme AND the
+/// skill id.
 #[test]
 fn server_build_rejects_skill_requirement_with_undeclared_scheme() {
     let public = base_card(vec![skill_with_requirement("search", "bearer")]);
@@ -250,10 +254,10 @@ fn server_build_rejects_skill_requirement_with_undeclared_scheme() {
     );
 }
 
-/// ADR-015 §4.1 test 3a: an extended-card skill-level requirement
-/// naming an undeclared scheme MUST also fail build. Without this
-/// surface covered, the extended card could ship a reference that the
-/// public card would have caught.
+/// An extended-card skill-level requirement naming an undeclared
+/// scheme MUST also fail build. Without this surface covered, the
+/// extended card could ship a reference that the public card would
+/// have caught.
 #[test]
 fn server_build_rejects_extended_card_skill_requirement_with_undeclared_scheme() {
     let public = base_card(vec![]);
@@ -288,13 +292,13 @@ fn server_build_rejects_extended_card_skill_requirement_with_undeclared_scheme()
 }
 
 // ---------------------------------------------------------------------------
-// §4.1 tests 4-6 — post-merge acceptance paths
+// Post-merge acceptance paths
 // ---------------------------------------------------------------------------
 
-/// ADR-015 §4.1 test 4: a skill advertises a requirement naming
-/// `"bearer"`; the adopter card declares no schemes; a middleware
-/// contributes `"bearer"` via `SecurityContribution`. The validator
-/// sees the merged map and accepts the card. `build()` returns Ok.
+/// A skill advertises a requirement naming `"bearer"`; the adopter
+/// card declares no schemes; a middleware contributes `"bearer"` via
+/// `SecurityContribution`. The validator sees the merged map and
+/// accepts the card. `build()` returns Ok.
 ///
 /// This test guards against the failure mode where the post-merge
 /// validator runs against an un-merged card snapshot and rejects a
@@ -352,10 +356,10 @@ async fn server_build_accepts_skill_requirement_satisfied_by_middleware() {
     assert!(only.get("schemes").and_then(|v| v.get("bearer")).is_some());
 }
 
-/// ADR-015 §4.1 test 5: the adopter both declares
-/// `security_schemes["bearer"]` and references it from one skill's
-/// `security_requirements`. No middleware. Build must succeed. The
-/// served public card round-trips the skill-level requirement
+/// The adopter both declares `security_schemes["bearer"]` and
+/// references it from one skill's `security_requirements`. No
+/// middleware. Build must succeed. The served public card
+/// round-trips the skill-level requirement
 /// untouched (camelCase per proto JSON mapping).
 #[tokio::test]
 async fn server_build_accepts_skill_requirement_declared_by_adopter() {
@@ -395,9 +399,8 @@ async fn server_build_accepts_skill_requirement_declared_by_adopter() {
     );
 }
 
-/// ADR-015 §4.1 test 6: bearer middleware + an adopter-supplied
-/// skill-level requirement naming the same scheme. The merged card
-/// must:
+/// Bearer middleware + an adopter-supplied skill-level requirement
+/// naming the same scheme. The merged card must:
 ///   - expose `securitySchemes.bearer` exactly once (dedup),
 ///   - carry the middleware-contributed agent-level requirement,
 ///   - preserve the skill's requirement verbatim.
@@ -468,12 +471,11 @@ async fn middleware_contributions_and_skill_requirements_both_survive() {
 }
 
 // ---------------------------------------------------------------------------
-// §4.2 test 7 — declaration-only runtime invariant
+// Declaration-only runtime invariant
 // ---------------------------------------------------------------------------
 
-/// ADR-015 §4.2 test 7: advertising a skill-level
-/// `SecurityRequirement` MUST NOT, on its own, install any runtime
-/// gatekeeper. With no middleware in the stack the request succeeds
+/// Advertising a skill-level `SecurityRequirement` MUST NOT, on its
+/// own, install any runtime gatekeeper. With no middleware in the stack the request succeeds
 /// regardless of whether the wire names any skill or carries any
 /// Authorization header — the message body carries no
 /// skill-targeting metadata by design.

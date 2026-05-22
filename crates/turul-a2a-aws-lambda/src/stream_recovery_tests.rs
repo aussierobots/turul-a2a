@@ -1,6 +1,6 @@
-//! / §10 tests for [`LambdaStreamRecoveryHandler`].
+//! Tests for [`LambdaStreamRecoveryHandler`].
 //!
-//! The release-gate contract (ADR §10.5, §10.6, §10.7):
+//! Release-gate contract:
 //!
 //! - Valid marker + successful redispatch → no BatchItemFailure; POST fires.
 //! - `get_task → Ok(None)` (task deleted) → no BatchItemFailure, marker deleted.
@@ -225,9 +225,8 @@ async fn stream_success_path_fires_one_post_and_no_batch_failures() {
 
 #[tokio::test]
 async fn stream_deleted_task_returns_success_and_deletes_marker() {
-    // / §10.5: task deleted between marker write and
-    // stream delivery → delete marker, return success (NO
-    // BatchItemFailure).
+    // Task deleted between marker write and stream delivery → delete
+    // marker, return success (NO BatchItemFailure).
     let (storage, dispatcher, delivery) = build_stack().await;
     let (tenant, task_id, owner, seq) =
         seed_task_with_marker(&storage, "http://unused.invalid/webhook", "t-deleted").await;
@@ -440,9 +439,8 @@ async fn stream_non_insert_records_are_skipped() {
 
 #[tokio::test]
 async fn stream_duplicate_inserts_produce_exactly_one_post() {
-    // / §10.7: duplicate stream records for the same
-    // (tenant, task_id, event_sequence) — claim fencing yields
-    // exactly one POST.
+    // Duplicate stream records for the same (tenant, task_id,
+    // event_sequence) — claim fencing yields exactly one POST.
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/webhook"))

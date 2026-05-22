@@ -1,8 +1,8 @@
 //! In-flight task tracking and supervisor-panic cleanup.
 //!
-//! Shared runtime substrate for ADR-010 (long-running tasks + EventSink),
-//! (cancellation propagation), and ADR-011 (push delivery). The
-//! types in this module own the invariants around spawned executors —
+//! Shared runtime substrate for long-running tasks (executor +
+//! EventSink), cancellation propagation, and push delivery. The types
+//! in this module own the invariants around spawned executors —
 //! cancellation signalling, blocking-send return, abort capability,
 //! cleanup on every exit path.
 //!
@@ -450,7 +450,7 @@ impl Drop for SupervisorSentinel {
 }
 
 // ---------------------------------------------------------------------------
-// Cross-instance cancel poller (ADR-012 §3/§4)
+// Cross-instance cancel poller
 // ---------------------------------------------------------------------------
 
 /// Run a cross-instance cancel-marker poll loop until `shutdown` is cancelled.

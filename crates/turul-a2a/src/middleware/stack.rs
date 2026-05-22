@@ -92,9 +92,9 @@ impl A2aMiddleware for AnyOfMiddleware {
         }
 
         // All children failed. Select highest-precedence error, ties by
-        // registration order. ADR-016 §2.1 + §2.3: WWW-Authenticate is
-        // built at the transport layer from the selected error's kind —
-        // no manual challenge-string concatenation.
+        // registration order. `WWW-Authenticate` is built at the transport
+        // layer from the selected error's kind — no manual challenge-string
+        // concatenation here.
         let selected = errors
             .into_iter()
             .reduce(|champion, challenger| {
@@ -422,7 +422,7 @@ mod tests {
     // =========================================================
 
     // =========================================================
-    // AnyOfMiddleware — challenge selection (ADR-016: no concat).
+    // AnyOfMiddleware — challenge selection (no concat).
     // WWW-Authenticate is built at the transport boundary from the
     // selected error's kind, not by merging child challenge strings.
     // =========================================================
@@ -499,7 +499,8 @@ mod tests {
 
     #[test]
     fn authenticated_with_literal_anonymous_owner_is_still_authenticated() {
-        // Per ADR-007: a principal literally named "anonymous" IS authenticated
+        // A principal literally named "anonymous" IS authenticated — auth state
+        // is an enum, not `owner != "anonymous"`.
         let id = AuthIdentity::Authenticated {
             owner: "anonymous".into(),
             claims: None,

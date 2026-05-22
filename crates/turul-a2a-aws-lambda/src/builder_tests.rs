@@ -1,5 +1,5 @@
-//! Builder wiring tests for ADR-012 same-backend requirements on the
-//! Lambda adapter. Proves that:
+//! Builder wiring tests for same-backend requirements on the Lambda
+//! adapter. Proves that:
 //!
 //! - `.storage()` requires `A2aCancellationSupervisor` on the bundled
 //!   backend (bound at the type-system level).
@@ -374,7 +374,7 @@ fn build_succeeds_with_explicit_cancellation_supervisor_same_backend() {
 }
 
 // ---------------------------------------------------------------------
-// / §10.2 Lambda builder mirror of main-server consistency.
+// Lambda builder mirror of main-server push-dispatch consistency.
 // ---------------------------------------------------------------------
 
 #[test]

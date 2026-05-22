@@ -331,8 +331,9 @@ async fn cancel_vs_cancel_idempotency() {
         assert_eq!(s, Some("TASK_STATE_CANCELED"), "both return CANCELED");
     }
 
-    // Event store has exactly one CANCELED event (the single-terminal-writer
-    // invariant from ADR-010 §7.1 enforces this at the atomic-store layer).
+    // Event store has exactly one CANCELED event: the
+    // single-terminal-writer invariant (terminal-write CAS in the
+    // atomic store) enforces this.
     use turul_a2a::storage::A2aEventStore;
     let events = storage
         .get_events_after("default", "t-idem", 0)
@@ -527,9 +528,9 @@ async fn supervisor_panic_cleanup_via_sentinel_under_cancellation() {
 // Test 9: SSE subscriber sees terminal CANCELED.
 //
 // Subscribe while the task is WORKING, call core_cancel_task, assert
-// the stream delivers the CANCELED terminal event (ADR-012 §11 test
-// item #11). The test does not rely on a spawned executor: the
-// `CancelTask` handler writes the CANCELED event via
+// the stream delivers the CANCELED terminal event. The test does not
+// rely on a spawned executor: the `CancelTask` handler writes the
+// CANCELED event via
 // `A2aAtomicStore::update_task_status_with_events` (terminal-CAS
 // path) and notifies the event broker, while `core_subscribe_to_task`
 // reads from the same durable store and closes on terminal events.

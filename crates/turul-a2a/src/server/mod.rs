@@ -84,7 +84,7 @@ pub struct RuntimeConfig {
     /// `false` — the runtime cannot guarantee post-return execution;
     /// `core_send_message` rejects `return_immediately = true` with
     /// `A2aError::UnsupportedOperation` before any storage write. The
-    /// AWS Lambda adapter (ADR-008, ADR-013 §4.4) sets this.
+    /// AWS Lambda adapter sets this.
     ///
     /// # Override policy
     ///
@@ -102,14 +102,12 @@ pub struct RuntimeConfig {
     /// started", not "workflow finished". If the A2A task is meant to
     /// track the full workflow lifecycle, the workflow itself must
     /// later call back into turul-a2a storage to update task state.
-    /// See ADR-017 §"Alternatives considered" — Pattern A.
     ///
-    /// A future ADR will add a capability-taking
-    /// `LambdaA2aServerBuilder` method (shape:
-    /// `with_durable_return_immediately(handler)`) that accepts a
-    /// durable continuation mechanism as an argument and sets this
-    /// flag as a side effect. At that point the flag still SHOULD NOT
-    /// be flipped directly — reach for the builder method.
+    /// A future capability-taking `LambdaA2aServerBuilder` method
+    /// (shape: `with_durable_return_immediately(handler)`) will accept
+    /// a durable continuation mechanism as an argument and flip this
+    /// flag as a side effect. Even then, the flag SHOULD NOT be flipped
+    /// directly — reach for the builder method.
     pub supports_return_immediately: bool,
 }
 
@@ -342,8 +340,8 @@ impl A2aServerBuilder {
     }
 
     /// Set the cancellation supervisor individually. Prefer `.storage()`
-    /// for ADR-009 same-backend compliance. Consumed by the `:cancel`
-    /// handler for cross-instance marker reads.
+    /// so a single backend implements every storage trait. Consumed by
+    /// the `:cancel` handler for cross-instance marker reads.
     pub fn cancellation_supervisor(
         mut self,
         supervisor: impl crate::storage::A2aCancellationSupervisor + 'static,
@@ -352,25 +350,29 @@ impl A2aServerBuilder {
         self
     }
 
-    /// Set task storage individually. Prefer `.storage()` for ADR-009 compliance.
+    /// Set task storage individually. Prefer `.storage()` so a single
+    /// backend implements every storage trait.
     pub fn task_storage(mut self, storage: impl A2aTaskStorage + 'static) -> Self {
         self.task_storage = Some(Arc::new(storage));
         self
     }
 
-    /// Set push notification storage individually. Prefer `.storage()` for ADR-009 compliance.
+    /// Set push notification storage individually. Prefer `.storage()`
+    /// so a single backend implements every storage trait.
     pub fn push_storage(mut self, storage: impl A2aPushNotificationStorage + 'static) -> Self {
         self.push_storage = Some(Arc::new(storage));
         self
     }
 
-    /// Set event store individually. Prefer `.storage()` for ADR-009 compliance.
+    /// Set event store individually. Prefer `.storage()` so a single
+    /// backend implements every storage trait.
     pub fn event_store(mut self, store: impl crate::storage::A2aEventStore + 'static) -> Self {
         self.event_store = Some(Arc::new(store));
         self
     }
 
-    /// Set atomic store individually. Prefer `.storage()` for ADR-009 compliance.
+    /// Set atomic store individually. Prefer `.storage()` so a single
+    /// backend implements every storage trait.
     pub fn atomic_store(mut self, store: impl A2aAtomicStore + 'static) -> Self {
         self.atomic_store = Some(Arc::new(store));
         self
@@ -381,8 +383,9 @@ impl A2aServerBuilder {
     /// Required when push-notification delivery is enabled in the
     /// deployment. `.storage()` wires this automatically from a unified
     /// backend; use this setter only for mixed-backend tests or when
-    /// running against an external push-coordination service. Prefer
-    /// `.storage()` for ADR-009 same-backend compliance.
+    /// running against an external push-coordination service. The
+    /// builder rejects split configurations where the atomic store and
+    /// the push delivery store come from different concrete instances.
     pub fn push_delivery_store(
         mut self,
         store: impl crate::push::A2aPushDeliveryStore + 'static,
@@ -514,7 +517,8 @@ impl A2aServerBuilder {
                 // Build the push-delivery worker + dispatcher now that
                 // we've validated the horizon. Runtime config carries
                 // the full worker tuning; the dispatcher closes the
-                // commit-to-POST loop (ADR-011 §2 + §13.13).
+                // commit-to-POST loop so every terminal status commit
+                // fans out to registered push configs.
                 let delivery_cfg = crate::push::delivery::PushDeliveryConfig {
                     max_attempts: self.runtime_config.push_max_attempts as u32,
                     backoff_base: self.runtime_config.push_backoff_base,
@@ -780,7 +784,7 @@ impl A2aServer {
     }
 
     /// Build the tonic gRPC router with the Tower auth stack already
-    /// layered (ADR-014 §2.2 / §2.4).
+    /// layered.
     ///
     /// The returned `tonic::transport::server::Router` always applies
     /// the same [`MiddlewareStack`] as the HTTP path. A raw
@@ -1330,7 +1334,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Push-dispatch consistency (ADR-013 §4.3 / §10.2)
+    // Push-dispatch consistency: the atomic store's pending-dispatch
+    // marker must be writable iff a push delivery consumer is wired,
+    // and the builder rejects inconsistent configurations on both axes.
     // -----------------------------------------------------------------
 
     #[test]

@@ -30,7 +30,7 @@
 //! for `SendStreamingMessage` + `SubscribeToTask` is exercised in the
 //! dedicated streaming suites (`sse_tests.rs`, `d3_streaming_tests.rs`);
 //! this file asserts only the "terminal-task subscribe returns
-//! UnsupportedOperationError" contract (§3.1.6).
+//! UnsupportedOperationError" contract (A2A spec §3.1.6).
 //!
 //! For each operation we assert:
 //! - the wire path + verb match the proto's `google.api.http` option,
@@ -200,7 +200,7 @@ async fn jsonrpc_call(
     json
 }
 
-/// Spec §5.4 / ADR-004: every A2A error response carries a
+/// A2A spec §5.4: every A2A error response carries a
 /// `google.rpc.ErrorInfo` record with `reason` + `domain`.
 ///
 /// The exact slot differs by transport:
@@ -844,7 +844,7 @@ async fn jsonrpc_unknown_method_returns_method_not_found() {
 // HTTP at `/extendedAgentCard`, over JSON-RPC as
 // `GetExtendedAgentCard`, and over gRPC as
 // `A2AService.GetExtendedAgentCard`. There is no `GetAgentCard` /
-// `A2AService.GetAgentCard` in the proto — see ADR-015 §4.3.
+// `A2AService.GetAgentCard` in the proto.
 // ---------------------------------------------------------------------------
 
 /// Executor whose public + extended cards both carry the same
@@ -1059,7 +1059,8 @@ mod adr015_grpc_roundtrip {
         (addr, handle)
     }
 
-    /// gRPC `A2AService.GetExtendedAgentCard` arm of ADR-015 §4.3 test 8.
+    /// gRPC `A2AService.GetExtendedAgentCard` arm of the extended-card
+    /// skill-requirements round-trip parity check.
     #[tokio::test]
     async fn adr015_extended_card_skill_requirements_roundtrip_over_grpc() {
         let (addr, _handle) = spawn_grpc().await;
@@ -1177,7 +1178,7 @@ async fn send_streaming_message_returns_text_event_stream() {
 //      `ErrorInfo.reason` strings and the canonical
 //      `a2a-protocol.org` domain on all three transports. A bug in a
 //      `core_*` function MUST produce an identically-labeled failure
-//      on HTTP, JSON-RPC, and gRPC (ADR-005 extended, ADR-014 §2.11).
+//      on HTTP, JSON-RPC, and gRPC.
 
 #[cfg(feature = "grpc")]
 mod grpc_parity {

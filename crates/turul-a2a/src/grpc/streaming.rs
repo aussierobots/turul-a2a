@@ -12,8 +12,8 @@
 //! via the pbjson-generated `serde` impls, so the wire shape matches
 //! what the HTTP+SSE encoder emits. `last_chunk` on
 //! `TaskArtifactUpdateEvent` is read back from
-//! `ArtifactUpdatePayload.last_chunk` in the stored event (ADR-014
-//! §2.3 two-layer persistence) — the adapter never invents it.
+//! `ArtifactUpdatePayload.last_chunk` in the stored event — the adapter
+//! never invents it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,7 +35,7 @@ use crate::streaming::replay;
 /// (`router.rs` `STORE_POLL_INTERVAL`). A local wake notification makes
 /// this timer effectively zero-latency on the active instance; the
 /// periodic tick covers the multi-instance case where writes land on
-/// another instance's broker (ADR-009 §§3-4).
+/// another instance's broker.
 const STORE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Channel depth for the spawned producer task. Matches the SSE path.
@@ -57,8 +57,7 @@ pub async fn handle_send_streaming_message(
     owner: String,
     body: String,
 ) -> Result<BoxedStreamResponseStream, Status> {
-    // gRPC auth claims are not yet wired (future ADR). Pass None for now;
-    // matches the pre-ADR-018 runtime behaviour on this path.
+    // gRPC auth claims are not yet wired. Pass None for now.
     let (task_id, wake_rx) =
         router::setup_streaming_send(state.clone(), &tenant, &owner, None, body)
             .await
@@ -98,9 +97,8 @@ pub async fn handle_subscribe_to_task(
             })
         })?;
 
-    // Terminal-state rejection: shared core raises
-    // UnsupportedOperationError; the mapping table in
-    // §2.5 turns that into FAILED_PRECONDITION + ErrorInfo.
+    // Terminal-state rejection: shared core raises UnsupportedOperationError;
+    // the gRPC error mapping turns that into FAILED_PRECONDITION + ErrorInfo.
     if let Some(status) = task.status() {
         if let Ok(s) = status.state() {
             if s.is_terminal() {
@@ -118,8 +116,8 @@ pub async fn handle_subscribe_to_task(
         .map(|parsed| parsed.sequence)
         .unwrap_or(0);
 
-    // Spec §3.1.6 + ADR-014 §2.11: the first event on a fresh attach is
-    // the `Task` snapshot. On resume the client already has it — skip.
+    // A2A spec §3.1.6: the first event on a fresh attach is the `Task`
+    // snapshot. On resume the client already has it — skip.
     let initial_task = if after_sequence == 0 {
         Some(task)
     } else {

@@ -247,8 +247,7 @@ pub trait A2aPushNotificationStorage: Send + Sync {
         page_size: Option<i32>,
     ) -> Result<PushConfigListPage, A2aStorageError>;
 
-    /// List configs eligible for fan-out of a specific terminal event
-    /// (ADR-013 §4.5 / §6.2).
+    /// List configs eligible for fan-out of a specific terminal event.
     ///
     /// Returns configs whose `registered_after_event_sequence <
     /// event_sequence`. Strictly less-than: a config recorded AT
