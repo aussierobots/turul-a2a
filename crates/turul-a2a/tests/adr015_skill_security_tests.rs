@@ -482,11 +482,10 @@ async fn middleware_contributions_and_skill_requirements_both_survive() {
 ///
 /// The invariant under test is precisely that advertising
 /// skill-level requirements is declaration-only; authorization is
-/// governed solely by the installed middleware stack. If a successor
-/// ADR both (a) introduces a normative way for a message to target a
-/// skill and (b) enables runtime enforcement, the assertion in this
-/// test flips and this comment's conditional becomes the migration
-/// note.
+/// governed solely by the installed middleware stack. If a future
+/// spec revision introduces a normative way for a message to target
+/// a specific skill AND enables runtime enforcement keyed on that
+/// targeting, the assertion in this test flips.
 #[tokio::test]
 async fn advertised_skill_requirements_do_not_install_middleware() {
     let mut public = base_card(vec![skill_with_requirement("search", "bearer")]);

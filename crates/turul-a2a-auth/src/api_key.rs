@@ -40,10 +40,11 @@ impl ApiKeyLookup for StaticApiKeyLookup {
 ///
 /// Internal storage uses a plain `HashMap<String, String>` — keys remain
 /// in-process strings but are unreachable via `Debug`, `Display`, or
-/// `Serialize`. This is the simplest shape that satisfies the ADR
-/// invariant; adopter implementations may reach for more elaborate
-/// containers (`secrecy::SecretString` with newtype, etc.) if their
-/// deployment requires stronger guarantees.
+/// `Serialize`. This is the simplest shape that keeps key material
+/// out of logs, panic output, and serialized state. Adopter
+/// implementations may reach for more elaborate containers
+/// (`secrecy::SecretString` with newtype, etc.) if their deployment
+/// requires stronger guarantees.
 ///
 /// ```
 /// use std::collections::HashMap;

@@ -406,9 +406,9 @@ mod tests {
     #[test]
     fn metadata_ignored_when_proto_non_empty_even_on_conflict() {
         // The conflict case: proto and metadata disagree. Contract: proto
-        // wins, metadata silently ignored (no error). Add-on to the three
-        // ADR-mandated cases above — covers the "accidentally addressing
-        // two tenants" scenario flagged during ADR review.
+        // wins, metadata silently ignored (no error). Covers the
+        // "accidentally addressing two tenants" scenario; the three cases
+        // above plus this one are the complete decision matrix.
         let req = make_request((), Some("tenant-B"));
         assert_eq!(tenant_from(&req, "tenant-A"), "tenant-A");
     }

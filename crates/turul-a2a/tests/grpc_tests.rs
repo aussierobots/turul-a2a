@@ -518,8 +518,9 @@ async fn grpc_send_streaming_message_to_terminal() {
         }
         other => panic!(
             "first event must be StatusUpdate(SUBMITTED); got {other:?}. A synthetic \
-             Task first event would indicate regression of the narrowed ADR-014 §2.3 \
-             contract."
+             Task first event would indicate regression of the gRPC streaming \
+             contract (first event MUST be the SUBMITTED status, not a Task \
+             snapshot)."
         ),
     }
 
@@ -670,7 +671,7 @@ async fn grpc_auth_middleware_rejects_with_unauthenticated() {
     assert_eq!(
         err.code(),
         tonic::Code::Unauthenticated,
-        "auth failure must surface as UNAUTHENTICATED (ADR-014 §2.4 / §2.5)"
+        "auth failure must surface as gRPC UNAUTHENTICATED status"
     );
 }
 

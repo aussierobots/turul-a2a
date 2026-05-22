@@ -815,7 +815,7 @@ pub async fn core_send_message(
             owner = owner,
             "rejecting SendMessageConfiguration.return_immediately=true: \
              this runtime does not support post-return executor continuation \
-             (ADR-017 §Decision Bug 1, ADR-013 §4.4)"
+             (a persistent durable-executor worker is required)"
         );
         return Err(A2aError::UnsupportedOperation {
             message: "return_immediately=true is not supported on this runtime \

@@ -624,8 +624,8 @@ async fn extended_agent_card_available_over_jsonrpc() {
 
 #[tokio::test]
 async fn subscribe_to_task_terminal_returns_unsupported_operation() {
-    // Per A2A spec §3.1.6 (and ADR on subscribe): subscribing to an
-    // already-terminal task MUST return UnsupportedOperationError.
+    // Per A2A spec §3.1.6: subscribing to an already-terminal task
+    // MUST return UnsupportedOperationError.
     // `ComplianceAgent` completes synchronously, so the task we
     // create via send is immediately terminal.
     let router = compliance_router();

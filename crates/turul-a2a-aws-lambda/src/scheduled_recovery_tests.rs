@@ -116,9 +116,9 @@ async fn scheduled_sweep_recovers_stale_marker_and_fires_post() {
         seed_task_with_marker(&storage, &format!("{}/webhook", mock.uri()), "t-stale").await;
 
     // Configure a zero-length stale cutoff so the just-written marker
-    // qualifies immediately. This matches the ADR's contract — the
-    // cutoff is operator-tuned, not hard-coded; tests set it to the
-    // shortest value that admits the seeded marker.
+    // qualifies immediately. The stale cutoff is operator-tuned, not
+    // hard-coded; tests set it to the shortest value that admits the
+    // seeded marker.
     let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery.clone()).with_config(
         LambdaScheduledRecoveryConfig {
             stale_cutoff: std::time::Duration::ZERO,
