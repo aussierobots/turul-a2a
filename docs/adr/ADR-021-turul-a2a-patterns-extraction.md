@@ -1,6 +1,6 @@
 # ADR-021: Create `turul-a2a-patterns` Skill-Pattern Crate
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-05-22
 - **Depends on:** ADR-001 (proto-first), ADR-002 (wrapper boundary),
   ADR-015 (declaration-only precedent), ADR-020 (deferred-extraction
