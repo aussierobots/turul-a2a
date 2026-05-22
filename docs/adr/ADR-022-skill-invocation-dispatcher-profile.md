@@ -1,7 +1,8 @@
 # ADR-022: Skill-Invocation Dispatcher — Profile Extension Convention
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-05-22
+- **Accepted:** 2026-05-23 (red-phase tests + placement sketch landed)
 
 ## Review status (2026-05-23)
 
