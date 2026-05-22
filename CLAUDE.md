@@ -142,9 +142,28 @@ The builder rejects inconsistent configurations (ADR-013 §4.3). Non-push adopte
 
 ### Architecture Decision Records
 
-Long-form rationale lives under `docs/adr/`. ADR refs are durable internal anchors — keep them out of READMEs, crate-level `//!` docs, `pub` item `///` docs, and adopter-visible prose. Cite ADR numbers freely in private/inline source comments and CHANGELOG entries when they help future maintainers.
+Long-form rationale lives under `docs/adr/`. ADR refs belong in commit messages, PR descriptions, `CHANGELOG.md`, ADR cross-references, and `README.md` files. **They do NOT belong in code comments, docstrings, or rustdoc** — see §"Comment and Docstring Style" for the rule and the litmus test.
 
 For non-trivial architecture changes, the ADR should be accepted before implementation starts.
+
+### ADR-review agent — mandatory precommit gate
+
+Before committing any change that touches `crates/`, `examples/`, `docs/adr/`, `CLAUDE.md`, `CHANGELOG.md`, or the root `Cargo.toml`, **dispatch the project-shared `adr-review` subagent** (`.claude/agents/adr-review.md`). It runs read-only checks for:
+
+- Comment-style violations (ADR/§/Phase/Wave refs in code).
+- Crate-visibility invariants (`turul-a2a-patterns` stays `publish = false`; not a dep of any publishable crate).
+- Dep-direction invariants (`turul-a2a-patterns` does not depend on `turul-a2a`).
+- Newtype bridge pattern (no orphan-rule-violating impls in examples).
+- async_trait ergonomics (no visible `Pin<Box<dyn Future>>` in adopter-facing code).
+- SKILL.md coverage for callable showcase skills.
+- Wrapper-vs-raw-proto example policy.
+- Build-artifact contamination (Go binaries, Python venvs, etc.).
+- ADR drift — public API parity with binding contracts (`SkillError` variants, `ProgressState` excludes terminals, `SkillCard` constructor invariant, etc.).
+- Proto SHA drift (re-verification trigger when `proto/a2a.proto` changes).
+
+The agent reports findings with severity. **BLOCKERs and HIGHs MUST be addressed before the commit lands.** MEDIUMs and LOWs may be addressed in a follow-up commit if they aren't trivially fixable in scope.
+
+The agent is read-only — it does not modify files. The user (or another agent) applies the fixes; the user (or `adr-review` rerun) verifies them.
 
 ### Example and API Surface Policy
 
