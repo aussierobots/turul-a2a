@@ -2,6 +2,52 @@
 
 - **Status:** Proposed
 - **Date:** 2026-05-22
+
+## Review status (2026-05-23)
+
+Recommendation: **Keep Proposed with concrete blockers below.**
+
+The contract in §2 is spec-truthful and concretely specified
+(request shape picked: `Message.metadata` carrying `a2a.skillId` +
+`a2a.skillParams`; activation via the standard `A2A-Extensions`
+header). The four-point profile shape matches what A2A v1.0's
+extension model permits.
+
+**Blockers before acceptance:**
+
+1. **Red-phase test suite** for the dispatch behaviour does not yet
+   exist. Specifically: tests that pin (a) `A2A-Extensions` header
+   parsing in `turul-a2a`'s router, (b) `Message.metadata`-keyed
+   skill routing, (c) `UnsupportedOperationError` on a `required`
+   extension that the server doesn't honour, (d) header echo on the
+   response.
+2. **First-profile placement decision** unresolved. ADR-021 §5
+   states: when there's a single profile inhabitant, the profile
+   lives in `turul-a2a` (the transport-owning crate) rather than a
+   new profile/extensions crate. Acceptance of this ADR commits to
+   that placement; needs a `pub(crate)` module sketch in
+   `crates/turul-a2a/src/` for review before flipping.
+3. **Interop probe.** The current cross-language clients (`a2a-sdk`
+   1.0.2, `a2aproject/a2a-go` v2.3.1) do not send `A2A-Extensions`
+   headers by default. Acceptance needs at least one client smoke
+   demonstrating the dispatch path works end-to-end (would extend
+   `examples/interop-clients/<agent>/<lang>/` with a profile-aware
+   variant or require a dedicated `examples/skill-dispatch-profile-agent`).
+
+**Why not Accept now:** the design is sound, but acceptance is
+load-bearing — it commits the framework to a URI namespace and a
+header-dispatch behaviour. Without the red-phase tests + interop
+probe, acceptance ships a contract we haven't actually exercised.
+
+**Why not Reject:** the four-point contract is the right shape for
+A2A's extension model; the spec-compliance review found no drift.
+Rejection would only make sense if upstream A2A added a normative
+`skill_id` field to `Message` — that hasn't happened.
+
+**Next action (to clear blockers):** dispatch a red-phase test
+writer for the dispatcher hook in `turul-a2a`'s router, plus a
+first-profile placement sketch as a `pub(crate)` module under
+`crates/turul-a2a/src/`. When green, this ADR moves to Accepted.
 - **Depends on:** ADR-001 (proto-first architecture), ADR-015
   (declaration-only precedent for skill-level security), ADR-021
   (patterns extraction; deferred dispatcher §2.4/§2.5 + four-point

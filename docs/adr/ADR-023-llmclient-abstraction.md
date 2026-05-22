@@ -4,6 +4,68 @@
 - **Date:** 2026-05-22
 - **Depends on:** ADR-021
 
+## Review status (2026-05-23)
+
+Recommendation: **Keep Proposed with concrete blockers below.**
+
+The ADR's recommended disposition (Option C — separate `turul-llm-client`
+crate, trait-only, no provider adapters in the framework) is the
+right shape *if* a unified LLM-client abstraction is needed. The
+reservation is whether the framework needs to ship an abstraction at
+all (Option A — adopters write their own).
+
+**Blockers before acceptance:**
+
+1. **Trait shape unvalidated against real provider semantics.** The
+   §4 sketch shows the high-level shape (`async fn complete(rendered_prompt, output_schema, provider_config) -> Result<Value, LlmError>`)
+   but has not been exercised against more than one provider. Ollama
+   alone fits cleanly; OpenAI / Anthropic / Vertex have meaningfully
+   different request shapes (system vs user prompts, tool calls,
+   streaming-first APIs, content blocks, structured-output formats).
+   Acceptance pre-emptively commits the framework to a trait that
+   hasn't survived contact with provider diversity.
+2. **No red-phase tests.** Phase A.2 sign-off requires a
+   compiling-but-failing test suite for the proposed trait.
+3. **Open questions in §7 are answer-dependent.** Streaming, retries,
+   token budgeting, observability hooks, and system-prompt-vs-user-prompt
+   distinction each have multiple defensible answers; accepting the
+   ADR with all five unresolved would ship a trait that can't be
+   used without picking those answers anyway.
+4. **No demand signal.** Phase C's `examples/skill-manifest-ollama-agent`
+   proves the provider call works fine in adopter code — the
+   framework crate stays provider-neutral via the manifest's opaque
+   `providerConfig:` block. No external adopter has requested a
+   framework-level LLM-client surface. The Ollama example pattern
+   has not yet shown significant in-tree duplication.
+
+**Why not Accept now:** publishing `turul-llm-client` claims a name
+on crates.io (irreversible — yank only hides), commits the
+framework to maintaining a trait that hasn't met two providers, and
+addresses no real adopter pain. Acceptance without the four
+blockers cleared ships a contract that costs us flexibility without
+buying us anything.
+
+**Why not Reject:** Option C remains the *least-bad* path *if*
+demand emerges. Rejecting now would force a successor ADR to
+re-derive the same recommendation from scratch when the question
+reopens. Keeping this ADR as Proposed preserves the analysis.
+
+**Why not flip to Option A in this review:** the ADR could be amended
+to "we will never ship a `turul-llm-client` crate; each adopter
+copies the Ollama example pattern." That's defensible. But
+without explicit user direction to commit to Option A
+*as a permanent decision*, the safer disposition is to keep the
+question open — the cost of "Proposed with blockers" is one
+unresolved ADR; the cost of "Rejected" is foreclosing an option we
+might want.
+
+**Next action (to clear blockers):** when an external adopter requests
+a unified surface, or when a second in-tree LLM-backed example
+emerges that would duplicate the Ollama provider call, drive trait
+validation against at least one additional provider (OpenAI
+structured outputs is the natural second target) and add red-phase
+tests. Then revisit Accept vs Reject.
+
 ## 1. Context
 
 ADR-021 §2.4 explicitly defers the `LlmClient` question: "A separate ADR decides
