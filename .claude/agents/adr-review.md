@@ -75,12 +75,12 @@ Any `turul-a2a = …` line → **BLOCKER**.
 
 Example agents that bridge the framework's `EventSink` into `SkillProgressSink` MUST use a local newtype (`struct ExampleProgressSink(EventSink);`) and impl the trait on the newtype. A direct `impl SkillProgressSink for EventSink` from an example crate is **illegal Rust** (orphan rule: both trait and type external to the example).
 
-Check with:
+Check with (match real impl blocks at column 0, NOT doc-comment mentions):
 ```bash
-grep -rn 'impl SkillProgressSink for EventSink' examples/
+grep -rnE '^impl[[:space:]]+(turul_a2a_patterns::)?SkillProgressSink[[:space:]]+for[[:space:]]+EventSink' examples/ crates/
 ```
 
-Any hit in `examples/*/src/*.rs` (other than inside a future direct-impl path inside `crates/turul-a2a`) → **BLOCKER**.
+Any hit in `examples/*/src/*.rs` (other than inside `crates/turul-a2a` post-§4) → **BLOCKER**. Doc-comment mentions of the future post-publish state (e.g. `/// direct impl SkillProgressSink for EventSink`) are fine.
 
 ## 5. async_trait ergonomics
 
