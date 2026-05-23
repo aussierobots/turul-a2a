@@ -195,6 +195,34 @@ flips to publishable: the newtype is no longer required, because
 EventSink` (both trait and type are local to that crate). The example
 keeps the newtype as documentation; new adopters can drop it.
 
+## Typed input / output structs
+
+The handler uses example-local `GreetInput { user: UserInput, style:
+GreetingStyle }` and `GreetOutput { greeting: String }` structs instead
+of digging through `serde_json::Value`. **SKILL.md is still the
+authoritative contract** — the handler calls `card.validate_input`
+before deserialising into `GreetInput`, and `card.validate_output`
+after serialising `GreetOutput` back to JSON. The typed structs sit
+between those calls; they are ergonomics, not the contract.
+
+Four tests pin the structs to the manifest so struct/schema drift is
+caught at `cargo test` time:
+
+- `every_example_payload_deserialises_into_struct` — every payload
+  shown in this README, in `tests/smoke.rs`, and in the manifest's
+  `examples` block must `serde_json::from_value::<GreetInput>(_)`.
+- `typed_input_serialises_to_schema_valid_json` — a sample
+  `GreetInput` must serialise to JSON that satisfies the manifest's
+  `inputSchema`.
+- `typed_output_serialises_to_schema_valid_json` — same for
+  `GreetOutput` and `outputSchema`.
+- `manifest_validates_before_struct_deserialises` — proves the
+  manifest catches constraints the typed struct alone cannot (e.g.
+  `user.name` `minLength: 1`, which serde happily accepts as `""`).
+
+If you add a new example payload anywhere in this crate, add it to
+`EXAMPLE_PAYLOADS` in `src/main.rs` so the first test exercises it.
+
 ## The SKILL.md manifest
 
 The canonical file is [`skills/demo/SKILL.md`](skills/demo/SKILL.md).

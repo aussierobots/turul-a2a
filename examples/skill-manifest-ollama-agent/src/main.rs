@@ -18,6 +18,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use turul_a2a::A2aServer;
 use turul_a2a::card_builder::AgentCardBuilder;
@@ -123,6 +124,53 @@ fn map_llm_error(err: LlmError) -> SkillError {
 }
 
 // ---------------------------------------------------------------------------
+// Typed input / output for the `greet` skill.
+//
+// These structs are example-local ergonomics; SKILL.md is the authoritative
+// contract. The handler still runs `card.validate_input` and
+// `card.validate_output` against the manifest schemas — typed structs sit
+// between those calls. Tests at the bottom of this file pin every typed
+// payload round-trip against the manifest so struct/schema drift is caught.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GreetInput {
+    user: UserInput,
+    #[serde(default)]
+    style: GreetingStyle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UserInput {
+    name: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum GreetingStyle {
+    #[default]
+    Casual,
+    Formal,
+}
+
+impl GreetingStyle {
+    fn salutation(&self) -> &'static str {
+        match self {
+            GreetingStyle::Formal => "Good day",
+            GreetingStyle::Casual => "Hi",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GreetOutput {
+    greeting: String,
+}
+
+// ---------------------------------------------------------------------------
 // Skill handler — offline stub by default, Ollama when env vars are set.
 // ---------------------------------------------------------------------------
 
@@ -156,11 +204,9 @@ impl GreetHandler {
             .unwrap_or("llama3.1")
     }
 
-    async fn run_live(&self, base_url: &str, prompt: &str) -> Result<Value, SkillError> {
-        // Build the provider-neutral request. The schema-passthrough lives
-        // inside the OllamaClient adapter (it maps `output_schema` to
-        // Ollama's `format` field). When the trait gains a second provider,
-        // the example's wiring here does not change.
+    async fn run_live(&self, base_url: &str, prompt: &str) -> Result<GreetOutput, SkillError> {
+        // The schema-passthrough lives inside the OllamaClient adapter (it
+        // maps `output_schema` to Ollama's `format` field).
         let client = OllamaClient::new(base_url, self.provider_model());
         let mut request = CompletionRequest::new(prompt);
         if let Some(schema) = self.card.output_schema.clone() {
@@ -168,24 +214,23 @@ impl GreetHandler {
         }
 
         let response = client.complete(request).await.map_err(map_llm_error)?;
-        Ok(response.parsed_output)
+        serde_json::from_value::<GreetOutput>(response.parsed_output).map_err(|e| {
+            SkillError::Internal(format!(
+                "LLM response did not match typed output struct \
+                 (manifest schema passed but struct rejected — possible drift): {e}"
+            ))
+        })
     }
 
-    fn run_offline(&self, params: &Value, prompt: &str) -> Value {
-        let user_name = params
-            .get("user")
-            .and_then(|u| u.get("name"))
-            .and_then(|n| n.as_str())
-            .unwrap_or("friend");
-        let style = params
-            .get("style")
-            .and_then(|s| s.as_str())
-            .unwrap_or("casual");
-        let prefix = if style == "formal" { "Good day" } else { "Hi" };
-        let _ = prompt; // referenced via tracing below; offline ignores it
-        json!({
-            "greeting": format!("{prefix}, {user_name}! (offline stub)")
-        })
+    fn run_offline(&self, input: &GreetInput, prompt: &str) -> GreetOutput {
+        let _ = prompt;
+        GreetOutput {
+            greeting: format!(
+                "{}, {}! (offline stub)",
+                input.style.salutation(),
+                input.user.name
+            ),
+        }
     }
 }
 
@@ -193,29 +238,44 @@ impl GreetHandler {
 impl SkillHandler for GreetHandler {
     async fn run(&self, params: Value, sink: &dyn SkillProgressSink) -> Result<Value, SkillError> {
         // 1. Validate inbound params against the manifest's input schema.
+        //    SKILL.md is authoritative — typed-struct deserialisation below
+        //    layers on top of this check, not in place of it.
         self.card
             .validate_input(&params)
             .map_err(|e| SkillError::InvalidRequest(format!("inputSchema violation: {e}")))?;
 
-        // 2. Emit a Working ping so streaming subscribers see motion.
+        // 2. Deserialise into the typed input. If this fails after the
+        //    manifest validator passed, the typed struct has drifted from the
+        //    schema — flag it as Internal so the operator notices.
+        let input: GreetInput = serde_json::from_value(params.clone()).map_err(|e| {
+            SkillError::Internal(format!(
+                "manifest input validated but typed struct rejected \
+                 (struct/schema drift?): {e}"
+            ))
+        })?;
+
+        // 3. Emit a Working ping so streaming subscribers see motion.
         let _ = sink.set_status(ProgressState::Working, None).await;
 
-        // 3. Render the SKILL.md body as a prompt against the params.
+        // 4. Render the SKILL.md body as a prompt against the params.
         let prompt = self
             .card
             .render_prompt(&params)
             .map_err(|e| SkillError::Internal(format!("prompt render failed: {e}")))?;
 
-        // 4. Dispatch to live Ollama or offline stub.
-        let output = if let Some(base) = Self::ollama_base_url() {
+        // 5. Dispatch to live Ollama or offline stub.
+        let typed_output = if let Some(base) = Self::ollama_base_url() {
             tracing::info!(target: "skill-manifest-ollama-agent", base, "ollama dispatch");
             self.run_live(&base, &prompt).await?
         } else {
             tracing::info!(target: "skill-manifest-ollama-agent", "offline stub dispatch");
-            self.run_offline(&params, &prompt)
+            self.run_offline(&input, &prompt)
         };
 
-        // 5. Validate output against the manifest's output schema.
+        // 6. Re-serialise to JSON and validate against the manifest's output
+        //    schema — the manifest is still the authoritative output contract.
+        let output = serde_json::to_value(&typed_output)
+            .map_err(|e| SkillError::Internal(format!("output serialisation failed: {e}")))?;
         self.card
             .validate_output(&output)
             .map_err(|e| SkillError::Internal(format!("outputSchema violation: {e}")))?;
@@ -436,9 +496,105 @@ mod unit {
         let handler = GreetHandler::new(card.clone());
         let params = json!({"user": {"name": "Ada"}, "style": "formal"});
         let prompt = card.render_prompt(&params).unwrap();
-        let output = handler.run_offline(&params, &prompt);
-        card.validate_output(&output)
+        let input: GreetInput = serde_json::from_value(params).unwrap();
+        let output = handler.run_offline(&input, &prompt);
+        let output_json = serde_json::to_value(&output).unwrap();
+        card.validate_output(&output_json)
             .expect("offline stub output must satisfy outputSchema");
-        assert!(output["greeting"].as_str().unwrap().contains("Ada"));
+        assert!(output.greeting.contains("Ada"));
+    }
+
+    // -----------------------------------------------------------------
+    // Typed struct ↔ SKILL.md schema round-trip tests.
+    //
+    // These pin every example payload to the typed structs AND assert
+    // the structs serialise back to schema-valid JSON. If SKILL.md or
+    // the structs drift apart, one of these fails before the example
+    // ships a broken contract.
+    //
+    // SKILL.md remains the authoritative schema — the structs layer
+    // over it for ergonomics, never replace it.
+    // -----------------------------------------------------------------
+
+    /// Every JSON payload an external caller might send must deserialise
+    /// into `GreetInput`. The list mirrors the README + smoke + SKILL.md
+    /// `examples` block so adding new doc examples is forced through this
+    /// gate.
+    const EXAMPLE_PAYLOADS: &[&str] = &[
+        // README "JSON-shaped greeting" curl payload (also smoke.rs).
+        r#"{"user":{"name":"Ada"},"style":"formal"}"#,
+        // README plain-text fallback after extract_params lifts a name.
+        r#"{"user":{"name":"Ada"}}"#,
+        // SKILL.md examples block "Casually greet Grace" — extract_params
+        // produces this shape from plain text input.
+        r#"{"user":{"name":"Grace"},"style":"casual"}"#,
+        // Bare minimum the schema permits (style defaults to casual).
+        r#"{"user":{"name":"friend"}}"#,
+    ];
+
+    #[test]
+    fn every_example_payload_deserialises_into_struct() {
+        for raw in EXAMPLE_PAYLOADS {
+            let v: Value = serde_json::from_str(raw)
+                .unwrap_or_else(|e| panic!("payload `{raw}` is not valid JSON: {e}"));
+            serde_json::from_value::<GreetInput>(v).unwrap_or_else(|e| {
+                panic!(
+                    "GreetInput failed to deserialise example payload `{raw}`: {e} \
+                     (the typed struct may have drifted from SKILL.md inputSchema)"
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn typed_input_serialises_to_schema_valid_json() {
+        let card = SkillCard::parse(SKILL_MANIFEST).unwrap();
+        let sample = GreetInput {
+            user: UserInput { name: "Ada".into() },
+            style: GreetingStyle::Formal,
+        };
+        let v = serde_json::to_value(&sample).unwrap();
+        card.validate_input(&v).expect(
+            "GreetInput must serialise to JSON that satisfies SKILL.md inputSchema \
+             (struct ↔ schema drift?)",
+        );
+    }
+
+    #[test]
+    fn typed_output_serialises_to_schema_valid_json() {
+        let card = SkillCard::parse(SKILL_MANIFEST).unwrap();
+        let sample = GreetOutput {
+            greeting: "Hello, world!".into(),
+        };
+        let v = serde_json::to_value(&sample).unwrap();
+        card.validate_output(&v).expect(
+            "GreetOutput must serialise to JSON that satisfies SKILL.md outputSchema \
+             (struct ↔ schema drift?)",
+        );
+    }
+
+    /// SKILL.md inputSchema enforces invariants that the typed struct
+    /// alone cannot express (here: `user.name` `minLength: 1`). The
+    /// handler must run `card.validate_input` BEFORE typed deserialise
+    /// so this kind of constraint is caught at the manifest boundary,
+    /// not silently accepted by serde.
+    #[test]
+    fn manifest_validates_before_struct_deserialises() {
+        let card = SkillCard::parse(SKILL_MANIFEST).unwrap();
+        let invalid = json!({"user": {"name": ""}});
+
+        // The manifest must reject empty name.
+        assert!(
+            card.validate_input(&invalid).is_err(),
+            "SKILL.md inputSchema must reject `user.name = \"\"` (minLength: 1); \
+             if this passes, the manifest is no longer enforcing real constraints"
+        );
+
+        // Confirms the typed struct alone would NOT catch this — serde
+        // happily accepts an empty string. This is exactly why the
+        // handler runs validate_input first.
+        let struct_accepts: GreetInput =
+            serde_json::from_value(invalid).expect("serde should accept empty string");
+        assert_eq!(struct_accepts.user.name, "");
     }
 }
