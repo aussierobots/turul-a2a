@@ -71,16 +71,27 @@ grep -E '^turul-a2a' crates/turul-a2a-patterns/Cargo.toml
 
 Any `turul-a2a = …` line → **BLOCKER**.
 
-## 4. Newtype bridge pattern (Rust orphan rule)
+## 4. Newtype bridge pattern (Rust orphan rule + named-field readability)
 
-Example agents that bridge the framework's `EventSink` into `SkillProgressSink` MUST use a local newtype (`struct ExampleProgressSink(EventSink);`) and impl the trait on the newtype. A direct `impl SkillProgressSink for EventSink` from an example crate is **illegal Rust** (orphan rule: both trait and type external to the example).
+Example agents that bridge the framework's `EventSink` into `SkillProgressSink` MUST use a local wrapper type and impl the trait on the wrapper. A direct `impl SkillProgressSink for EventSink` from an example crate is **illegal Rust** (orphan rule: both trait and type external to the example).
 
-Check with (match real impl blocks at column 0, NOT doc-comment mentions):
+Check the orphan-rule violation with (match real impl blocks at column 0):
 ```bash
 grep -rnE '^impl[[:space:]]+(turul_a2a_patterns::)?SkillProgressSink[[:space:]]+for[[:space:]]+EventSink' examples/ crates/
 ```
+Any hit in `examples/*/src/*.rs` (other than inside `crates/turul-a2a` post-§4) → **BLOCKER**.
 
-Any hit in `examples/*/src/*.rs` (other than inside `crates/turul-a2a` post-§4) → **BLOCKER**. Doc-comment mentions of the future post-publish state (e.g. `/// direct impl SkillProgressSink for EventSink`) are fine.
+**Sub-rule — named fields, not tuple newtypes, in example bridges.** When the wrapped value is part of the pattern the example is teaching (notably `EventSink`, `A2aClient`, `SkillCard`), the bridge MUST use named fields. `struct ExampleProgressSink { event_sink: EventSink }` with `self.event_sink` — NOT `struct ExampleProgressSink(EventSink);` with `self.0`. The `.0` access discards the signal that the inner value is "the framework's event sink"; the reader pasting the example into their own codebase needs to see what role the wrapped value plays.
+
+Check with:
+```bash
+# tuple bridges around named framework types in examples
+grep -rnE 'struct [A-Z][A-Za-z]+\((EventSink|A2aClient|SkillCard)\)' examples/
+# .0 accesses inside example bridges
+grep -rn 'self\.0' examples/*/src/
+```
+
+Any tuple wrapper around `EventSink` / `A2aClient` / `SkillCard` in `examples/*/src/*.rs` → **HIGH**. Library-internal tuple newtypes (`pub struct ContextId(String)` and similar primitive wrappers in `crates/`) are fine and NOT flagged. Doc-comment mentions are fine.
 
 ## 5. async_trait ergonomics
 

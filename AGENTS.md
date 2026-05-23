@@ -259,6 +259,7 @@ cargo fmt --all -- --check
 - If a common operation (complete a task, add an artifact, set status) requires manual proto construction in an example, that is a signal that the wrapper surface is missing a helper method. Design the helper first, then update the example.
 - Repeated raw proto surgery in examples or tests is a review blocker — it teaches users the wrong pattern and bypasses the wrapper boundary the project claims to maintain.
 - Raw proto access is an escape hatch for unusual cases, not the primary development path.
+- Bridge wrappers in `examples/*/src/*.rs` must use named-field structs, not tuple newtypes, when the wrapped value is part of the pattern being taught. Write `struct ExampleProgressSink { event_sink: EventSink }` with `self.event_sink`, NOT `struct ExampleProgressSink(EventSink);` with `self.0`. Reason: the inner value's role is the lesson; `.0` discards that signal. The rule does not ban tuple newtypes in library code (small domain wrappers like `pub struct ContextId(String)` are fine) — it applies only to example bridges where the wrapped framework type is what the reader is meant to recognise.
 
 ## Documentation Rules
 
