@@ -104,7 +104,7 @@ aws-sdk-dynamodb = "1"
 # Lambda
 lambda_http = "1"
 lambda_runtime = "1"
-aws_lambda_events = { version = "1.1", default-features = false, features = ["dynamodb", "eventbridge", "sqs"] }
+aws_lambda_events = { version = "1.2", default-features = false, features = ["dynamodb", "eventbridge", "sqs"] }
 aws-sdk-sqs = "1"
 
 # Testing / crypto
