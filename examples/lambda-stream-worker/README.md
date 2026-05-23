@@ -26,6 +26,23 @@ cargo lambda build --release -p lambda-stream-worker
 # Output: target/lambda/lambda-stream-worker/bootstrap.zip
 ```
 
+## Local smoke
+
+```bash
+# Terminal 1
+cargo lambda watch -p lambda-stream-worker
+
+# Terminal 2 — feed it an empty DynamoDB Stream batch
+echo '{"Records": []}' > /tmp/ddb-stream.json
+cargo lambda invoke bootstrap --data-file /tmp/ddb-stream.json
+# {"batchItemFailures":[]}
+```
+
+That proves the binary starts under the Lambda runtime emulator and
+handles the DynamoDB Stream event shape. A populated `Records` array
+needs real DynamoDB to recover meaningful state — see
+`examples/LOCAL_TESTING.md` for the LocalStack + AWS variants.
+
 ## Deploy
 
 1. Create a DynamoDB Stream on the `a2a_push_pending_dispatches` table with

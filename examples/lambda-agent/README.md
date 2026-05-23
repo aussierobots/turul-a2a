@@ -16,12 +16,21 @@ See ADR-008 (Lambda adapter) and ADR-013 (Lambda push-delivery parity).
 ## Build & run locally
 
 ```bash
-# Local invoke loop via cargo-lambda
+# Local invoke loop via cargo-lambda. The watch process listens on
+# http://localhost:9000 and auto-wraps plain HTTP requests into the
+# Lambda event the function expects.
 cargo lambda watch -p lambda-agent
 
-# In another terminal
-cargo lambda invoke lambda-agent \
-  --data-ascii '{"httpMethod":"GET","path":"/.well-known/agent-card.json"}'
+# In another terminal — talk to it like any A2A HTTP server:
+curl -s http://localhost:9000/.well-known/agent-card.json \
+  -H 'a2a-version: 1.0' | jq '{name, skills: [.skills[].id]}'
+# { "name": "Lambda Echo Agent", "skills": ["lambda-echo"] }
+
+curl -s -X POST http://localhost:9000/message:send \
+  -H 'a2a-version: 1.0' -H 'content-type: application/json' \
+  -d '{"message":{"messageId":"m1","role":"ROLE_USER","parts":[{"text":"probe"}]}}' \
+  | jq '.task | {state: .status.state, artifact: .artifacts[0].parts[0].text}'
+# { "state": "TASK_STATE_COMPLETED", "artifact": "Hello from Lambda!" }
 ```
 
 ## Deploy

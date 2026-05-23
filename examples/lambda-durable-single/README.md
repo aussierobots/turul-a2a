@@ -61,10 +61,19 @@ text. Eight assertions; exits with the failure count.
 
 ## Local testing
 
-Before deploying to AWS, see `examples/LOCAL_TESTING.md` for the
-local-first test matrix — automated in-process tests, `cargo lambda
-watch` + `cargo lambda invoke` for HTTP and SQS dispatch, hybrid
-patterns against real AWS, and LocalStack full-local setup.
+The bootstrap binary requires `A2A_EXECUTOR_QUEUE_URL` plus the five
+DynamoDB table names at startup. With dummy values the binary loads
+but panics on the first request when AWS clients try to reach the
+fake endpoints — `cargo lambda watch` alone is not enough.
+
+For end-to-end local smoke, point the env vars at LocalStack or a
+real AWS account. See `examples/LOCAL_TESTING.md` for the full
+matrix (in-process tests, `cargo lambda watch` against real-or-
+LocalStack SQS+DynamoDB, hybrid patterns).
+
+For a `cargo lambda watch` smoke that needs no AWS access, use
+`examples/lambda-agent` instead — it ships with `InMemoryA2aStorage`
+and answers HTTP requests at `http://localhost:9000` out of the box.
 
 ## Prerequisites
 

@@ -40,6 +40,32 @@ cargo lambda build --release -p lambda-scheduled-worker
 # Output: target/lambda/lambda-scheduled-worker/bootstrap.zip
 ```
 
+## Local smoke
+
+```bash
+# Terminal 1
+cargo lambda watch -p lambda-scheduled-worker
+
+# Terminal 2 — feed a synthetic EventBridge tick
+cat > /tmp/eventbridge-event.json <<'EOF'
+{
+  "version": "0", "id": "test-event", "detail-type": "Scheduled Event",
+  "source": "aws.events", "account": "123456789012",
+  "time": "2026-05-23T00:00:00Z", "region": "ap-southeast-2",
+  "resources": ["arn:aws:events:ap-southeast-2:123456789012:rule/test"],
+  "detail": {}
+}
+EOF
+cargo lambda invoke bootstrap --data-file /tmp/eventbridge-event.json
+# {"staleMarkersFound":0,"staleMarkersRecovered":0,"staleMarkersTransientErrors":0,
+#  "reclaimableClaimsFound":0,"reclaimableClaimsProcessed":0,"errors":[]}
+```
+
+The empty-storage response proves the binary starts under the Lambda
+runtime emulator and accepts the EventBridge event shape. Meaningful
+recovery output requires real DynamoDB (see
+`examples/LOCAL_TESTING.md` for the LocalStack + AWS variants).
+
 ## Deploy
 
 1. Create an EventBridge Scheduler schedule targeting this Lambda.

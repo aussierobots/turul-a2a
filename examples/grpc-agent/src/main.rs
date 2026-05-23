@@ -103,8 +103,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  cargo run -p grpc-agent --bin grpc-client -- stream \"stream this\"");
     println!("  cargo run -p grpc-agent --bin grpc-client -- list");
     println!();
-    println!("Or use grpcurl (if you enable --features grpc-reflection on the server):");
-    println!("  grpcurl -plaintext 127.0.0.1:{GRPC_PORT} list");
+    // The `grpc-reflection` feature only pulls in `tonic-reflection`
+    // as a dep; the framework's `make_grpc_router` does not currently
+    // register the reflection service. Point grpcurl at the vendored
+    // proto via import-path instead:
+    println!("Or use grpcurl with the vendored proto:");
+    println!(
+        "  grpcurl -plaintext -import-path $(git rev-parse --show-toplevel)/proto -proto a2a.proto \\"
+    );
+    println!("    127.0.0.1:{GRPC_PORT} lf.a2a.v1.A2AService/ListTasks");
 
     router.serve(addr).await?;
     Ok(())
