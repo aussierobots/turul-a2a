@@ -47,7 +47,9 @@ const SKILL_MANIFEST: &str = include_str!("../skills/demo/SKILL.md");
 // crate.)
 // ---------------------------------------------------------------------------
 
-struct ExampleProgressSink(EventSink);
+struct ExampleProgressSink {
+    event_sink: EventSink,
+}
 
 #[async_trait]
 impl SkillProgressSink for ExampleProgressSink {
@@ -65,7 +67,7 @@ impl SkillProgressSink for ExampleProgressSink {
             ProgressState::AuthRequired => TaskState::AuthRequired,
             _ => TaskState::Working,
         };
-        self.0
+        self.event_sink
             .set_status(task_state, message)
             .await
             .map(|_seq| ())
@@ -78,7 +80,7 @@ impl SkillProgressSink for ExampleProgressSink {
         append: bool,
         last_chunk: bool,
     ) -> Result<(), SinkError> {
-        self.0
+        self.event_sink
             .emit_artifact(artifact, append, last_chunk)
             .await
             .map(|_seq| ())
@@ -86,7 +88,7 @@ impl SkillProgressSink for ExampleProgressSink {
     }
 
     fn is_closed(&self) -> bool {
-        self.0.is_closed()
+        self.event_sink.is_closed()
     }
 }
 
@@ -364,7 +366,9 @@ impl AgentExecutor for ManifestExecutor {
 
         // Bridge the framework EventSink through our newtype to satisfy
         // the trait the handler expects.
-        let sink = ExampleProgressSink(ctx.events.clone());
+        let sink = ExampleProgressSink {
+            event_sink: ctx.events.clone(),
+        };
 
         match handler.run(params, &sink).await {
             Ok(_output) => {

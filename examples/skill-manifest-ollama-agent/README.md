@@ -168,24 +168,34 @@ location + reason — by design (§2.2 item 3 of ADR-021).
 | `manifest parse error …`                             | `skills/demo/SKILL.md` edited into an invalid shape  | Re-read [the three-section frontmatter](#the-skillmd-manifest); restore the camelCase keys   |
 | `inputSchema violation` on `/message:send`           | Sent JSON does not satisfy the manifest input schema | Match the schema, e.g. `{"user":{"name":"Ada"}}`                                             |
 
-## The `ExampleProgressSink(EventSink)` newtype
+## The `ExampleProgressSink` bridge
 
-The example wraps the framework's `EventSink` in a local newtype:
+The example wraps the framework's `EventSink` in a local struct so it
+can implement the `SkillProgressSink` trait from `turul-a2a-patterns`:
 
 ```rust
-struct ExampleProgressSink(EventSink);
+struct ExampleProgressSink {
+    event_sink: EventSink,
+}
 
 impl turul_a2a_patterns::SkillProgressSink for ExampleProgressSink { … }
 ```
 
-Why the newtype: `SkillProgressSink` lives in `turul-a2a-patterns`,
-`EventSink` lives in `turul-a2a`, and the example crate is a third
-crate. Rust's [orphan rule](https://doc.rust-lang.org/reference/items/implementations.html#orphan-rules)
+The named `event_sink` field is deliberate — it tells the reader the
+wrapped value's role at the call site (`self.event_sink.set_status(...)`),
+which is the whole point of the example. A tuple newtype
+(`struct ExampleProgressSink(EventSink)` with `self.0`) would compile
+identically but discard that signal; the workspace's CLAUDE.md /
+AGENTS.md rule requires the named-field shape in showcase examples.
+
+Why the wrapper exists: `SkillProgressSink` lives in
+`turul-a2a-patterns`, `EventSink` lives in `turul-a2a`, and the
+example crate is a third crate. Rust's [orphan rule](https://doc.rust-lang.org/reference/items/implementations.html#orphan-rules)
 forbids implementing an external trait for an external type from a
-third crate, so the impl must hang off a local type — the newtype.
+third crate, so the impl must hang off a local type.
 
 Adopter consequence today: if you copy this example into your own
-service repo, you also copy the newtype. The two methods that matter
+service repo, you also copy the wrapper. The two methods that matter
 just delegate to the inner `EventSink`'s public API
 (`set_status` / `emit_artifact`).
 
