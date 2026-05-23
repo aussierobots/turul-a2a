@@ -172,7 +172,7 @@ Send `"count 3"`:
 curl -s -X POST http://localhost:3014/message:send \
   -H 'Content-Type: application/json' -H 'a2a-version: 1.0' \
   -d '{"message":{"messageId":"1","role":"ROLE_USER","parts":[{"text":"count 3"}]}}' \
-  | jq '.artifacts[0].parts[0].text | fromjson'
+  | jq '.task.artifacts[0].parts[0].text | fromjson'
 # { "squared": 9 }
 ```
 
@@ -187,18 +187,23 @@ the counter's `success` field bumps by 1.
 Send `"count three"` — `"three"` does not parse as an integer, so the
 planner forwards `{"n": "three"}`. The input schema rejects it as a string
 instead of an integer; the handler returns `SkillError::InvalidRequest`,
-which becomes an A2A `InvalidRequest` on the wire:
+which the executor surfaces as a `Task` in `TASK_STATE_FAILED` with the
+validator message in `status.message.parts[0].text`:
 
 ```bash
 curl -s -X POST http://localhost:3014/message:send \
   -H 'Content-Type: application/json' -H 'a2a-version: 1.0' \
-  -d '{"message":{"messageId":"err","role":"ROLE_USER","parts":[{"text":"count three"}]}}'
-# A2A error envelope, not an artifact
+  -d '{"message":{"messageId":"err","role":"ROLE_USER","parts":[{"text":"count three"}]}}' \
+  | jq '.task | {state: .status.state, error: .status.message.parts[0].text}'
+# {
+#   "state": "TASK_STATE_FAILED",
+#   "error": "executor error: Invalid request: inputSchema violation: schema validation failed at /n: \"three\" is not of type \"integer\""
+# }
 ```
 
 The hook fires with `SkillOutcome::Failure(&err)` and the counter's
 `failure` field bumps by 1. The hook does not change the response — the
-caller still sees the error.
+caller still sees the failed task with its error message.
 
 ### `metrics`
 
@@ -208,7 +213,7 @@ Send `"metrics"`:
 curl -s -X POST http://localhost:3014/message:send \
   -H 'Content-Type: application/json' -H 'a2a-version: 1.0' \
   -d '{"message":{"messageId":"m","role":"ROLE_USER","parts":[{"text":"metrics"}]}}' \
-  | jq '.artifacts[0].parts[0].text | fromjson'
+  | jq '.task.artifacts[0].parts[0].text | fromjson'
 # { "success": 1, "failure": 1, "last": "err(count): ..." }
 ```
 

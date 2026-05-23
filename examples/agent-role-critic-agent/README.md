@@ -170,7 +170,7 @@ curl -s http://localhost:3013/.well-known/agent-card.json | jq '.skills[].id'
 curl -s -X POST http://localhost:3013/message:send \
   -H 'Content-Type: application/json' -H 'a2a-version: 1.0' \
   -d '{"message":{"messageId":"1","role":"ROLE_USER","parts":[{"text":"{\"kind\":\"validate_against_schema\",\"value\":{\"name\":\"ok\",\"count\":3},\"schema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"}},\"required\":[\"name\",\"count\"]}}"}]}}' \
-  | jq '.artifacts[0].parts[0].text | fromjson'
+  | jq '.task.artifacts[0].parts[0].text | fromjson'
 # { "valid": true, "errors": [] }
 ```
 
@@ -180,10 +180,10 @@ curl -s -X POST http://localhost:3013/message:send \
 curl -s -X POST http://localhost:3013/message:send \
   -H 'Content-Type: application/json' -H 'a2a-version: 1.0' \
   -d '{"message":{"messageId":"2","role":"ROLE_USER","parts":[{"text":"{\"kind\":\"validate_against_schema\",\"value\":{\"name\":\"missing\"},\"schema\":{\"type\":\"object\",\"required\":[\"name\",\"count\"]}}"}]}}' \
-  | jq '.artifacts[0].parts[0].text | fromjson'
+  | jq '.task.artifacts[0].parts[0].text | fromjson'
 # {
 #   "valid": false,
-#   "errors": ["\"count\" is a required property"]
+#   "errors": ["schema validation failed at #: \"count\" is a required property"]
 # }
 ```
 
@@ -193,7 +193,7 @@ curl -s -X POST http://localhost:3013/message:send \
 curl -s -X POST http://localhost:3013/message:send \
   -H 'Content-Type: application/json' -H 'a2a-version: 1.0' \
   -d '{"message":{"messageId":"3","role":"ROLE_USER","parts":[{"text":"{\"kind\":\"check_invariants\",\"value\":[\"foo\",\"bar\",\"baz\"],\"invariants\":[{\"name\":\"is_non_empty\",\"check\":\"non_empty\"},{\"name\":\"min_3\",\"check\":\"min_length\",\"args\":{\"min\":3}},{\"name\":\"max_5\",\"check\":\"max_length\",\"args\":{\"max\":5}},{\"name\":\"has_bar\",\"check\":\"contains\",\"args\":{\"needle\":\"bar\"}}]}"}]}}' \
-  | jq '.artifacts[0].parts[0].text | fromjson'
+  | jq '.task.artifacts[0].parts[0].text | fromjson'
 # { "verdict": "pass", "failures": [] }
 ```
 
@@ -203,7 +203,7 @@ curl -s -X POST http://localhost:3013/message:send \
 curl -s -X POST http://localhost:3013/message:send \
   -H 'Content-Type: application/json' -H 'a2a-version: 1.0' \
   -d '{"message":{"messageId":"4","role":"ROLE_USER","parts":[{"text":"{\"kind\":\"check_invariants\",\"value\":\"hi\",\"invariants\":[{\"name\":\"is_non_empty\",\"check\":\"non_empty\"},{\"name\":\"min_5\",\"check\":\"min_length\",\"args\":{\"min\":5}}]}"}]}}' \
-  | jq '.artifacts[0].parts[0].text | fromjson'
+  | jq '.task.artifacts[0].parts[0].text | fromjson'
 # {
 #   "verdict": "fail",
 #   "failures": [{"name": "min_5", "reason": "length 2 is below minimum 5"}]

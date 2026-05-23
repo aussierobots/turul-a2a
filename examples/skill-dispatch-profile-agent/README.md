@@ -208,37 +208,32 @@ fmt.Println(resp.Header.Get("A2A-Extensions"))
 ### Rust (`turul-a2a-client`)
 
 ```rust
-use serde_json::json;
+use std::collections::HashMap;
+use serde_json::{json, Value};
 use turul_a2a_client::prelude::*;
 
-let mut client = A2aClient::connect("http://localhost:3015").await?;
-let mut msg = MessageBuilder::new()
-    .role_user()
-    .add_text("hi")
-    .build()?;
-// Inject the two reserved metadata keys via the proto layer.
-let mut inner = msg.into_proto();
-inner.metadata = Some(turul_a2a_types::pbjson::json_object_to_struct(
-    [
-        ("a2a.skillId".into(), json!("echo_loud")),
-        ("a2a.skillParams".into(), json!({"text": "hi"})),
-    ]
-    .into_iter()
-    .collect(),
-));
-let msg = turul_a2a_types::Message::try_from(inner)?;
+const PROFILE: &str = "https://turul.dev/a2a/extensions/skill-invocation/v1";
 
-// `A2aClient` does not currently expose a typed setter for the
-// activation header; the cross-language smoke probe sets it at the
-// HTTP layer (see Python/Go above) until the client gains a helper.
+// `with_extensions` attaches the `A2A-Extensions` activation header to
+// every subsequent request — that's what server-side dispatch keys off.
+let client = A2aClient::new("http://localhost:3015")
+    .with_extensions([PROFILE]);
+
+// `metadata_json` packs the two reserved keys into `Message.metadata`.
+let mut metadata: HashMap<String, Value> = HashMap::new();
+metadata.insert("a2a.skillId".into(), Value::String("echo_loud".into()));
+metadata.insert("a2a.skillParams".into(), json!({"text": "hi"}));
+
+let request = MessageBuilder::new()
+    .text("dispatch:echo_loud")
+    .metadata_json(metadata);
+
+let response = client.send_message(request).await?;
+// response is SendResponse::Task with artifact body {"shouted":"HI"}.
 ```
 
-> **Patterns/framework gap:** `turul-a2a-client` currently has no
-> first-class helper for setting `Message.metadata` or the
-> `A2A-Extensions` request header. Adopters either drop down to a
-> raw HTTP client (recommended for the activation header) or convert
-> their `Message` through `pbjson::json_object_to_struct`. Flagged
-> for follow-up.
+Working end-to-end at
+[`examples/interop-clients/skill-dispatch-profile/rust/src/main.rs`](../interop-clients/skill-dispatch-profile/rust/src/main.rs).
 
 ## Failure modes
 
