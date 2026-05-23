@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-role-critic-agent"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "reqwest 0.13.3",
@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "agent-role-planner-router-agent"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "reqwest 0.13.3",
@@ -142,7 +142,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auth-agent"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -740,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "callback-agent"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "axum",
@@ -847,7 +847,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "conversation-agent"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "axum",
@@ -1062,7 +1062,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "echo-agent"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "tokio",
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "grpc-agent"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "futures",
@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "interop-agent-role-critic-rust"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "serde_json",
  "tokio",
@@ -1871,7 +1871,7 @@ dependencies = [
 
 [[package]]
 name = "interop-agent-role-planner-router-rust"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "serde_json",
  "tokio",
@@ -1881,7 +1881,7 @@ dependencies = [
 
 [[package]]
 name = "interop-post-task-hook-rust"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "serde_json",
  "tokio",
@@ -1891,7 +1891,7 @@ dependencies = [
 
 [[package]]
 name = "interop-remote-delegate-rust"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "serde_json",
  "tokio",
@@ -1901,7 +1901,7 @@ dependencies = [
 
 [[package]]
 name = "interop-skill-dispatch-profile-rust"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "serde_json",
  "tokio",
@@ -1911,7 +1911,7 @@ dependencies = [
 
 [[package]]
 name = "interop-skill-manifest-ollama-rust"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "serde_json",
  "tokio",
@@ -1921,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "interrupting-agent"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "axum",
@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-agent"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "lambda_runtime",
@@ -2084,7 +2084,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-durable-agent"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-durable-single"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2120,7 +2120,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-durable-worker"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "lambda_runtime",
@@ -2135,7 +2135,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-scheduled-worker"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "aws_lambda_events",
@@ -2153,7 +2153,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-stream-worker"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "aws_lambda_events",
@@ -2689,7 +2689,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "post-task-hook-agent"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "reqwest 0.13.3",
@@ -3074,7 +3074,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "remote-delegate-agent"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "dotenvy",
@@ -3660,7 +3660,7 @@ dependencies = [
 
 [[package]]
 name = "skill-dispatch-profile-agent"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "reqwest 0.13.3",
@@ -3678,7 +3678,7 @@ dependencies = [
 
 [[package]]
 name = "skill-manifest-ollama-agent"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "dotenvy",
@@ -3700,7 +3700,7 @@ dependencies = [
 
 [[package]]
 name = "skill-security-agent"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "tokio",
@@ -3969,7 +3969,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "streaming-agent"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "axum",
@@ -4467,7 +4467,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "turul-a2a"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4508,7 +4508,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-auth"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "jsonwebtoken",
@@ -4524,7 +4524,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-aws-lambda"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "aws-sdk-sqs",
@@ -4553,7 +4553,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-client"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "futures",
  "reqwest 0.13.3",
@@ -4572,7 +4572,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-patterns"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "futures",
@@ -4589,7 +4589,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-proto"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "pbjson",
  "pbjson-build",
@@ -4607,7 +4607,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-types"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "chrono",
  "pbjson-types",

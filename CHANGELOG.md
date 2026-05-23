@@ -4,6 +4,64 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.24] — 2026-05-23
+
+Dependency-refresh slice. No publishable-crate API change; patch
+release.
+
+### Changed — workspace dependency lockfile refresh
+
+Patch and minor SemVer-compatible bumps via `cargo update`:
+
+- `serde_json` 1.0.149 → 1.0.150
+- `tokio` 1.52.1 → 1.52.3
+- `tower-http` 0.6.8 → 0.6.11
+- `reqwest` 0.13.2 → 0.13.3
+- `aws_lambda_events` 1.1.3 → 1.2.0 (manifest minimum also bumped:
+  `version = "1.1"` → `"1.2"`)
+- `lambda_http` 1.1.3 → 1.2.0
+- `lambda_runtime` 1.1.3 → 1.2.0
+
+`cargo update --workspace` reports 0 further actionable packages
+within MSRV 1.85 — every other available bump is gated by a higher
+required Rust version (the AWS SDK / smithy stack at 1.91.1, tonic
+0.14.6 MSRV-gated, etc.).
+
+### Deferred — two major bumps need their own slices
+
+These are tracked as follow-up tasks (Tasks #49 and #50) and stay
+deferred per the dep-sweep policy in Task #47: one major-version
+bump per commit, only when it lands cleanly.
+
+- **`sqlx` 0.8 → 0.9** (Task #49) — sqlx 0.9.0 hard-requires Rust
+  1.94. Our workspace MSRV is 1.85; closing the gap is a framework
+  policy decision, not a dep refresh. The 0.9 release also carries
+  several API breaks (`query*()` now takes `impl SqlSafeStr`;
+  `RawSql` gained a `DB` type parameter; deprecated combined
+  `runtime-tokio-rustls` feature removed) that need a focused
+  storage-parity pass.
+- **`jsonschema` 0.30 → 0.46** (Task #50) — 16 minor versions
+  spanning breaking changes including the 0.46 `Registry` /
+  `with_registry` redesign and the 0.45 `ValidationError::into_parts`
+  shape change. Needs review against `turul-a2a-patterns::schema` +
+  `manifest` strict-keyword behavior. MSRV is fine (0.46 declares
+  1.71.1); the blocker is migration work.
+
+### `turul-llm` (sibling workspace)
+
+- `cargo update --workspace` reports zero actionable bumps; all 9
+  available upgrades (`icu_*`, `idna_adapter`, `wasip2`) need Rust
+  ≥ 1.86 and are blocked by the shared MSRV ceiling. No commit
+  lands in `turul-llm` for this slice.
+
+### Internal
+
+- Tasks #49 and #50 created with concrete acceptance criteria and
+  stop conditions; both blocked on the same MSRV-policy
+  conversation (in #49's case directly, in #50's case indirectly —
+  raising MSRV unlocks fresher transitive deps that would simplify
+  the jsonschema migration).
+
 ## [0.1.23] — 2026-05-23
 
 Composition-patterns slice. No publishable-crate behavior change;
