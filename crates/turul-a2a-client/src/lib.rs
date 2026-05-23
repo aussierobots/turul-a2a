@@ -35,6 +35,7 @@ pub struct A2aClient {
     base_url: String,
     tenant: Option<String>,
     auth: ClientAuth,
+    extensions: Vec<String>,
     http: reqwest::Client,
     agent_card: Option<pb::AgentCard>,
 }
@@ -46,6 +47,7 @@ impl A2aClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             tenant: None,
             auth: ClientAuth::None,
+            extensions: Vec::new(),
             http: reqwest::Client::new(),
             agent_card: None,
         }
@@ -58,6 +60,19 @@ impl A2aClient {
 
     pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
         self.tenant = Some(tenant.into());
+        self
+    }
+
+    /// Activate one or more A2A protocol extensions on outbound requests
+    /// by sending an `A2A-Extensions` header (comma-separated URIs). The
+    /// server may echo the negotiated set on the response. Calling this
+    /// replaces any previously set extension URIs.
+    pub fn with_extensions<I, S>(mut self, uris: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.extensions = uris.into_iter().map(Into::into).collect();
         self
     }
 
@@ -120,6 +135,9 @@ impl A2aClient {
             ClientAuth::ApiKey { header, key } => {
                 req = req.header(header.as_str(), key.as_str());
             }
+        }
+        if !self.extensions.is_empty() {
+            req = req.header("a2a-extensions", self.extensions.join(", "));
         }
         req
     }
