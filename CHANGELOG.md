@@ -4,25 +4,124 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.1.23] — 2026-05-23
 
-### Changed — `examples/skill-manifest-ollama-agent` now consumes `turul-llm` (pinned git rev)
+Composition-patterns slice. No publishable-crate behavior change;
+all changes land in examples, ADR drafts, and project documentation.
+Patch release.
 
-- Replaces the inline `reqwest`-based Ollama call with a dependency on
-  `turul-llm-core::LlmClient` + `turul-llm-ollama::OllamaClient` from
-  the sibling [`turul-llm`](https://github.com/aussierobots/turul-llm)
-  workspace. Pinned to rev
-  `52eff3c2cbf63efea11dcef7686ef588b9aa79a6` so a clean clone of
-  `turul-a2a` builds without requiring a sibling checkout on disk.
+### Added — `examples/remote-delegate-agent` (server-side delegation pattern)
+
+- New showcase agent (port 3016) whose `AgentExecutor` owns a
+  `turul-a2a-client::A2aClient` and forwards every inbound message
+  to a configured upstream A2A agent. Upstream artifacts are
+  re-emitted as the delegate's own (fresh local `artifact_id`;
+  `Part`s preserved verbatim).
+- Defaults to forwarding to `skill-manifest-ollama-agent` on
+  `:3010`, so the two agents pair out of the box in offline mode.
+- Explicit contract (§1 discovery / §2 forwarding / §3 task & artifact
+  mapping / §4 error mapping / §5 timeout / §6 auth-NOT-forwarded /
+  §7 streaming-deferred) documented in the crate's README and
+  enforced by 4 unit tests + 1 end-to-end smoke that spawns BOTH
+  agents on test ports.
+- Pattern demonstrated: A2A composes naturally over A2A. The
+  delegation is invisible at the wire boundary — a third-party
+  client only knows about the delegate.
+
+### Added — Python / Go / Rust interop clients for `remote-delegate-agent`
+
+- `examples/interop-clients/remote-delegate/{python,go,rust}/`
+  exercising the two-hop chain (`client → delegate → upstream`)
+  end-to-end. Each client asserts the upstream's `offline stub`
+  marker appears in the returned artifact body — proof the chain
+  rounded through both agents.
+- `CLIENT_MATRIX.md` grows the 6th row. Matrix is now **6 agents ×
+  3 languages = 18 cells, all manually verified**.
+
+### Changed — typed input/output structs in `examples/skill-manifest-ollama-agent`
+
+- The `greet` skill handler now consumes `GreetInput { user, style }`
+  and produces `GreetOutput { greeting }` instead of walking
+  `serde_json::Value` with `.get().and_then()` chains. Handler body
+  shrinks by ~25 LOC; the example reads as the *pattern* rather
+  than as JSON plumbing.
+- **SKILL.md remains authoritative.** The handler still calls
+  `card.validate_input` before typed deserialise and
+  `card.validate_output` after re-serialise. Four new tests pin
+  every example payload through both directions of the round-trip
+  so struct ↔ manifest drift is caught at `cargo test` time.
+
+### Changed — `examples/skill-manifest-ollama-agent` consumes `turul-llm` (pinned git rev)
+
+- The example's LLM call now goes through `turul-llm-core::LlmClient`
+  + `turul-llm-ollama::OllamaClient` from the sibling
+  [`turul-llm`](https://github.com/aussierobots/turul-llm) workspace
+  instead of an inline `reqwest` call. Pinned to git rev
+  `52eff3c2cbf63efea11dcef7686ef588b9aa79a6` so clean clones build
+  without requiring a sibling checkout on disk.
 - Offline-stub mode is unchanged.
-- The provider-neutral invariant on the framework dep-graph still
-  binds: no publishable `turul-a2a` crate depends on `turul-llm-*`;
-  only `examples/skill-manifest-ollama-agent` does. See ADR-023
-  revision 3.
-- Workspace `Cargo.toml` adds `turul-llm-core` and `turul-llm-ollama`
-  as git deps under `[workspace.dependencies]` with a dep-direction
-  guard comment. Versioned crates.io migration deferred until
-  `turul-llm` ships its first stable release.
+- The provider-neutral invariant binds: no publishable `turul-a2a`
+  crate depends on `turul-llm-*`; only the example does. See
+  ADR-023 revision 3.
+- Versioned crates.io migration deferred until `turul-llm` ships
+  its first stable release.
+
+### Changed — named-field bridge wrappers across showcase examples
+
+- The five existing showcase agents (`skill-manifest-ollama-agent`,
+  `agent-role-critic-agent`, `agent-role-planner-router-agent`,
+  `post-task-hook-agent`, `skill-dispatch-profile-agent`) switch
+  their `ExampleProgressSink` from `struct ExampleProgressSink(EventSink);`
+  with `self.0` to `struct ExampleProgressSink { event_sink: EventSink }`
+  with `self.event_sink`. Pure refactor; zero behavior change.
+- Reason: in showcase examples the wrapped framework type IS the
+  lesson; `.0` discards that signal and forces the reader to chase
+  the struct definition. Named fields make the pattern obvious at
+  the call site.
+
+### Added — `ADR-024` (Proposed): `TypedSkillHandler` trait sketch
+
+- Records the design question raised by the typed-example migration
+  above: when does generic `Value` plumbing in `SkillHandler::run`
+  warrant a typed trait?
+- Status stays Proposed. No code lands. Promotion criteria are
+  concrete and falsifiable: ≥2 examples carrying typed structs by
+  hand, repeated boilerplate documented, schema-equivalence strategy
+  decided (test-only / runtime startup check / build-time codegen),
+  one adopter signal.
+- `schemars` is NOT added to the workspace.
+
+### Added — `ADR-025` (Proposed): deferred composition patterns + escalation triggers
+
+- Six deferred patterns (graph engine, swarm, agent-as-LLM-tool
+  adapter, A2A↔MCP-tool bridge, `A2aClient`-based executor helper,
+  `remote-delegate-agent` streaming passthrough) each documented
+  with a falsifiable trigger condition.
+- Forcing function for future review: when a maintainer says "we
+  should add X", the answer is "check if the trigger has fired".
+  If yes, open a successor ADR. If no, "deferred per ADR-025 §<N>".
+
+### Added — project rule: named-field bridges in showcase examples
+
+- `CLAUDE.md` "Example and API Surface Policy" + `AGENTS.md`
+  "Example and API Surface Rules" + `.claude/agents/adr-review.md`
+  §4 all updated. The adr-review subagent now flags tuple wrappers
+  around `EventSink` / `A2aClient` / `SkillCard` in
+  `examples/*/src/*.rs` as **HIGH**. Library-internal primitive
+  wrappers (`pub struct ContextId(String)`) are explicitly NOT
+  banned.
+
+### Internal — ADR-022 / ADR-023 polish
+
+- ADR-022 (skill-invocation dispatcher) stale Proposed-state
+  scaffolding scrubbed; section banner clarifies §§1–8 as
+  reference/seed material with the current contract captured at
+  the top.
+- ADR-022's adopter surface re-exported through the stable
+  `turul_a2a::profiles` module (the underlying `profile_dispatch`
+  module is `#[doc(hidden)]`).
+- ADR-023 §1–§7 carries a clearer historical banner; revision-3
+  records the path-dep → pinned-git-rev integration.
 
 ## [0.1.22] — 2026-05-23
 
