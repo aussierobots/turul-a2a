@@ -9,6 +9,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
+readme = "README.md"
 publish = false
 description = "Reusable A2A skill-authoring patterns (ADR-021). Path-only until §4 gates clear."
 
