@@ -19,11 +19,15 @@ now satisfied. Recorded here for the audit trail; the live status is
 
 2. **First-profile placement decided.** Per ADR-021 §5 (single
    profile inhabitant lives in the transport-owning crate), the
-   dispatcher is implemented as `pub mod profile_dispatch` inside
-   `crates/turul-a2a/src/profile_dispatch.rs` (197 LOC) and wired
+   dispatcher is implemented inside `crates/turul-a2a/src/profile_dispatch.rs`
+   (197 LOC; `#[doc(hidden)] pub mod` — internal plumbing) and wired
    into router (`src/router.rs`), JSON-RPC (`src/jsonrpc.rs`), and
-   gRPC (`src/grpc/service.rs`). A new profile/extensions crate is
-   not introduced; the trigger for one remains ≥2 profile inhabitants.
+   gRPC (`src/grpc/service.rs`). The stable adopter-facing surface
+   is `turul_a2a::profiles` — a thin re-export module that exposes
+   only the URI constants and header names, leaving the parse /
+   validate / response-header helpers hidden. A new
+   profile/extensions crate is not introduced; the trigger for one
+   remains ≥2 profile inhabitants.
 
 3. **Interop probe landed.** `examples/skill-dispatch-profile-agent/`
    advertises the profile URI; `examples/interop-clients/skill-dispatch-profile/{python,go,rust}/`
@@ -34,7 +38,7 @@ now satisfied. Recorded here for the audit trail; the live status is
 
 The contract committed by acceptance: profile URI
 `https://turul.dev/a2a/extensions/skill-invocation/v1` (exposed as
-`turul_a2a::profile_dispatch::SKILL_INVOCATION_PROFILE_V1`), header
+`turul_a2a::profiles::SKILL_INVOCATION_PROFILE_V1`), header
 activation, metadata-keyed request shape, response echo.
 
 **Why not Reject:** the four-point contract is the right shape for
@@ -53,6 +57,14 @@ Rejection would only make sense if upstream A2A added a normative
   description, required, params }`), L430-447 (`AgentSkill`),
   L642-651 (`SendMessageRequest`); A2A spec extensions activation:
   https://a2a-protocol.org/latest/topics/extensions/
+
+> **Sections 1–8 below are reference / seed material.** The current
+> contract is fully captured at the top of this file (Status,
+> Acceptance gates cleared, plus the §2 Decision summary that
+> follows). Sections 1, 3, 5, 6, 7, 8 describe the design reasoning
+> from when the ADR was Proposed; they remain useful as background
+> but are no longer normative beyond what the top of the file
+> already states.
 
 ## 1. Context
 
@@ -441,11 +453,11 @@ mechanisms are needed simultaneously.
 > - Gate 1 (acceptance) fired 2026-05-23 — see top-of-file Status
 >   and the "Acceptance gates cleared" section.
 > - Gate 2 (location for the URI constant) was resolved by placing
->   `SKILL_INVOCATION_PROFILE_V1` inside `turul-a2a`'s
->   `pub mod profile_dispatch` rather than waiting on
->   `turul-a2a-patterns` to become publishable. The patterns crate
->   stays internal; the URI constant lives in the transport-owning
->   crate per ADR-021 §5 single-profile placement.
+>   `SKILL_INVOCATION_PROFILE_V1` inside `turul-a2a` and re-exporting
+>   it from the stable `turul_a2a::profiles` module, rather than
+>   waiting on `turul-a2a-patterns` to become publishable. The
+>   patterns crate stays internal; the URI constant lives in the
+>   transport-owning crate per ADR-021 §5 single-profile placement.
 > - The reference example is `examples/skill-dispatch-profile-agent/`
 >   (port 3015) with Python/Go/Rust interop clients.
 

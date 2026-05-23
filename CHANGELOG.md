@@ -26,12 +26,12 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.1.22] — 2026-05-23
 
-### Added — ADR-022 skill-invocation dispatcher profile (Accepted + implemented)
+### Added — A2A skill-invocation dispatcher profile
 
-- **ADR-022 Accepted.** Phase A red-phase tests landed; first-profile placement decided (inside `turul-a2a` as `pub mod profile_dispatch`, per ADR-021 §5 single-profile rule); interop probe via the new showcase agent + clients (below).
-- New `pub(crate)` dispatcher in `crates/turul-a2a/src/profile_dispatch.rs`: parses the `A2A-Extensions` request header, validates against `AgentCard.capabilities.extensions[]`, echoes activated URIs on the response, rejects required-but-missing extensions with `UnsupportedOperationError`. Wired into HTTP `/message:send` + `/message:stream`, JSON-RPC `/jsonrpc`, and gRPC `SendMessage` + `SendStreamingMessage`. 13 tests in `crates/turul-a2a/tests/profile_dispatch_tests.rs` (8 pure-unit + 5 axum end-to-end).
-- Public constant `pub const SKILL_INVOCATION_PROFILE_V1: &str = "https://turul.dev/a2a/extensions/skill-invocation/v1"` available as `turul_a2a::profile_dispatch::SKILL_INVOCATION_PROFILE_V1` for adopter use.
-- New `AgentCardBuilder::extension(AgentExtension)` setter — additive non-breaking method letting adopters declare advertised extensions in their agent card.
+- A new wire-affecting A2A profile extension: clients activate it by sending the standard `A2A-Extensions` request header carrying `https://turul.dev/a2a/extensions/skill-invocation/v1`; the server routes by `Message.metadata["a2a.skillId"]` + `["a2a.skillParams"]`, echoes the activated URI on the response, and rejects required-but-missing extensions with `UnsupportedOperationError`. Wired into HTTP (`/message:send` + `/message:stream`), JSON-RPC, and gRPC (`SendMessage` + `SendStreamingMessage`).
+- Adopter surface: `turul_a2a::profiles::SKILL_INVOCATION_PROFILE_V1` (URI constant) and `turul_a2a::profiles::A2A_EXTENSIONS_HEADER` (`"a2a-extensions"`). Both re-exported from a stable `profiles` module; the underlying dispatcher module is internal.
+- New `AgentCardBuilder::extension(AgentExtension)` — additive setter for declaring advertised extensions in the agent card.
+- Rationale and contract: see ADR-022 (Accepted).
 
 ### Added — showcase agent + interop clients for the dispatcher profile
 
@@ -49,18 +49,17 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Internal
 
-- ADR-022 review-status section + Phase B acceptance commit precede the Phase C implementation commit in `git log`, mirroring the pattern established by ADR-021.
-- `.claude/agents/adr-review.md` subagent definition added — codifies the precommit ADR-compliance review (comment-style, dep-direction, newtype bridge, async_trait ergonomics, SKILL.md coverage, wrapper-API policy, generated-artifact contamination, public-API parity).
-- Comment-style rule tightened: `CLAUDE.md` + `AGENTS.md` both reject ADR/§/Phase/Wave refs in source comments. The earlier in-workspace ADR refs (235 hits across 51 files) have been scrubbed; surviving `§N`-pattern matches are all A2A spec / JSON-RPC / RFC citations (durable external anchors, explicitly permitted).
+- New `.claude/agents/adr-review.md` subagent codifies the precommit ADR-compliance review (comment-style, dep-direction, newtype bridge, async_trait ergonomics, SKILL.md coverage, wrapper-API policy, generated-artifact contamination, public-API parity).
+- Comment-style rule tightened in `CLAUDE.md` + `AGENTS.md`: no ADR / section / phase / wave / step references in source comments, rustdoc, or test comments. ADR refs remain permitted in commit messages, CHANGELOG entries, ADR cross-refs, and READMEs.
 
 ## [0.1.21] — 2026-05-23
 
-### Added — `turul-a2a-patterns` skill-pattern crate (ADR-021 Phase C)
+### Added — `turul-a2a-patterns` skill-pattern crate (ADR-021)
 
 - New **path-only** workspace crate `crates/turul-a2a-patterns/` (`publish = false`, `version.workspace = true`) hosting reusable A2A skill-authoring abstractions. Per ADR-021 §2.1 / §4.1, the crate is intentionally NOT published until §4 gates clear (two real adopters + dispatcher decision + test coverage + downstream impact survey). The crate is consumed today by example agents via workspace path.
 - Public surface (six primary + one Q5-resolved additive):
   - `SkillHandler` — `#[async_trait]` async trait; impls write plain `async fn run(&self, params, sink) -> Result<Value, SkillError>`.
-  - `SkillProgressSink` + `ProgressState` (non-terminal states only, `#[non_exhaustive]`) + `SinkError` (`Closed` / `Backend`) — `#[async_trait]` per Wave 8 ergonomics pass.
+  - `SkillProgressSink` + `ProgressState` (non-terminal states only, `#[non_exhaustive]`) + `SinkError` (`Closed` / `Backend`) — `#[async_trait]` for adopter ergonomics (no visible `Pin<Box<dyn Future>>`).
   - `SkillRegistry` trait + `InMemorySkillRegistry` impl; `register_manifest(card, handler)` is the canonical path.
   - `SkillCard` + SKILL.md manifest parser (camelCase frontmatter, JSON Schema 2020-12 strict-reject-unknown-keywords, `{{ var }}` template grammar with dotted paths, missing-variable structured error). Three-section frontmatter: discovery / provider-neutral execution metadata / opaque `providerConfig`.
   - `SkillDescriptor` — single source of truth for `params_schema` (derived from manifest input schema for manifest-backed skills; supplied once at registration for programmatic skills; never adopter-fillable independently).
@@ -95,7 +94,7 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Workspace deps added: `async-trait = "0.1"`, `dotenvy = "0.15"`, `jsonschema = "0.30"`, `serde_yaml = "0.9"`.
 - `examples/clients/` (the earlier generic-client layout) removed; replaced by per-agent `examples/interop-clients/<agent>/<language>/` structure.
-- ADR-021 amended through Phase C to reflect: orphan-rule-safe newtype bridge in examples (§2.3), `async_trait` adopter ergonomics (§2.3, §9 Q5), reduced-expressivity `securityRequirements` in v1 SKILL.md (§2.2 item 3), explicit "patterns crate ships zero role abstractions; planner/router/critic/post-task-hook are examples only" (§9 Q3), `a2aproject/a2a-go/v2 v2.3.1` Go SDK research result (§7.3 step 8).
+- ADR-021 amended during implementation to reflect: orphan-rule-safe newtype bridge in examples, `async_trait` adopter ergonomics, reduced-expressivity `securityRequirements` in v1 SKILL.md, explicit "patterns crate ships zero role abstractions; planner/router/critic/post-task-hook are examples only", and the `a2aproject/a2a-go/v2 v2.3.1` Go SDK research result.
 
 ## [0.1.20] — 2026-05-21
 

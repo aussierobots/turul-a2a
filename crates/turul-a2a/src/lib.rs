@@ -64,6 +64,16 @@ pub mod middleware;
 pub mod prelude;
 #[doc(hidden)]
 pub mod profile_dispatch;
+
+/// Stable adopter-facing constants for A2A profile extensions
+/// implemented in this crate. The underlying dispatcher lives in
+/// `profile_dispatch` (kept doc-hidden because its parse/validate
+/// helpers are internal plumbing for the router / JSON-RPC / gRPC
+/// transports). Re-export new profile URIs and header names here as
+/// further profiles are added.
+pub mod profiles {
+    pub use crate::profile_dispatch::{A2A_EXTENSIONS_HEADER, SKILL_INVOCATION_PROFILE_V1};
+}
 pub mod push;
 pub mod router;
 pub mod server;

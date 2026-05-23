@@ -25,7 +25,7 @@ use turul_a2a::card_builder::AgentCardBuilder;
 use turul_a2a::error::A2aError;
 use turul_a2a::event_sink::EventSink;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
-use turul_a2a::profile_dispatch::SKILL_INVOCATION_PROFILE_V1;
+use turul_a2a::profiles::SKILL_INVOCATION_PROFILE_V1;
 use turul_a2a_patterns::{
     InMemorySkillRegistry, ProgressState, SinkError, SkillCard, SkillError, SkillHandler,
     SkillProgressSink, SkillRegistry,
