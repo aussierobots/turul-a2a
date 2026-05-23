@@ -97,7 +97,7 @@ dotenvy = "0.15"
 secrecy = "0.10"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "postgres", "json"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "sqlite", "postgres", "json"] }
 aws-config = "1"
 aws-sdk-dynamodb = "1"
 

@@ -223,12 +223,12 @@ impl PostgresA2aStorage {
         let mut proto = task.into_proto();
         if let Some(0) = history_length {
             proto.history.clear();
-        } else if let Some(n) = history_length {
-            if n > 0 {
-                let n = n as usize;
-                let start = proto.history.len().saturating_sub(n);
-                proto.history = proto.history[start..].to_vec();
-            }
+        } else if let Some(n) = history_length
+            && n > 0
+        {
+            let n = n as usize;
+            let start = proto.history.len().saturating_sub(n);
+            proto.history = proto.history[start..].to_vec();
         }
         if !include_artifacts {
             proto.artifacts.clear();
@@ -408,9 +408,13 @@ impl A2aTaskStorage for PostgresA2aStorage {
              ORDER BY updated_at DESC, task_id DESC LIMIT ${param_idx}"
         );
 
-        let mut query = sqlx::query_as::<_, (serde_json::Value, String)>(&select_sql)
-            .bind(tenant)
-            .bind(owner);
+        // `select_sql` is built from an allow-list of conditions and
+        // numbered placeholders ($1, $2, ...); no caller-supplied SQL
+        // ever reaches this string.
+        let mut query =
+            sqlx::query_as::<_, (serde_json::Value, String)>(sqlx::AssertSqlSafe(select_sql))
+                .bind(tenant)
+                .bind(owner);
         for val in &bind_values {
             query = query.bind(val);
         }
@@ -525,16 +529,15 @@ impl A2aTaskStorage for PostgresA2aStorage {
             .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?;
 
         let mut proto = task.into_proto();
-        if append {
-            if let Some(existing) = proto
+        if append
+            && let Some(existing) = proto
                 .artifacts
                 .iter_mut()
                 .find(|a| a.artifact_id == artifact.as_proto().artifact_id)
-            {
-                existing.parts.extend(artifact.into_proto().parts);
-                let updated = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
-                return self.update_task(tenant, owner, updated).await;
-            }
+        {
+            existing.parts.extend(artifact.into_proto().parts);
+            let updated = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+            return self.update_task(tenant, owner, updated).await;
         }
         proto.artifacts.push(artifact.into_proto());
         let updated = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
@@ -1432,10 +1435,10 @@ impl A2aAtomicStore for PostgresA2aStorage {
 /// (SQLSTATE 40001). Used by the create_config CAS retry loop to
 /// distinguish a losable race from a hard error.
 fn is_serialization_failure(e: &sqlx::Error) -> bool {
-    if let Some(db_err) = e.as_database_error() {
-        if let Some(code) = db_err.code() {
-            return code == "40001";
-        }
+    if let Some(db_err) = e.as_database_error()
+        && let Some(code) = db_err.code()
+    {
+        return code == "40001";
     }
     false
 }
@@ -2517,7 +2520,9 @@ mod tests {
             .connect(&base_url)
             .await
             .unwrap();
-        sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+        // Test-only DDL with a controlled schema name (locally generated
+        // UUID below); no caller-supplied input reaches this format.
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA \"{schema}\"")))
             .execute(&admin)
             .await
             .unwrap();
@@ -2550,8 +2555,11 @@ mod tests {
             other => panic!("expected DatabaseError, got: {other:?}"),
         }
 
-        let _ = sqlx::query(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
-            .execute(&admin)
-            .await;
+        // Test-only DDL; same controlled-schema-name rationale as above.
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA \"{schema}\" CASCADE"
+        )))
+        .execute(&admin)
+        .await;
     }
 }

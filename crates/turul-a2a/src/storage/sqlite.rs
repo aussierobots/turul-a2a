@@ -242,12 +242,12 @@ impl SqliteA2aStorage {
         let mut proto = task.into_proto();
         if let Some(0) = history_length {
             proto.history.clear();
-        } else if let Some(n) = history_length {
-            if n > 0 {
-                let n = n as usize;
-                let start = proto.history.len().saturating_sub(n);
-                proto.history = proto.history[start..].to_vec();
-            }
+        } else if let Some(n) = history_length
+            && n > 0
+        {
+            let n = n as usize;
+            let start = proto.history.len().saturating_sub(n);
+            proto.history = proto.history[start..].to_vec();
         }
         if !include_artifacts {
             proto.artifacts.clear();
@@ -373,9 +373,11 @@ impl A2aTaskStorage for SqliteA2aStorage {
 
         let where_clause = conditions.join(" AND ");
 
-        // Count total
+        // Count total. The where-clause is built from a fixed
+        // allow-list of conditions above (status_state predicate only);
+        // no user-supplied SQL ever reaches this `format!`.
         let count_sql = format!("SELECT COUNT(*) FROM a2a_tasks WHERE {where_clause}");
-        let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql)
+        let mut count_query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql))
             .bind(tenant)
             .bind(owner);
         if let Some(ref ctx) = filter.context_id {
@@ -419,9 +421,10 @@ impl A2aTaskStorage for SqliteA2aStorage {
             )
         };
 
-        let mut select_query = sqlx::query_as::<_, (String, String)>(&select_sql)
-            .bind(tenant)
-            .bind(owner);
+        let mut select_query =
+            sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(select_sql))
+                .bind(tenant)
+                .bind(owner);
         if let Some(ref ctx) = filter.context_id {
             select_query = select_query.bind(ctx);
         }
@@ -543,16 +546,15 @@ impl A2aTaskStorage for SqliteA2aStorage {
             .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?;
 
         let mut proto = task.into_proto();
-        if append {
-            if let Some(existing) = proto
+        if append
+            && let Some(existing) = proto
                 .artifacts
                 .iter_mut()
                 .find(|a| a.artifact_id == artifact.as_proto().artifact_id)
-            {
-                existing.parts.extend(artifact.into_proto().parts);
-                let updated = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
-                return self.update_task(tenant, owner, updated).await;
-            }
+        {
+            existing.parts.extend(artifact.into_proto().parts);
+            let updated = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+            return self.update_task(tenant, owner, updated).await;
         }
         proto.artifacts.push(artifact.into_proto());
         let updated = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
@@ -681,7 +683,9 @@ impl crate::storage::A2aCancellationSupervisor for SqliteA2aStorage {
                AND cancel_requested = 1
                AND status_state NOT IN ('Completed', 'Failed', 'Canceled', 'Rejected')"
         );
-        let mut query = sqlx::query_as::<_, (String,)>(&sql).bind(tenant);
+        // `placeholders` is a comma-joined list of `?`; no user input
+        // ever reaches the SQL string itself (only the bind values).
+        let mut query = sqlx::query_as::<_, (String,)>(sqlx::AssertSqlSafe(sql)).bind(tenant);
         for id in task_ids {
             query = query.bind(id);
         }
