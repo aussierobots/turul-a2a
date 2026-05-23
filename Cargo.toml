@@ -129,8 +129,7 @@ turul-a2a = { version = "0.1.26", path = "crates/turul-a2a" }
 turul-a2a-proto = { version = "0.1.26", path = "crates/turul-a2a-proto" }
 turul-a2a-types = { version = "0.1.26", path = "crates/turul-a2a-types" }
 turul-a2a-client = { path = "crates/turul-a2a-client" }
-# Path-only per ADR-021 §2.1 — not publishable, not a [dependencies] of any publishable crate.
-turul-a2a-patterns = { path = "crates/turul-a2a-patterns" }
+turul-a2a-patterns = { version = "0.1.26", path = "crates/turul-a2a-patterns" }
 turul-jwt-validator = "0.2"
 
 # Sibling repo turul-llm — provider-neutral LLM client abstraction +

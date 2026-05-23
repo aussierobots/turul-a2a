@@ -271,7 +271,7 @@ fn parse_two_numbers_ws(s: &str) -> Option<(f64, f64)> {
     Some((a, b))
 }
 
-/// Find a "<n> + <n>" subexpression. Hand-rolled to keep deps minimal — the
+/// Find a `<n> + <n>` subexpression. Hand-rolled to keep deps minimal — the
 /// example deliberately avoids `regex` to stay light.
 fn parse_infix_plus(s: &str) -> Option<(f64, f64)> {
     let bytes = s.as_bytes();

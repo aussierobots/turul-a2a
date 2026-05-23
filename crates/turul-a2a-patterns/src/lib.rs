@@ -5,12 +5,27 @@
 //! runtime. It does NOT change the A2A wire contract; profile/extension
 //! machinery lives elsewhere.
 //!
-//! The crate is organised into focused modules: errors ([`error`]),
-//! progress sink ([`sink`]), handler trait ([`handler`]), terminal hook
-//! ([`hook`]), SKILL.md manifest ([`manifest`]), prompt template rendering
-//! ([`template`]), JSON Schema strict validation ([`schema`]), and the
-//! registry surface ([`registry`]). The flat `turul_a2a_patterns::*`
-//! re-exports below preserve the original API.
+//! Public surface (all re-exported from the crate root):
+//!
+//! - Errors: [`SkillError`], [`SinkError`], [`ManifestError`],
+//!   [`RenderError`], [`ValidationError`].
+//! - Skill handler trait: [`SkillHandler`] taking a
+//!   [`SkillProgressSink`] for non-terminal status / artifact emits.
+//! - Progress sink: [`SkillProgressSink`] + [`ProgressState`]
+//!   (non-terminal states only; terminals come from the handler's
+//!   return value).
+//! - Terminal hook: [`TerminalHook`] + [`SkillOutcome`].
+//! - SKILL.md manifest: [`SkillCard`] (parse, validate_input,
+//!   validate_output, render_prompt, to_agent_skill) +
+//!   [`ExecutionHints`].
+//! - Registry: [`SkillRegistry`] trait + [`InMemorySkillRegistry`] +
+//!   [`SkillDescriptor`].
+//! - Schema validation: [`validate_json`] (JSON Schema 2020-12
+//!   strict-keyword check).
+//!
+//! Internal modules (`error`, `sink`, `handler`, `hook`, `manifest`,
+//! `template`, `schema`, `registry`) are implementation detail; use
+//! the flat re-exports above.
 
 mod error;
 mod handler;

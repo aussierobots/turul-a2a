@@ -47,18 +47,30 @@ If hits are found in source code or non-README markdown inside `crates/` / `exam
 
 ## 2. ADR-021 §2.1 — `turul-a2a-patterns` crate visibility
 
-Until ADR-021 §4 gates clear:
+As of the 0.1.26 release `turul-a2a-patterns` is publishable
+(ADR-021 §4 gates overridden — see the ADR's §4 status update for
+the rationale). The remaining invariants are:
 
-- `crates/turul-a2a-patterns/Cargo.toml` MUST have `publish = false`.
-- Root `[workspace.dependencies]` MUST list `turul-a2a-patterns = { path = "crates/turul-a2a-patterns" }` (path-only, no `version` field).
-- `turul-a2a-patterns` MUST NOT appear in `[dependencies]` of any publishable crate (`turul-a2a`, `turul-a2a-proto`, `turul-a2a-types`, `turul-a2a-client`, `turul-a2a-auth`, `turul-a2a-aws-lambda`). Allowed in `[dev-dependencies]` of those.
+- `crates/turul-a2a-patterns/Cargo.toml` is `publish = true` (no
+  `publish = false` line; the default is true).
+- Root `[workspace.dependencies]` MUST list
+  `turul-a2a-patterns = { version = "X.Y.Z", path = "crates/turul-a2a-patterns" }`
+  (both fields — version for crates.io, path for local resolution).
+- `turul-a2a-patterns` SHOULD remain absent from `[dependencies]`
+  of `turul-a2a` core publishable crates for now (the
+  `impl SkillProgressSink for EventSink` move from §4.1 has not
+  landed). Allowed in `[dev-dependencies]` of those, and in the
+  `[dependencies]` of example crates.
 
 Check with:
 ```bash
 grep -l 'turul-a2a-patterns' crates/*/Cargo.toml
 ```
 
-For each match, confirm it's a dev-dep or `publish = false`. Else **BLOCKER**.
+If a `crates/turul-a2a*/Cargo.toml` (publishable crate) lists
+`turul-a2a-patterns` under `[dependencies]` rather than
+`[dev-dependencies]`, surface as **HIGH** and confirm against
+ADR-021 §4.1 whether the move has been intentionally landed.
 
 ## 3. Dep direction — `turul-a2a-patterns` MUST NOT depend on `turul-a2a`
 

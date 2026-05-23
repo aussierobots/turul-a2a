@@ -618,6 +618,44 @@ The activation dispatch hook (parse, echo, reject) lives in
 
 ## 4. Pre-publish gates
 
+> **Status update (2026-05-23):** ADR-021 §4 gates explicitly
+> overridden as part of the 0.1.26 release. The crate flips from
+> `publish = false` to publishable; the workspace dep declaration
+> gains a `version` field; `.claude/agents/adr-review.md` no longer
+> BLOCKERs the `publish = false` invariant.
+>
+> Rationale for the override (chosen over a strict gate-by-gate
+> read of §4):
+>
+> - **ADR-022 Accepted with `A2A-Extensions` activation wired into
+>   `turul-a2a`'s transport** — §4 gate #2 (dispatcher decision)
+>   cleanly satisfied.
+> - **ADR-023 / ADR-024 / ADR-025 in place** — the LLM-client
+>   abstraction, the typed-handler design sketch, and the deferred
+>   composition patterns each have their own ADR. The surface
+>   `turul-a2a-patterns` exposes is no longer the only place an
+>   adopter has to reason about where to put what.
+> - **Five showcase examples + 18-cell interop matrix** —
+>   `skill-manifest-ollama-agent`, `agent-role-planner-router-agent`,
+>   `agent-role-critic-agent`, `post-task-hook-agent`, and
+>   `skill-dispatch-profile-agent` collectively exercise every §2.2
+>   public surface end-to-end across Python / Go / Rust clients.
+>   This is treated as the practical equivalent of the §4 gate #1
+>   "two real adopters" requirement: not two external adopters, but
+>   five in-workspace consumers with cross-language clients
+>   verifying the wire contract.
+> - **§4 gate #3 (test coverage)** — 26 tests across 8 test files
+>   cover the five §2.2 public surfaces. Verified clean at release
+>   time.
+> - **§4 gate #4 (downstream impact survey)** — no formal survey
+>   was executed; the crate has never been published, so there is
+>   no downstream to migrate. The override acknowledges this gate
+>   is not strictly satisfied and accepts the consequence: future
+>   `0.1.x → 0.2.0` breakage will be visible in the changelog and
+>   adopter migration will happen at that boundary, not now.
+>
+> The original §4 text below is preserved as historical context.
+
 These gates flip the crate from path-only to publishable. Each is
 independently observable; none is satisfied by this ADR.
 
