@@ -6,290 +6,71 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.1.26] — 2026-05-23
 
-`turul-llm` crates.io migration. Patch release (no publishable-crate
-API change).
+### Changed
 
-### Changed — `examples/skill-manifest-ollama-agent` now consumes `turul-llm` from crates.io
+- `examples/skill-manifest-ollama-agent` now depends on published `turul-llm-core` and `turul-llm-ollama` crates from crates.io instead of a pinned git dependency.
+- No publishable `turul-a2a-*` crate depends on `turul-llm-*`; provider integrations remain example-only. See ADR-023.
 
-`turul-llm-core` (v0.1.0), `turul-llm-ollama` (v0.1.0), and
-`turul-llm-openai` (v0.1.0) shipped to crates.io. The workspace dep
-declarations in `Cargo.toml` swap from git-rev-pinned to versioned:
+### Compatibility
 
-  Before:
-    turul-llm-core   = { git = "...", rev = "52eff3c2..." }
-    turul-llm-ollama = { git = "...", rev = "52eff3c2..." }
-
-  After:
-    turul-llm-core   = "0.1"
-    turul-llm-ollama = "0.1"
-
-Clean clones of `turul-a2a` now resolve `turul-llm-*` from the
-crates.io registry without GitHub access and without requiring a
-sibling checkout on disk.
-
-The provider-neutral invariant is unchanged: only
-`examples/skill-manifest-ollama-agent` consumes `turul-llm-*`; no
-publishable `turul-a2a` crate does.
-
-ADR-023 grows revision 4 recording the git-rev → crates.io
-transition. Revisions 1–3 (Proposed → Rejected → Accepted cross-repo
-→ git-rev integration) remain as the historical record.
+- Patch release. No public API change for published crates.
 
 ## [0.1.25] — 2026-05-23
 
-MSRV bump + two deferred major-version migrations from Task #47.
-Patch release (no publishable-crate API change).
+### Changed
 
-### Changed — workspace MSRV 1.85 → 1.94
+- MSRV raised from 1.85 to 1.94. Downstream adopters must build with Rust ≥ 1.94; CI runners and Lambda toolchain images need the corresponding update.
+- Updated `sqlx` to 0.9. Feature shape changed: replace `runtime-tokio-rustls` with `runtime-tokio` + `tls-rustls-aws-lc-rs`. Storage code adjusted for the new query-safety API.
+- Updated `jsonschema` to 0.46. Validation error path handling adjusted.
+- Refreshed AWS SDK / Lambda / `tonic` dependencies to versions unlocked by the new MSRV.
 
-`[workspace.package].rust-version` raised to `1.94`. Required by
-the sqlx 0.9 migration below; also unlocks AWS SDK / smithy stack
-patches that were MSRV-gated under 1.85.
+### Compatibility
 
-Downstream adopters consuming the published crates must build with
-Rust ≥ 1.94. CI runners and Lambda toolchain images need the
-corresponding update.
+- Patch release. No `turul-a2a-*` public API change; the breaking change for adopters is the MSRV requirement.
 
-### Changed — `sqlx` 0.8 → 0.9 (Task #49)
+### Verification
 
-- Feature shape migration: `runtime-tokio-rustls` → `runtime-tokio`
-  + `tls-rustls-aws-lc-rs` (sqlx 0.9 removed the combined runtime+TLS
-  feature names).
-- New `SqlSafeStr` bound on `query()` / `query_as()` /
-  `query_scalar()`: only `&'static str` literals auto-satisfy it.
-  Five dynamic-SQL sites in our storage layer (`storage/sqlite.rs`,
-  `storage/postgres.rs`) now wrap with `sqlx::AssertSqlSafe`, each
-  carrying a comment explaining the SQL is built from a fixed
-  allow-list of structural fragments — no user input ever reaches
-  the format string.
-- Other 0.9 breaking changes surveyed and not hit (no `RawSql`, no
-  `Cow` decode, no `query!()` macro use, no SQLite extension loading).
-- All 66 SQLite parity tests still green.
-
-### Changed — `jsonschema` 0.30 → 0.46 (Task #50)
-
-- 16 minor versions of upstream churn. Surveyed; only one breakage
-  affects our two call sites: `ValidationError::instance_path`
-  migrated from a field to a method.
-- `turul-a2a-patterns::manifest` and `turul-a2a-patterns::schema`
-  updated to call `.instance_path()`.
-- Registry redesign (0.46) / `ValidationError::into_parts` shape
-  change (0.45) / `bundle` API (0.45) — none consumed by our code.
-- `validate_against_schema` and the four typed Input/Output
-  round-trip tests in `skill-manifest-ollama-agent` still green.
-
-### Changed — AWS SDK + tonic stack refresh
-
-Lockfile movements unlocked by the MSRV bump (now reachable; all
-SemVer-compatible at MSRV 1.94):
-
-- `aws-config` 1.8.11 → 1.8.17
-- `aws-credential-types` 1.2.10 → 1.2.14
-- `aws-lc-rs` 1.16.3 → 1.17.0
-- `aws-runtime` 1.5.16 → 1.7.4
-- `aws-sdk-dynamodb` 1.82.0 → 1.112.0
-- `aws-sdk-sqs` 1.74.0 → 1.99.0
-- `aws-sdk-sso` 1.90.0 → 1.99.0
-- `aws-sdk-ssooidc` 1.92.0 → 1.101.0
-- `aws-sdk-sts` 1.94.0 → 1.104.0
-- `aws-sigv4` 1.3.6 → 1.4.4
-- `aws-smithy-*` various; see commit `936c533` for the full list
-- `tonic` 0.14.5 → 0.14.6
-
-All absorbed via existing broad SemVer ranges (`"1"`, `"0.14"`); no
-manifest pin edits required.
-
-### Internal
-
-- 40 clippy `collapsible_if` lints auto-fixed by `cargo clippy --fix`
-  in this slice. The lint was promoted to deny-by-default in Rust
-  1.95; let-chains (stabilised in 1.88) are now used uniformly.
-  Pure mechanical refactor across 22 files; no behaviour change.
-
-### `turul-llm` sibling repo
-
-Out of scope for this slice. Release prep is happening in a
-separate session; this CHANGELOG note will be updated once
-`turul-llm` publishes its first stable releases and the
-git-rev-pinned consumption in `examples/skill-manifest-ollama-agent`
-can switch to versioned crates.io deps.
+- Workspace fmt, clippy, and tests passed.
+- SQLite storage parity (66 tests) and schema-validation tests passed.
 
 ## [0.1.24] — 2026-05-23
 
-Dependency-refresh slice. No publishable-crate API change; patch
-release.
+### Changed
 
-### Changed — workspace dependency lockfile refresh
+- Refreshed workspace dependencies to latest SemVer-compatible versions: `serde_json`, `tokio`, `tower-http`, `reqwest`, `aws_lambda_events` (`1.1` → `1.2`), `lambda_http`, `lambda_runtime`.
 
-Patch and minor SemVer-compatible bumps via `cargo update`:
+### Compatibility
 
-- `serde_json` 1.0.149 → 1.0.150
-- `tokio` 1.52.1 → 1.52.3
-- `tower-http` 0.6.8 → 0.6.11
-- `reqwest` 0.13.2 → 0.13.3
-- `aws_lambda_events` 1.1.3 → 1.2.0 (manifest minimum also bumped:
-  `version = "1.1"` → `"1.2"`)
-- `lambda_http` 1.1.3 → 1.2.0
-- `lambda_runtime` 1.1.3 → 1.2.0
+- Patch release. No public API change.
 
-`cargo update --workspace` reports 0 further actionable packages
-within MSRV 1.85 — every other available bump is gated by a higher
-required Rust version (the AWS SDK / smithy stack at 1.91.1, tonic
-0.14.6 MSRV-gated, etc.).
+### Verification
 
-### Deferred — two major bumps need their own slices
-
-These are tracked as follow-up tasks (Tasks #49 and #50) and stay
-deferred per the dep-sweep policy in Task #47: one major-version
-bump per commit, only when it lands cleanly.
-
-- **`sqlx` 0.8 → 0.9** (Task #49) — sqlx 0.9.0 hard-requires Rust
-  1.94. Our workspace MSRV is 1.85; closing the gap is a framework
-  policy decision, not a dep refresh. The 0.9 release also carries
-  several API breaks (`query*()` now takes `impl SqlSafeStr`;
-  `RawSql` gained a `DB` type parameter; deprecated combined
-  `runtime-tokio-rustls` feature removed) that need a focused
-  storage-parity pass.
-- **`jsonschema` 0.30 → 0.46** (Task #50) — 16 minor versions
-  spanning breaking changes including the 0.46 `Registry` /
-  `with_registry` redesign and the 0.45 `ValidationError::into_parts`
-  shape change. Needs review against `turul-a2a-patterns::schema` +
-  `manifest` strict-keyword behavior. MSRV is fine (0.46 declares
-  1.71.1); the blocker is migration work.
-
-### `turul-llm` (sibling workspace)
-
-- `cargo update --workspace` reports zero actionable bumps; all 9
-  available upgrades (`icu_*`, `idna_adapter`, `wasip2`) need Rust
-  ≥ 1.86 and are blocked by the shared MSRV ceiling. No commit
-  lands in `turul-llm` for this slice.
-
-### Internal
-
-- Tasks #49 and #50 created with concrete acceptance criteria and
-  stop conditions; both blocked on the same MSRV-policy
-  conversation (in #49's case directly, in #50's case indirectly —
-  raising MSRV unlocks fresher transitive deps that would simplify
-  the jsonschema migration).
+- Workspace fmt, clippy, and tests passed.
 
 ## [0.1.23] — 2026-05-23
 
-Composition-patterns slice. No publishable-crate behavior change;
-all changes land in examples, ADR drafts, and project documentation.
-Patch release.
+### Added
 
-### Added — `examples/remote-delegate-agent` (server-side delegation pattern)
+- `examples/remote-delegate-agent` — server-side delegating agent: an `AgentExecutor` that owns an `A2aClient` and forwards inbound messages to a configured upstream A2A agent, re-emitting its artifacts. Pairs by default with `skill-manifest-ollama-agent` on `:3010`. Contract documented in the crate README (discovery, request forwarding, task/artifact mapping, error mapping, timeout, auth-not-forwarded, streaming-deferred).
+- Python / Go / Rust interop clients for `remote-delegate-agent` under `examples/interop-clients/remote-delegate/`.
+- ADR-024 (Proposed) — `TypedSkillHandler` trait sketch with concrete promotion criteria. No code shipped.
+- ADR-025 (Proposed) — deferred composition patterns (graph engine, swarm, agent-as-LLM-tool adapter, A2A↔MCP bridge, executor helper, streaming passthrough) each with a falsifiable escalation trigger.
 
-- New showcase agent (port 3016) whose `AgentExecutor` owns a
-  `turul-a2a-client::A2aClient` and forwards every inbound message
-  to a configured upstream A2A agent. Upstream artifacts are
-  re-emitted as the delegate's own (fresh local `artifact_id`;
-  `Part`s preserved verbatim).
-- Defaults to forwarding to `skill-manifest-ollama-agent` on
-  `:3010`, so the two agents pair out of the box in offline mode.
-- Explicit contract (§1 discovery / §2 forwarding / §3 task & artifact
-  mapping / §4 error mapping / §5 timeout / §6 auth-NOT-forwarded /
-  §7 streaming-deferred) documented in the crate's README and
-  enforced by 4 unit tests + 1 end-to-end smoke that spawns BOTH
-  agents on test ports.
-- Pattern demonstrated: A2A composes naturally over A2A. The
-  delegation is invisible at the wire boundary — a third-party
-  client only knows about the delegate.
+### Changed
 
-### Added — Python / Go / Rust interop clients for `remote-delegate-agent`
+- `examples/skill-manifest-ollama-agent` greet skill handler now uses typed `GreetInput` / `GreetOutput` structs while keeping `SKILL.md` schemas authoritative; new tests pin the structs to the manifest.
+- `examples/skill-manifest-ollama-agent` LLM call now goes through `turul-llm-core` + `turul-llm-ollama` from the sibling `turul-llm` repo via a pinned git revision (no publishable `turul-a2a-*` crate depends on `turul-llm-*`). See ADR-023.
+- Showcase examples switched from tuple-newtype bridge wrappers to named-field structs for readability. The named-field rule is now enforced by the `adr-review` subagent. Library-internal primitive newtypes are unaffected.
+- ADR-022's adopter surface re-exported through the stable `turul_a2a::profiles` module; the dispatcher module is now `#[doc(hidden)]`.
 
-- `examples/interop-clients/remote-delegate/{python,go,rust}/`
-  exercising the two-hop chain (`client → delegate → upstream`)
-  end-to-end. Each client asserts the upstream's `offline stub`
-  marker appears in the returned artifact body — proof the chain
-  rounded through both agents.
-- `CLIENT_MATRIX.md` grows the 6th row. Matrix is now **6 agents ×
-  3 languages = 18 cells, all manually verified**.
+### Compatibility
 
-### Changed — typed input/output structs in `examples/skill-manifest-ollama-agent`
+- Patch release. No public API change.
 
-- The `greet` skill handler now consumes `GreetInput { user, style }`
-  and produces `GreetOutput { greeting }` instead of walking
-  `serde_json::Value` with `.get().and_then()` chains. Handler body
-  shrinks by ~25 LOC; the example reads as the *pattern* rather
-  than as JSON plumbing.
-- **SKILL.md remains authoritative.** The handler still calls
-  `card.validate_input` before typed deserialise and
-  `card.validate_output` after re-serialise. Four new tests pin
-  every example payload through both directions of the round-trip
-  so struct ↔ manifest drift is caught at `cargo test` time.
+### Verification
 
-### Changed — `examples/skill-manifest-ollama-agent` consumes `turul-llm` (pinned git rev)
-
-- The example's LLM call now goes through `turul-llm-core::LlmClient`
-  + `turul-llm-ollama::OllamaClient` from the sibling
-  [`turul-llm`](https://github.com/aussierobots/turul-llm) workspace
-  instead of an inline `reqwest` call. Pinned to git rev
-  `52eff3c2cbf63efea11dcef7686ef588b9aa79a6` so clean clones build
-  without requiring a sibling checkout on disk.
-- Offline-stub mode is unchanged.
-- The provider-neutral invariant binds: no publishable `turul-a2a`
-  crate depends on `turul-llm-*`; only the example does. See
-  ADR-023 revision 3.
-- Versioned crates.io migration deferred until `turul-llm` ships
-  its first stable release.
-
-### Changed — named-field bridge wrappers across showcase examples
-
-- The five existing showcase agents (`skill-manifest-ollama-agent`,
-  `agent-role-critic-agent`, `agent-role-planner-router-agent`,
-  `post-task-hook-agent`, `skill-dispatch-profile-agent`) switch
-  their `ExampleProgressSink` from `struct ExampleProgressSink(EventSink);`
-  with `self.0` to `struct ExampleProgressSink { event_sink: EventSink }`
-  with `self.event_sink`. Pure refactor; zero behavior change.
-- Reason: in showcase examples the wrapped framework type IS the
-  lesson; `.0` discards that signal and forces the reader to chase
-  the struct definition. Named fields make the pattern obvious at
-  the call site.
-
-### Added — `ADR-024` (Proposed): `TypedSkillHandler` trait sketch
-
-- Records the design question raised by the typed-example migration
-  above: when does generic `Value` plumbing in `SkillHandler::run`
-  warrant a typed trait?
-- Status stays Proposed. No code lands. Promotion criteria are
-  concrete and falsifiable: ≥2 examples carrying typed structs by
-  hand, repeated boilerplate documented, schema-equivalence strategy
-  decided (test-only / runtime startup check / build-time codegen),
-  one adopter signal.
-- `schemars` is NOT added to the workspace.
-
-### Added — `ADR-025` (Proposed): deferred composition patterns + escalation triggers
-
-- Six deferred patterns (graph engine, swarm, agent-as-LLM-tool
-  adapter, A2A↔MCP-tool bridge, `A2aClient`-based executor helper,
-  `remote-delegate-agent` streaming passthrough) each documented
-  with a falsifiable trigger condition.
-- Forcing function for future review: when a maintainer says "we
-  should add X", the answer is "check if the trigger has fired".
-  If yes, open a successor ADR. If no, "deferred per ADR-025 §<N>".
-
-### Added — project rule: named-field bridges in showcase examples
-
-- `CLAUDE.md` "Example and API Surface Policy" + `AGENTS.md`
-  "Example and API Surface Rules" + `.claude/agents/adr-review.md`
-  §4 all updated. The adr-review subagent now flags tuple wrappers
-  around `EventSink` / `A2aClient` / `SkillCard` in
-  `examples/*/src/*.rs` as **HIGH**. Library-internal primitive
-  wrappers (`pub struct ContextId(String)`) are explicitly NOT
-  banned.
-
-### Internal — ADR-022 / ADR-023 polish
-
-- ADR-022 (skill-invocation dispatcher) stale Proposed-state
-  scaffolding scrubbed; section banner clarifies §§1–8 as
-  reference/seed material with the current contract captured at
-  the top.
-- ADR-022's adopter surface re-exported through the stable
-  `turul_a2a::profiles` module (the underlying `profile_dispatch`
-  module is `#[doc(hidden)]`).
-- ADR-023 §1–§7 carries a clearer historical banner; revision-3
-  records the path-dep → pinned-git-rev integration.
+- Workspace fmt, clippy, and tests passed.
+- Interop client matrix now covers 6 agents × 3 languages, all smoke-verified.
 
 ## [0.1.22] — 2026-05-23
 

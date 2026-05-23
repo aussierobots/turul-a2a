@@ -273,6 +273,7 @@ cargo fmt --all -- --check
 - If a behavior is temporary while a feature is being built, keep that explanation in planning docs, ADR amendments, issues, or commit messages. In source comments, state the current contract plainly and add a TODO only when it names the concrete missing behavior and removal trigger, not the internal phase that will deliver it.
 - Architectural decisions made during planning or implementation should be captured later as ADRs under `docs/adr/`.
 - For meaningful architecture changes, require the ADR to be written and accepted before implementation proceeds.
+- `CHANGELOG.md` is for adopters, operators, and maintainers — not project working history. Each entry answers "what changed for someone consuming or operating these crates?" Use `### Added` / `### Changed` / `### Fixed` / `### Removed` / `### Compatibility` headings and an optional one-line `### Verification` block for behaviour-sensitive changes. Do NOT include task / slice / phase / wave / round numbers, commit hashes, ADR section numbers, revision-list narration, internal review status (`adr-review`, `gates green`), or exhaustive enumerations of clippy lints / transitive deps. Those belong in commit messages, ADRs, and PR descriptions. ADR references like `see ADR-023` are fine when they orient the release; do not cite section numbers or revision IDs. Litmus: can an adopter decide from the entry whether to bump and what (if anything) to change in their code? If not, rewrite or trim.
 
 ## Final Review Standard
 

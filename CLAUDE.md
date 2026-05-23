@@ -58,6 +58,20 @@ cargo lambda watch -p lambda-agent         # Lambda agent via cargo-lambda
 - Do not push unless explicitly asked
 - Version bumps follow SemVer per the user's global versioning rule (patch = compatible runtime, minor = contract change, major = breaking architecture). See `CHANGELOG.md` for per-release classification.
 
+## CHANGELOG.md style
+
+`CHANGELOG.md` is for **adopters, operators, and maintainers**, not project working history. Answer "what changed for someone consuming or operating these crates?"
+
+**Do write:** the user-visible change (`### Added` / `### Changed` / `### Fixed` / `### Removed` / `### Compatibility`), the smallest concrete code/manifest impact (`sqlx 0.8 → 0.9`, `MSRV raised to 1.94`), and a one-line `### Verification` block when behaviour-sensitive (e.g. "SQLite storage parity tests passed") so operators know which surfaces were exercised.
+
+**Do NOT write:** task / slice / phase / wave / round numbers, commit hashes, ADR section numbers or revision-list narration, "Proposed → Rejected → Accepted" disposition arcs, internal review-loop status (`adr-review`, `codex says`, `gates green`), enumerations of every clippy lint or transitive dep bump. Those live in commit messages, ADRs, PR descriptions, and `cargo update --verbose` output.
+
+**ADR references in CHANGELOG:** `see ADR-023` is fine when it helps orient the release. Do NOT cite ADR section numbers or revision IDs — they rot and don't help adopters.
+
+**Older entries:** don't churn historical releases. Apply the rule to the current draft and the next entry; once a release is cut, leave it alone.
+
+**Litmus test:** can a downstream adopter, reading the entry, decide whether to bump and what (if anything) to change in their code? If yes, the entry is right-sized. If they need to read the diff to know, it's too detailed (or pointing the wrong way).
+
 ## Release & Publish (crates.io)
 
 The workspace publishes 6 crates. Publishing is irreversible (yank only hides). Never run `cargo publish` without explicit user instruction.
