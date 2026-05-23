@@ -167,9 +167,30 @@ Working end-to-end examples live in
 [`examples/agent-role-planner-router-agent`](../../examples/agent-role-planner-router-agent/),
 [`examples/agent-role-critic-agent`](../../examples/agent-role-critic-agent/),
 and [`examples/post-task-hook-agent`](../../examples/post-task-hook-agent/).
-Each shows the newtype-adapter pattern (`struct ExampleProgressSink(EventSink)`) that
-bridges the framework's runtime `EventSink` into `SkillProgressSink` — see
-ADR-021 §2.3 for the orphan-rule rationale.
+Each shows the bridge-adapter pattern:
+
+```rust
+struct ExampleProgressSink {
+    event_sink: EventSink,
+}
+
+#[async_trait]
+impl SkillProgressSink for ExampleProgressSink {
+    async fn set_status(/* ... */) -> Result<(), SinkError> {
+        self.event_sink.set_status(/* ... */).await /* ... */
+    }
+    // emit_artifact + is_closed delegate to self.event_sink likewise
+}
+```
+
+The named-field shape (`event_sink:`, not `.0`) is a CLAUDE.md /
+AGENTS.md rule for showcase examples: the wrapped framework value
+is part of the lesson, so the field name should make that obvious
+at the call site. Orphan-rule rationale for needing a local wrapper
+at all: `SkillProgressSink` lives in this crate, `EventSink` lives
+in `turul-a2a`, and the example crate is a third crate — a direct
+`impl SkillProgressSink for EventSink` from the example is illegal
+Rust.
 
 ## Module layout
 
