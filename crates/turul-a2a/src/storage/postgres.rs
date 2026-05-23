@@ -2521,7 +2521,8 @@ mod tests {
             .await
             .unwrap();
         // Test-only DDL with a controlled schema name (locally generated
-        // UUID below); no caller-supplied input reaches this format.
+        // from SystemTime nanos above); no caller-supplied input reaches
+        // this format.
         sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA \"{schema}\"")))
             .execute(&admin)
             .await

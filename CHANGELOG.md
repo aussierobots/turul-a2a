@@ -4,6 +4,85 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.25] — 2026-05-23
+
+MSRV bump + two deferred major-version migrations from Task #47.
+Patch release (no publishable-crate API change).
+
+### Changed — workspace MSRV 1.85 → 1.94
+
+`[workspace.package].rust-version` raised to `1.94`. Required by
+the sqlx 0.9 migration below; also unlocks AWS SDK / smithy stack
+patches that were MSRV-gated under 1.85.
+
+Downstream adopters consuming the published crates must build with
+Rust ≥ 1.94. CI runners and Lambda toolchain images need the
+corresponding update.
+
+### Changed — `sqlx` 0.8 → 0.9 (Task #49)
+
+- Feature shape migration: `runtime-tokio-rustls` → `runtime-tokio`
+  + `tls-rustls-aws-lc-rs` (sqlx 0.9 removed the combined runtime+TLS
+  feature names).
+- New `SqlSafeStr` bound on `query()` / `query_as()` /
+  `query_scalar()`: only `&'static str` literals auto-satisfy it.
+  Five dynamic-SQL sites in our storage layer (`storage/sqlite.rs`,
+  `storage/postgres.rs`) now wrap with `sqlx::AssertSqlSafe`, each
+  carrying a comment explaining the SQL is built from a fixed
+  allow-list of structural fragments — no user input ever reaches
+  the format string.
+- Other 0.9 breaking changes surveyed and not hit (no `RawSql`, no
+  `Cow` decode, no `query!()` macro use, no SQLite extension loading).
+- All 66 SQLite parity tests still green.
+
+### Changed — `jsonschema` 0.30 → 0.46 (Task #50)
+
+- 16 minor versions of upstream churn. Surveyed; only one breakage
+  affects our two call sites: `ValidationError::instance_path`
+  migrated from a field to a method.
+- `turul-a2a-patterns::manifest` and `turul-a2a-patterns::schema`
+  updated to call `.instance_path()`.
+- Registry redesign (0.46) / `ValidationError::into_parts` shape
+  change (0.45) / `bundle` API (0.45) — none consumed by our code.
+- `validate_against_schema` and the four typed Input/Output
+  round-trip tests in `skill-manifest-ollama-agent` still green.
+
+### Changed — AWS SDK + tonic stack refresh
+
+Lockfile movements unlocked by the MSRV bump (now reachable; all
+SemVer-compatible at MSRV 1.94):
+
+- `aws-config` 1.8.11 → 1.8.17
+- `aws-credential-types` 1.2.10 → 1.2.14
+- `aws-lc-rs` 1.16.3 → 1.17.0
+- `aws-runtime` 1.5.16 → 1.7.4
+- `aws-sdk-dynamodb` 1.82.0 → 1.112.0
+- `aws-sdk-sqs` 1.74.0 → 1.99.0
+- `aws-sdk-sso` 1.90.0 → 1.99.0
+- `aws-sdk-ssooidc` 1.92.0 → 1.101.0
+- `aws-sdk-sts` 1.94.0 → 1.104.0
+- `aws-sigv4` 1.3.6 → 1.4.4
+- `aws-smithy-*` various; see commit `936c533` for the full list
+- `tonic` 0.14.5 → 0.14.6
+
+All absorbed via existing broad SemVer ranges (`"1"`, `"0.14"`); no
+manifest pin edits required.
+
+### Internal
+
+- 40 clippy `collapsible_if` lints auto-fixed by `cargo clippy --fix`
+  in this slice. The lint was promoted to deny-by-default in Rust
+  1.95; let-chains (stabilised in 1.88) are now used uniformly.
+  Pure mechanical refactor across 22 files; no behaviour change.
+
+### `turul-llm` sibling repo
+
+Out of scope for this slice. Release prep is happening in a
+separate session; this CHANGELOG note will be updated once
+`turul-llm` publishes its first stable releases and the
+git-rev-pinned consumption in `examples/skill-manifest-ollama-agent`
+can switch to versioned crates.io deps.
+
 ## [0.1.24] — 2026-05-23
 
 Dependency-refresh slice. No publishable-crate API change; patch
