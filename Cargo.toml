@@ -131,6 +131,15 @@ turul-a2a-client = { path = "crates/turul-a2a-client" }
 turul-a2a-patterns = { path = "crates/turul-a2a-patterns" }
 turul-jwt-validator = "0.2"
 
+# Sibling repo: provider-neutral LLM client abstraction + adapters.
+# Path-only — these crates are not published yet and are consumed only by
+# example agents in this workspace. Core publishable crates (turul-a2a,
+# turul-a2a-types, turul-a2a-proto, turul-a2a-client, turul-a2a-auth,
+# turul-a2a-aws-lambda) MUST NOT depend on turul-llm-* — the framework
+# stays provider-neutral. See docs/adr/ADR-023.
+turul-llm-core = { path = "../turul-llm/crates/turul-llm-core" }
+turul-llm-ollama = { path = "../turul-llm/crates/turul-llm-ollama" }
+
 # Generic JSON-RPC 2.0 framework. We use the dispatcher + handler trait for
 # the inner non-streaming dispatch table; the outer wire boundary stays in
 # turul-a2a (parse, envelope validation, notifications, params shape, compat-

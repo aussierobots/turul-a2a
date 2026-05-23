@@ -10,6 +10,8 @@ turul-a2a = { workspace = true }
 turul-a2a-types = { workspace = true }
 turul-a2a-proto = { workspace = true }
 turul-a2a-patterns = { workspace = true }
+turul-llm-core = { workspace = true }
+turul-llm-ollama = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -17,7 +19,6 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { workspace = true }
 futures = { workspace = true }
 dotenvy = { workspace = true }
 

@@ -162,8 +162,9 @@ location + reason — by design (§2.2 item 3 of ADR-021).
 | Symptom                                              | Cause                                                | Fix                                                                                          |
 | ---------------------------------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | `address already in use` on startup                  | Another process bound `:3010`                        | Stop it, or `A2A_PORT=3011 cargo run -p skill-manifest-ollama-agent`                         |
-| `ollama POST … failed`                               | Live mode, but Ollama not running / wrong URL        | Start `ollama serve`, confirm `curl http://localhost:11434/api/tags` works                   |
-| `ollama … structured-output payload not valid JSON`  | Model returned non-JSON despite `format`             | Try a different model (`llama3.1:8b-instruct`, etc.), or fall back to the offline mode       |
+| `LLM call failed: LLM transport error: …`            | Live mode, but Ollama not running / wrong URL        | Start `ollama serve`, confirm `curl http://localhost:11434/api/tags` works                   |
+| `LLM call failed: LLM provider error: …`             | Ollama reached but returned non-2xx (e.g. model not pulled, bad payload) | Confirm the model is pulled (`ollama list`), check the `model` in `skills/demo/SKILL.md`'s `providerConfig` |
+| `LLM call failed: LLM response did not satisfy output schema: …` | Model returned non-JSON despite `format`             | Try a different model (`llama3.1:8b-instruct`, etc.), or fall back to the offline mode       |
 | `manifest parse error …`                             | `skills/demo/SKILL.md` edited into an invalid shape  | Re-read [the three-section frontmatter](#the-skillmd-manifest); restore the camelCase keys   |
 | `inputSchema violation` on `/message:send`           | Sent JSON does not satisfy the manifest input schema | Match the schema, e.g. `{"user":{"name":"Ada"}}`                                             |
 

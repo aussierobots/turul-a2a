@@ -3674,6 +3674,8 @@ dependencies = [
  "turul-a2a-patterns",
  "turul-a2a-proto",
  "turul-a2a-types",
+ "turul-llm-core",
+ "turul-llm-ollama",
  "uuid",
 ]
 
@@ -4610,6 +4612,28 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "turul-llm-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "turul-llm-ollama"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "turul-llm-core",
 ]
 
 [[package]]

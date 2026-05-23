@@ -29,6 +29,8 @@ use turul_a2a_patterns::{
     SkillProgressSink, SkillRegistry,
 };
 use turul_a2a_types::{Artifact, Message, Part, Task, TaskState};
+use turul_llm_core::{CompletionRequest, LlmClient, LlmError};
+use turul_llm_ollama::OllamaClient;
 
 const DEFAULT_BIND_PORT: u16 = 3010;
 
@@ -111,21 +113,26 @@ fn map_event_sink_error(err: A2aError) -> SinkError {
     }
 }
 
+/// Map `LlmError` from the provider adapter into the skill-handler error
+/// type. The example treats every LLM failure as `Internal` because no
+/// LLM variant currently signals a caller-recoverable condition — schema
+/// violations from the provider are still operator-visible bugs in the
+/// SKILL.md output schema or the model's structured-output support.
+fn map_llm_error(err: LlmError) -> SkillError {
+    SkillError::Internal(format!("LLM call failed: {err}"))
+}
+
 // ---------------------------------------------------------------------------
 // Skill handler — offline stub by default, Ollama when env vars are set.
 // ---------------------------------------------------------------------------
 
 struct GreetHandler {
     card: SkillCard,
-    http: reqwest::Client,
 }
 
 impl GreetHandler {
     fn new(card: SkillCard) -> Self {
-        Self {
-            card,
-            http: reqwest::Client::new(),
-        }
+        Self { card }
     }
 
     fn ollama_base_url() -> Option<String> {
@@ -150,59 +157,18 @@ impl GreetHandler {
     }
 
     async fn run_live(&self, base_url: &str, prompt: &str) -> Result<Value, SkillError> {
-        let model = self.provider_model().to_string();
-        let format_schema = self
-            .card
-            .output_schema
-            .clone()
-            .unwrap_or_else(|| json!({"type": "object"}));
-
-        let body = json!({
-            "model": model,
-            "stream": false,
-            "format": format_schema,
-            "messages": [
-                {"role": "user", "content": prompt},
-            ],
-        });
-
-        let url = format!("{base_url}/api/chat");
-        let resp = self
-            .http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| SkillError::Internal(format!("ollama POST {url} failed: {e}")))?;
-
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| SkillError::Internal(format!("ollama body read failed: {e}")))?;
-        if !status.is_success() {
-            return Err(SkillError::Internal(format!(
-                "ollama {url} returned HTTP {status}: {text}"
-            )));
+        // Build the provider-neutral request. The schema-passthrough lives
+        // inside the OllamaClient adapter (it maps `output_schema` to
+        // Ollama's `format` field). When the trait gains a second provider,
+        // the example's wiring here does not change.
+        let client = OllamaClient::new(base_url, self.provider_model());
+        let mut request = CompletionRequest::new(prompt);
+        if let Some(schema) = self.card.output_schema.clone() {
+            request = request.with_output_schema(schema);
         }
 
-        let envelope: Value = serde_json::from_str(&text)
-            .map_err(|e| SkillError::Internal(format!("ollama JSON parse failed: {e}: {text}")))?;
-        let content = envelope
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .ok_or_else(|| {
-                SkillError::Internal(format!(
-                    "ollama response missing /message/content: {envelope}"
-                ))
-            })?;
-
-        serde_json::from_str::<Value>(content).map_err(|e| {
-            SkillError::Internal(format!(
-                "ollama structured-output payload not valid JSON: {e}: {content}"
-            ))
-        })
+        let response = client.complete(request).await.map_err(map_llm_error)?;
+        Ok(response.parsed_output)
     }
 
     fn run_offline(&self, params: &Value, prompt: &str) -> Value {

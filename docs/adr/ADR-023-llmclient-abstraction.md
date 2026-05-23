@@ -19,12 +19,21 @@ test suite.
 | `turul-a2a` server / proto / types / patterns / client / auth / aws-lambda | This repo. Provider-neutral. |
 | `turul-a2a` example agents | This repo. **Provider calls stay example-local** until `turul-llm` ships its first release. |
 
-`turul-a2a` examples MAY take a dependency on `turul-llm` crates
-**only after** `turul-llm` exists with its own published tests and
-releases. Until then, every provider call in a `turul-a2a` example
-(such as the Ollama call in `examples/skill-manifest-ollama-agent`)
-lives in the example crate's own source — provider-neutral framework
-remains provider-neutral at the dep-graph level.
+`turul-a2a` examples MAY take a `path`-only dependency on `turul-llm`
+crates once that workspace is locally usable (its own tests green,
+trait shape Accepted in `turul-llm/docs/adr/`). They MUST switch to
+a versioned crates.io dependency only after `turul-llm` ships its
+first stable release. Either way, no `turul-a2a` *publishable* crate
+(server / proto / types / patterns / client / auth / aws-lambda) may
+depend on `turul-llm-*`. The provider-neutral invariant binds at the
+publishable-crate boundary, not at the example boundary.
+
+As of 2026-05-23, `examples/skill-manifest-ollama-agent` consumes
+`turul-llm-core` + `turul-llm-ollama` via path dep (sibling repo at
+`../turul-llm`). The previous inline Ollama call in
+`examples/skill-manifest-ollama-agent/src/main.rs` has been replaced
+with an `OllamaClient` + `LlmClient::complete` call. Offline mode is
+unchanged (the offline stub still bypasses the LLM trait entirely).
 
 This supersedes both the original "Recommended: Option C" framing
 and the 2026-05-23 morning Rejected disposition. The original Option
@@ -471,3 +480,23 @@ ADR-021 §2.4 was written to prevent. Rejected without reopening ADR-021.
    }` input type would let adopters express role boundaries without embedding
    role markers in the prompt template. Defer to a trait amendment once a second
    provider adapter makes the generalisation apparent.
+
+## Revision history
+
+- **rev 1 (2026-05-23, Rejected)** — proposed adding `turul-llm-core` as
+  a new workspace crate inside `turul-a2a`. Rejected: cadence mismatch
+  with the framework, audience mismatch, and ADR-021 §2.4 forbids
+  pulling new contract surfaces into the framework workspace without
+  the wider gates.
+- **rev 2 (2026-05-23, Accepted)** — cross-repo decision: abstraction
+  lives in the sibling `turul-llm` repo. `turul-a2a` stays
+  provider-neutral at the publishable-crate boundary. Examples carry
+  inline provider calls until `turul-llm` is locally usable.
+- **rev 3 (2026-05-23, current)** — `turul-llm` is locally usable
+  (workspace scaffold, two adapters validating the trait shape,
+  ADR-001 Accepted in that repo). `examples/skill-manifest-ollama-agent`
+  switched from an inline `reqwest` Ollama call to a path-dep on
+  `turul-llm-core` + `turul-llm-ollama`. The provider-neutral
+  invariant still binds: no publishable `turul-a2a` crate depends on
+  `turul-llm-*`. Versioned crates.io migration is gated on
+  `turul-llm`'s first stable release.

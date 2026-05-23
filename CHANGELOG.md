@@ -4,6 +4,20 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed — `examples/skill-manifest-ollama-agent` now consumes `turul-llm`
+
+- Replaces the inline `reqwest`-based Ollama call with a path-dep on
+  `turul-llm-core::LlmClient` + `turul-llm-ollama::OllamaClient`
+  (sibling repo at `../turul-llm`). Offline-stub mode is unchanged.
+  The provider-neutral invariant on the framework dep-graph still
+  binds — no publishable `turul-a2a` crate depends on `turul-llm-*`;
+  only this example crate does. See ADR-023 revision 3.
+- Workspace `Cargo.toml` adds path entries for `turul-llm-core` +
+  `turul-llm-ollama`. Versioned crates.io migration deferred until
+  `turul-llm` ships its first stable release.
+
 ## [0.1.22] — 2026-05-23
 
 ### Added — ADR-022 skill-invocation dispatcher profile (Accepted + implemented)
