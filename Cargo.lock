@@ -3630,6 +3630,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "skill-dispatch-profile-agent"
+version = "0.1.21"
+dependencies = [
+ "async-trait",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "turul-a2a",
+ "turul-a2a-patterns",
+ "turul-a2a-proto",
+ "turul-a2a-types",
+ "uuid",
+]
+
+[[package]]
 name = "skill-manifest-ollama-agent"
 version = "0.1.21"
 dependencies = [

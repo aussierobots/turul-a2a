@@ -16,6 +16,7 @@ members = [
   "examples/skill-security-agent",
   "examples/skill-manifest-ollama-agent",
   "examples/agent-role-planner-router-agent",
+  "examples/skill-dispatch-profile-agent",
   "examples/agent-role-critic-agent",
   "examples/post-task-hook-agent",
   "examples/conversation-agent",
