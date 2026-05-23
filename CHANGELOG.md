@@ -4,6 +4,37 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.26] — 2026-05-23
+
+`turul-llm` crates.io migration. Patch release (no publishable-crate
+API change).
+
+### Changed — `examples/skill-manifest-ollama-agent` now consumes `turul-llm` from crates.io
+
+`turul-llm-core` (v0.1.0), `turul-llm-ollama` (v0.1.0), and
+`turul-llm-openai` (v0.1.0) shipped to crates.io. The workspace dep
+declarations in `Cargo.toml` swap from git-rev-pinned to versioned:
+
+  Before:
+    turul-llm-core   = { git = "...", rev = "52eff3c2..." }
+    turul-llm-ollama = { git = "...", rev = "52eff3c2..." }
+
+  After:
+    turul-llm-core   = "0.1"
+    turul-llm-ollama = "0.1"
+
+Clean clones of `turul-a2a` now resolve `turul-llm-*` from the
+crates.io registry without GitHub access and without requiring a
+sibling checkout on disk.
+
+The provider-neutral invariant is unchanged: only
+`examples/skill-manifest-ollama-agent` consumes `turul-llm-*`; no
+publishable `turul-a2a` crate does.
+
+ADR-023 grows revision 4 recording the git-rev → crates.io
+transition. Revisions 1–3 (Proposed → Rejected → Accepted cross-repo
+→ git-rev integration) remain as the historical record.
+
 ## [0.1.25] — 2026-05-23
 
 MSRV bump + two deferred major-version migrations from Task #47.

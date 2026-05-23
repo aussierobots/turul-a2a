@@ -37,7 +37,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.25"
+version = "0.1.26"
 edition = "2024"
 authors = ["Nick Hortovanyi <nick@aussierobots.com.au>"]
 license = "MIT OR Apache-2.0"
@@ -125,25 +125,24 @@ bytes = "1"
 serde_yaml = "0.9"
 jsonschema = "0.46"
 
-turul-a2a = { version = "0.1.25", path = "crates/turul-a2a" }
-turul-a2a-proto = { version = "0.1.25", path = "crates/turul-a2a-proto" }
-turul-a2a-types = { version = "0.1.25", path = "crates/turul-a2a-types" }
+turul-a2a = { version = "0.1.26", path = "crates/turul-a2a" }
+turul-a2a-proto = { version = "0.1.26", path = "crates/turul-a2a-proto" }
+turul-a2a-types = { version = "0.1.26", path = "crates/turul-a2a-types" }
 turul-a2a-client = { path = "crates/turul-a2a-client" }
 # Path-only per ADR-021 §2.1 — not publishable, not a [dependencies] of any publishable crate.
 turul-a2a-patterns = { path = "crates/turul-a2a-patterns" }
 turul-jwt-validator = "0.2"
 
-# Sibling repo: provider-neutral LLM client abstraction + adapters.
-# Pinned git rev so a clean clone of turul-a2a builds without requiring
-# a sibling checkout on disk. These crates are not yet published to
-# crates.io — when they are, switch to versioned deps.
+# Sibling repo turul-llm — provider-neutral LLM client abstraction +
+# adapters. Published to crates.io as of 2026-05-23 at v0.1.0; consumed
+# here via versioned deps.
 #
 # Consumed only by example agents in this workspace. Core publishable
 # crates (turul-a2a, turul-a2a-types, turul-a2a-proto, turul-a2a-client,
 # turul-a2a-auth, turul-a2a-aws-lambda) MUST NOT depend on turul-llm-*
 # — the framework stays provider-neutral. See docs/adr/ADR-023.
-turul-llm-core = { git = "https://github.com/aussierobots/turul-llm.git", rev = "52eff3c2cbf63efea11dcef7686ef588b9aa79a6" }
-turul-llm-ollama = { git = "https://github.com/aussierobots/turul-llm.git", rev = "52eff3c2cbf63efea11dcef7686ef588b9aa79a6" }
+turul-llm-core = "0.1"
+turul-llm-ollama = "0.1"
 
 # Generic JSON-RPC 2.0 framework. We use the dispatcher + handler trait for
 # the inner non-streaming dispatch table; the outer wire boundary stays in
