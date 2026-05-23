@@ -1890,6 +1890,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "interop-remote-delegate-rust"
+version = "0.1.22"
+dependencies = [
+ "serde_json",
+ "tokio",
+ "turul-a2a-client",
+ "turul-a2a-types",
+]
+
+[[package]]
 name = "interop-skill-dispatch-profile-rust"
 version = "0.1.22"
 dependencies = [

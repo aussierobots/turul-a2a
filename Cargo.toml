@@ -33,6 +33,7 @@ members = [
   "examples/interop-clients/agent-role-planner-router/rust",
   "examples/interop-clients/agent-role-critic/rust",
   "examples/interop-clients/post-task-hook/rust",
+  "examples/interop-clients/remote-delegate/rust",
 ]
 
 [workspace.package]

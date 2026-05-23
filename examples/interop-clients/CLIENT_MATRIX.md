@@ -29,17 +29,28 @@ surfaces; each SDK picks based on the AgentCard's `supportedInterfaces[]`.
 | **`agent-role-critic-agent`** (port 3013) | ✓ JSON-RPC `/jsonrpc`, `SendStreamingMessage` (SSE) | ✓ JSON-RPC `/jsonrpc`, `SendMessage` | ✓ REST `/message:send` |
 | **`post-task-hook-agent`** (port 3014) | ✓ JSON-RPC `/jsonrpc`, `SendStreamingMessage` (SSE) | ✓ JSON-RPC `/jsonrpc`, `SendMessage` | ✓ REST `/message:send` |
 | **`skill-dispatch-profile-agent`** (port 3015) — exercises the ADR-022 dispatcher profile via `A2A-Extensions` header + `Message.metadata["a2a.skillId"]` | ✓ JSON-RPC `/jsonrpc` + `A2A-Extensions` header + metadata-keyed routing | ✓ JSON-RPC `/jsonrpc` + `A2A-Extensions` header + metadata-keyed routing | ✓ REST `/message:send` + `A2A-Extensions` header (via `A2aClient::with_extensions`) + metadata-keyed routing |
+| **`remote-delegate-agent`** (port 3016) — two-hop chain: client → delegate → upstream (`skill-manifest-ollama-agent`); proves A2A composes over A2A | ✓ JSON-RPC `/jsonrpc` (buffered `SendMessage`) — two-hop verified via upstream offline-stub marker in artifact | ✓ JSON-RPC `/jsonrpc`, `SendMessage` — two-hop verified | ✓ REST `/message:send` — two-hop verified |
 
-**15 cells, 15 manually verified.** Each ✓ corresponds to a smoke run
-that started the agent on its default port, sent the agent's actual
-payload, and observed the expected response shape end-to-end. All
-four showcase agents are manifest-backed; the fifth
-(`skill-dispatch-profile-agent`) additionally advertises the
-skill-invocation profile extension URI in its AgentCard and
-exercises the framework's `A2A-Extensions` header dispatch — all
-three clients confirmed the URI is echoed in the response header
-on every call. Evidence trail is in each client's README
-"Expected output" section.
+**18 cells, 18 manually verified.** Each ✓ corresponds to a smoke run
+that started the agent(s) on default ports, sent the documented
+payload, and observed the expected response shape end-to-end. The
+showcase coverage is now:
+
+- Four manifest-backed skill agents (`skill-manifest-ollama-agent`,
+  `agent-role-planner-router-agent`, `agent-role-critic-agent`,
+  `post-task-hook-agent`).
+- `skill-dispatch-profile-agent` — additionally exercises the
+  ADR-022 skill-invocation dispatcher profile (`A2A-Extensions`
+  header echoed by the server, verified by all three clients).
+- `remote-delegate-agent` — additionally exercises **server-side
+  delegation**: each client speaks only to the delegate, but the
+  artifact body carries the upstream agent's offline-stub marker,
+  proving the two-hop chain returned the upstream's response
+  verbatim. This row requires *two* A2A servers to be running
+  during the smoke; see each client's README for the exact
+  sequence.
+
+Evidence trail is in each client's README "Expected output" section.
 
 ## Per-agent payloads
 
@@ -49,6 +60,7 @@ on every call. Evidence trail is in each client's README
 | `agent-role-planner-router-agent` | `"add 3 5"` then `"concat: foo bar baz"` | `{"result":8}` then `{"joined":"foo bar baz"}` |
 | `agent-role-critic-agent` | JSON `validate_against_schema` (value+schema) + `check_invariants` (value+invariants) | `{"valid":true,"errors":[]}` + `{"verdict":"pass","failures":[]}` |
 | `post-task-hook-agent` | `"count 3"` three times then `"metrics"` | `{"squared":9}` thrice + `{"success":3,"failure":0,"last":"…"}` |
+| `remote-delegate-agent` | JSON text `{"user":{"name":"Ada"},"style":"formal"}` (same as `skill-manifest-ollama-agent`) | `{"greeting":"Good day, Ada! (offline stub)"}` — body propagates from the upstream; delegate rewraps the artifact id but preserves all `Part`s. Requires both `skill-manifest-ollama-agent` (upstream, :3010) and `remote-delegate-agent` (:3016) to be running. |
 
 ## Wire-contract notes
 
