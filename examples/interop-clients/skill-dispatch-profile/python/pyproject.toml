@@ -1,0 +1,12 @@
+[project]
+name = "turul-a2a-interop-client-skill-dispatch-profile"
+version = "0.1.0"
+description = "Python A2A client for the skill-dispatch-profile-agent example."
+requires-python = ">=3.10"
+dependencies = [
+    "a2a-sdk==1.0.2",
+    "httpx",
+]
+
+[tool.uv]
+package = false

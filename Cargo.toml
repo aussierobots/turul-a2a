@@ -28,6 +28,7 @@ members = [
   "examples/lambda-stream-worker",
   "examples/lambda-scheduled-worker",
   "examples/interop-clients/skill-manifest-ollama/rust",
+  "examples/interop-clients/skill-dispatch-profile/rust",
   "examples/interop-clients/agent-role-planner-router/rust",
   "examples/interop-clients/agent-role-critic/rust",
   "examples/interop-clients/post-task-hook/rust",

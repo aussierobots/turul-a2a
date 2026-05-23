@@ -28,15 +28,18 @@ surfaces; each SDK picks based on the AgentCard's `supportedInterfaces[]`.
 | **`agent-role-planner-router-agent`** (port 3012) | ✓ JSON-RPC `/jsonrpc`, `SendStreamingMessage` (SSE) | ✓ JSON-RPC `/jsonrpc`, `SendMessage` | ✓ REST `/message:send` |
 | **`agent-role-critic-agent`** (port 3013) | ✓ JSON-RPC `/jsonrpc`, `SendStreamingMessage` (SSE) | ✓ JSON-RPC `/jsonrpc`, `SendMessage` | ✓ REST `/message:send` |
 | **`post-task-hook-agent`** (port 3014) | ✓ JSON-RPC `/jsonrpc`, `SendStreamingMessage` (SSE) | ✓ JSON-RPC `/jsonrpc`, `SendMessage` | ✓ REST `/message:send` |
+| **`skill-dispatch-profile-agent`** (port 3015) — exercises the ADR-022 dispatcher profile via `A2A-Extensions` header + `Message.metadata["a2a.skillId"]` | ✓ JSON-RPC `/jsonrpc` + `A2A-Extensions` header + metadata-keyed routing | ✓ JSON-RPC `/jsonrpc` + `A2A-Extensions` header + metadata-keyed routing | ✓ REST `/message:send` + `A2A-Extensions` header (via `A2aClient::with_extensions`) + metadata-keyed routing |
 
-**12 cells, 12 manually verified.** Each ✓ corresponds to a smoke run
+**15 cells, 15 manually verified.** Each ✓ corresponds to a smoke run
 that started the agent on its default port, sent the agent's actual
-payload, and observed the expected response shape end-to-end. Last
-re-verified after Wave 8: all four agents are now manifest-backed
-(see `examples/<agent>/skills/<skill-id>/SKILL.md` per agent); the
-wire shape is unchanged so the same client payloads still work
-end-to-end. Evidence trail is in each client's README "Expected
-output" section.
+payload, and observed the expected response shape end-to-end. All
+four showcase agents are manifest-backed; the fifth
+(`skill-dispatch-profile-agent`) additionally advertises the
+skill-invocation profile extension URI in its AgentCard and
+exercises the framework's `A2A-Extensions` header dispatch — all
+three clients confirmed the URI is echoed in the response header
+on every call. Evidence trail is in each client's README
+"Expected output" section.
 
 ## Per-agent payloads
 
