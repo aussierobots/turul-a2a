@@ -132,13 +132,16 @@ turul-a2a-patterns = { path = "crates/turul-a2a-patterns" }
 turul-jwt-validator = "0.2"
 
 # Sibling repo: provider-neutral LLM client abstraction + adapters.
-# Path-only — these crates are not published yet and are consumed only by
-# example agents in this workspace. Core publishable crates (turul-a2a,
-# turul-a2a-types, turul-a2a-proto, turul-a2a-client, turul-a2a-auth,
-# turul-a2a-aws-lambda) MUST NOT depend on turul-llm-* — the framework
-# stays provider-neutral. See docs/adr/ADR-023.
-turul-llm-core = { path = "../turul-llm/crates/turul-llm-core" }
-turul-llm-ollama = { path = "../turul-llm/crates/turul-llm-ollama" }
+# Pinned git rev so a clean clone of turul-a2a builds without requiring
+# a sibling checkout on disk. These crates are not yet published to
+# crates.io — when they are, switch to versioned deps.
+#
+# Consumed only by example agents in this workspace. Core publishable
+# crates (turul-a2a, turul-a2a-types, turul-a2a-proto, turul-a2a-client,
+# turul-a2a-auth, turul-a2a-aws-lambda) MUST NOT depend on turul-llm-*
+# — the framework stays provider-neutral. See docs/adr/ADR-023.
+turul-llm-core = { git = "https://github.com/aussierobots/turul-llm.git", rev = "52eff3c2cbf63efea11dcef7686ef588b9aa79a6" }
+turul-llm-ollama = { git = "https://github.com/aussierobots/turul-llm.git", rev = "52eff3c2cbf63efea11dcef7686ef588b9aa79a6" }
 
 # Generic JSON-RPC 2.0 framework. We use the dispatcher + handler trait for
 # the inner non-streaming dispatch table; the outer wire boundary stays in

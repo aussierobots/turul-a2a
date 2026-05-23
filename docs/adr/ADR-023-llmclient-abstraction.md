@@ -19,21 +19,33 @@ test suite.
 | `turul-a2a` server / proto / types / patterns / client / auth / aws-lambda | This repo. Provider-neutral. |
 | `turul-a2a` example agents | This repo. **Provider calls stay example-local** until `turul-llm` ships its first release. |
 
-`turul-a2a` examples MAY take a `path`-only dependency on `turul-llm`
-crates once that workspace is locally usable (its own tests green,
-trait shape Accepted in `turul-llm/docs/adr/`). They MUST switch to
-a versioned crates.io dependency only after `turul-llm` ships its
-first stable release. Either way, no `turul-a2a` *publishable* crate
-(server / proto / types / patterns / client / auth / aws-lambda) may
-depend on `turul-llm-*`. The provider-neutral invariant binds at the
-publishable-crate boundary, not at the example boundary.
+`turul-a2a` examples MAY take a dependency on `turul-llm` crates once
+that workspace is locally usable (its own tests green, trait shape
+Accepted in `turul-llm/docs/adr/`). Two consumption modes are
+recognised:
+
+- **Pinned git rev** — committed in `[workspace.dependencies]`. This
+  is the mode used today for cross-clone reproducibility while
+  `turul-llm` is `publish = false`.
+- **Local path** — useful only for in-repo development against an
+  uncommitted sibling checkout (e.g. coordinated changes across both
+  repos). Not committed.
+
+Examples MUST switch to a versioned crates.io dependency once
+`turul-llm` ships its first stable release. Either way, no
+`turul-a2a` *publishable* crate (server / proto / types / patterns /
+client / auth / aws-lambda) may depend on `turul-llm-*`. The
+provider-neutral invariant binds at the publishable-crate boundary,
+not at the example boundary.
 
 As of 2026-05-23, `examples/skill-manifest-ollama-agent` consumes
-`turul-llm-core` + `turul-llm-ollama` via path dep (sibling repo at
-`../turul-llm`). The previous inline Ollama call in
-`examples/skill-manifest-ollama-agent/src/main.rs` has been replaced
-with an `OllamaClient` + `LlmClient::complete` call. Offline mode is
-unchanged (the offline stub still bypasses the LLM trait entirely).
+`turul-llm-core` + `turul-llm-ollama` from
+https://github.com/aussierobots/turul-llm pinned to a specific git
+rev (recorded in revision 3 below). The previous inline Ollama call
+in `examples/skill-manifest-ollama-agent/src/main.rs` has been
+replaced with an `OllamaClient` + `LlmClient::complete` call.
+Offline mode is unchanged (the offline stub still bypasses the LLM
+trait entirely).
 
 This supersedes both the original "Recommended: Option C" framing
 and the 2026-05-23 morning Rejected disposition. The original Option
@@ -141,7 +153,8 @@ Preserved below as historical record; not normative here.
 > (`https://github.com/aussierobots/turul-llm`, or local sibling
 > path), `turul-a2a` stays provider-neutral at the publishable-crate
 > boundary, and the reference example `examples/skill-manifest-ollama-agent`
-> now consumes `turul-llm-core` + `turul-llm-ollama` via path dep.
+> now consumes `turul-llm-core` + `turul-llm-ollama` via a pinned
+> git revision.
 > Read sections 1–7 for the seed reasoning, but treat any
 > "ships in this workspace" or "inline Ollama call" framing as
 > superseded by the cross-repo decision and revision 3 in the
@@ -506,11 +519,14 @@ ADR-021 §2.4 was written to prevent. Rejected without reopening ADR-021.
   lives in the sibling `turul-llm` repo. `turul-a2a` stays
   provider-neutral at the publishable-crate boundary. Examples carry
   inline provider calls until `turul-llm` is locally usable.
-- **rev 3 (2026-05-23, current)** — `turul-llm` is locally usable
-  (workspace scaffold, two adapters validating the trait shape,
-  ADR-001 Accepted in that repo). `examples/skill-manifest-ollama-agent`
-  switched from an inline `reqwest` Ollama call to a path-dep on
-  `turul-llm-core` + `turul-llm-ollama`. The provider-neutral
+- **rev 3 (2026-05-23, current)** — `turul-llm` is published at
+  https://github.com/aussierobots/turul-llm (workspace scaffold, two
+  adapters validating the trait shape, ADR-001 Accepted in that repo).
+  `examples/skill-manifest-ollama-agent` switched from an inline
+  `reqwest` Ollama call to a dependency on `turul-llm-core` +
+  `turul-llm-ollama`, pinned to a specific git rev in
+  `[workspace.dependencies]` so clean clones of `turul-a2a` build
+  without requiring a sibling checkout on disk. The provider-neutral
   invariant still binds: no publishable `turul-a2a` crate depends on
-  `turul-llm-*`. Versioned crates.io migration is gated on
-  `turul-llm`'s first stable release.
+  `turul-llm-*`; only the example does. Versioned crates.io migration
+  is gated on `turul-llm`'s first stable release.

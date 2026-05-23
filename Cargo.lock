@@ -4617,6 +4617,7 @@ dependencies = [
 [[package]]
 name = "turul-llm-core"
 version = "0.1.0"
+source = "git+https://github.com/aussierobots/turul-llm.git?rev=52eff3c2cbf63efea11dcef7686ef588b9aa79a6#52eff3c2cbf63efea11dcef7686ef588b9aa79a6"
 dependencies = [
  "async-trait",
  "serde",
@@ -4627,6 +4628,7 @@ dependencies = [
 [[package]]
 name = "turul-llm-ollama"
 version = "0.1.0"
+source = "git+https://github.com/aussierobots/turul-llm.git?rev=52eff3c2cbf63efea11dcef7686ef588b9aa79a6#52eff3c2cbf63efea11dcef7686ef588b9aa79a6"
 dependencies = [
  "async-trait",
  "reqwest 0.13.2",

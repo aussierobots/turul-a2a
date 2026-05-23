@@ -4,36 +4,24 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased] — local-only, not pushable as-is
+## [Unreleased]
 
-> **Not pushable as a `turul-a2a` release.** This Unreleased block
-> documents a *local-only* integration: `examples/skill-manifest-ollama-agent`
-> consumes the sibling `turul-llm` workspace at `../turul-llm` via a
-> filesystem path dependency. A clean clone of `turul-a2a` will not
-> build without the sibling repo present at the same relative path.
-> Before any push or release, one of the following must happen:
->
-> 1. **Drop the integration from this branch.** Revert
->    `examples/skill-manifest-ollama-agent` to the inline Ollama
->    call. Land turul-llm separately, then re-integrate.
-> 2. **Publish `turul-llm-core` + `turul-llm-ollama` to crates.io**
->    and switch the example's `Cargo.toml` to versioned deps.
-> 3. **Switch to a pinned `git` dependency** (`git = "…", rev = "…"`)
->    once `turul-llm` has a public origin, accepting that example
->    builds will require network access.
->
-> Decision pending the maintainer.
+### Changed — `examples/skill-manifest-ollama-agent` now consumes `turul-llm` (pinned git rev)
 
-### Changed — `examples/skill-manifest-ollama-agent` now consumes `turul-llm` (local path)
-
-- Replaces the inline `reqwest`-based Ollama call with a path-dep on
-  `turul-llm-core::LlmClient` + `turul-llm-ollama::OllamaClient`
-  (sibling repo at `../turul-llm`). Offline-stub mode is unchanged.
-  The provider-neutral invariant on the framework dep-graph still
-  binds — no publishable `turul-a2a` crate depends on `turul-llm-*`;
-  only this example crate does. See ADR-023 revision 3.
-- Workspace `Cargo.toml` adds path entries for `turul-llm-core` +
-  `turul-llm-ollama`. Versioned crates.io migration deferred until
+- Replaces the inline `reqwest`-based Ollama call with a dependency on
+  `turul-llm-core::LlmClient` + `turul-llm-ollama::OllamaClient` from
+  the sibling [`turul-llm`](https://github.com/aussierobots/turul-llm)
+  workspace. Pinned to rev
+  `52eff3c2cbf63efea11dcef7686ef588b9aa79a6` so a clean clone of
+  `turul-a2a` builds without requiring a sibling checkout on disk.
+- Offline-stub mode is unchanged.
+- The provider-neutral invariant on the framework dep-graph still
+  binds: no publishable `turul-a2a` crate depends on `turul-llm-*`;
+  only `examples/skill-manifest-ollama-agent` does. See ADR-023
+  revision 3.
+- Workspace `Cargo.toml` adds `turul-llm-core` and `turul-llm-ollama`
+  as git deps under `[workspace.dependencies]` with a dep-direction
+  guard comment. Versioned crates.io migration deferred until
   `turul-llm` ships its first stable release.
 
 ## [0.1.22] — 2026-05-23
