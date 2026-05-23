@@ -4,6 +4,35 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.22] — 2026-05-23
+
+### Added — ADR-022 skill-invocation dispatcher profile (Accepted + implemented)
+
+- **ADR-022 Accepted.** Phase A red-phase tests landed; first-profile placement decided (inside `turul-a2a` as `pub mod profile_dispatch`, per ADR-021 §5 single-profile rule); interop probe via the new showcase agent + clients (below).
+- New `pub(crate)` dispatcher in `crates/turul-a2a/src/profile_dispatch.rs`: parses the `A2A-Extensions` request header, validates against `AgentCard.capabilities.extensions[]`, echoes activated URIs on the response, rejects required-but-missing extensions with `UnsupportedOperationError`. Wired into HTTP `/message:send` + `/message:stream`, JSON-RPC `/jsonrpc`, and gRPC `SendMessage` + `SendStreamingMessage`. 13 tests in `crates/turul-a2a/tests/profile_dispatch_tests.rs` (8 pure-unit + 5 axum end-to-end).
+- Public constant `pub const SKILL_INVOCATION_PROFILE_V1: &str = "https://turul.dev/a2a/extensions/skill-invocation/v1"` available as `turul_a2a::profile_dispatch::SKILL_INVOCATION_PROFILE_V1` for adopter use.
+- New `AgentCardBuilder::extension(AgentExtension)` setter — additive non-breaking method letting adopters declare advertised extensions in their agent card.
+
+### Added — showcase agent + interop clients for the dispatcher profile
+
+- `examples/skill-dispatch-profile-agent/` (port 3015) — multi-skill agent with `echo_loud` + `reverse` skills (both SKILL.md-backed). Advertises the profile URI; reads `Message.metadata["a2a.skillId"]` + `["a2a.skillParams"]` for routing per ADR-022 §2.3. 9 tests (5 unit + 4 smoke).
+- `examples/interop-clients/skill-dispatch-profile/{python,go,rust}/` — three per-language clients exercising the dispatcher end-to-end (header activation + metadata-keyed routing + response echo verification). All three smoke-verified.
+- `examples/interop-clients/CLIENT_MATRIX.md` grows the new row; matrix is now 5 agents × 3 languages = 15 cells, all manually verified.
+
+### Added — `turul-a2a-client::A2aClient::with_extensions`
+
+- Additive `pub` builder method on `A2aClient` for sending the `A2A-Extensions` HTTP header alongside outbound requests. Enables Rust adopters to activate server-side profile extensions (e.g. the skill-invocation dispatcher) ergonomically without dropping to a raw HTTP client. ~15 LOC patch; zero existing API changed; all 20 `client_tests` still pass.
+
+### Revised — ADR-023 disposition
+
+- ADR-023 (LlmClient abstraction) revised from "Proposed" to **Accepted with cross-repo decision**: the LLM-client abstraction lives in a separate `turul-llm` GitHub repo, not in this workspace. `turul-a2a` stays provider-neutral; examples MAY optionally consume `turul-llm` crates once that repo ships its first stable releases. Until then, provider calls stay example-local. Original §4 trait sketch and §7 open questions preserved as seed material for `turul-llm`'s own design ADRs.
+
+### Internal
+
+- ADR-022 review-status section + Phase B acceptance commit precede the Phase C implementation commit in `git log`, mirroring the pattern established by ADR-021.
+- `.claude/agents/adr-review.md` subagent definition added — codifies the precommit ADR-compliance review (comment-style, dep-direction, newtype bridge, async_trait ergonomics, SKILL.md coverage, wrapper-API policy, generated-artifact contamination, public-API parity).
+- Comment-style rule tightened: `CLAUDE.md` + `AGENTS.md` both reject ADR/§/Phase/Wave refs in source comments. The earlier in-workspace ADR refs (235 hits across 51 files) have been scrubbed; surviving `§N`-pattern matches are all A2A spec / JSON-RPC / RFC citations (durable external anchors, explicitly permitted).
+
 ## [0.1.21] — 2026-05-23
 
 ### Added — `turul-a2a-patterns` skill-pattern crate (ADR-021 Phase C)

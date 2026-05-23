@@ -35,7 +35,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.21"
+version = "0.1.22"
 edition = "2024"
 authors = ["Nick Hortovanyi <nick@aussierobots.com.au>"]
 license = "MIT OR Apache-2.0"
@@ -123,9 +123,9 @@ bytes = "1"
 serde_yaml = "0.9"
 jsonschema = "0.30"
 
-turul-a2a = { version = "0.1.21", path = "crates/turul-a2a" }
-turul-a2a-proto = { version = "0.1.21", path = "crates/turul-a2a-proto" }
-turul-a2a-types = { version = "0.1.21", path = "crates/turul-a2a-types" }
+turul-a2a = { version = "0.1.22", path = "crates/turul-a2a" }
+turul-a2a-proto = { version = "0.1.22", path = "crates/turul-a2a-proto" }
+turul-a2a-types = { version = "0.1.22", path = "crates/turul-a2a-types" }
 turul-a2a-client = { path = "crates/turul-a2a-client" }
 # Path-only per ADR-021 §2.1 — not publishable, not a [dependencies] of any publishable crate.
 turul-a2a-patterns = { path = "crates/turul-a2a-patterns" }
