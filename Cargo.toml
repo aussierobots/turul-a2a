@@ -19,6 +19,7 @@ members = [
   "examples/skill-dispatch-profile-agent",
   "examples/agent-role-critic-agent",
   "examples/post-task-hook-agent",
+  "examples/remote-delegate-agent",
   "examples/conversation-agent",
   "examples/interrupting-agent",
   "examples/lambda-agent",

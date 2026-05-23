@@ -1,0 +1,24 @@
+[package]
+name = "remote-delegate-agent"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Server-side delegating A2A agent: an AgentExecutor that owns an A2aClient and forwards inbound messages to a configured remote A2A agent."
+
+[dependencies]
+turul-a2a = { workspace = true }
+turul-a2a-types = { workspace = true }
+turul-a2a-proto = { workspace = true }
+turul-a2a-client = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+dotenvy = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+wiremock = { workspace = true }
+serde_json = { workspace = true }
