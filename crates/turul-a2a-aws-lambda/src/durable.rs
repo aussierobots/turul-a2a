@@ -167,17 +167,17 @@ async fn drive_sqs_record(state: &AppState, record: SqsMessage) -> Result<(), St
     };
 
     // Terminal already → idempotent no-op success.
-    if let Some(status) = task.status() {
-        if let Ok(s) = status.state() {
-            use turul_a2a_types::state_machine::is_terminal;
-            if is_terminal(s) {
-                tracing::debug!(
-                    item = %identifier,
-                    state = ?s,
-                    "task already terminal; skipping executor invocation"
-                );
-                return Ok(());
-            }
+    if let Some(status) = task.status()
+        && let Ok(s) = status.state()
+    {
+        use turul_a2a_types::state_machine::is_terminal;
+        if is_terminal(s) {
+            tracing::debug!(
+                item = %identifier,
+                state = ?s,
+                "task already terminal; skipping executor invocation"
+            );
+            return Ok(());
         }
     }
 

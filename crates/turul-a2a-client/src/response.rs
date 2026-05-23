@@ -120,10 +120,10 @@ pub fn artifact_text(task: &Task) -> String {
 pub fn first_data_artifact(task: &Task) -> Option<serde_json::Value> {
     for artifact in task.artifacts() {
         for part in &artifact.parts {
-            if let Some(pb::part::Content::Data(proto_struct)) = &part.content {
-                if let Ok(value) = serde_json::to_value(proto_struct) {
-                    return Some(value);
-                }
+            if let Some(pb::part::Content::Data(proto_struct)) = &part.content
+                && let Ok(value) = serde_json::to_value(proto_struct)
+            {
+                return Some(value);
             }
         }
     }

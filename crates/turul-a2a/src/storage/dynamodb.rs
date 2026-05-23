@@ -207,12 +207,12 @@ impl DynamoDbA2aStorage {
         let mut proto = task.into_proto();
         if let Some(0) = history_length {
             proto.history.clear();
-        } else if let Some(n) = history_length {
-            if n > 0 {
-                let n = n as usize;
-                let start = proto.history.len().saturating_sub(n);
-                proto.history = proto.history[start..].to_vec();
-            }
+        } else if let Some(n) = history_length
+            && n > 0
+        {
+            let n = n as usize;
+            let start = proto.history.len().saturating_sub(n);
+            proto.history = proto.history[start..].to_vec();
         }
         if !include_artifacts {
             proto.artifacts.clear();
@@ -565,16 +565,15 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?;
 
         let mut proto = task.into_proto();
-        if append {
-            if let Some(existing) = proto
+        if append
+            && let Some(existing) = proto
                 .artifacts
                 .iter_mut()
                 .find(|a| a.artifact_id == artifact.as_proto().artifact_id)
-            {
-                existing.parts.extend(artifact.into_proto().parts);
-                let updated = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
-                return self.update_task(tenant, owner, updated).await;
-            }
+        {
+            existing.parts.extend(artifact.into_proto().parts);
+            let updated = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+            return self.update_task(tenant, owner, updated).await;
         }
         proto.artifacts.push(artifact.into_proto());
         let updated = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
@@ -637,10 +636,10 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
                     match self.get_task(tenant, task_id, owner, Some(0)).await {
                         Ok(Some(t)) => {
                             let state = t.status().and_then(|s| s.state().ok());
-                            if let Some(s) = state {
-                                if turul_a2a_types::state_machine::is_terminal(s) {
-                                    return Err(A2aStorageError::TerminalState(s));
-                                }
+                            if let Some(s) = state
+                                && turul_a2a_types::state_machine::is_terminal(s)
+                            {
+                                return Err(A2aStorageError::TerminalState(s));
                             }
                             // get_task succeeded but state is non-terminal —
                             // means owner check must have been the failing
@@ -735,40 +734,37 @@ impl crate::storage::A2aCancellationSupervisor for DynamoDbA2aStorage {
                 .send()
                 .await
                 .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
-            if let Some(responses) = resp.responses {
-                if let Some(items) = responses.get(&self.config.tasks_table) {
-                    for item in items {
-                        let pk = item
-                            .get("pk")
-                            .and_then(|v| v.as_s().ok())
-                            .cloned()
-                            .unwrap_or_default();
-                        let state_str = item
-                            .get("statusState")
-                            .and_then(|v| v.as_s().ok())
-                            .map(String::as_str);
-                        let is_terminal = matches!(
-                            state_str,
-                            Some("Completed")
-                                | Some("Failed")
-                                | Some("Canceled")
-                                | Some("Rejected")
-                        );
-                        if is_terminal {
-                            continue;
-                        }
-                        let marker = item
-                            .get("cancelRequested")
-                            .and_then(|v| v.as_bool().ok().copied())
-                            .unwrap_or(false);
-                        if !marker {
-                            continue;
-                        }
-                        // pk = "{tenant}#{task_id}" per task_key; extract
-                        // the task_id by splitting on the first '#'.
-                        if let Some(task_id) = pk.split_once('#').map(|(_, t)| t.to_string()) {
-                            hits.push(task_id);
-                        }
+            if let Some(responses) = resp.responses
+                && let Some(items) = responses.get(&self.config.tasks_table)
+            {
+                for item in items {
+                    let pk = item
+                        .get("pk")
+                        .and_then(|v| v.as_s().ok())
+                        .cloned()
+                        .unwrap_or_default();
+                    let state_str = item
+                        .get("statusState")
+                        .and_then(|v| v.as_s().ok())
+                        .map(String::as_str);
+                    let is_terminal = matches!(
+                        state_str,
+                        Some("Completed") | Some("Failed") | Some("Canceled") | Some("Rejected")
+                    );
+                    if is_terminal {
+                        continue;
+                    }
+                    let marker = item
+                        .get("cancelRequested")
+                        .and_then(|v| v.as_bool().ok().copied())
+                        .unwrap_or(false);
+                    if !marker {
+                        continue;
+                    }
+                    // pk = "{tenant}#{task_id}" per task_key; extract
+                    // the task_id by splitting on the first '#'.
+                    if let Some(task_id) = pk.split_once('#').map(|(_, t)| t.to_string()) {
+                        hits.push(task_id);
                     }
                 }
             }
@@ -1108,12 +1104,12 @@ async fn query_latest_event_sequence(
         .send()
         .await
         .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
-    if let Some(item) = result.item {
-        if let Some(AttributeValue::N(n)) = item.get("latestEventSequence") {
-            return n
-                .parse::<u64>()
-                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()));
-        }
+    if let Some(item) = result.item
+        && let Some(AttributeValue::N(n)) = item.get("latestEventSequence")
+    {
+        return n
+            .parse::<u64>()
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()));
     }
     Ok(0)
 }
@@ -1141,14 +1137,13 @@ async fn query_max_sequence(
         .await
         .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
 
-    if let Some(items) = result.items {
-        if let Some(item) = items.first() {
-            if let Some(AttributeValue::N(n)) = item.get("eventSequence") {
-                return n
-                    .parse::<u64>()
-                    .map_err(|e| A2aStorageError::DatabaseError(e.to_string()));
-            }
-        }
+    if let Some(items) = result.items
+        && let Some(item) = items.first()
+        && let Some(AttributeValue::N(n)) = item.get("eventSequence")
+    {
+        return n
+            .parse::<u64>()
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()));
     }
     Ok(0)
 }
@@ -1595,15 +1590,15 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                     match self.get_task(tenant, task_id, owner, Some(0)).await {
                         Ok(Some(current_task)) => {
                             let probe_state = current_task.status().and_then(|s| s.state().ok());
-                            if let Some(s) = probe_state {
-                                if turul_a2a_types::state_machine::is_terminal(s) {
-                                    return Err(A2aStorageError::TerminalStateAlreadySet {
-                                        task_id: task_id.to_string(),
-                                        current_state:
-                                            crate::storage::terminal_cas::task_state_wire_name(s)
-                                                .to_string(),
-                                    });
-                                }
+                            if let Some(s) = probe_state
+                                && turul_a2a_types::state_machine::is_terminal(s)
+                            {
+                                return Err(A2aStorageError::TerminalStateAlreadySet {
+                                    task_id: task_id.to_string(),
+                                    current_state:
+                                        crate::storage::terminal_cas::task_state_wire_name(s)
+                                            .to_string(),
+                                });
                             }
                         }
                         Ok(None) => {
@@ -1737,15 +1732,15 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                     match self.get_task(tenant, &task_id, owner, Some(0)).await {
                         Ok(Some(current_task)) => {
                             let probe_state = current_task.status().and_then(|s| s.state().ok());
-                            if let Some(s) = probe_state {
-                                if turul_a2a_types::state_machine::is_terminal(s) {
-                                    return Err(A2aStorageError::TerminalStateAlreadySet {
-                                        task_id,
-                                        current_state:
-                                            crate::storage::terminal_cas::task_state_wire_name(s)
-                                                .to_string(),
-                                    });
-                                }
+                            if let Some(s) = probe_state
+                                && turul_a2a_types::state_machine::is_terminal(s)
+                            {
+                                return Err(A2aStorageError::TerminalStateAlreadySet {
+                                    task_id,
+                                    current_state:
+                                        crate::storage::terminal_cas::task_state_wire_name(s)
+                                            .to_string(),
+                                });
                             }
                         }
                         Ok(None) => {
@@ -2865,12 +2860,11 @@ mod tests {
         // Wait for table to become ACTIVE
         for _ in 0..30 {
             let desc = client.describe_table().table_name(table_name).send().await;
-            if let Ok(resp) = desc {
-                if let Some(table) = resp.table {
-                    if table.table_status == Some(aws_sdk_dynamodb::types::TableStatus::Active) {
-                        return;
-                    }
-                }
+            if let Ok(resp) = desc
+                && let Some(table) = resp.table
+                && table.table_status == Some(aws_sdk_dynamodb::types::TableStatus::Active)
+            {
+                return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
@@ -2929,12 +2923,11 @@ mod tests {
         }
         for _ in 0..30 {
             let desc = client.describe_table().table_name(table_name).send().await;
-            if let Ok(resp) = desc {
-                if let Some(table) = resp.table {
-                    if table.table_status == Some(aws_sdk_dynamodb::types::TableStatus::Active) {
-                        return;
-                    }
-                }
+            if let Ok(resp) = desc
+                && let Some(table) = resp.table
+                && table.table_status == Some(aws_sdk_dynamodb::types::TableStatus::Active)
+            {
+                return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
@@ -2992,12 +2985,11 @@ mod tests {
         // Wait for table to become ACTIVE
         for _ in 0..30 {
             let desc = client.describe_table().table_name(table_name).send().await;
-            if let Ok(resp) = desc {
-                if let Some(table) = resp.table {
-                    if table.table_status == Some(aws_sdk_dynamodb::types::TableStatus::Active) {
-                        return;
-                    }
-                }
+            if let Ok(resp) = desc
+                && let Some(table) = resp.table
+                && table.table_status == Some(aws_sdk_dynamodb::types::TableStatus::Active)
+            {
+                return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }

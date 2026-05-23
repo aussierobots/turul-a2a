@@ -199,10 +199,10 @@ pub fn decide(
     if let Err(reason) = validate_scheme(url, allow_insecure) {
         return SsrfDecision::Block(reason);
     }
-    if let Some(validator) = outbound_validator {
-        if validator(url).is_err() {
-            return SsrfDecision::Block(SsrfBlockReason::ValidatorDenied);
-        }
+    if let Some(validator) = outbound_validator
+        && validator(url).is_err()
+    {
+        return SsrfDecision::Block(SsrfBlockReason::ValidatorDenied);
     }
     // Pick the first IP that passes the blocklist. When
     // `allow_insecure` is true we also bypass the blocklist so

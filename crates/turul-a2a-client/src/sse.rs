@@ -62,10 +62,10 @@ impl SseStream {
                             // Stream ended — check if there's a final event in the buffer
                             let remaining = buffer.trim().to_string();
                             buffer.clear();
-                            if !remaining.is_empty() {
-                                if let Some(event) = parse_sse_event(&remaining) {
-                                    return Some((Ok(event), (stream, buffer)));
-                                }
+                            if !remaining.is_empty()
+                                && let Some(event) = parse_sse_event(&remaining)
+                            {
+                                return Some((Ok(event), (stream, buffer)));
                             }
                             return None; // Stream complete
                         }

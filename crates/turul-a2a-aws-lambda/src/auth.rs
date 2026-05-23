@@ -71,13 +71,13 @@ fn collect_authorizer_claims(headers: &http::HeaderMap) -> serde_json::Value {
     let mut claims = serde_json::Map::new();
     for (key, value) in headers.iter() {
         let key_str = key.as_str();
-        if let Some(field) = key_str.strip_prefix(AUTHORIZER_HEADER_PREFIX) {
-            if let Ok(val) = value.to_str() {
-                claims.insert(
-                    field.to_string(),
-                    serde_json::Value::String(val.to_string()),
-                );
-            }
+        if let Some(field) = key_str.strip_prefix(AUTHORIZER_HEADER_PREFIX)
+            && let Ok(val) = value.to_str()
+        {
+            claims.insert(
+                field.to_string(),
+                serde_json::Value::String(val.to_string()),
+            );
         }
     }
     serde_json::Value::Object(claims)

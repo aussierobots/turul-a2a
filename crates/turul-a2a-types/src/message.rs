@@ -299,15 +299,14 @@ impl Message {
         &self,
     ) -> Option<Result<T, crate::error::A2aTypeError>> {
         for part in &self.inner.parts {
-            if let Some(pb::part::Content::Data(proto_struct)) = &part.content {
-                if let Ok(json) = serde_json::to_value(proto_struct) {
-                    let normalized = normalize_proto_numbers_for_deser(json);
-                    return Some(
-                        serde_json::from_value(normalized).map_err(|e| {
-                            crate::error::A2aTypeError::Deserialization(e.to_string())
-                        }),
-                    );
-                }
+            if let Some(pb::part::Content::Data(proto_struct)) = &part.content
+                && let Ok(json) = serde_json::to_value(proto_struct)
+            {
+                let normalized = normalize_proto_numbers_for_deser(json);
+                return Some(
+                    serde_json::from_value(normalized)
+                        .map_err(|e| crate::error::A2aTypeError::Deserialization(e.to_string())),
+                );
             }
         }
         None
@@ -332,14 +331,13 @@ impl Message {
 
         // Fall back to first Text part parsed as JSON (a2a-sdk / Strands clients)
         for part in &self.inner.parts {
-            if let Some(pb::part::Content::Text(text)) = &part.content {
-                if text.trim_start().starts_with('{') {
-                    return Some(
-                        serde_json::from_str(text).map_err(|e| {
-                            crate::error::A2aTypeError::Deserialization(e.to_string())
-                        }),
-                    );
-                }
+            if let Some(pb::part::Content::Text(text)) = &part.content
+                && text.trim_start().starts_with('{')
+            {
+                return Some(
+                    serde_json::from_str(text)
+                        .map_err(|e| crate::error::A2aTypeError::Deserialization(e.to_string())),
+                );
             }
         }
 
@@ -397,13 +395,14 @@ impl<'de> Deserialize<'de> for Message {
 fn normalize_proto_numbers_for_deser(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Number(n) => {
-            if let Some(f) = n.as_f64() {
-                if f.is_finite() && f.fract() == 0.0 {
-                    if f >= 0.0 && f <= u64::MAX as f64 {
-                        return serde_json::Value::Number((f as u64).into());
-                    } else if f >= i64::MIN as f64 && f <= i64::MAX as f64 {
-                        return serde_json::Value::Number((f as i64).into());
-                    }
+            if let Some(f) = n.as_f64()
+                && f.is_finite()
+                && f.fract() == 0.0
+            {
+                if f >= 0.0 && f <= u64::MAX as f64 {
+                    return serde_json::Value::Number((f as u64).into());
+                } else if f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+                    return serde_json::Value::Number((f as i64).into());
                 }
             }
             serde_json::Value::Number(n)

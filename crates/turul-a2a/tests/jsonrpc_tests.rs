@@ -480,10 +480,10 @@ async fn collect_jsonrpc_sse(body: Body, timeout: std::time::Duration) -> Vec<se
     let mut events = Vec::new();
     for chunk in buf.split("\n\n") {
         for line in chunk.lines() {
-            if let Some(data) = line.strip_prefix("data:") {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data.trim()) {
-                    events.push(json);
-                }
+            if let Some(data) = line.strip_prefix("data:")
+                && let Ok(json) = serde_json::from_str::<serde_json::Value>(data.trim())
+            {
+                events.push(json);
             }
         }
     }

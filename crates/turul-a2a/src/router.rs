@@ -591,14 +591,13 @@ pub(crate) async fn core_subscribe_to_task(
         })?;
 
     // Spec §3.1.6: terminal tasks return UnsupportedOperationError
-    if let Some(status) = task.status() {
-        if let Ok(s) = status.state() {
-            if s.is_terminal() {
-                return Err(A2aError::UnsupportedOperation {
-                    message: format!("Task {task_id} is already in terminal state {s:?}"),
-                });
-            }
-        }
+    if let Some(status) = task.status()
+        && let Ok(s) = status.state()
+        && s.is_terminal()
+    {
+        return Err(A2aError::UnsupportedOperation {
+            message: format!("Task {task_id} is already in terminal state {s:?}"),
+        });
     }
 
     // Parse Last-Event-ID for replay
@@ -899,17 +898,17 @@ pub async fn core_send_message(
         }
 
         // Continuation is only valid from interrupted states.
-        if let Some(status) = existing.status() {
-            if let Ok(s) = status.state() {
-                match s {
-                    TaskState::InputRequired | TaskState::AuthRequired => {}
-                    _ => {
-                        return Err(A2aError::InvalidRequest {
-                            message: format!(
-                                "Task {msg_task_id} is in state {s:?}, only INPUT_REQUIRED or AUTH_REQUIRED tasks accept follow-up messages"
-                            ),
-                        });
-                    }
+        if let Some(status) = existing.status()
+            && let Ok(s) = status.state()
+        {
+            match s {
+                TaskState::InputRequired | TaskState::AuthRequired => {}
+                _ => {
+                    return Err(A2aError::InvalidRequest {
+                        message: format!(
+                            "Task {msg_task_id} is in state {s:?}, only INPUT_REQUIRED or AUTH_REQUIRED tasks accept follow-up messages"
+                        ),
+                    });
                 }
             }
         }
@@ -1493,14 +1492,13 @@ pub async fn core_cancel_task(
         })?;
 
     // Step 2: reject terminal tasks up-front with 409.
-    if let Some(status) = initial_task.status() {
-        if let Ok(s) = status.state() {
-            if turul_a2a_types::state_machine::is_terminal(s) {
-                return Err(A2aError::TaskNotCancelable {
-                    task_id: task_id.to_string(),
-                });
-            }
-        }
+    if let Some(status) = initial_task.status()
+        && let Ok(s) = status.state()
+        && turul_a2a_types::state_machine::is_terminal(s)
+    {
+        return Err(A2aError::TaskNotCancelable {
+            task_id: task_id.to_string(),
+        });
     }
 
     let context_id = initial_task.context_id().to_string();
@@ -1553,15 +1551,14 @@ pub async fn core_cancel_task(
             .map_err(A2aError::from)?
         {
             Some(current) => {
-                if let Some(status) = current.status() {
-                    if let Ok(s) = status.state() {
-                        if turul_a2a_types::state_machine::is_terminal(s) {
-                            // Cooperative terminal (or another path) resolved
-                            // the cancel during grace. Return persisted state.
-                            state.event_broker.notify(task_id).await;
-                            return Ok(Json(serde_json::to_value(&current).unwrap_or_default()));
-                        }
-                    }
+                if let Some(status) = current.status()
+                    && let Ok(s) = status.state()
+                    && turul_a2a_types::state_machine::is_terminal(s)
+                {
+                    // Cooperative terminal (or another path) resolved
+                    // the cancel during grace. Return persisted state.
+                    state.event_broker.notify(task_id).await;
+                    return Ok(Json(serde_json::to_value(&current).unwrap_or_default()));
                 }
             }
             None => {
@@ -1807,13 +1804,13 @@ pub(crate) fn attach_extension_echo(
     mut response: axum::response::Response,
     echoed: &std::collections::HashSet<String>,
 ) -> axum::response::Response {
-    if let Some(value) = crate::profile_dispatch::response_header_value(echoed) {
-        if let Ok(header_value) = axum::http::HeaderValue::from_str(&value) {
-            response.headers_mut().insert(
-                axum::http::HeaderName::from_static(crate::profile_dispatch::A2A_EXTENSIONS_HEADER),
-                header_value,
-            );
-        }
+    if let Some(value) = crate::profile_dispatch::response_header_value(echoed)
+        && let Ok(header_value) = axum::http::HeaderValue::from_str(&value)
+    {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static(crate::profile_dispatch::A2A_EXTENSIONS_HEADER),
+            header_value,
+        );
     }
     response
 }

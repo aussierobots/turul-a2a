@@ -125,10 +125,10 @@ pub(crate) fn strip_request_path_prefix(
 
 fn inject_authorizer_header(headers: &mut http::HeaderMap, key: &str, value: &str) {
     let header_name = format!("{AUTHORIZER_HEADER_PREFIX}{}", key.to_lowercase());
-    if let Ok(name) = http::header::HeaderName::from_bytes(header_name.as_bytes()) {
-        if let Ok(val) = http::header::HeaderValue::from_str(value) {
-            headers.insert(name, val);
-        }
+    if let Ok(name) = http::header::HeaderName::from_bytes(header_name.as_bytes())
+        && let Ok(val) = http::header::HeaderValue::from_str(value)
+    {
+        headers.insert(name, val);
     }
 }
 

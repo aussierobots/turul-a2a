@@ -99,14 +99,13 @@ pub async fn handle_subscribe_to_task(
 
     // Terminal-state rejection: shared core raises UnsupportedOperationError;
     // the gRPC error mapping turns that into FAILED_PRECONDITION + ErrorInfo.
-    if let Some(status) = task.status() {
-        if let Ok(s) = status.state() {
-            if s.is_terminal() {
-                return Err(a2a_to_status(A2aError::UnsupportedOperation {
-                    message: format!("Task {task_id} is already in terminal state {s:?}"),
-                }));
-            }
-        }
+    if let Some(status) = task.status()
+        && let Ok(s) = status.state()
+        && s.is_terminal()
+    {
+        return Err(a2a_to_status(A2aError::UnsupportedOperation {
+            message: format!("Task {task_id} is already in terminal state {s:?}"),
+        }));
     }
 
     let after_sequence = last_event_id_meta

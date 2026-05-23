@@ -112,11 +112,11 @@ fn middleware_error_to_response(err: &MiddlewareError) -> Response<Body> {
         .status(status)
         .header(http::header::CONTENT_TYPE, "application/json");
 
-    if let MiddlewareError::HttpChallenge(kind) = err {
-        if let Some(code) = kind.bearer_rfc6750_code() {
-            let header = format!("Bearer realm=\"a2a\", error=\"{code}\"");
-            builder = builder.header(http::header::WWW_AUTHENTICATE, header);
-        }
+    if let MiddlewareError::HttpChallenge(kind) = err
+        && let Some(code) = kind.bearer_rfc6750_code()
+    {
+        let header = format!("Bearer realm=\"a2a\", error=\"{code}\"");
+        builder = builder.header(http::header::WWW_AUTHENTICATE, header);
     }
 
     builder

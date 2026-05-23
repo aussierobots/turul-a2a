@@ -217,10 +217,10 @@ async fn collect_sse(body: Body, timeout: Duration) -> Vec<serde_json::Value> {
 
     let result = tokio::time::timeout(timeout, async {
         while let Some(frame) = body.frame().await {
-            if let Ok(frame) = frame {
-                if let Some(data) = frame.data_ref() {
-                    buf.extend_from_slice(data);
-                }
+            if let Ok(frame) = frame
+                && let Some(data) = frame.data_ref()
+            {
+                buf.extend_from_slice(data);
             }
         }
     })

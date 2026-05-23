@@ -327,29 +327,27 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         let mut filtered: Vec<&StoredTask> = tasks
             .values()
             .filter(|s| {
-                if let Some(ref t) = filter.tenant {
-                    if s.tenant != *t {
-                        return false;
-                    }
+                if let Some(ref t) = filter.tenant
+                    && s.tenant != *t
+                {
+                    return false;
                 }
-                if let Some(ref o) = filter.owner {
-                    if s.owner != *o {
-                        return false;
-                    }
+                if let Some(ref o) = filter.owner
+                    && s.owner != *o
+                {
+                    return false;
                 }
-                if let Some(ref ctx) = filter.context_id {
-                    if s.task.context_id() != ctx.as_str() {
-                        return false;
-                    }
+                if let Some(ref ctx) = filter.context_id
+                    && s.task.context_id() != ctx.as_str()
+                {
+                    return false;
                 }
-                if let Some(ref status) = filter.status {
-                    if let Some(ts) = s.task.status() {
-                        if let Ok(state) = ts.state() {
-                            if state != *status {
-                                return false;
-                            }
-                        }
-                    }
+                if let Some(ref status) = filter.status
+                    && let Some(ts) = s.task.status()
+                    && let Ok(state) = ts.state()
+                    && state != *status
+                {
+                    return false;
                 }
                 true
             })
@@ -1075,29 +1073,30 @@ impl A2aAtomicStore for InMemoryA2aStorage {
             let seq = *counter;
             sequences.push(seq);
 
-            if let Some(guard) = pending_dispatches.as_mut() {
-                if event.is_terminal() && matches!(event, StreamEvent::StatusUpdate { .. }) {
-                    // §Pending-dispatch optimization: skip the
-                    // marker write if no push configs exist for the
-                    // task. Configs registered after terminal are not
-                    // eligible for that terminal event anyway
-                    //, so skipping costs zero correctness
-                    // and avoids steady-state row accumulation for
-                    // deployments that terminate tasks without ever
-                    // registering a webhook.
-                    let has_configs = push_configs_snapshot.as_ref().is_some_and(|cfgs| {
-                        cfgs.keys()
-                            .any(|(t, tid, _)| t.as_str() == tenant && tid.as_str() == task_id)
-                    });
-                    if has_configs {
-                        guard.insert(
-                            (tenant.to_string(), task_id.to_string(), seq),
-                            StoredPendingDispatch {
-                                owner: owner.to_string(),
-                                recorded_at: std::time::SystemTime::now(),
-                            },
-                        );
-                    }
+            if let Some(guard) = pending_dispatches.as_mut()
+                && event.is_terminal()
+                && matches!(event, StreamEvent::StatusUpdate { .. })
+            {
+                // §Pending-dispatch optimization: skip the
+                // marker write if no push configs exist for the
+                // task. Configs registered after terminal are not
+                // eligible for that terminal event anyway
+                //, so skipping costs zero correctness
+                // and avoids steady-state row accumulation for
+                // deployments that terminate tasks without ever
+                // registering a webhook.
+                let has_configs = push_configs_snapshot.as_ref().is_some_and(|cfgs| {
+                    cfgs.keys()
+                        .any(|(t, tid, _)| t.as_str() == tenant && tid.as_str() == task_id)
+                });
+                if has_configs {
+                    guard.insert(
+                        (tenant.to_string(), task_id.to_string(), seq),
+                        StoredPendingDispatch {
+                            owner: owner.to_string(),
+                            recorded_at: std::time::SystemTime::now(),
+                        },
+                    );
                 }
             }
 
@@ -1160,20 +1159,16 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         // persisted task is already terminal, refuse the write and
         // commit nothing — a full-task replacement must not silently
         // overwrite a terminal committed by a concurrent writer.
-        if let Some(stored) = tasks.get(&task_key) {
-            if let Some(status) = stored.task.status() {
-                if let Ok(state) = status.state() {
-                    if turul_a2a_types::state_machine::is_terminal(state) {
-                        return Err(A2aStorageError::TerminalStateAlreadySet {
-                            task_id: task.id().to_string(),
-                            current_state: crate::storage::terminal_cas::task_state_wire_name(
-                                state,
-                            )
-                            .to_string(),
-                        });
-                    }
-                }
-            }
+        if let Some(stored) = tasks.get(&task_key)
+            && let Some(status) = stored.task.status()
+            && let Ok(state) = status.state()
+            && turul_a2a_types::state_machine::is_terminal(state)
+        {
+            return Err(A2aStorageError::TerminalStateAlreadySet {
+                task_id: task.id().to_string(),
+                current_state: crate::storage::terminal_cas::task_state_wire_name(state)
+                    .to_string(),
+            });
         }
 
         // Preserve cancel_requested (monotonic) and snapshot

@@ -486,29 +486,29 @@ impl A2aClient {
         let body = resp.text().await.unwrap_or_default();
 
         // Try to parse as AIP-193 error
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-            if let Some(error) = json.get("error") {
-                let message = error
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown error")
-                    .to_string();
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
+            && let Some(error) = json.get("error")
+        {
+            let message = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown error")
+                .to_string();
 
-                // Extract ErrorInfo reason if present
-                let reason = error
-                    .get("details")
-                    .and_then(|d| d.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|info| info.get("reason"))
-                    .and_then(|r| r.as_str())
-                    .map(|s| s.to_string());
+            // Extract ErrorInfo reason if present
+            let reason = error
+                .get("details")
+                .and_then(|d| d.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|info| info.get("reason"))
+                .and_then(|r| r.as_str())
+                .map(|s| s.to_string());
 
-                return A2aClientError::A2aError {
-                    status,
-                    message,
-                    reason,
-                };
-            }
+            return A2aClientError::A2aError {
+                status,
+                message,
+                reason,
+            };
         }
 
         A2aClientError::Http {

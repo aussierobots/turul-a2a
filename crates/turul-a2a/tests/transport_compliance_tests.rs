@@ -123,10 +123,10 @@ async fn request_without_a2a_version_rejects_strict() {
         status, 400,
         "Missing A2A-Version header → VersionNotSupportedError"
     );
-    if let Some(details) = body["error"]["details"].as_array() {
-        if !details.is_empty() {
-            assert_eq!(details[0]["reason"], "VERSION_NOT_SUPPORTED");
-        }
+    if let Some(details) = body["error"]["details"].as_array()
+        && !details.is_empty()
+    {
+        assert_eq!(details[0]["reason"], "VERSION_NOT_SUPPORTED");
     }
 }
 
@@ -140,10 +140,10 @@ async fn request_with_unsupported_version_returns_400() {
         .unwrap();
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 400);
-    if let Some(details) = body["error"]["details"].as_array() {
-        if !details.is_empty() {
-            assert_eq!(details[0]["reason"], "VERSION_NOT_SUPPORTED");
-        }
+    if let Some(details) = body["error"]["details"].as_array()
+        && !details.is_empty()
+    {
+        assert_eq!(details[0]["reason"], "VERSION_NOT_SUPPORTED");
     }
 }
 

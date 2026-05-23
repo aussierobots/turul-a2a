@@ -552,14 +552,13 @@ async fn dispatch_subscribe_to_task(
         })?;
 
     // Spec §3.1.6: terminal tasks return UnsupportedOperationError
-    if let Some(status) = task.status() {
-        if let Ok(s) = status.state() {
-            if s.is_terminal() {
-                return Err(A2aError::UnsupportedOperation {
-                    message: format!("Task {task_id} is already in terminal state {s:?}"),
-                });
-            }
-        }
+    if let Some(status) = task.status()
+        && let Ok(s) = status.state()
+        && s.is_terminal()
+    {
+        return Err(A2aError::UnsupportedOperation {
+            message: format!("Task {task_id} is already in terminal state {s:?}"),
+        });
     }
 
     // Parse Last-Event-ID for replay (Turul extension — proto has no cursor field)

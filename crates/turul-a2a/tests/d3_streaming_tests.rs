@@ -117,10 +117,10 @@ fn parse_sse_events(text: &str) -> Vec<(Option<String>, serde_json::Value)> {
         for line in chunk.lines() {
             if let Some(v) = line.strip_prefix("id:") {
                 id = Some(v.trim().to_string());
-            } else if let Some(v) = line.strip_prefix("data:") {
-                if let Ok(j) = serde_json::from_str::<serde_json::Value>(v.trim()) {
-                    data = Some(j);
-                }
+            } else if let Some(v) = line.strip_prefix("data:")
+                && let Ok(j) = serde_json::from_str::<serde_json::Value>(v.trim())
+            {
+                data = Some(j);
             }
         }
         if let Some(d) = data {

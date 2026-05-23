@@ -303,10 +303,10 @@ impl A2aGrpcClient {
             id: task_id.into(),
         };
         let mut tonic_req = self.prepare(req);
-        if let Some(id) = last_event_id {
-            if let Ok(v) = MetadataValue::try_from(id) {
-                tonic_req.metadata_mut().insert("a2a-last-event-id", v);
-            }
+        if let Some(id) = last_event_id
+            && let Ok(v) = MetadataValue::try_from(id)
+        {
+            tonic_req.metadata_mut().insert("a2a-last-event-id", v);
         }
         let stream = self.inner.subscribe_to_task(tonic_req).await?.into_inner();
         Ok(Box::pin(map_stream(stream)))

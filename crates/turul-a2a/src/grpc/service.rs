@@ -51,12 +51,11 @@ pub(crate) fn tenant_from<T>(req: &Request<T>, proto_tenant: &str) -> String {
     if !proto_tenant.is_empty() {
         return proto_tenant.to_string();
     }
-    if let Some(val) = req.metadata().get(TENANT_METADATA) {
-        if let Ok(s) = val.to_str() {
-            if !s.is_empty() {
-                return s.to_string();
-            }
-        }
+    if let Some(val) = req.metadata().get(TENANT_METADATA)
+        && let Ok(s) = val.to_str()
+        && !s.is_empty()
+    {
+        return s.to_string();
     }
     String::new()
 }
@@ -112,13 +111,13 @@ fn attach_extension_echo_grpc<T>(
     response: &mut Response<T>,
     echoed: &std::collections::HashSet<String>,
 ) {
-    if let Some(value) = crate::profile_dispatch::response_header_value(echoed) {
-        if let Ok(metadata_value) = tonic::metadata::MetadataValue::try_from(value.as_str()) {
-            response.metadata_mut().insert(
-                crate::profile_dispatch::A2A_EXTENSIONS_HEADER,
-                metadata_value,
-            );
-        }
+    if let Some(value) = crate::profile_dispatch::response_header_value(echoed)
+        && let Ok(metadata_value) = tonic::metadata::MetadataValue::try_from(value.as_str())
+    {
+        response.metadata_mut().insert(
+            crate::profile_dispatch::A2A_EXTENSIONS_HEADER,
+            metadata_value,
+        );
     }
 }
 
