@@ -140,7 +140,7 @@ pub fn validate_json(
         reason: format!("invalid schema: {e}"),
     })?;
     if let Some(err) = validator.iter_errors(instance).next() {
-        let path = err.instance_path.to_string();
+        let path = err.instance_path().to_string();
         let location = if path.is_empty() {
             "#".to_string()
         } else {

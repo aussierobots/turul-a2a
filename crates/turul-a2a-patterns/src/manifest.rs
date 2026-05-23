@@ -236,7 +236,7 @@ fn validate_against(
     })?;
     if let Some(err) = validator.iter_errors(instance).next() {
         return Err(ValidationError::Invalid {
-            location: err.instance_path.to_string(),
+            location: err.instance_path().to_string(),
             reason: err.to_string(),
         });
     }
