@@ -134,6 +134,20 @@ design discussion that will happen in the `turul-llm` repo:
 
 Preserved below as historical record; not normative here.
 
+> **Sections 1–7 below are historical seed material.** They describe
+> the in-workspace `turul-llm-client` design considered before this
+> ADR was finalised. The normative decision is at the top of the
+> file: the abstraction lives in the sibling `turul-llm` repo
+> (`https://github.com/aussierobots/turul-llm`, or local sibling
+> path), `turul-a2a` stays provider-neutral at the publishable-crate
+> boundary, and the reference example `examples/skill-manifest-ollama-agent`
+> now consumes `turul-llm-core` + `turul-llm-ollama` via path dep.
+> Read sections 1–7 for the seed reasoning, but treat any
+> "ships in this workspace" or "inline Ollama call" framing as
+> superseded by the cross-repo decision and revision 3 in the
+> revision history at the end of this ADR. Future design work on the
+> trait belongs in `turul-llm/docs/adr/`, not here.
+
 ## 1. Context
 
 ADR-021 §2.4 explicitly defers the `LlmClient` question: "A separate ADR decides

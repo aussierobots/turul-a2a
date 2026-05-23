@@ -4,51 +4,43 @@
 - **Date:** 2026-05-22
 - **Accepted:** 2026-05-23 (red-phase tests + placement sketch landed)
 
-## Review status (2026-05-23)
+## Acceptance gates cleared (2026-05-23)
 
-Recommendation: **Keep Proposed with concrete blockers below.**
+Three blockers were named when this ADR was Proposed. All three are
+now satisfied. Recorded here for the audit trail; the live status is
+`Accepted` (top of file).
 
-The contract in §2 is spec-truthful and concretely specified
-(request shape picked: `Message.metadata` carrying `a2a.skillId` +
-`a2a.skillParams`; activation via the standard `A2A-Extensions`
-header). The four-point profile shape matches what A2A v1.0's
-extension model permits.
+1. **Red-phase test suite landed.** `crates/turul-a2a/tests/profile_dispatch_tests.rs`
+   (343 LOC, 13 tests) pins:
+   - `A2A-Extensions` request-header parsing,
+   - `Message.metadata["a2a.skillId"]` + `["a2a.skillParams"]` keyed routing,
+   - `UnsupportedOperationError` on a `required` extension the server doesn't honour,
+   - echo of activated URIs on the response header.
 
-**Blockers before acceptance:**
+2. **First-profile placement decided.** Per ADR-021 §5 (single
+   profile inhabitant lives in the transport-owning crate), the
+   dispatcher is implemented as `pub mod profile_dispatch` inside
+   `crates/turul-a2a/src/profile_dispatch.rs` (197 LOC) and wired
+   into router (`src/router.rs`), JSON-RPC (`src/jsonrpc.rs`), and
+   gRPC (`src/grpc/service.rs`). A new profile/extensions crate is
+   not introduced; the trigger for one remains ≥2 profile inhabitants.
 
-1. **Red-phase test suite** for the dispatch behaviour does not yet
-   exist. Specifically: tests that pin (a) `A2A-Extensions` header
-   parsing in `turul-a2a`'s router, (b) `Message.metadata`-keyed
-   skill routing, (c) `UnsupportedOperationError` on a `required`
-   extension that the server doesn't honour, (d) header echo on the
-   response.
-2. **First-profile placement decision** unresolved. ADR-021 §5
-   states: when there's a single profile inhabitant, the profile
-   lives in `turul-a2a` (the transport-owning crate) rather than a
-   new profile/extensions crate. Acceptance of this ADR commits to
-   that placement; needs a `pub(crate)` module sketch in
-   `crates/turul-a2a/src/` for review before flipping.
-3. **Interop probe.** The current cross-language clients (`a2a-sdk`
-   1.0.2, `a2aproject/a2a-go` v2.3.1) do not send `A2A-Extensions`
-   headers by default. Acceptance needs at least one client smoke
-   demonstrating the dispatch path works end-to-end (would extend
-   `examples/interop-clients/<agent>/<lang>/` with a profile-aware
-   variant or require a dedicated `examples/skill-dispatch-profile-agent`).
+3. **Interop probe landed.** `examples/skill-dispatch-profile-agent/`
+   advertises the profile URI; `examples/interop-clients/skill-dispatch-profile/{python,go,rust}/`
+   exercise the dispatch path end-to-end. All three smoke-verified:
+   header activation + metadata-keyed routing + response echo
+   confirmed in each language. `examples/interop-clients/CLIENT_MATRIX.md`
+   records the row.
 
-**Why not Accept now:** the design is sound, but acceptance is
-load-bearing — it commits the framework to a URI namespace and a
-header-dispatch behaviour. Without the red-phase tests + interop
-probe, acceptance ships a contract we haven't actually exercised.
+The contract committed by acceptance: profile URI
+`https://turul.dev/a2a/extensions/skill-invocation/v1` (exposed as
+`turul_a2a::profile_dispatch::SKILL_INVOCATION_PROFILE_V1`), header
+activation, metadata-keyed request shape, response echo.
 
 **Why not Reject:** the four-point contract is the right shape for
 A2A's extension model; the spec-compliance review found no drift.
 Rejection would only make sense if upstream A2A added a normative
 `skill_id` field to `Message` — that hasn't happened.
-
-**Next action (to clear blockers):** dispatch a red-phase test
-writer for the dispatcher hook in `turul-a2a`'s router, plus a
-first-profile placement sketch as a `pub(crate)` module under
-`crates/turul-a2a/src/`. When green, this ADR moves to Accepted.
 - **Depends on:** ADR-001 (proto-first architecture), ADR-015
   (declaration-only precedent for skill-level security), ADR-021
   (patterns extraction; deferred dispatcher §2.4/§2.5 + four-point
@@ -441,26 +433,21 @@ mechanisms are needed simultaneously.
 
 ## 6. Implementation Triggers
 
-This ADR documents a convention only. No implementation code ships
-while this ADR is **Proposed**. Code is gated on two conditions
-(per ADR-021 §4, §5):
-
-1. **This ADR is Accepted.** Acceptance requires the spec-compliance
-   and test-sketch sign-offs described in §7.
-2. **`turul-a2a-patterns` is publishable** (ADR-021 §4 gates
-   cleared), so the URI constant and `SkillDispatchPayload` helpers
-   can live beside the patterns they assist without creating a
-   path-only publication dependency.
-
-Adopters who need a dispatcher before both conditions are met MUST
-implement it in their own code, following this ADR's convention for
-forward compatibility. The `examples/skill-manifest-ollama-agent`
-dispatcher is the reference implementation until the framework-level
-hook ships.
-
-No new example crate (`examples/skill-dispatch-profile-agent/` or
-similar) is created until this ADR is Accepted (per ADR-021 §7.3
-step 8 stop conditions).
+> *Historical section.* This text was written when the ADR was
+> Proposed and recorded the gates that had to fire before code
+> shipped. Both gates fired before acceptance and the implementation
+> has landed. The current state:
+>
+> - Gate 1 (acceptance) fired 2026-05-23 — see top-of-file Status
+>   and the "Acceptance gates cleared" section.
+> - Gate 2 (location for the URI constant) was resolved by placing
+>   `SKILL_INVOCATION_PROFILE_V1` inside `turul-a2a`'s
+>   `pub mod profile_dispatch` rather than waiting on
+>   `turul-a2a-patterns` to become publishable. The patterns crate
+>   stays internal; the URI constant lives in the transport-owning
+>   crate per ADR-021 §5 single-profile placement.
+> - The reference example is `examples/skill-dispatch-profile-agent/`
+>   (port 3015) with Python/Go/Rust interop clients.
 
 ## 7. Phase A Acceptance Gates
 
@@ -540,7 +527,7 @@ must be reviewable alongside this ADR.
 8. **`dispatch_payload_absent_params_is_ok`** — metadata with only
    `a2a.skillId` (no `a2a.skillParams`) is valid.
 
-## 8. Open Questions (do not block Proposed → Accepted)
+## 8. Open Questions (did not block acceptance)
 
 - **Q1 — version in URI path vs `params`**: This ADR places the
   version in the URI path (`/v1`). An alternative is to keep the URI

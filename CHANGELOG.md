@@ -4,9 +4,27 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [Unreleased] — local-only, not pushable as-is
 
-### Changed — `examples/skill-manifest-ollama-agent` now consumes `turul-llm`
+> **Not pushable as a `turul-a2a` release.** This Unreleased block
+> documents a *local-only* integration: `examples/skill-manifest-ollama-agent`
+> consumes the sibling `turul-llm` workspace at `../turul-llm` via a
+> filesystem path dependency. A clean clone of `turul-a2a` will not
+> build without the sibling repo present at the same relative path.
+> Before any push or release, one of the following must happen:
+>
+> 1. **Drop the integration from this branch.** Revert
+>    `examples/skill-manifest-ollama-agent` to the inline Ollama
+>    call. Land turul-llm separately, then re-integrate.
+> 2. **Publish `turul-llm-core` + `turul-llm-ollama` to crates.io**
+>    and switch the example's `Cargo.toml` to versioned deps.
+> 3. **Switch to a pinned `git` dependency** (`git = "…", rev = "…"`)
+>    once `turul-llm` has a public origin, accepting that example
+>    builds will require network access.
+>
+> Decision pending the maintainer.
+
+### Changed — `examples/skill-manifest-ollama-agent` now consumes `turul-llm` (local path)
 
 - Replaces the inline `reqwest`-based Ollama call with a path-dep on
   `turul-llm-core::LlmClient` + `turul-llm-ollama::OllamaClient`
