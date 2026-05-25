@@ -4,6 +4,24 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.27] — 2026-05-26
+
+### Fixed
+
+- DynamoDB backend: task rows now retain their `ttl` attribute across status and content updates. Previously the status-update write path replaced the task item without re-writing `ttl` (and `tenant`/`taskId`); since DynamoDB `PutItem` is whole-item replacement, the TTL set at creation was dropped on the first transition, so task rows never expired even with table TTL enabled. The same write also dropped the `tenant` attribute that `list_tasks` filters on, so updated tasks could disappear from listings. All task writes now route through a single item builder.
+
+### Changed
+
+- DynamoDB default `task_ttl_seconds` lowered from 7 days to 1 day. Adopters relying on the previous default get shorter task retention; set `DynamoDbConfig.task_ttl_seconds` explicitly to override (`0` disables expiry).
+
+### Compatibility
+
+- Patch release. No public API change. Existing rows written before this release have no `ttl` attribute and will not expire until rewritten — backfill separately if bounded retention is required.
+
+### Verification
+
+- DynamoDB unit + shape tests passed (`cargo test -p turul-a2a --features dynamodb --lib -- storage::dynamodb`); clippy and fmt clean.
+
 ## [0.1.26] — 2026-05-23
 
 ### Changed

@@ -37,7 +37,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.26"
+version = "0.1.27"
 edition = "2024"
 authors = ["Nick Hortovanyi <nick@aussierobots.com.au>"]
 license = "MIT OR Apache-2.0"
@@ -125,11 +125,11 @@ bytes = "1"
 serde_yaml = "0.9"
 jsonschema = "0.46"
 
-turul-a2a = { version = "0.1.26", path = "crates/turul-a2a" }
-turul-a2a-proto = { version = "0.1.26", path = "crates/turul-a2a-proto" }
-turul-a2a-types = { version = "0.1.26", path = "crates/turul-a2a-types" }
+turul-a2a = { version = "0.1.27", path = "crates/turul-a2a" }
+turul-a2a-proto = { version = "0.1.27", path = "crates/turul-a2a-proto" }
+turul-a2a-types = { version = "0.1.27", path = "crates/turul-a2a-types" }
 turul-a2a-client = { path = "crates/turul-a2a-client" }
-turul-a2a-patterns = { version = "0.1.26", path = "crates/turul-a2a-patterns" }
+turul-a2a-patterns = { version = "0.1.27", path = "crates/turul-a2a-patterns" }
 turul-jwt-validator = "0.2"
 
 # Sibling repo turul-llm — provider-neutral LLM client abstraction +

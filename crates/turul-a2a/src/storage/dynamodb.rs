@@ -37,7 +37,7 @@ pub struct DynamoDbConfig {
     /// Pending-dispatch marker table. See
     /// [`crate::push::A2aPushDeliveryStore::record_pending_dispatch`].
     pub push_pending_dispatches_table: String,
-    /// TTL for task items in seconds. 0 = no expiry. Default: 7 days (604800).
+    /// TTL for task items in seconds. 0 = no expiry. Default: 1 day (86400).
     pub task_ttl_seconds: u64,
     /// TTL for event items in seconds. 0 = no expiry. Default: 24 hours (86400).
     pub event_ttl_seconds: u64,
@@ -47,8 +47,8 @@ pub struct DynamoDbConfig {
     pub push_delivery_ttl_seconds: u64,
 }
 
-/// 7 days in seconds.
-const DEFAULT_TASK_TTL: u64 = 7 * 24 * 3600;
+/// 1 day in seconds.
+const DEFAULT_TASK_TTL: u64 = 24 * 3600;
 /// 24 hours in seconds.
 const DEFAULT_EVENT_TTL: u64 = 24 * 3600;
 /// 7 days in seconds.
@@ -162,6 +162,75 @@ impl DynamoDbA2aStorage {
         item
     }
 
+    /// Single source of truth for the task put-item shape.
+    ///
+    /// Every task-write path — `create_task`, `update_task`,
+    /// `create_task_with_events`, `update_task_status_with_events`,
+    /// `update_task_with_events` — constructs the task row through this
+    /// helper so they cannot diverge.
+    ///
+    /// DynamoDB `PutItem` (and a transactional `Put`) replaces the
+    /// entire item rather than merging; any attribute a write path
+    /// omits is silently dropped from the persisted row. A task is
+    /// written on creation and rewritten on every status/content
+    /// transition, so an attribute that is present on create but absent
+    /// on update is lost the first time the task advances. Routing every
+    /// write through one builder guarantees `ttl`, `tenant`, and
+    /// `taskId` survive each write, not just the first.
+    ///
+    /// Attributes:
+    /// - `pk`: partition key, from [`Self::task_key`].
+    /// - `tenant`, `taskId`, `owner`, `contextId`, `statusState`:
+    ///   scalar lookup/filter attributes (`list_tasks` filters on
+    ///   `tenant`, so it must persist across updates).
+    /// - `taskJson`: serialized [`Task`] JSON, the source of truth.
+    /// - `updatedAt`: write timestamp.
+    /// - `latestEventSequence`: causal floor; present only on the
+    ///   `*_with_events` paths.
+    /// - `ttl`: optional epoch-seconds attribute for DynamoDB TTL;
+    ///   omitted when the backend is configured without task TTL.
+    ///
+    /// Exposed `pub(crate)` so unit tests in the same crate can exercise
+    /// the shape directly without a live backend.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_task_item(
+        pk: &str,
+        tenant: &str,
+        task_id: &str,
+        owner: &str,
+        context_id: &str,
+        state_str: &str,
+        task_json: &str,
+        latest_event_sequence: Option<u64>,
+        ttl: Option<AttributeValue>,
+    ) -> std::collections::HashMap<String, AttributeValue> {
+        let mut item = std::collections::HashMap::new();
+        item.insert("pk".into(), AttributeValue::S(pk.to_string()));
+        item.insert("tenant".into(), AttributeValue::S(tenant.to_string()));
+        item.insert("taskId".into(), AttributeValue::S(task_id.to_string()));
+        item.insert("owner".into(), AttributeValue::S(owner.to_string()));
+        item.insert(
+            "contextId".into(),
+            AttributeValue::S(context_id.to_string()),
+        );
+        item.insert(
+            "statusState".into(),
+            AttributeValue::S(state_str.to_string()),
+        );
+        item.insert("taskJson".into(), AttributeValue::S(task_json.to_string()));
+        item.insert("updatedAt".into(), AttributeValue::S(Self::now_iso()));
+        if let Some(seq) = latest_event_sequence {
+            item.insert(
+                "latestEventSequence".into(),
+                AttributeValue::N(seq.to_string()),
+            );
+        }
+        if let Some(ttl_val) = ttl {
+            item.insert("ttl".into(), ttl_val);
+        }
+        item
+    }
+
     fn now_iso() -> String {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -238,25 +307,22 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         let json = Self::task_to_json(&task)?;
         let state_str = Self::status_state_str(&task);
 
-        let mut req = self
-            .client
+        let item = Self::build_task_item(
+            &pk,
+            tenant,
+            task.id(),
+            owner,
+            task.context_id(),
+            &state_str,
+            &json,
+            None,
+            Self::ttl_epoch(self.config.task_ttl_seconds),
+        );
+        self.client
             .put_item()
             .table_name(&self.config.tasks_table)
-            .item("pk", AttributeValue::S(pk))
-            .item("tenant", AttributeValue::S(tenant.to_string()))
-            .item("taskId", AttributeValue::S(task.id().to_string()))
-            .item("owner", AttributeValue::S(owner.to_string()))
-            .item(
-                "contextId",
-                AttributeValue::S(task.context_id().to_string()),
-            )
-            .item("statusState", AttributeValue::S(state_str))
-            .item("taskJson", AttributeValue::S(json))
-            .item("updatedAt", AttributeValue::S(Self::now_iso()));
-        if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
-            req = req.item("ttl", ttl);
-        }
-        req.send()
+            .set_item(Some(item))
+            .send()
             .await
             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
 
@@ -330,27 +396,27 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
 
         // Conditional write: only succeeds if the item exists AND owner matches.
         // This prevents ownership transfer and ensures isolation.
-        let mut req = self
+        let item = Self::build_task_item(
+            &pk,
+            tenant,
+            task.id(),
+            owner,
+            task.context_id(),
+            &state_str,
+            &json,
+            None,
+            Self::ttl_epoch(self.config.task_ttl_seconds),
+        );
+        let result = self
             .client
             .put_item()
             .table_name(&self.config.tasks_table)
-            .item("pk", AttributeValue::S(pk))
-            .item("tenant", AttributeValue::S(tenant.to_string()))
-            .item("taskId", AttributeValue::S(task.id().to_string()))
-            .item("owner", AttributeValue::S(owner.to_string()))
-            .item(
-                "contextId",
-                AttributeValue::S(task.context_id().to_string()),
-            )
-            .item("statusState", AttributeValue::S(state_str))
-            .item("taskJson", AttributeValue::S(json))
+            .set_item(Some(item))
             .condition_expression("attribute_exists(pk) AND #o = :expected_owner")
             .expression_attribute_names("#o", "owner")
-            .expression_attribute_values(":expected_owner", AttributeValue::S(owner.to_string()));
-        if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
-            req = req.item("ttl", ttl);
-        }
-        let result = req.send().await;
+            .expression_attribute_values(":expected_owner", AttributeValue::S(owner.to_string()))
+            .send()
+            .await;
 
         match result {
             Ok(_) => Ok(()),
@@ -1294,26 +1360,20 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         // Build TransactWriteItems: task put + event puts. The task
         // put carries `latestEventSequence` directly so
         // one Put covers the causal-floor maintenance.
-        let mut task_put = aws_sdk_dynamodb::types::Put::builder()
+        let task_item = Self::build_task_item(
+            &pk,
+            tenant,
+            task.id(),
+            owner,
+            task.context_id(),
+            &state_str,
+            &task_json,
+            Some(latest_event_sequence),
+            Self::ttl_epoch(self.config.task_ttl_seconds),
+        );
+        let task_put = aws_sdk_dynamodb::types::Put::builder()
             .table_name(&self.config.tasks_table)
-            .item("pk", AttributeValue::S(pk.clone()))
-            .item("tenant", AttributeValue::S(tenant.to_string()))
-            .item("taskId", AttributeValue::S(task.id().to_string()))
-            .item("owner", AttributeValue::S(owner.to_string()))
-            .item("taskJson", AttributeValue::S(task_json))
-            .item(
-                "contextId",
-                AttributeValue::S(task.context_id().to_string()),
-            )
-            .item("statusState", AttributeValue::S(state_str))
-            .item("updatedAt", AttributeValue::S(Self::now_iso()))
-            .item(
-                "latestEventSequence",
-                AttributeValue::N(latest_event_sequence.to_string()),
-            );
-        if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
-            task_put = task_put.item("ttl", ttl);
-        }
+            .set_item(Some(task_item));
         let mut items = vec![
             aws_sdk_dynamodb::types::TransactWriteItem::builder()
                 .put(
@@ -1424,24 +1484,23 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         // instance may have committed a terminal for this pk — the
         // condition-expression rejects our write atomically at the
         // backend, preserving the single-terminal-writer invariant.
+        let task_item = Self::build_task_item(
+            &pk,
+            tenant,
+            task_id,
+            owner,
+            updated_task.context_id(),
+            &state_str,
+            &task_json,
+            Some(new_latest_event_sequence),
+            Self::ttl_epoch(self.config.task_ttl_seconds),
+        );
         let mut items = vec![
             aws_sdk_dynamodb::types::TransactWriteItem::builder()
                 .put(
                     aws_sdk_dynamodb::types::Put::builder()
                         .table_name(&self.config.tasks_table)
-                        .item("pk", AttributeValue::S(pk.clone()))
-                        .item("owner", AttributeValue::S(owner.to_string()))
-                        .item("taskJson", AttributeValue::S(task_json))
-                        .item(
-                            "contextId",
-                            AttributeValue::S(updated_task.context_id().to_string()),
-                        )
-                        .item("statusState", AttributeValue::S(state_str))
-                        .item("updatedAt", AttributeValue::S(Self::now_iso()))
-                        .item(
-                            "latestEventSequence",
-                            AttributeValue::N(new_latest_event_sequence.to_string()),
-                        )
+                        .set_item(Some(task_item))
                         .condition_expression(
                             "#owner = :owner AND (attribute_not_exists(statusState) \
                              OR NOT statusState IN (:completed, :failed, :canceled, :rejected))",
@@ -1640,23 +1699,20 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         // writes against a task whose persisted statusState is already
         // terminal, protecting against full-task replacement
         // clobbering a concurrent terminal commit.
-        let mut task_put = aws_sdk_dynamodb::types::Put::builder()
+        let task_item = Self::build_task_item(
+            &pk,
+            tenant,
+            task.id(),
+            owner,
+            task.context_id(),
+            &state_str,
+            &task_json,
+            Some(new_latest_event_sequence),
+            Self::ttl_epoch(self.config.task_ttl_seconds),
+        );
+        let task_put = aws_sdk_dynamodb::types::Put::builder()
             .table_name(&self.config.tasks_table)
-            .item("pk", AttributeValue::S(pk.clone()))
-            .item("tenant", AttributeValue::S(tenant.to_string()))
-            .item("taskId", AttributeValue::S(task.id().to_string()))
-            .item("owner", AttributeValue::S(owner.to_string()))
-            .item("taskJson", AttributeValue::S(task_json))
-            .item(
-                "contextId",
-                AttributeValue::S(task.context_id().to_string()),
-            )
-            .item("statusState", AttributeValue::S(state_str))
-            .item("updatedAt", AttributeValue::S(Self::now_iso()))
-            .item(
-                "latestEventSequence",
-                AttributeValue::N(new_latest_event_sequence.to_string()),
-            )
+            .set_item(Some(task_item))
             .condition_expression(
                 "#owner = :owner AND (attribute_not_exists(statusState) \
                  OR NOT statusState IN (:completed, :failed, :canceled, :rejected))",
@@ -1667,9 +1723,6 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             .expression_attribute_values(":failed", AttributeValue::S("Failed".to_string()))
             .expression_attribute_values(":canceled", AttributeValue::S("Canceled".to_string()))
             .expression_attribute_values(":rejected", AttributeValue::S("Rejected".to_string()));
-        if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
-            task_put = task_put.item("ttl", ttl);
-        }
         let mut items = vec![
             aws_sdk_dynamodb::types::TransactWriteItem::builder()
                 .put(
@@ -3998,6 +4051,104 @@ mod tests {
             Some(got) => assert_eq!(got, &ttl_attr),
             None => panic!("ttl attribute should be present when provided"),
         }
+    }
+
+    /// Attributes every task row MUST carry regardless of write path.
+    /// `tenant` is asserted because `list_tasks` filters on it — a row
+    /// that drops `tenant` on update silently disappears from listings.
+    #[allow(clippy::too_many_arguments)]
+    fn assert_required_task_attributes(
+        item: &std::collections::HashMap<String, AttributeValue>,
+        expected_pk: &str,
+        expected_tenant: &str,
+        expected_task_id: &str,
+        expected_owner: &str,
+        expected_context_id: &str,
+        expected_state: &str,
+        expected_json: &str,
+    ) {
+        let s = |k: &str| match item.get(k) {
+            Some(AttributeValue::S(v)) => v.clone(),
+            other => panic!("missing/wrong {k} attribute: {other:?}"),
+        };
+        assert_eq!(s("pk"), expected_pk);
+        assert_eq!(s("tenant"), expected_tenant);
+        assert_eq!(s("taskId"), expected_task_id);
+        assert_eq!(s("owner"), expected_owner);
+        assert_eq!(s("contextId"), expected_context_id);
+        assert_eq!(s("statusState"), expected_state);
+        assert_eq!(s("taskJson"), expected_json);
+        assert!(item.contains_key("updatedAt"), "updatedAt must be present");
+    }
+
+    /// Regression guard: every task write path must persist `ttl`,
+    /// `tenant`, and `taskId`. DynamoDB Put replaces the whole item, so
+    /// a path that omits these drops them from the row on the first
+    /// update — which is how task rows ended up with TTL enabled on the
+    /// table but no `ttl` attribute ever populated.
+    #[test]
+    fn build_task_item_persists_ttl_tenant_and_taskid() {
+        let ttl_attr = AttributeValue::N("1700000000".into());
+        let item = DynamoDbA2aStorage::build_task_item(
+            "tenant-a#task-1",
+            "tenant-a",
+            "task-1",
+            "owner-1",
+            "ctx-1",
+            "Working",
+            "{\"id\":\"task-1\"}",
+            Some(5),
+            Some(ttl_attr.clone()),
+        );
+        assert_required_task_attributes(
+            &item,
+            "tenant-a#task-1",
+            "tenant-a",
+            "task-1",
+            "owner-1",
+            "ctx-1",
+            "Working",
+            "{\"id\":\"task-1\"}",
+        );
+        assert_eq!(item.get("ttl"), Some(&ttl_attr), "ttl must be persisted");
+        match item.get("latestEventSequence") {
+            Some(AttributeValue::N(v)) => assert_eq!(v, "5"),
+            other => panic!("missing/wrong latestEventSequence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_task_item_omits_optional_attrs_when_absent() {
+        let item = DynamoDbA2aStorage::build_task_item(
+            "t#x",
+            "t",
+            "x",
+            "o",
+            "c",
+            "Submitted",
+            "{}",
+            None,
+            None,
+        );
+        assert!(
+            !item.contains_key("ttl"),
+            "ttl must be absent when not configured"
+        );
+        assert!(
+            !item.contains_key("latestEventSequence"),
+            "latestEventSequence must be absent on non-event write paths"
+        );
+        // tenant/taskId are NOT optional — they must always be present.
+        assert!(item.contains_key("tenant"));
+        assert!(item.contains_key("taskId"));
+    }
+
+    /// The default task TTL is 1 day. A multi-day default lets terminal
+    /// task rows accumulate; operators expecting bounded retention were
+    /// surprised by week-long persistence.
+    #[test]
+    fn default_task_ttl_is_one_day() {
+        assert_eq!(DynamoDbConfig::default().task_ttl_seconds, 24 * 3600);
     }
 
     // =========================================================
