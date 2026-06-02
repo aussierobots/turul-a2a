@@ -24,7 +24,7 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Verification
 
-- In-memory and SQLite retention parity tests passed live, including batched draining beyond `cleanup_batch_size` and age-based reaping of terminal tasks. PostgreSQL and DynamoDB cleanup were exercised at compile only (feature-gated, no live database this cycle); the PostgreSQL batched-delete path (`ctid IN (… LIMIT n)`) has not yet been run against a live server.
+- In-memory, SQLite, and PostgreSQL retention parity tests passed live, including batched draining beyond `cleanup_batch_size` (the `ctid IN (… LIMIT n)` path on PostgreSQL) and age-based reaping of terminal tasks. DynamoDB cleanup is engine-native (`Ok(0)`) and exercised at compile only.
 
 ## [0.1.27] — 2026-05-26
 
