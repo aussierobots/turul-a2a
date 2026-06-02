@@ -211,6 +211,7 @@ pub use event::{LambdaEvent, classify_event};
 pub use no_streaming::NoStreamingLayer;
 pub use scheduled_recovery::{
     LambdaScheduledRecoveryConfig, LambdaScheduledRecoveryHandler, LambdaScheduledRecoveryResponse,
+    handle_maintenance_trigger,
 };
 pub use stream_recovery::LambdaStreamRecoveryHandler;
 

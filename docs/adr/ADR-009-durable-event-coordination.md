@@ -2,7 +2,9 @@
 
 - **Status:** Accepted (§12 amended by ADR-010, 2026-04-17)
 - **Date:** 2026-04-11
-- **Amendments:** §12 "Terminal Task Replay" is superseded by ADR-010 §4.3. The proposed terminal-replay carve-out was never implemented and is out of spec with A2A v1.0 §3.1.6 / §9.4.6. Terminal SubscribeToTask returns `UnsupportedOperationError`. The rest of ADR-009 (durable event store, atomic writes, replay for non-terminal tasks, broker-as-wake-up, parity requirements) remains authoritative.
+- **Amendments:**
+  - §12 "Terminal Task Replay" is superseded by ADR-010 §4.3. The proposed terminal-replay carve-out was never implemented and is out of spec with A2A v1.0 §3.1.6 / §9.4.6. Terminal SubscribeToTask returns `UnsupportedOperationError`. The rest of ADR-009 (durable event store, atomic writes, replay for non-terminal tasks, broker-as-wake-up, parity requirements) remains authoritative.
+  - §8 "TTL/Cleanup" is amended by ADR-026 (2026-06-02). The original text claimed `cleanup_expired()` was "called periodically by server maintenance"; nothing ever called it and every backend returned `Ok(0)`. ADR-026 supplies the real reaping mechanics and the trigger model: `cleanup_expired()` runs only on operator opt-in, retention is age-based across events and tasks, and DynamoDB stays engine-native (no-op `cleanup_expired()`). See ADR-026.
 
 ## Context
 
@@ -209,7 +211,7 @@ If the transaction fails, neither the task nor the event is persisted. The calle
 
 **Duplicate delivery:** Possible during the transition from replay to live. Clients MUST be prepared to handle duplicates. Event identity is `(task_id, event_sequence)` — deduplication is straightforward.
 
-**TTL/Cleanup:** Events older than TTL are deleted by `cleanup_expired()`, called periodically by server maintenance. Default TTL: 24 hours. Configurable per deployment.
+**TTL/Cleanup:** Events older than TTL are deleted by `cleanup_expired()`. The retention mechanics, the age-based expiry semantic (events and tasks alike), and the trigger model are defined by ADR-026 — `cleanup_expired()` is not called automatically by the framework. It runs only when an operator opts in: a self-hosted background maintenance loop (opt-in builder method, default OFF) or, on Lambda, a discrete maintenance handler driven by an external EventBridge Scheduler cron. On DynamoDB, retention is engine-native (the `ttl` attribute) and `cleanup_expired()` is an intentional no-op. Default event TTL: 24 hours on DynamoDB; `0` (no expiry) on SQL and in-memory backends until configured. See ADR-026.
 
 ### 9. Verification Plan
 

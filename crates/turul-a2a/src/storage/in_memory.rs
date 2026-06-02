@@ -9,6 +9,7 @@ use super::atomic::A2aAtomicStore;
 use super::error::A2aStorageError;
 use super::event_store::A2aEventStore;
 use super::filter::{PushConfigListPage, TaskFilter, TaskListPage};
+use super::retention::RetentionConfig;
 use super::traits::{A2aPushNotificationStorage, A2aTaskStorage};
 use crate::push::{
     A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
@@ -46,6 +47,14 @@ fn now_iso() -> String {
     let millis = now.subsec_millis();
     // Simple formatting without chrono dependency
     format!("{secs:010}.{millis:03}")
+}
+
+/// Parse the integer-seconds prefix of a [`now_iso`] timestamp back
+/// into seconds since the Unix epoch. Returns `None` for strings not
+/// produced by `now_iso`. Used by age-based cleanup to compare a
+/// task's last-update time against the configured TTL window.
+fn epoch_secs(ts: &str) -> Option<u64> {
+    ts.split('.').next()?.parse::<u64>().ok()
 }
 
 type TaskKey = (String, String); // (tenant, task_id)
@@ -97,8 +106,11 @@ impl StoredDeliveryClaim {
 type PendingDispatchKey = (String, String, u64);
 
 /// In-memory event-log shape: per `EventKey`, the full history of
-/// `(event_sequence, event)` pairs the atomic store appended.
-type EventLog = Vec<(u64, StreamEvent)>;
+/// `(event_sequence, event, appended_at)` tuples the atomic store
+/// appended. `appended_at` is the wall-clock append time, the age
+/// basis for TTL-driven cleanup. It is storage-internal and stripped
+/// before events are returned over the trait surface.
+type EventLog = Vec<(u64, StreamEvent, std::time::SystemTime)>;
 
 /// In-memory A2A storage backend.
 /// Implements A2aTaskStorage, A2aPushNotificationStorage, A2aEventStore,
@@ -118,6 +130,10 @@ pub struct InMemoryA2aStorage {
     /// When false (default), the atomic commit is task + events only —
     /// non-push deployments never touch the pending-dispatches map.
     push_dispatch_enabled: bool,
+    /// Age-based retention window. Zero TTLs (the default) disable
+    /// cleanup entirely; a non-zero TTL makes `cleanup_expired` reap
+    /// rows older than the window regardless of task state.
+    retention: RetentionConfig,
     #[cfg(test)]
     cas_hook: Arc<RwLock<Option<CasHook>>>,
 }
@@ -158,9 +174,17 @@ impl InMemoryA2aStorage {
             push_delivery_claims: Arc::new(RwLock::new(HashMap::new())),
             pending_dispatches: Arc::new(RwLock::new(HashMap::new())),
             push_dispatch_enabled: false,
+            retention: RetentionConfig::DISABLED,
             #[cfg(test)]
             cas_hook: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Set the age-based retention window consulted by
+    /// `cleanup_expired`. Defaults to no expiry.
+    pub fn with_retention(mut self, retention: RetentionConfig) -> Self {
+        self.retention = retention;
+        self
     }
 
     /// Opt in to atomic pending-dispatch marker writes.
@@ -872,7 +896,7 @@ impl A2aEventStore for InMemoryA2aStorage {
         events
             .entry(key)
             .or_insert_with(Vec::new)
-            .push((seq, event));
+            .push((seq, event, std::time::SystemTime::now()));
 
         Ok(seq)
     }
@@ -890,8 +914,8 @@ impl A2aEventStore for InMemoryA2aStorage {
         match task_events {
             Some(evts) => Ok(evts
                 .iter()
-                .filter(|(seq, _)| *seq > after_sequence)
-                .cloned()
+                .filter(|(seq, _, _)| *seq > after_sequence)
+                .map(|(seq, event, _)| (*seq, event.clone()))
                 .collect()),
             None => Ok(vec![]),
         }
@@ -904,8 +928,99 @@ impl A2aEventStore for InMemoryA2aStorage {
     }
 
     async fn cleanup_expired(&self) -> Result<u64, A2aStorageError> {
-        // In-memory: no TTL tracking. No-op.
-        Ok(0)
+        let task_ttl_seconds = self.retention.task_ttl_seconds;
+        let event_ttl_seconds = self.retention.event_ttl_seconds;
+        let batch = self.retention.batch();
+
+        // Zero TTLs disable expiry for that row class; nothing to do
+        // when both are off.
+        if task_ttl_seconds == 0 && event_ttl_seconds == 0 {
+            return Ok(0);
+        }
+
+        let now = std::time::SystemTime::now();
+        let now_secs = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut removed: u64 = 0;
+
+        // Tasks: age-based on `updated_at`, state-independent. A task
+        // older than the window is reaped even if still live. Removed in
+        // batches of `batch`, dropping the write lock between batches so
+        // a large sweep does not stall concurrent access.
+        if task_ttl_seconds > 0 {
+            loop {
+                let mut tasks = self.tasks.write().await;
+                let expired: Vec<TaskKey> = tasks
+                    .iter()
+                    .filter(|(_, stored)| {
+                        epoch_secs(&stored.updated_at)
+                            .map(|t| now_secs.saturating_sub(t) >= task_ttl_seconds)
+                            .unwrap_or(false)
+                    })
+                    .map(|(key, _)| key.clone())
+                    .take(batch)
+                    .collect();
+                let n = expired.len();
+                for key in expired {
+                    tasks.remove(&key);
+                }
+                drop(tasks);
+                removed += n as u64;
+                if n < batch {
+                    break;
+                }
+            }
+        }
+
+        // Events: age-based on each entry's append time. Expired entries
+        // are dropped in place and an emptied task log is removed; the
+        // per-batch budget and lock release mirror the task sweep.
+        if event_ttl_seconds > 0 {
+            let cutoff = std::time::Duration::from_secs(event_ttl_seconds);
+            loop {
+                let mut events = self.events.write().await;
+                let mut n = 0usize;
+                let mut emptied: Vec<EventKey> = Vec::new();
+                'scan: for (key, log) in events.iter_mut() {
+                    let mut i = 0;
+                    while i < log.len() {
+                        let expired = now
+                            .duration_since(log[i].2)
+                            .map(|age| age >= cutoff)
+                            .unwrap_or(false);
+                        if expired {
+                            log.remove(i);
+                            n += 1;
+                            if n >= batch {
+                                if log.is_empty() {
+                                    emptied.push(key.clone());
+                                }
+                                break 'scan;
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    if log.is_empty() {
+                        emptied.push(key.clone());
+                    }
+                }
+                for key in &emptied {
+                    if events.get(key).is_some_and(|log| log.is_empty()) {
+                        events.remove(key);
+                    }
+                }
+                drop(events);
+                removed += n as u64;
+                if n < batch {
+                    break;
+                }
+            }
+        }
+
+        Ok(removed)
     }
 }
 
@@ -944,7 +1059,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
             *counter += 1;
             let seq = *counter;
             sequences.push(seq);
-            task_events.push((seq, event));
+            task_events.push((seq, event, std::time::SystemTime::now()));
         }
 
         // latest_event_sequence = max(0, new_seqs). Maintained
@@ -1100,7 +1215,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
                 }
             }
 
-            task_events.push((seq, event));
+            task_events.push((seq, event, std::time::SystemTime::now()));
         }
 
         // Maintain latest_event_sequence UNCONDITIONALLY: monotonic
@@ -1188,7 +1303,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
             *counter += 1;
             let seq = *counter;
             sequences.push(seq);
-            task_events.push((seq, event));
+            task_events.push((seq, event, std::time::SystemTime::now()));
         }
 
         // Maintain latest_event_sequence UNCONDITIONALLY: monotonic
@@ -1805,6 +1920,38 @@ mod tests {
     async fn test_invalid_transition_distinct_from_terminal_already_set() {
         let s = storage();
         parity_tests::test_invalid_transition_distinct_from_terminal_already_set(&s, &s).await;
+    }
+
+    // TTL / retention cleanup parity.
+
+    #[tokio::test]
+    async fn test_cleanup_survives_within_ttl() {
+        let s = storage().with_retention(RetentionConfig::new(3600, 3600));
+        parity_tests::test_cleanup_survives_within_ttl(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_reaps_events_and_tasks_past_ttl() {
+        let s = storage().with_retention(RetentionConfig::new(1, 1));
+        parity_tests::test_cleanup_reaps_events_and_tasks_past_ttl(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_reaps_terminal_task_past_ttl() {
+        let s = storage().with_retention(RetentionConfig::new(1, 0));
+        parity_tests::test_cleanup_reaps_terminal_task_past_ttl(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_batched_drains_beyond_batch_size() {
+        let s = storage().with_retention(RetentionConfig::new(1, 1).with_batch_size(2));
+        parity_tests::test_cleanup_batched_drains_beyond_batch_size(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_zero_ttl_keeps_everything() {
+        let s = storage().with_retention(RetentionConfig::DISABLED);
+        parity_tests::test_cleanup_zero_ttl_keeps_everything(&s, &s, &s).await;
     }
 
     // Cancel-marker parity.

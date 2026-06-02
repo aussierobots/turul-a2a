@@ -2279,6 +2279,327 @@ pub async fn test_invalid_transition_distinct_from_terminal_already_set(
 }
 
 // =========================================================
+// TTL / retention cleanup parity tests
+//
+// `cleanup_expired` is the single idempotent maintenance entry point.
+// It reaps events and tasks by AGE against the store's configured TTLs
+// and returns the total count deleted. Reaping is state-independent: a
+// task older than its TTL is removed regardless of TaskState (terminal
+// or live), matching engine-native TTL semantics. The store carries its
+// own TTLs, so each backend wrapper constructs the store with the right
+// retention before calling these helpers.
+//
+// DynamoDB exception: `cleanup_expired` returns 0 because expiry is
+// engine-native via the `ttl` attribute, not application-driven. The
+// DynamoDB wrappers assert the Ok(0) contract instead of deletion.
+//
+// Reap tests use a 1-second TTL and sleep past it. The sleep clears the
+// whole-second timestamp granularity used by the in-memory and SQLite
+// task-age comparisons, so the row is unambiguously outside the window.
+// =========================================================
+
+/// A task and an event written within a large TTL window survive
+/// `cleanup_expired`, which deletes nothing and returns 0.
+///
+/// Call with a store configured for a long retention window (e.g.
+/// `task_ttl_seconds`/`event_ttl_seconds` of an hour) so nothing is
+/// old enough to reap.
+pub async fn test_cleanup_survives_within_ttl(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+) {
+    let task = make_task("ttl-keep-1", "ctx-ttl");
+    atomic
+        .create_task_with_events(
+            "default",
+            "owner-ttl",
+            task,
+            vec![make_status_event_for(
+                "ttl-keep-1",
+                "ctx-ttl",
+                "TASK_STATE_SUBMITTED",
+            )],
+        )
+        .await
+        .unwrap();
+
+    let deleted = events.cleanup_expired().await.unwrap();
+    assert_eq!(
+        deleted, 0,
+        "nothing is older than the TTL window, so cleanup must delete nothing"
+    );
+
+    let fetched = tasks
+        .get_task("default", "ttl-keep-1", "owner-ttl", None)
+        .await
+        .unwrap();
+    assert!(fetched.is_some(), "fresh task must survive cleanup");
+    let stored = events
+        .get_events_after("default", "ttl-keep-1", 0)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1, "fresh event must survive cleanup");
+}
+
+/// A task and an event written before their TTL elapsed are both reaped
+/// by `cleanup_expired`, and the returned count reflects both. Covers
+/// the combined event+task deletion path and the deleted-count contract.
+///
+/// Call with a store configured for a 1-second TTL on both events and
+/// tasks. The helper sleeps past the window before invoking cleanup.
+pub async fn test_cleanup_reaps_events_and_tasks_past_ttl(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+) {
+    let task = make_task("ttl-reap-1", "ctx-ttl");
+    atomic
+        .create_task_with_events(
+            "default",
+            "owner-ttl",
+            task,
+            vec![make_status_event_for(
+                "ttl-reap-1",
+                "ctx-ttl",
+                "TASK_STATE_SUBMITTED",
+            )],
+        )
+        .await
+        .unwrap();
+
+    // Sleep past the 1-second TTL window. The margin clears the
+    // whole-second timestamp granularity used by in-memory and SQLite.
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+
+    let deleted = events.cleanup_expired().await.unwrap();
+    assert_eq!(
+        deleted, 2,
+        "both the expired event and the expired task must be reaped and counted"
+    );
+
+    let fetched = tasks
+        .get_task("default", "ttl-reap-1", "owner-ttl", None)
+        .await
+        .unwrap();
+    assert!(fetched.is_none(), "task older than TTL must be reaped");
+    let stored = events
+        .get_events_after("default", "ttl-reap-1", 0)
+        .await
+        .unwrap();
+    assert!(stored.is_empty(), "event older than TTL must be reaped");
+
+    // Idempotent: a second sweep finds nothing left.
+    let again = events.cleanup_expired().await.unwrap();
+    assert_eq!(again, 0, "cleanup_expired is idempotent");
+}
+
+/// Age-based reaping is state-independent: a task that has reached a
+/// terminal state is still reaped once it is older than its TTL. This is
+/// the documented hazard — a non-zero task TTL can reap completed (and
+/// long-running live) tasks alike.
+///
+/// Call with a store configured for a 1-second task TTL.
+pub async fn test_cleanup_reaps_terminal_task_past_ttl(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+) {
+    let task = make_task("ttl-term-1", "ctx-ttl");
+    tasks
+        .create_task("default", "owner-ttl", task)
+        .await
+        .unwrap();
+    // Drive the task to a terminal state before it ages out.
+    atomic
+        .update_task_status_with_events(
+            "default",
+            "ttl-term-1",
+            "owner-ttl",
+            TaskStatus::new(TaskState::Working),
+            vec![],
+        )
+        .await
+        .unwrap();
+    atomic
+        .update_task_status_with_events(
+            "default",
+            "ttl-term-1",
+            "owner-ttl",
+            TaskStatus::new(TaskState::Completed),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // Confirm it is terminal before reaping.
+    let before = tasks
+        .get_task("default", "ttl-term-1", "owner-ttl", None)
+        .await
+        .unwrap()
+        .expect("task exists before cleanup");
+    assert_eq!(
+        before.status().unwrap().state().unwrap(),
+        TaskState::Completed
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+
+    let deleted = events.cleanup_expired().await.unwrap();
+    assert!(
+        deleted >= 1,
+        "terminal task older than TTL must be reaped despite its terminal state"
+    );
+
+    let fetched = tasks
+        .get_task("default", "ttl-term-1", "owner-ttl", None)
+        .await
+        .unwrap();
+    assert!(
+        fetched.is_none(),
+        "age-based reaping deletes a terminal task regardless of TaskState"
+    );
+}
+
+/// Cleanup drains a backlog larger than the batch size in a single call.
+/// Call with a store configured for a 1-second TTL and a `cleanup_batch_size`
+/// smaller than the number of rows created here, so the batched delete loop
+/// runs several iterations.
+pub async fn test_cleanup_batched_drains_beyond_batch_size(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+) {
+    const N: usize = 5;
+    for i in 0..N {
+        let id = format!("ttl-batch-{i}");
+        let task = make_task(&id, "ctx-batch");
+        atomic
+            .create_task_with_events(
+                "default",
+                "owner-batch",
+                task,
+                vec![make_status_event_for(
+                    &id,
+                    "ctx-batch",
+                    "TASK_STATE_SUBMITTED",
+                )],
+            )
+            .await
+            .unwrap();
+    }
+
+    // Sleep past the 1-second TTL window. The margin clears the
+    // whole-second timestamp granularity used by in-memory and SQLite.
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+
+    // A single call drains the whole backlog even though the batch size
+    // is smaller than the number of eligible rows.
+    let deleted = events.cleanup_expired().await.unwrap();
+    assert_eq!(
+        deleted as usize,
+        N * 2,
+        "every expired task and its event must be reaped across multiple batches"
+    );
+
+    for i in 0..N {
+        let id = format!("ttl-batch-{i}");
+        let fetched = tasks
+            .get_task("default", &id, "owner-batch", None)
+            .await
+            .unwrap();
+        assert!(fetched.is_none(), "task {id} must be reaped");
+    }
+
+    let again = events.cleanup_expired().await.unwrap();
+    assert_eq!(again, 0, "cleanup_expired is idempotent after draining");
+}
+
+/// A zero TTL disables expiry: nothing is reaped no matter how old, and
+/// `cleanup_expired` returns 0.
+///
+/// Call with a store configured for `RetentionConfig::DISABLED` (both
+/// TTLs zero).
+pub async fn test_cleanup_zero_ttl_keeps_everything(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+) {
+    let task = make_task("ttl-zero-1", "ctx-ttl");
+    atomic
+        .create_task_with_events(
+            "default",
+            "owner-ttl",
+            task,
+            vec![make_status_event_for(
+                "ttl-zero-1",
+                "ctx-ttl",
+                "TASK_STATE_SUBMITTED",
+            )],
+        )
+        .await
+        .unwrap();
+
+    // Even after the row ages, a zero TTL must not reap it.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+    let deleted = events.cleanup_expired().await.unwrap();
+    assert_eq!(deleted, 0, "zero TTL disables expiry; nothing is reaped");
+
+    let fetched = tasks
+        .get_task("default", "ttl-zero-1", "owner-ttl", None)
+        .await
+        .unwrap();
+    assert!(fetched.is_some(), "zero TTL must keep the task");
+    let stored = events
+        .get_events_after("default", "ttl-zero-1", 0)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1, "zero TTL must keep the event");
+}
+
+/// DynamoDB-only contract: `cleanup_expired` returns 0 because expiry is
+/// engine-native via the item `ttl` attribute, not application-driven.
+/// The task and event remain readable from the application's
+/// perspective (DynamoDB local does not enforce TTL deletion).
+#[cfg(feature = "dynamodb")]
+pub async fn test_cleanup_is_noop_for_engine_native_ttl(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+) {
+    let task = make_task("ttl-native-1", "ctx-ttl");
+    atomic
+        .create_task_with_events(
+            "default",
+            "owner-ttl",
+            task,
+            vec![make_status_event_for(
+                "ttl-native-1",
+                "ctx-ttl",
+                "TASK_STATE_SUBMITTED",
+            )],
+        )
+        .await
+        .unwrap();
+
+    let deleted = events.cleanup_expired().await.unwrap();
+    assert_eq!(
+        deleted, 0,
+        "engine-native TTL backends do app-level no cleanup; cleanup_expired returns 0"
+    );
+
+    let fetched = tasks
+        .get_task("default", "ttl-native-1", "owner-ttl", None)
+        .await
+        .unwrap();
+    assert!(
+        fetched.is_some(),
+        "engine-native cleanup does not delete via the application path"
+    );
+}
+
+// =========================================================
 // A2aPushDeliveryStore parity tests
 //
 // Executable helpers every backend wires into its own test module.

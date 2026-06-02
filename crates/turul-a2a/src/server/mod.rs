@@ -73,6 +73,17 @@ pub struct RuntimeConfig {
     /// them, and returns. The next tick picks up any remainder.
     pub push_reclaim_sweep_batch: usize,
 
+    /// Interval for the opt-in retention-maintenance loop, or `None` to
+    /// disable it. When `Some`, `A2aServer::run` spawns a background
+    /// task that calls `cleanup_expired` on the event store on this
+    /// cadence to reap expired events and tasks. `None` (default) means
+    /// no maintenance loop runs — the server never deletes on a timer.
+    ///
+    /// Serverless deployments (AWS Lambda) leave this `None`: there is
+    /// no persistent process to host the loop. They invoke
+    /// `cleanup_expired` from a discrete scheduled handler instead.
+    pub maintenance_interval: Option<Duration>,
+
     /// Whether this runtime can honour
     /// `SendMessageConfiguration.return_immediately = true`.
     ///
@@ -133,6 +144,7 @@ impl Default for RuntimeConfig {
             allow_insecure_push_urls: false,
             push_reclaim_sweep_interval: Duration::from_secs(60),
             push_reclaim_sweep_batch: 64,
+            maintenance_interval: None,
             supports_return_immediately: true,
         }
     }
@@ -300,6 +312,26 @@ impl A2aServerBuilder {
     /// Max rows pulled per reclaim sweep tick. Default 64.
     pub fn push_reclaim_sweep_batch(mut self, n: usize) -> Self {
         self.runtime_config.push_reclaim_sweep_batch = n;
+        self
+    }
+
+    /// Enable the opt-in retention-maintenance loop.
+    ///
+    /// `A2aServer::run` spawns a background task that calls
+    /// `cleanup_expired` on the storage backend every `interval`.
+    /// Disabled by default — without this call the server never deletes
+    /// on a timer.
+    ///
+    /// The TTL window is configured on the storage backend itself (its
+    /// retention config); this method only sets the cadence at which the
+    /// backend's reaper is invoked. A backend with no retention configured
+    /// reaps nothing even when this loop runs.
+    ///
+    /// Expiry is age-based and state-independent: a non-zero task TTL
+    /// can reap long-running live tasks. Choose `interval` and TTLs that
+    /// suit the deployment's task lifetimes.
+    pub fn maintenance(mut self, interval: Duration) -> Self {
+        self.runtime_config.maintenance_interval = Some(interval);
         self
     }
 
@@ -856,6 +888,8 @@ impl A2aServer {
         let sweep_interval_for_task = self.state.runtime_config.push_reclaim_sweep_interval;
         let sweep_batch_for_task = self.state.runtime_config.push_reclaim_sweep_batch;
         let push_claim_expiry_for_sweep = self.state.runtime_config.push_claim_expiry;
+        let maintenance_event_store = self.state.event_store.clone();
+        let maintenance_interval = self.state.runtime_config.maintenance_interval;
 
         let app = self.into_router();
         let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -969,12 +1003,59 @@ impl A2aServer {
             _ => None,
         };
 
+        // Opt-in retention-maintenance loop. Reaps expired events and
+        // tasks on a fixed cadence. Off unless `.maintenance(..)` was
+        // called on the builder. Each tick calls `cleanup_expired` and
+        // logs the deleted count; storage errors are logged and the loop
+        // continues so a transient backend failure does not kill it.
+        let maintenance_handle = match maintenance_interval {
+            Some(interval) => {
+                let shutdown = shutdown.clone();
+                let event_store = maintenance_event_store;
+                Some(tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(interval);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    // First immediate tick fires at spawn; skip it so the
+                    // first cleanup runs one full interval after startup.
+                    ticker.tick().await;
+                    loop {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            _ = ticker.tick() => {
+                                match event_store.cleanup_expired().await {
+                                    Ok(deleted) => {
+                                        tracing::info!(
+                                            target: "turul_a2a::maintenance_cleanup",
+                                            deleted,
+                                            "retention maintenance reaped expired rows"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            target: "turul_a2a::maintenance_cleanup_error",
+                                            error = %e,
+                                            "retention maintenance cleanup failed; \
+                                             will retry next tick"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }))
+            }
+            None => None,
+        };
+
         let serve_result = axum::serve(listener, app).await;
 
         // Gracefully stop background loops — relevant if axum::serve ever returns.
         shutdown.cancel();
         let _ = poller_handle.await;
         if let Some(h) = sweep_handle {
+            let _ = h.await;
+        }
+        if let Some(h) = maintenance_handle {
             let _ = h.await;
         }
 

@@ -4,6 +4,28 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.28] — 2026-06-02
+
+### Fixed
+
+- Retention cleanup now actually runs. `cleanup_expired` was documented to delete expired events but was a no-op on every backend (in-memory, SQLite, PostgreSQL, DynamoDB) and was never invoked. It now deletes expired **events and tasks** on the in-memory, SQLite, and PostgreSQL backends using age-based, state-independent expiry: events past the event TTL and tasks past the task TTL are reaped regardless of `TaskState`. Setting a non-zero task TTL can therefore reap long-running live tasks — size the window above your longest expected task lifetime, or leave it `0`. DynamoDB continues to reap via engine-native TTL (`cleanup_expired` stays `Ok(0)`).
+
+### Added
+
+- `RetentionConfig` (`turul_a2a::storage::RetentionConfig`): backend-agnostic `task_ttl_seconds` / `event_ttl_seconds` (`0` = no expiry; default for SQL and in-memory backends) plus `cleanup_batch_size` (default 1000). Cleanup deletes in committed batches of that size, looping until drained, so a large backlog never holds one long transaction or the in-memory write lock for the whole sweep.
+- `.with_retention(RetentionConfig)` on the in-memory, SQLite, and PostgreSQL storage backends configures the TTL window the backend reaps to. The backend is the single source of truth for retention.
+- `A2aServer::builder().maintenance(interval)`: opt-in background loop that calls `cleanup_expired` on a fixed cadence. **Off by default** — existing servers see no behaviour change. TTLs come from the storage backend's `RetentionConfig`, not this method.
+- `turul_a2a_aws_lambda::handle_maintenance_trigger(event, event_store)`: discrete maintenance entry point for serverless deployments, invoked by an EventBridge Scheduler cron. Lambda runs no background loop; the operator owns the schedule.
+
+### Compatibility
+
+- Backward-compatible patch. New API (the config type, per-backend `.with_retention()`, the builder maintenance method, and the Lambda handler) is additive. SQL and in-memory backends default to no expiry, so retention stays inert until a TTL is configured and the maintenance trigger is wired. `DynamoDbConfig` keeps its existing `task_ttl_seconds` / `event_ttl_seconds` fields unchanged.
+- DynamoDB behaviour is unchanged: it keeps its 24h task/event TTL defaults and reaps items via native table TTL. Items are reaped only if the TTL attribute is provisioned on the table — legacy rows written without it will not expire until rewritten or backfilled.
+
+### Verification
+
+- In-memory and SQLite retention parity tests passed live, including batched draining beyond `cleanup_batch_size` and age-based reaping of terminal tasks. PostgreSQL and DynamoDB cleanup were exercised at compile only (feature-gated, no live database this cycle); the PostgreSQL batched-delete path (`ctid IN (… LIMIT n)`) has not yet been run against a live server.
+
 ## [0.1.27] — 2026-05-26
 
 ### Fixed

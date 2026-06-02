@@ -8,6 +8,7 @@ use super::atomic::A2aAtomicStore;
 use super::error::A2aStorageError;
 use super::event_store::A2aEventStore;
 use super::filter::{PushConfigListPage, TaskFilter, TaskListPage};
+use super::retention::RetentionConfig;
 use super::traits::{A2aPushNotificationStorage, A2aTaskStorage};
 use crate::push::{
     A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
@@ -45,6 +46,9 @@ pub struct PostgresA2aStorage {
     pool: PgPool,
     /// opt-in — see `InMemoryA2aStorage::push_dispatch_enabled`.
     push_dispatch_enabled: bool,
+    /// Age-based retention thresholds applied by `cleanup_expired`.
+    /// Zero TTL (the default) disables reaping for that record kind.
+    retention: RetentionConfig,
 }
 
 impl PostgresA2aStorage {
@@ -58,6 +62,7 @@ impl PostgresA2aStorage {
         let storage = Self {
             pool,
             push_dispatch_enabled: false,
+            retention: RetentionConfig::DISABLED,
         };
         if !config.assume_schema_initialized {
             storage.create_tables().await?;
@@ -68,6 +73,13 @@ impl PostgresA2aStorage {
     /// Opt in to atomic pending-dispatch marker writes.
     pub fn with_push_dispatch_enabled(mut self, enabled: bool) -> Self {
         self.push_dispatch_enabled = enabled;
+        self
+    }
+
+    /// Set the age-based retention thresholds used by `cleanup_expired`.
+    /// Defaults to disabled (no reaping) when not set.
+    pub fn with_retention(mut self, retention: RetentionConfig) -> Self {
+        self.retention = retention;
         self
     }
 
@@ -1016,7 +1028,55 @@ impl A2aEventStore for PostgresA2aStorage {
     }
 
     async fn cleanup_expired(&self) -> Result<u64, A2aStorageError> {
-        Ok(0)
+        // Age-based reaping, independent of task state. A non-zero task
+        // TTL can therefore reap long-running live tasks, by design.
+        // Rows are deleted in committed batches (each statement
+        // autocommits) so a large backlog never holds one long
+        // transaction; each loop runs until the eligible rows are drained.
+        let batch = self.retention.batch() as i64;
+        let mut deleted: u64 = 0;
+
+        if self.retention.event_ttl_seconds > 0 {
+            let interval = format!("{} seconds", self.retention.event_ttl_seconds);
+            loop {
+                let n = sqlx::query(
+                    "DELETE FROM a2a_task_events WHERE ctid IN \
+                     (SELECT ctid FROM a2a_task_events WHERE created_at < NOW() - $1::interval LIMIT $2)",
+                )
+                .bind(&interval)
+                .bind(batch)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?
+                .rows_affected();
+                deleted += n;
+                if n < batch as u64 {
+                    break;
+                }
+            }
+        }
+
+        if self.retention.task_ttl_seconds > 0 {
+            let interval = format!("{} seconds", self.retention.task_ttl_seconds);
+            loop {
+                let n = sqlx::query(
+                    "DELETE FROM a2a_tasks WHERE ctid IN \
+                     (SELECT ctid FROM a2a_tasks WHERE updated_at < NOW() - $1::interval LIMIT $2)",
+                )
+                .bind(&interval)
+                .bind(batch)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?
+                .rows_affected();
+                deleted += n;
+                if n < batch as u64 {
+                    break;
+                }
+            }
+        }
+
+        Ok(deleted)
     }
 }
 
@@ -2299,6 +2359,46 @@ mod tests {
     async fn test_invalid_transition_distinct_from_terminal_already_set() {
         let s = storage().await;
         parity_tests::test_invalid_transition_distinct_from_terminal_already_set(&s, &s).await;
+    }
+
+    // TTL / retention cleanup parity.
+
+    async fn storage_with_retention(
+        retention: crate::storage::RetentionConfig,
+    ) -> PostgresA2aStorage {
+        storage().await.with_retention(retention)
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_survives_within_ttl() {
+        let s = storage_with_retention(crate::storage::RetentionConfig::new(3600, 3600)).await;
+        parity_tests::test_cleanup_survives_within_ttl(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_reaps_events_and_tasks_past_ttl() {
+        let s = storage_with_retention(crate::storage::RetentionConfig::new(1, 1)).await;
+        parity_tests::test_cleanup_reaps_events_and_tasks_past_ttl(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_reaps_terminal_task_past_ttl() {
+        let s = storage_with_retention(crate::storage::RetentionConfig::new(1, 0)).await;
+        parity_tests::test_cleanup_reaps_terminal_task_past_ttl(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_batched_drains_beyond_batch_size() {
+        let s =
+            storage_with_retention(crate::storage::RetentionConfig::new(1, 1).with_batch_size(2))
+                .await;
+        parity_tests::test_cleanup_batched_drains_beyond_batch_size(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_zero_ttl_keeps_everything() {
+        let s = storage_with_retention(crate::storage::RetentionConfig::DISABLED).await;
+        parity_tests::test_cleanup_zero_ttl_keeps_everything(&s, &s, &s).await;
     }
 
     // Cancel-marker parity.

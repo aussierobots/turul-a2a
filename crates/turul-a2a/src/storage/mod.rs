@@ -2,6 +2,7 @@ pub mod atomic;
 pub mod error;
 pub mod event_store;
 pub mod filter;
+pub mod retention;
 pub mod terminal_cas;
 pub mod traits;
 
@@ -24,6 +25,7 @@ pub use atomic::A2aAtomicStore;
 pub use error::A2aStorageError;
 pub use event_store::A2aEventStore;
 pub use filter::{PushConfigListPage, TaskFilter, TaskListPage};
+pub use retention::RetentionConfig;
 pub use traits::{A2aCancellationSupervisor, A2aPushNotificationStorage, A2aTaskStorage};
 
 #[cfg(feature = "in-memory")]

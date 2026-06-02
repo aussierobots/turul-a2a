@@ -37,6 +37,7 @@ use std::time::{Duration, SystemTime};
 use aws_lambda_events::event::eventbridge::EventBridgeEvent;
 use serde::Serialize;
 use turul_a2a::push::{A2aPushDeliveryStore, PushDispatcher};
+use turul_a2a::storage::{A2aEventStore, A2aStorageError};
 
 /// Summary returned from a single scheduled-recovery tick.
 ///
@@ -213,4 +214,34 @@ impl LambdaScheduledRecoveryHandler {
             errors.push(msg);
         }
     }
+}
+
+/// Run one retention-maintenance sweep, invoked by an EventBridge
+/// Scheduler rule.
+///
+/// Lambda has no persistent process to host the server's background
+/// maintenance loop, so retention cleanup is driven externally: an
+/// EventBridge Scheduler cron invokes the function, the adopter routes
+/// the event here, and this calls `cleanup_expired` on the event store
+/// to reap expired events and tasks (age-based, state-independent — see
+/// [`A2aEventStore::cleanup_expired`]).
+///
+/// `cleanup_expired` is defined on [`A2aEventStore`], so the store is
+/// taken as `Arc<dyn A2aEventStore>` (not the atomic store). The TTL
+/// window is configured on the storage backend itself; this handler only
+/// triggers the backend's reaper.
+///
+/// The `event` payload is not inspected — each invocation is one sweep
+/// regardless of cron metadata. Returns
+/// `{ "deleted": <count>, "timestamp": <RFC3339 now> }`.
+pub async fn handle_maintenance_trigger(
+    event: serde_json::Value,
+    event_store: Arc<dyn A2aEventStore>,
+) -> Result<serde_json::Value, A2aStorageError> {
+    let _ = event;
+    let deleted = event_store.cleanup_expired().await?;
+    Ok(serde_json::json!({
+        "deleted": deleted,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    }))
 }

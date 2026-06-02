@@ -41,7 +41,20 @@ pub trait A2aEventStore: Send + Sync {
     /// Returns 0 if no events exist. Tenant-scoped.
     async fn latest_sequence(&self, tenant: &str, task_id: &str) -> Result<u64, A2aStorageError>;
 
-    /// Delete events older than the configured TTL.
-    /// Returns count of deleted events.
+    /// Delete all expired events and tasks based on the configured TTL.
+    ///
+    /// Age-based, state-independent expiry: events older than the
+    /// configured event TTL (measured from each event's `created_at`)
+    /// and tasks older than the configured task TTL (measured from each
+    /// task's `updated_at`) are deleted regardless of `TaskState` — a
+    /// terminal task and a long-running live task past the window are
+    /// reaped alike.
+    ///
+    /// Returns the total count of deleted rows (events + tasks combined).
+    /// Idempotent: safe to call repeatedly. When a backend has no TTL
+    /// configured (`0`), the corresponding row class is never deleted.
+    ///
+    /// DynamoDB returns `Ok(0)`: it reaps expired items via native TTL
+    /// attributes, so application-level cleanup is bypassed there.
     async fn cleanup_expired(&self) -> Result<u64, A2aStorageError>;
 }

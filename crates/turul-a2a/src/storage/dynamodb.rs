@@ -38,12 +38,16 @@ pub struct DynamoDbConfig {
     /// [`crate::push::A2aPushDeliveryStore::record_pending_dispatch`].
     pub push_pending_dispatches_table: String,
     /// TTL for task items in seconds. 0 = no expiry. Default: 1 day (86400).
+    /// Written as a native `ttl` attribute (epoch seconds) per item; the
+    /// engine reaps expired rows.
     pub task_ttl_seconds: u64,
     /// TTL for event items in seconds. 0 = no expiry. Default: 24 hours (86400).
+    /// Written as a native `ttl` attribute (epoch seconds) per item; the
+    /// engine reaps expired rows.
     pub event_ttl_seconds: u64,
     /// TTL for push-delivery claim items in seconds. 0 = no expiry.
     /// Default: 7 days (604800); GaveUp rows are retained for operator
-    /// inspection within this windowb.
+    /// inspection within this window.
     pub push_delivery_ttl_seconds: u64,
 }
 
@@ -1325,6 +1329,13 @@ impl A2aEventStore for DynamoDbA2aStorage {
         query_max_sequence(&self.client, &self.config.events_table, &pk).await
     }
 
+    /// No-op on DynamoDB: expired tasks and events are reaped by the
+    /// engine's native TTL on each item's `ttl` attribute (epoch
+    /// seconds), written from `task_ttl_seconds` / `event_ttl_seconds`.
+    /// There is no application-side delete to perform, so this always
+    /// returns `Ok(0)`.
+    /// Native TTL deletion is asynchronous and typically completes within
+    /// 48 hours of expiry — it is not immediate.
     async fn cleanup_expired(&self) -> Result<u64, A2aStorageError> {
         Ok(0)
     }
@@ -3833,6 +3844,16 @@ mod tests {
     async fn test_invalid_transition_distinct_from_terminal_already_set() {
         skip_unless_dynamodb_env!(s);
         parity_tests::test_invalid_transition_distinct_from_terminal_already_set(&s, &s).await;
+    }
+
+    // TTL / retention cleanup parity. DynamoDB expiry is engine-native via
+    // the item `ttl` attribute, so `cleanup_expired` is an app-level no-op
+    // returning 0. The age-based reap helpers do not apply to this backend.
+
+    #[tokio::test]
+    async fn test_cleanup_is_noop_for_engine_native_ttl() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_cleanup_is_noop_for_engine_native_ttl(&s, &s, &s).await;
     }
 
     // Cancel-marker parity.
