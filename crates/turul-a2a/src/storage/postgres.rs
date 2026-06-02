@@ -1628,7 +1628,7 @@ impl A2aPushDeliveryStore for PostgresA2aStorage {
             .begin()
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
-        let existing: Option<(String, i64, i64, i64, String)> = sqlx::query_as(
+        let existing: Option<(String, i64, i64, i32, String)> = sqlx::query_as(
             "SELECT owner, generation, expires_at_micros, delivery_attempt_count, status \
              FROM a2a_push_deliveries \
              WHERE tenant = $1 AND task_id = $2 AND event_sequence = $3 AND config_id = $4 \
@@ -1762,7 +1762,7 @@ impl A2aPushDeliveryStore for PostgresA2aStorage {
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         // Fenced on identity AND non-terminal status — terminal rows
         // are frozen and cannot restart an attempt.
-        let rows: Option<(i64,)> = sqlx::query_as(
+        let rows: Option<(i32,)> = sqlx::query_as(
             "UPDATE a2a_push_deliveries SET \
                 delivery_attempt_count = delivery_attempt_count + 1, \
                 status = CASE WHEN status = 'Pending' THEN 'Attempting' ELSE status END, \

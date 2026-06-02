@@ -4,6 +4,16 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.29] — 2026-06-02
+
+### Fixed
+
+- PostgreSQL push-delivery: `record_delivery_claim` and `increment_delivery_attempt` decoded the `delivery_attempt_count` column (declared `INTEGER`/INT4) as `i64`, which sqlx rejects as a type mismatch (`i64` is not compatible with `INT4`). Both sites now decode `i32`, matching the column type, the write path, and the other read site. This only affected the PostgreSQL backend's push-delivery claim/attempt paths; no schema migration is required.
+
+### Verification
+
+- Fix is compile-verified (`cargo test -p turul-a2a --features postgres --no-run`); the live `storage::postgres` push-delivery suite is re-run against a real PostgreSQL server in a separate session (no live database in this one).
+
 ## [0.1.28] — 2026-06-02
 
 ### Fixed
