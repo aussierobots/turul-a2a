@@ -12,7 +12,7 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Verification
 
-- Fix is compile-verified (`cargo test -p turul-a2a --features postgres --no-run`); the live `storage::postgres` push-delivery suite is re-run against a real PostgreSQL server in a separate session (no live database in this one).
+- Verified live against a real PostgreSQL server: the full `storage::postgres` suite passes (70 passed, 0 failed) — all push-delivery tests plus the retention-cleanup tests, with no INT4/i64 decode mismatch remaining.
 
 ## [0.1.28] — 2026-06-02
 
