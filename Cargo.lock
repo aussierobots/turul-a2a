@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-role-critic-agent"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "agent-role-planner-router-agent"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -151,7 +151,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auth-agent"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -806,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "callback-agent"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "axum",
@@ -913,7 +913,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "conversation-agent"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "axum",
@@ -1140,7 +1140,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "echo-agent"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "tokio",
@@ -1461,7 +1461,7 @@ dependencies = [
 
 [[package]]
 name = "grpc-agent"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "futures",
@@ -1953,7 +1953,7 @@ dependencies = [
 
 [[package]]
 name = "interop-agent-role-critic-rust"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "serde_json",
  "tokio",
@@ -1963,7 +1963,7 @@ dependencies = [
 
 [[package]]
 name = "interop-agent-role-planner-router-rust"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "serde_json",
  "tokio",
@@ -1973,7 +1973,7 @@ dependencies = [
 
 [[package]]
 name = "interop-post-task-hook-rust"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "serde_json",
  "tokio",
@@ -1983,7 +1983,7 @@ dependencies = [
 
 [[package]]
 name = "interop-remote-delegate-rust"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "serde_json",
  "tokio",
@@ -1993,7 +1993,7 @@ dependencies = [
 
 [[package]]
 name = "interop-skill-dispatch-profile-rust"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "serde_json",
  "tokio",
@@ -2003,7 +2003,7 @@ dependencies = [
 
 [[package]]
 name = "interop-skill-manifest-ollama-rust"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "serde_json",
  "tokio",
@@ -2013,7 +2013,7 @@ dependencies = [
 
 [[package]]
 name = "interrupting-agent"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "axum",
@@ -2167,7 +2167,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-agent"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "lambda_runtime",
@@ -2183,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-durable-agent"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-durable-single"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2219,7 +2219,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-durable-worker"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "lambda_runtime",
@@ -2234,7 +2234,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-scheduled-worker"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "aws_lambda_events",
@@ -2252,7 +2252,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-stream-worker"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "aws_lambda_events",
@@ -2714,7 +2714,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "post-task-hook-agent"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -3072,7 +3072,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remote-delegate-agent"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "dotenvy",
@@ -3609,7 +3609,7 @@ dependencies = [
 
 [[package]]
 name = "skill-dispatch-profile-agent"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -3627,7 +3627,7 @@ dependencies = [
 
 [[package]]
 name = "skill-manifest-ollama-agent"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "dotenvy",
@@ -3649,7 +3649,7 @@ dependencies = [
 
 [[package]]
 name = "skill-security-agent"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "tokio",
@@ -3891,7 +3891,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "streaming-agent"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "axum",
@@ -4369,7 +4369,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "turul-a2a"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4411,7 +4411,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-auth"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "jsonwebtoken",
@@ -4427,7 +4427,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-aws-lambda"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "aws-sdk-sqs",
@@ -4456,7 +4456,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-client"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "futures",
  "reqwest",
@@ -4475,7 +4475,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-patterns"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "async-trait",
  "futures",
@@ -4492,7 +4492,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-proto"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "pbjson",
  "pbjson-build",
@@ -4510,7 +4510,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-types"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "chrono",
  "pbjson-types",

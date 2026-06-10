@@ -4,6 +4,12 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.32] — 2026-06-10
+
+### Fixed
+
+- A PostgreSQL-only build (`--features postgres` without sqlite/dynamodb) emitted dead-code warnings for the internal TEXT-column JSON helpers in the artifact-separation module, which the SQLite/DynamoDB backends use but PostgreSQL (JSONB) does not. The helpers are now gated to `any(feature = "sqlite", feature = "dynamodb")`, so every single-feature build is warning-free. No runtime or API change; dependents never saw these warnings.
+
 ## [0.1.31] — 2026-06-10
 
 ### Fixed
