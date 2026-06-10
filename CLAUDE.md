@@ -82,7 +82,7 @@ The workspace publishes 6 crates. Publishing is irreversible (yank only hides). 
 2. **Write the CHANGELOG entry.**
 3. **Run the pre-publish gate:**
    - `cargo test --workspace` green
-   - `cargo clippy --workspace --all-targets -- -D warnings` clean — run this on **default features** exactly as written. A run with extra `--features` added is a *supplement*, never a substitute: enabling a feature can mark a feature-gated module as "used" and hide dead-code warnings that a default-feature consumer (and the `cargo publish` build) will surface. A module consumed only by feature-gated backends must itself be gated on those features so a default build carries no dead code.
+   - `cargo clippy --workspace --all-targets -- -D warnings` clean — and **lint each storage feature in isolation**, not just default and all-features. Dead code hides under any *superset* of features: an all-features run (`--features sqlite,postgres,dynamodb`) marks a helper used by *any* backend as live, so it cannot catch code that is dead under one backend alone. Run the matrix: default (no features), `--features sqlite`, `--features postgres`, `--features dynamodb`, and all three together — each must be clean. (Example: the TEXT-column JSON helpers are used by SQLite/DynamoDB but not PostgreSQL, which uses JSONB; they are gated to `any(feature = "sqlite", feature = "dynamodb")` so a Postgres-only build carries no dead code.) A module consumed only by feature-gated backends must itself be gated on those features.
    - `cargo fmt --all -- --check` clean
    - `cargo doc --no-deps --workspace` no warnings
    - `cargo package -p <crate> --no-verify --allow-dirty` warning-free for every publish crate

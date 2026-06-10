@@ -103,20 +103,29 @@ pub(crate) fn reconcile(
     Ok(plan)
 }
 
+// String (TEXT-column) representations are used by the SQLite and
+// DynamoDB backends. PostgreSQL stores the manifest and artifact bodies
+// as JSONB and converts via `serde_json::Value` inline, so it needs none
+// of these — gate them to the TEXT backends to keep a Postgres-only build
+// free of dead code.
+#[cfg(any(feature = "sqlite", feature = "dynamodb"))]
 pub(crate) fn manifest_to_json(manifest: &[ManifestEntry]) -> Result<String, A2aStorageError> {
     serde_json::to_string(manifest).map_err(|e| A2aStorageError::SerializationError(e.to_string()))
 }
 
+#[cfg(any(feature = "sqlite", feature = "dynamodb"))]
 pub(crate) fn manifest_from_json(json: &str) -> Result<Vec<ManifestEntry>, A2aStorageError> {
     serde_json::from_str(json).map_err(|e| A2aStorageError::SerializationError(e.to_string()))
 }
 
+#[cfg(any(feature = "sqlite", feature = "dynamodb"))]
 pub(crate) fn artifact_to_json(
     artifact: &turul_a2a_proto::Artifact,
 ) -> Result<String, A2aStorageError> {
     serde_json::to_string(artifact).map_err(|e| A2aStorageError::SerializationError(e.to_string()))
 }
 
+#[cfg(any(feature = "sqlite", feature = "dynamodb"))]
 pub(crate) fn artifact_from_json(json: &str) -> Result<turul_a2a_proto::Artifact, A2aStorageError> {
     serde_json::from_str(json).map_err(|e| A2aStorageError::SerializationError(e.to_string()))
 }
@@ -155,10 +164,12 @@ mod tests {
 
     #[test]
     fn fingerprint_stable_across_encode_decode_round_trip() {
+        // Use serde_json directly (not the TEXT-backend helpers) so this
+        // test compiles under any single storage feature.
         let artifact = proto_artifact("art-1", "hello world");
         let before = artifact_fingerprint(&artifact).unwrap();
-        let json = artifact_to_json(&artifact).unwrap();
-        let decoded = artifact_from_json(&json).unwrap();
+        let json = serde_json::to_string(&artifact).unwrap();
+        let decoded: turul_a2a_proto::Artifact = serde_json::from_str(&json).unwrap();
         let after = artifact_fingerprint(&decoded).unwrap();
         assert_eq!(before, after);
     }
