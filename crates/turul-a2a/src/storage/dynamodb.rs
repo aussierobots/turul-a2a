@@ -111,6 +111,302 @@ impl DynamoDbA2aStorage {
         format!("{tenant}#{task_id}")
     }
 
+    /// Percent-escape the key delimiters (`%`, `|`, `#`) in a key
+    /// component. `%` is escaped first so the encoding is injective.
+    fn enc_key_component(s: &str) -> String {
+        s.replace('%', "%25")
+            .replace('|', "%7C")
+            .replace('#', "%23")
+    }
+
+    /// Partition key for a task's artifact items, in the events table.
+    ///
+    /// Every other record kind in the events table derives its `pk`
+    /// from [`Self::task_key`] (`{tenant}#{task_id}`) and so contains a
+    /// literal `#`. Artifact keys use a `art|`-prefixed, delimiter-escaped
+    /// form that contains no raw `#`, so the two key sets are disjoint by
+    /// construction for every tenant/task-id — event range queries on a
+    /// task's `pk` never see artifact items, and no task id is rejected.
+    fn artifact_pk(tenant: &str, task_id: &str) -> String {
+        format!(
+            "art|{}|{}",
+            Self::enc_key_component(tenant),
+            Self::enc_key_component(task_id)
+        )
+    }
+
+    /// Serialize a task with its artifact bodies stripped out, returning
+    /// the artifact-free JSON blob and the removed artifacts.
+    fn split_task(
+        task: &Task,
+    ) -> Result<(String, Vec<turul_a2a_proto::Artifact>), A2aStorageError> {
+        let mut proto = task.as_proto().clone();
+        let artifacts = std::mem::take(&mut proto.artifacts);
+        let stripped = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+        Ok((Self::task_to_json(&stripped)?, artifacts))
+    }
+
+    /// One artifact item for the events table: `pk = art|...`,
+    /// `sk = artifact_id`. Carries the task TTL so DynamoDB's native TTL
+    /// reaps artifact bodies with their task.
+    fn build_artifact_item(
+        art_pk: &str,
+        artifact_id: &str,
+        body_json: &str,
+        fingerprint: &str,
+        ttl: Option<AttributeValue>,
+    ) -> std::collections::HashMap<String, AttributeValue> {
+        let mut item = std::collections::HashMap::new();
+        item.insert("pk".into(), AttributeValue::S(art_pk.to_string()));
+        item.insert("sk".into(), AttributeValue::S(artifact_id.to_string()));
+        item.insert(
+            "artifactId".into(),
+            AttributeValue::S(artifact_id.to_string()),
+        );
+        item.insert(
+            "artifactJson".into(),
+            AttributeValue::S(body_json.to_string()),
+        );
+        item.insert(
+            "fingerprint".into(),
+            AttributeValue::S(fingerprint.to_string()),
+        );
+        if let Some(ttl_val) = ttl {
+            item.insert("ttl".into(), ttl_val);
+        }
+        item
+    }
+
+    /// Build the artifact put/delete `TransactWriteItem`s for a reconcile
+    /// plan. Returned items ride in the same transaction as the task
+    /// write so artifacts and the task row commit atomically.
+    fn artifact_transact_items(
+        &self,
+        art_pk: &str,
+        plan: &super::artifacts::ReconcilePlan,
+    ) -> Result<Vec<aws_sdk_dynamodb::types::TransactWriteItem>, A2aStorageError> {
+        let ttl = Self::ttl_epoch(self.config.task_ttl_seconds);
+        let mut items = Vec::with_capacity(plan.writes.len() + plan.deletes.len());
+        for (artifact, fingerprint) in &plan.writes {
+            let body = super::artifacts::artifact_to_json(artifact)?;
+            let item = Self::build_artifact_item(
+                art_pk,
+                &artifact.artifact_id,
+                &body,
+                fingerprint,
+                ttl.clone(),
+            );
+            let put = aws_sdk_dynamodb::types::Put::builder()
+                .table_name(&self.config.events_table)
+                .set_item(Some(item))
+                .build()
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            items.push(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(put)
+                    .build(),
+            );
+        }
+        for artifact_id in &plan.deletes {
+            let delete = aws_sdk_dynamodb::types::Delete::builder()
+                .table_name(&self.config.events_table)
+                .key("pk", AttributeValue::S(art_pk.to_string()))
+                .key("sk", AttributeValue::S(artifact_id.to_string()))
+                .build()
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            items.push(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .delete(delete)
+                    .build(),
+            );
+        }
+        Ok(items)
+    }
+
+    /// Guard the DynamoDB 100-item `TransactWriteItems` cap. The task
+    /// item plus event items already occupy a few slots, so a write
+    /// touching too many artifacts is rejected rather than silently
+    /// truncated (which would break replace semantics).
+    fn check_artifact_transaction_cap(
+        artifact_item_count: usize,
+        other_items: usize,
+    ) -> Result<(), A2aStorageError> {
+        const MAX: usize = 100;
+        if artifact_item_count + other_items > MAX {
+            return Err(A2aStorageError::DatabaseError(format!(
+                "artifact write exceeds DynamoDB transaction cap: {artifact_item_count} artifact items + {other_items} other items > {MAX}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Query a task's artifact partition into an id→artifact map.
+    async fn query_artifacts(
+        &self,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<std::collections::HashMap<String, turul_a2a_proto::Artifact>, A2aStorageError> {
+        let art_pk = Self::artifact_pk(tenant, task_id);
+        let mut bodies = std::collections::HashMap::new();
+        let mut last_key: Option<std::collections::HashMap<String, AttributeValue>> = None;
+        loop {
+            let mut query = self
+                .client
+                .query()
+                .table_name(&self.config.events_table)
+                .key_condition_expression("pk = :pk")
+                .expression_attribute_values(":pk", AttributeValue::S(art_pk.clone()));
+            if let Some(start) = last_key.take() {
+                query = query.set_exclusive_start_key(Some(start));
+            }
+            let out = query
+                .send()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            for item in out.items.unwrap_or_default() {
+                if let (Some(id), Some(body)) = (
+                    item.get("artifactId").and_then(|v| v.as_s().ok()),
+                    item.get("artifactJson").and_then(|v| v.as_s().ok()),
+                ) {
+                    bodies.insert(id.clone(), super::artifacts::artifact_from_json(body)?);
+                }
+            }
+            match out.last_evaluated_key {
+                Some(k) if !k.is_empty() => last_key = Some(k),
+                _ => break,
+            }
+        }
+        Ok(bodies)
+    }
+
+    /// Delete every artifact item in a task's artifact partition,
+    /// looping `BatchWriteItem` in chunks of 25 and retrying unprocessed
+    /// keys. Returns `Err` on failure so the caller can leave the task
+    /// item intact and retry.
+    async fn delete_artifact_partition(
+        &self,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<(), A2aStorageError> {
+        let art_pk = Self::artifact_pk(tenant, task_id);
+
+        // Collect sort keys (artifact ids) in the partition.
+        let mut sks: Vec<String> = Vec::new();
+        let mut last_key: Option<std::collections::HashMap<String, AttributeValue>> = None;
+        loop {
+            let mut query = self
+                .client
+                .query()
+                .table_name(&self.config.events_table)
+                .key_condition_expression("pk = :pk")
+                .projection_expression("sk")
+                .expression_attribute_values(":pk", AttributeValue::S(art_pk.clone()));
+            if let Some(start) = last_key.take() {
+                query = query.set_exclusive_start_key(Some(start));
+            }
+            let out = query
+                .send()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            for item in out.items.unwrap_or_default() {
+                if let Some(sk) = item.get("sk").and_then(|v| v.as_s().ok()) {
+                    sks.push(sk.clone());
+                }
+            }
+            match out.last_evaluated_key {
+                Some(k) if !k.is_empty() => last_key = Some(k),
+                _ => break,
+            }
+        }
+
+        for chunk in sks.chunks(25) {
+            let mut requests: Vec<aws_sdk_dynamodb::types::WriteRequest> = chunk
+                .iter()
+                .map(|sk| {
+                    let key = std::collections::HashMap::from([
+                        ("pk".to_string(), AttributeValue::S(art_pk.clone())),
+                        ("sk".to_string(), AttributeValue::S(sk.clone())),
+                    ]);
+                    aws_sdk_dynamodb::types::WriteRequest::builder()
+                        .delete_request(
+                            aws_sdk_dynamodb::types::DeleteRequest::builder()
+                                .set_key(Some(key))
+                                .build()
+                                .expect("delete request key set"),
+                        )
+                        .build()
+                })
+                .collect();
+
+            // Retry unprocessed items until the batch fully drains.
+            while !requests.is_empty() {
+                let out = self
+                    .client
+                    .batch_write_item()
+                    .request_items(self.config.events_table.clone(), requests.clone())
+                    .send()
+                    .await
+                    .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+                requests = out
+                    .unprocessed_items
+                    .and_then(|mut m| m.remove(&self.config.events_table))
+                    .unwrap_or_default();
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the stored artifact manifest for a task. An absent attribute
+    /// (legacy item) reconciles against an empty prior set.
+    async fn fetch_stored_manifest(
+        &self,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<Vec<super::artifacts::ManifestEntry>, A2aStorageError> {
+        let pk = Self::task_key(tenant, task_id);
+        let out = self
+            .client
+            .get_item()
+            .consistent_read(true)
+            .table_name(&self.config.tasks_table)
+            .key("pk", AttributeValue::S(pk))
+            .projection_expression("artifactManifest")
+            .send()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+        let manifest_json = out.item.and_then(|i| {
+            i.get("artifactManifest")
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+        });
+        match manifest_json {
+            Some(json) => super::artifacts::manifest_from_json(&json),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Reassemble a full task from its stored blob and manifest string.
+    /// A missing manifest is a legacy item whose artifacts are inline.
+    async fn rehydrate_task(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        blob: &str,
+        manifest_json: Option<&str>,
+    ) -> Result<Task, A2aStorageError> {
+        let manifest = match manifest_json {
+            None => return Self::task_from_json(blob),
+            Some(json) => super::artifacts::manifest_from_json(json)?,
+        };
+        let mut proto: turul_a2a_proto::Task = serde_json::from_str(blob)
+            .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
+        if !manifest.is_empty() {
+            let bodies = self.query_artifacts(tenant, task_id).await?;
+            proto.artifacts = super::artifacts::rehydrate_in_manifest_order(&manifest, bodies);
+        }
+        Task::try_from(proto).map_err(A2aStorageError::TypeError)
+    }
+
     /// DynamoDB range-key form for an event row.
     ///
     /// The events table uses `pk` (HASH) + `sk` (RANGE). The sort key
@@ -308,27 +604,56 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         task: Task,
     ) -> Result<Task, A2aStorageError> {
         let pk = Self::task_key(tenant, task.id());
-        let json = Self::task_to_json(&task)?;
+        let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
+        let plan = super::artifacts::reconcile(&artifacts, &[])?;
+        let manifest_json = super::artifacts::manifest_to_json(&plan.manifest)?;
 
-        let item = Self::build_task_item(
+        let mut item = Self::build_task_item(
             &pk,
             tenant,
             task.id(),
             owner,
             task.context_id(),
             &state_str,
-            &json,
+            &blob,
             None,
             Self::ttl_epoch(self.config.task_ttl_seconds),
         );
-        self.client
-            .put_item()
-            .table_name(&self.config.tasks_table)
-            .set_item(Some(item))
-            .send()
-            .await
-            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+        item.insert("artifactManifest".into(), AttributeValue::S(manifest_json));
+
+        if plan.writes.is_empty() {
+            // No artifact bodies to write — a plain PutItem keeps the
+            // common no-artifact create at single (non-transactional) cost.
+            self.client
+                .put_item()
+                .table_name(&self.config.tasks_table)
+                .set_item(Some(item))
+                .send()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+        } else {
+            let art_pk = Self::artifact_pk(tenant, task.id());
+            let artifact_items = self.artifact_transact_items(&art_pk, &plan)?;
+            Self::check_artifact_transaction_cap(artifact_items.len(), 1)?;
+            let task_put = aws_sdk_dynamodb::types::Put::builder()
+                .table_name(&self.config.tasks_table)
+                .set_item(Some(item))
+                .build()
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            let mut transact = vec![
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(task_put)
+                    .build(),
+            ];
+            transact.extend(artifact_items);
+            self.client
+                .transact_write_items()
+                .set_transact_items(Some(transact))
+                .send()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+        }
 
         Ok(task)
     }
@@ -384,7 +709,10 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .and_then(|v| v.as_s().ok())
             .ok_or_else(|| A2aStorageError::DatabaseError("Missing task_json".into()))?;
 
-        let task = Self::task_from_json(json)?;
+        let manifest_json = item.get("artifactManifest").and_then(|v| v.as_s().ok());
+        let task = self
+            .rehydrate_task(tenant, task_id, json, manifest_json.map(|s| s.as_str()))
+            .await?;
         Ok(Some(Self::trim_task(task, history_length, true)))
     }
 
@@ -395,37 +723,86 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         task: Task,
     ) -> Result<(), A2aStorageError> {
         let pk = Self::task_key(tenant, task.id());
-        let json = Self::task_to_json(&task)?;
+        let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
+
+        let stored = self.fetch_stored_manifest(tenant, task.id()).await?;
+        let plan = super::artifacts::reconcile(&artifacts, &stored)?;
+        let manifest_json = super::artifacts::manifest_to_json(&plan.manifest)?;
 
         // Conditional write: only succeeds if the item exists AND owner matches.
         // This prevents ownership transfer and ensures isolation.
-        let item = Self::build_task_item(
+        let mut item = Self::build_task_item(
             &pk,
             tenant,
             task.id(),
             owner,
             task.context_id(),
             &state_str,
-            &json,
+            &blob,
             None,
             Self::ttl_epoch(self.config.task_ttl_seconds),
         );
-        let result = self
-            .client
-            .put_item()
-            .table_name(&self.config.tasks_table)
-            .set_item(Some(item))
-            .condition_expression("attribute_exists(pk) AND #o = :expected_owner")
-            .expression_attribute_names("#o", "owner")
-            .expression_attribute_values(":expected_owner", AttributeValue::S(owner.to_string()))
-            .send()
-            .await;
+        item.insert("artifactManifest".into(), AttributeValue::S(manifest_json));
+
+        let artifact_items = if plan.writes.is_empty() && plan.deletes.is_empty() {
+            Vec::new()
+        } else {
+            let art_pk = Self::artifact_pk(tenant, task.id());
+            self.artifact_transact_items(&art_pk, &plan)?
+        };
+
+        // Both write paths map their distinct SDK error types to the
+        // debug string so the shared ConditionalCheckFailed → OwnerMismatch
+        // classification below applies uniformly.
+        let result: Result<(), String> = if artifact_items.is_empty() {
+            // No artifact changes — a plain conditional PutItem keeps the
+            // status/history update at single (non-transactional) cost.
+            self.client
+                .put_item()
+                .table_name(&self.config.tasks_table)
+                .set_item(Some(item))
+                .condition_expression("attribute_exists(pk) AND #o = :expected_owner")
+                .expression_attribute_names("#o", "owner")
+                .expression_attribute_values(
+                    ":expected_owner",
+                    AttributeValue::S(owner.to_string()),
+                )
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
+        } else {
+            Self::check_artifact_transaction_cap(artifact_items.len(), 1)?;
+            let task_put = aws_sdk_dynamodb::types::Put::builder()
+                .table_name(&self.config.tasks_table)
+                .set_item(Some(item))
+                .condition_expression("attribute_exists(pk) AND #o = :expected_owner")
+                .expression_attribute_names("#o", "owner")
+                .expression_attribute_values(
+                    ":expected_owner",
+                    AttributeValue::S(owner.to_string()),
+                )
+                .build()
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            let mut transact = vec![
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(task_put)
+                    .build(),
+            ];
+            transact.extend(artifact_items);
+            self.client
+                .transact_write_items()
+                .set_transact_items(Some(transact))
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
+        };
 
         match result {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let err_str = e.to_string();
+            Ok(()) => Ok(()),
+            Err(err_str) => {
                 if err_str.contains("ConditionalCheckFailed") {
                     Err(A2aStorageError::OwnerMismatch {
                         task_id: task.id().to_string(),
@@ -448,6 +825,12 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         if existing.is_none() {
             return Ok(false);
         }
+
+        // Artifacts first, task last: delete the artifact partition's
+        // items, then the task item. Any artifact-cleanup failure
+        // surfaces as Err (never a silent partial success), leaving the
+        // task item intact so the call is safely retryable.
+        self.delete_artifact_partition(tenant, task_id).await?;
 
         let pk = Self::task_key(tenant, task_id);
         self.client
@@ -500,8 +883,10 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         let items = result.items.unwrap_or_default();
         let total_size = items.len() as i32;
 
-        // Sort by updated_at DESC, task_id DESC (spec §3.1.4 MUST)
-        let mut tasks_with_times: Vec<(Task, String)> = items
+        // Sort by updated_at DESC, task_id DESC (spec §3.1.4 MUST). The
+        // task is parsed from the (possibly artifact-free) blob; the
+        // manifest is carried so a requested page can rehydrate bodies.
+        let mut tasks_with_times: Vec<(Task, String, Option<String>)> = items
             .iter()
             .filter_map(|item| {
                 let task = item
@@ -513,10 +898,14 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
                     .and_then(|v| v.as_s().ok())
                     .cloned()
                     .unwrap_or_default();
-                Some((task, updated_at))
+                let manifest_json = item
+                    .get("artifactManifest")
+                    .and_then(|v| v.as_s().ok())
+                    .cloned();
+                Some((task, updated_at, manifest_json))
             })
             .collect();
-        tasks_with_times.sort_by(|(a_task, a_time), (b_task, b_time)| {
+        tasks_with_times.sort_by(|(a_task, a_time, _), (b_task, b_time, _)| {
             b_time
                 .cmp(a_time)
                 .then_with(|| b_task.id().cmp(a_task.id()))
@@ -527,29 +916,43 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             if let Some((cursor_time, cursor_id)) = token.split_once('|') {
                 tasks_with_times
                     .iter()
-                    .position(|(t, time)| (time.as_str(), t.id()) < (cursor_time, cursor_id))
+                    .position(|(t, time, _)| (time.as_str(), t.id()) < (cursor_time, cursor_id))
                     .unwrap_or(tasks_with_times.len())
             } else {
                 tasks_with_times
                     .iter()
-                    .position(|(t, _)| t.id() < token.as_str())
+                    .position(|(t, _, _)| t.id() < token.as_str())
                     .unwrap_or(tasks_with_times.len())
             }
         } else {
             0
         };
 
+        // Artifacts are fetched only when requested. Excluded listings
+        // never read artifact items: separated blobs carry no bodies, and
+        // trimming clears any inline bodies on legacy rows.
         let include_artifacts = filter.include_artifacts.unwrap_or(false);
         let end_idx = (start_idx + page_size as usize).min(tasks_with_times.len());
-        let page_tasks: Vec<Task> = tasks_with_times[start_idx..end_idx]
-            .iter()
-            .map(|(t, _)| Self::trim_task(t.clone(), filter.history_length, include_artifacts))
-            .collect();
+        let mut page_tasks: Vec<Task> = Vec::with_capacity(end_idx - start_idx);
+        for (task, _, manifest_json) in &tasks_with_times[start_idx..end_idx] {
+            let task = if include_artifacts {
+                let blob = Self::task_to_json(task)?;
+                self.rehydrate_task(tenant, task.id(), &blob, manifest_json.as_deref())
+                    .await?
+            } else {
+                task.clone()
+            };
+            page_tasks.push(Self::trim_task(
+                task,
+                filter.history_length,
+                include_artifacts,
+            ));
+        }
 
         let next_page_token = if end_idx < tasks_with_times.len() {
             tasks_with_times
                 .get(end_idx - 1)
-                .map(|(t, updated_at)| format!("{}|{}", updated_at, t.id()))
+                .map(|(t, updated_at, _)| format!("{}|{}", updated_at, t.id()))
                 .unwrap_or_default()
         } else {
             String::new()
@@ -570,10 +973,44 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         owner: &str,
         new_status: TaskStatus,
     ) -> Result<Task, A2aStorageError> {
-        let task = self
-            .get_task(tenant, task_id, owner, None)
-            .await?
+        // Status transitions operate on the raw stored item via an
+        // UpdateItem that rewrites only the status fields. The manifest
+        // and latestEventSequence are left untouched, so artifact records
+        // are never rewritten (separated blobs stay artifact-free; legacy
+        // blobs keep their inline artifacts). The returned task is
+        // rehydrated so callers still observe artifacts.
+        let pk = Self::task_key(tenant, task_id);
+        let out = self
+            .client
+            .get_item()
+            .consistent_read(true)
+            .table_name(&self.config.tasks_table)
+            .key("pk", AttributeValue::S(pk.clone()))
+            .send()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+        let item = out
+            .item
             .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?;
+
+        let stored_owner = item
+            .get("owner")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default();
+        if stored_owner != owner {
+            return Err(A2aStorageError::TaskNotFound(task_id.to_string()));
+        }
+
+        let blob = item
+            .get("taskJson")
+            .and_then(|v| v.as_s().ok())
+            .ok_or_else(|| A2aStorageError::DatabaseError("Missing task_json".into()))?;
+        let manifest_json = item
+            .get("artifactManifest")
+            .and_then(|v| v.as_s().ok())
+            .cloned();
+        let task = Self::task_from_json(blob)?;
 
         let current_state = task
             .status()
@@ -598,8 +1035,37 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         let mut proto = task.as_proto().clone();
         proto.status = Some(new_status.into_proto());
         let updated = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
-        self.update_task(tenant, owner, updated.clone()).await?;
-        Ok(updated)
+        let new_blob = Self::task_to_json(&updated)?;
+        let state_str = Self::status_state_str(&updated);
+
+        let mut update = self
+            .client
+            .update_item()
+            .table_name(&self.config.tasks_table)
+            .key("pk", AttributeValue::S(pk))
+            .condition_expression("attribute_exists(pk) AND #o = :owner")
+            .expression_attribute_names("#o", "owner")
+            .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()))
+            .expression_attribute_values(":blob", AttributeValue::S(new_blob.clone()))
+            .expression_attribute_values(":state", AttributeValue::S(state_str))
+            .expression_attribute_values(":ts", AttributeValue::S(Self::now_iso()));
+        update = if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
+            update
+                .update_expression(
+                    "SET taskJson = :blob, statusState = :state, updatedAt = :ts, #ttl = :ttl",
+                )
+                .expression_attribute_names("#ttl", "ttl")
+                .expression_attribute_values(":ttl", ttl)
+        } else {
+            update.update_expression("SET taskJson = :blob, statusState = :state, updatedAt = :ts")
+        };
+        update
+            .send()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+
+        self.rehydrate_task(tenant, task_id, &new_blob, manifest_json.as_deref())
+            .await
     }
 
     async fn append_message(
@@ -1359,8 +1825,10 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         events: Vec<StreamEvent>,
     ) -> Result<(Task, Vec<u64>), A2aStorageError> {
         let pk = Self::task_key(tenant, task.id());
-        let task_json = Self::task_to_json(&task)?;
+        let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
+        let plan = super::artifacts::reconcile(&artifacts, &[])?;
+        let manifest_json = super::artifacts::manifest_to_json(&plan.manifest)?;
 
         // Sequence allocation: create_task_with_events always starts
         // at seq=1 (no prior events for a fresh task), so the max
@@ -1368,20 +1836,21 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let sequences: Vec<u64> = (1..=events.len() as u64).collect();
         let latest_event_sequence = sequences.last().copied().unwrap_or(0);
 
-        // Build TransactWriteItems: task put + event puts. The task
-        // put carries `latestEventSequence` directly so
-        // one Put covers the causal-floor maintenance.
-        let task_item = Self::build_task_item(
+        // Build TransactWriteItems: task put + artifact puts + event puts.
+        // The task put carries `latestEventSequence` directly so one Put
+        // covers the causal-floor maintenance, plus the artifact manifest.
+        let mut task_item = Self::build_task_item(
             &pk,
             tenant,
             task.id(),
             owner,
             task.context_id(),
             &state_str,
-            &task_json,
+            &blob,
             Some(latest_event_sequence),
             Self::ttl_epoch(self.config.task_ttl_seconds),
         );
+        task_item.insert("artifactManifest".into(), AttributeValue::S(manifest_json));
         let task_put = aws_sdk_dynamodb::types::Put::builder()
             .table_name(&self.config.tasks_table)
             .set_item(Some(task_item));
@@ -1394,6 +1863,11 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 )
                 .build(),
         ];
+
+        let art_pk = Self::artifact_pk(tenant, task.id());
+        let artifact_items = self.artifact_transact_items(&art_pk, &plan)?;
+        Self::check_artifact_transaction_cap(artifact_items.len(), 1 + events.len())?;
+        items.extend(artifact_items);
 
         for (i, event) in events.iter().enumerate() {
             let seq = sequences[i];
@@ -1441,11 +1915,39 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
     ) -> Result<(Task, Vec<u64>), A2aStorageError> {
         let pk = Self::task_key(tenant, task_id);
 
-        // Read current task for validation
-        let task = self
-            .get_task(tenant, task_id, owner, None)
-            .await?
+        // Read the raw item (consistent) for validation. The blob is used
+        // raw: status transitions never rewrite artifact records, so the
+        // separated layout's stripped blob stays stripped and the manifest
+        // is carried forward unchanged.
+        let read = self
+            .client
+            .get_item()
+            .consistent_read(true)
+            .table_name(&self.config.tasks_table)
+            .key("pk", AttributeValue::S(pk.clone()))
+            .send()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+        let item = read
+            .item
             .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?;
+        let stored_owner = item
+            .get("owner")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default();
+        if stored_owner != owner {
+            return Err(A2aStorageError::TaskNotFound(task_id.to_string()));
+        }
+        let blob = item
+            .get("taskJson")
+            .and_then(|v| v.as_s().ok())
+            .ok_or_else(|| A2aStorageError::DatabaseError("Missing task_json".into()))?;
+        let manifest_json = item
+            .get("artifactManifest")
+            .and_then(|v| v.as_s().ok())
+            .cloned();
+        let task = Self::task_from_json(blob)?;
 
         let current_state = task
             .status()
@@ -1470,7 +1972,8 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             },
         )?;
 
-        // Build updated task
+        // Build updated task from the raw (artifact-free for separated)
+        // blob, changing only status.
         let mut proto = task.as_proto().clone();
         proto.status = Some(new_status.into_proto());
         let updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
@@ -1495,7 +1998,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         // instance may have committed a terminal for this pk — the
         // condition-expression rejects our write atomically at the
         // backend, preserving the single-terminal-writer invariant.
-        let task_item = Self::build_task_item(
+        let mut task_item = Self::build_task_item(
             &pk,
             tenant,
             task_id,
@@ -1506,6 +2009,15 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             Some(new_latest_event_sequence),
             Self::ttl_epoch(self.config.task_ttl_seconds),
         );
+        // Preserve the artifact manifest across the status write so the
+        // separated layout's bodies remain reachable. Absent for legacy
+        // items (their artifacts stay inline in the blob).
+        if let Some(ref manifest) = manifest_json {
+            task_item.insert(
+                "artifactManifest".into(),
+                AttributeValue::S(manifest.clone()),
+            );
+        }
         let mut items = vec![
             aws_sdk_dynamodb::types::TransactWriteItem::builder()
                 .put(
@@ -1643,7 +2155,15 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             .await;
 
         match send_result {
-            Ok(_) => Ok((updated_task, sequences)),
+            Ok(_) => {
+                // The write kept the blob artifact-free for separated rows;
+                // rehydrate the returned task so callers (push dispatch,
+                // yielded-result handlers) observe its artifacts.
+                let rehydrated = self
+                    .rehydrate_task(tenant, task_id, &task_json, manifest_json.as_deref())
+                    .await?;
+                Ok((rehydrated, sequences))
+            }
             Err(err) => {
                 // Detect the task-item condition failure — either the owner
                 // check or the non-terminal CAS failed. Re-fetch the task to
@@ -1694,8 +2214,12 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         events: Vec<StreamEvent>,
     ) -> Result<Vec<u64>, A2aStorageError> {
         let pk = Self::task_key(tenant, task.id());
-        let task_json = Self::task_to_json(&task)?;
+        let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
+
+        let stored = self.fetch_stored_manifest(tenant, task.id()).await?;
+        let plan = super::artifacts::reconcile(&artifacts, &stored)?;
+        let manifest_json = super::artifacts::manifest_to_json(&plan.manifest)?;
 
         // Get current max sequence AND prior latest_event_sequence:
         // a full-replacement Put must not regress the causal floor
@@ -1706,21 +2230,22 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let new_latest_event_sequence = prior_latest.max(max_seq + events.len() as u64);
 
         // Build TransactWriteItems: task put (with owner check +
-        // terminal CAS) + event puts. The ConditionExpression rejects
-        // writes against a task whose persisted statusState is already
-        // terminal, protecting against full-task replacement
-        // clobbering a concurrent terminal commit.
-        let task_item = Self::build_task_item(
+        // terminal CAS) + artifact puts/deletes + event puts. The
+        // ConditionExpression rejects writes against a task whose
+        // persisted statusState is already terminal, protecting against
+        // full-task replacement clobbering a concurrent terminal commit.
+        let mut task_item = Self::build_task_item(
             &pk,
             tenant,
             task.id(),
             owner,
             task.context_id(),
             &state_str,
-            &task_json,
+            &blob,
             Some(new_latest_event_sequence),
             Self::ttl_epoch(self.config.task_ttl_seconds),
         );
+        task_item.insert("artifactManifest".into(), AttributeValue::S(manifest_json));
         let task_put = aws_sdk_dynamodb::types::Put::builder()
             .table_name(&self.config.tasks_table)
             .set_item(Some(task_item))
@@ -1743,6 +2268,11 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 )
                 .build(),
         ];
+
+        let art_pk = Self::artifact_pk(tenant, task.id());
+        let artifact_items = self.artifact_transact_items(&art_pk, &plan)?;
+        Self::check_artifact_transaction_cap(artifact_items.len(), 1 + events.len())?;
+        items.extend(artifact_items);
 
         let mut sequences = Vec::with_capacity(events.len());
         for (i, event) in events.iter().enumerate() {
@@ -3706,6 +4236,280 @@ mod tests {
     async fn test_artifact_chunk_semantics() {
         skip_unless_dynamodb_env!(s);
         parity_tests::test_artifact_chunk_semantics(&s).await;
+    }
+
+    // Artifact storage separation contract scenarios
+
+    #[tokio::test]
+    async fn test_artifact_separation_roundtrip() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_artifact_separation_roundtrip(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_artifact_chunks_survive_status_transition() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_artifact_chunks_survive_status_transition(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_artifact_removal_via_full_task_write() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_artifact_removal_via_full_task_write(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_artifact_mutation_bumps_list_order() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_artifact_mutation_bumps_list_order(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_include_artifacts_branches() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_list_include_artifacts_branches(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_create_task_with_artifacts() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_create_task_with_artifacts(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_task_removes_artifact_records() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_delete_task_removes_artifact_records(&s).await;
+    }
+
+    /// Backend shape assertion: the task item carries no
+    /// artifact bodies in taskJson, the artifact lives in the events
+    /// table under the `art|`-namespaced partition, and a status
+    /// transition does not rewrite the artifact item.
+    #[tokio::test]
+    async fn test_status_transition_does_not_rewrite_artifact_item() {
+        skip_unless_dynamodb_env!(s);
+        let tenant = s.scoped_tenant("default");
+        s.inner
+            .create_task(
+                &tenant,
+                "owner",
+                Task::new("ddb-shape-1", TaskStatus::new(TaskState::Submitted))
+                    .with_context_id("ctx"),
+            )
+            .await
+            .unwrap();
+        s.inner
+            .append_artifact(
+                &tenant,
+                "ddb-shape-1",
+                "owner",
+                Artifact::new("art-1", vec![turul_a2a_types::Part::text("body")]),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Task item: taskJson has no artifact bodies, manifest present.
+        let task_pk = DynamoDbA2aStorage::task_key(&tenant, "ddb-shape-1");
+        let task_item = s
+            .inner
+            .client
+            .get_item()
+            .table_name(&s.inner.config.tasks_table)
+            .key("pk", AttributeValue::S(task_pk))
+            .send()
+            .await
+            .unwrap()
+            .item
+            .unwrap();
+        let blob = task_item
+            .get("taskJson")
+            .and_then(|v| v.as_s().ok())
+            .unwrap();
+        let blob_task: turul_a2a_proto::Task = serde_json::from_str(blob).unwrap();
+        assert!(blob_task.artifacts.is_empty());
+        assert!(task_item.contains_key("artifactManifest"));
+
+        // Artifact item lives in the events table under art| partition.
+        let art_pk = DynamoDbA2aStorage::artifact_pk(&tenant, "ddb-shape-1");
+        let art_item = s
+            .inner
+            .client
+            .get_item()
+            .table_name(&s.inner.config.events_table)
+            .key("pk", AttributeValue::S(art_pk.clone()))
+            .key("sk", AttributeValue::S("art-1".into()))
+            .send()
+            .await
+            .unwrap()
+            .item
+            .unwrap();
+        let fp_before = art_item
+            .get("fingerprint")
+            .and_then(|v| v.as_s().ok())
+            .unwrap()
+            .clone();
+
+        s.inner
+            .update_task_status(
+                &tenant,
+                "ddb-shape-1",
+                "owner",
+                TaskStatus::new(TaskState::Working),
+            )
+            .await
+            .unwrap();
+
+        let art_after = s
+            .inner
+            .client
+            .get_item()
+            .table_name(&s.inner.config.events_table)
+            .key("pk", AttributeValue::S(art_pk))
+            .key("sk", AttributeValue::S("art-1".into()))
+            .send()
+            .await
+            .unwrap()
+            .item
+            .unwrap();
+        let fp_after = art_after
+            .get("fingerprint")
+            .and_then(|v| v.as_s().ok())
+            .unwrap()
+            .clone();
+        assert_eq!(
+            fp_before, fp_after,
+            "status transition must not rewrite artifact item"
+        );
+    }
+
+    /// A pre-0.1.30 task item stores its artifacts inline in taskJson with
+    /// no artifactManifest attribute. It must read correctly, keep its
+    /// inline artifacts through a status transition (no migration on
+    /// status), and migrate to the separated layout on a full-task write.
+    #[tokio::test]
+    async fn test_legacy_inline_artifact_item_reads_and_migrates() {
+        skip_unless_dynamodb_env!(s);
+        let tenant = s.scoped_tenant("default");
+
+        // Seed a legacy item directly: inline artifact in taskJson, no
+        // artifactManifest attribute.
+        let mut legacy =
+            Task::new("ddb-legacy-1", TaskStatus::new(TaskState::Submitted)).with_context_id("ctx");
+        legacy.push_text_artifact("art-legacy", "Result", "legacy body");
+        let pk = DynamoDbA2aStorage::task_key(&tenant, "ddb-legacy-1");
+        let legacy_json = DynamoDbA2aStorage::task_to_json(&legacy).unwrap();
+        let item = std::collections::HashMap::from([
+            ("pk".to_string(), AttributeValue::S(pk.clone())),
+            ("tenant".to_string(), AttributeValue::S(tenant.clone())),
+            (
+                "taskId".to_string(),
+                AttributeValue::S("ddb-legacy-1".into()),
+            ),
+            ("owner".to_string(), AttributeValue::S("owner".into())),
+            ("contextId".to_string(), AttributeValue::S("ctx".into())),
+            (
+                "statusState".to_string(),
+                AttributeValue::S("Submitted".into()),
+            ),
+            ("taskJson".to_string(), AttributeValue::S(legacy_json)),
+            (
+                "updatedAt".to_string(),
+                AttributeValue::S(DynamoDbA2aStorage::now_iso()),
+            ),
+        ]);
+        s.inner
+            .client
+            .put_item()
+            .table_name(&s.inner.config.tasks_table)
+            .set_item(Some(item))
+            .send()
+            .await
+            .unwrap();
+
+        // Legacy read returns the inline artifact.
+        let task = s
+            .inner
+            .get_task(&tenant, "ddb-legacy-1", "owner", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.artifacts().len(), 1);
+        assert_eq!(task.artifacts()[0].artifact_id, "art-legacy");
+
+        // Status transition preserves inline artifacts and stays legacy.
+        s.inner
+            .update_task_status(
+                &tenant,
+                "ddb-legacy-1",
+                "owner",
+                TaskStatus::new(TaskState::Working),
+            )
+            .await
+            .unwrap();
+        let after_status = s
+            .inner
+            .client
+            .get_item()
+            .table_name(&s.inner.config.tasks_table)
+            .key("pk", AttributeValue::S(pk.clone()))
+            .send()
+            .await
+            .unwrap()
+            .item
+            .unwrap();
+        assert!(
+            !after_status.contains_key("artifactManifest"),
+            "status transition must not migrate a legacy item"
+        );
+        let task = s
+            .inner
+            .get_task(&tenant, "ddb-legacy-1", "owner", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            task.artifacts().len(),
+            1,
+            "artifact survives status transition"
+        );
+
+        // First full-task write migrates to the separated layout.
+        s.inner.update_task(&tenant, "owner", task).await.unwrap();
+        let after_write = s
+            .inner
+            .client
+            .get_item()
+            .table_name(&s.inner.config.tasks_table)
+            .key("pk", AttributeValue::S(pk))
+            .send()
+            .await
+            .unwrap()
+            .item
+            .unwrap();
+        assert!(
+            after_write.contains_key("artifactManifest"),
+            "full-task write must migrate the item to the separated layout"
+        );
+        let blob = after_write
+            .get("taskJson")
+            .and_then(|v| v.as_s().ok())
+            .unwrap();
+        let blob_task: turul_a2a_proto::Task = serde_json::from_str(blob).unwrap();
+        assert!(
+            blob_task.artifacts.is_empty(),
+            "migrated blob carries no artifact bodies"
+        );
+        let task = s
+            .inner
+            .get_task(&tenant, "ddb-legacy-1", "owner", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.artifacts().len(), 1);
+        assert_eq!(task.artifacts()[0].artifact_id, "art-legacy");
     }
 
     #[tokio::test]

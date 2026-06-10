@@ -1,3 +1,4 @@
+pub(crate) mod artifacts;
 pub mod atomic;
 pub mod error;
 pub mod event_store;

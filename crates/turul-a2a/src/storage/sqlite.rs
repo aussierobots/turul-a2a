@@ -133,6 +133,39 @@ impl SqliteA2aStorage {
             Err(e) => return Err(A2aStorageError::DatabaseError(e.to_string())),
         }
 
+        // Artifact-separation manifest column. NULL marks a legacy row
+        // whose artifacts (if any) are inline in task_json; a non-NULL
+        // value (JSON array, possibly empty) marks the separated layout
+        // where artifact bodies live in a2a_task_artifacts and task_json
+        // carries no artifact bodies.
+        let alter_manifest = sqlx::query("ALTER TABLE a2a_tasks ADD COLUMN artifact_manifest TEXT")
+            .execute(&self.pool)
+            .await;
+        match alter_manifest {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(A2aStorageError::DatabaseError(e.to_string())),
+        }
+
+        // Separated artifact bodies: one row per (tenant, task_id,
+        // artifact_id). fingerprint lets a full-task write skip rewriting
+        // an unchanged artifact.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS a2a_task_artifacts (
+                tenant TEXT NOT NULL DEFAULT '',
+                task_id TEXT NOT NULL,
+                artifact_id TEXT NOT NULL,
+                artifact_json TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (tenant, task_id, artifact_id)
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS a2a_push_configs (
                 tenant TEXT NOT NULL DEFAULT '',
@@ -267,6 +300,118 @@ impl SqliteA2aStorage {
         Task::try_from(proto)
             .unwrap_or_else(|_| Task::new("err", TaskStatus::new(TaskState::Failed)))
     }
+
+    /// Serialize a task with its artifact bodies stripped out, returning
+    /// the artifact-free JSON blob and the removed artifacts. The blob is
+    /// what the separated layout persists in `task_json`.
+    fn split_task(
+        task: &Task,
+    ) -> Result<(String, Vec<turul_a2a_proto::Artifact>), A2aStorageError> {
+        let mut proto = task.as_proto().clone();
+        let artifacts = std::mem::take(&mut proto.artifacts);
+        let stripped = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+        Ok((Self::task_to_json(&stripped)?, artifacts))
+    }
+
+    /// Execute the artifact writes and deletes of a reconcile plan within
+    /// a transaction. The caller stores `plan.manifest` on the task row.
+    async fn apply_artifact_plan(
+        conn: &mut sqlx::SqliteConnection,
+        tenant: &str,
+        task_id: &str,
+        plan: &super::artifacts::ReconcilePlan,
+    ) -> Result<(), A2aStorageError> {
+        for (artifact, fingerprint) in &plan.writes {
+            let body = super::artifacts::artifact_to_json(artifact)?;
+            sqlx::query(
+                "INSERT INTO a2a_task_artifacts \
+                    (tenant, task_id, artifact_id, artifact_json, fingerprint, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, datetime('now')) \
+                 ON CONFLICT (tenant, task_id, artifact_id) DO UPDATE SET \
+                    artifact_json = excluded.artifact_json, \
+                    fingerprint = excluded.fingerprint, \
+                    updated_at = datetime('now')",
+            )
+            .bind(tenant)
+            .bind(task_id)
+            .bind(&artifact.artifact_id)
+            .bind(&body)
+            .bind(fingerprint)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        }
+        for artifact_id in &plan.deletes {
+            sqlx::query(
+                "DELETE FROM a2a_task_artifacts \
+                 WHERE tenant = ? AND task_id = ? AND artifact_id = ?",
+            )
+            .bind(tenant)
+            .bind(task_id)
+            .bind(artifact_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Read the stored manifest for a task. `None` marks a legacy row
+    /// (NULL manifest) or a missing row; both reconcile against an empty
+    /// prior set.
+    async fn fetch_manifest(
+        conn: &mut sqlx::SqliteConnection,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<Option<Vec<super::artifacts::ManifestEntry>>, A2aStorageError> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT artifact_manifest FROM a2a_tasks WHERE tenant = ? AND task_id = ?",
+        )
+        .bind(tenant)
+        .bind(task_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        match row {
+            Some((Some(json),)) => Ok(Some(super::artifacts::manifest_from_json(&json)?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Reassemble a full task from its stored blob and manifest. A NULL
+    /// manifest is a legacy row whose artifacts are already inline in the
+    /// blob; a non-NULL manifest drives a fetch of the separated bodies.
+    async fn rehydrate_task(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        blob: &str,
+        manifest_json: Option<String>,
+    ) -> Result<Task, A2aStorageError> {
+        let manifest = match manifest_json {
+            None => return Self::task_from_json(blob),
+            Some(json) => super::artifacts::manifest_from_json(&json)?,
+        };
+        let mut proto: turul_a2a_proto::Task = serde_json::from_str(blob)
+            .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
+        if !manifest.is_empty() {
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT artifact_id, artifact_json FROM a2a_task_artifacts \
+                 WHERE tenant = ? AND task_id = ?",
+            )
+            .bind(tenant)
+            .bind(task_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+            let mut bodies = std::collections::HashMap::with_capacity(rows.len());
+            for (id, body) in rows {
+                bodies.insert(id, super::artifacts::artifact_from_json(&body)?);
+            }
+            proto.artifacts = super::artifacts::rehydrate_in_manifest_order(&manifest, bodies);
+        }
+        Task::try_from(proto).map_err(A2aStorageError::TypeError)
+    }
 }
 
 #[async_trait]
@@ -281,21 +426,34 @@ impl A2aTaskStorage for SqliteA2aStorage {
         owner: &str,
         task: Task,
     ) -> Result<Task, A2aStorageError> {
-        let json = Self::task_to_json(&task)?;
+        let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
+        let plan = super::artifacts::reconcile(&artifacts, &[])?;
+        let manifest_json = super::artifacts::manifest_to_json(&plan.manifest)?;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         sqlx::query(
-            "INSERT INTO a2a_tasks (tenant, task_id, owner, task_json, context_id, status_state, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+            "INSERT INTO a2a_tasks (tenant, task_id, owner, task_json, context_id, status_state, artifact_manifest, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
         )
         .bind(tenant)
         .bind(task.id())
         .bind(owner)
-        .bind(&json)
+        .bind(&blob)
         .bind(task.context_id())
         .bind(&state_str)
-        .execute(&self.pool)
+        .bind(&manifest_json)
+        .execute(&mut *tx)
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        Self::apply_artifact_plan(&mut tx, tenant, task.id(), &plan).await?;
+        tx.commit()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         Ok(task)
     }
 
@@ -306,8 +464,9 @@ impl A2aTaskStorage for SqliteA2aStorage {
         owner: &str,
         history_length: Option<i32>,
     ) -> Result<Option<Task>, A2aStorageError> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT task_json FROM a2a_tasks WHERE tenant = ? AND task_id = ? AND owner = ?",
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT task_json, artifact_manifest FROM a2a_tasks \
+             WHERE tenant = ? AND task_id = ? AND owner = ?",
         )
         .bind(tenant)
         .bind(task_id)
@@ -317,8 +476,10 @@ impl A2aTaskStorage for SqliteA2aStorage {
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         match row {
-            Some((json,)) => {
-                let task = Self::task_from_json(&json)?;
+            Some((json, manifest_json)) => {
+                let task = self
+                    .rehydrate_task(tenant, task_id, &json, manifest_json)
+                    .await?;
                 Ok(Some(Self::trim_task(task, history_length, true)))
             }
             None => Ok(None),
@@ -331,25 +492,43 @@ impl A2aTaskStorage for SqliteA2aStorage {
         owner: &str,
         task: Task,
     ) -> Result<(), A2aStorageError> {
-        let json = Self::task_to_json(&task)?;
+        let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+        let stored = Self::fetch_manifest(&mut tx, tenant, task.id())
+            .await?
+            .unwrap_or_default();
+        let plan = super::artifacts::reconcile(&artifacts, &stored)?;
+        let manifest_json = super::artifacts::manifest_to_json(&plan.manifest)?;
+
         let result = sqlx::query(
-            "UPDATE a2a_tasks SET task_json = ?, status_state = ?, context_id = ?, updated_at = datetime('now')
+            "UPDATE a2a_tasks SET task_json = ?, status_state = ?, context_id = ?, artifact_manifest = ?, updated_at = datetime('now')
              WHERE tenant = ? AND task_id = ? AND owner = ?",
         )
-        .bind(&json)
+        .bind(&blob)
         .bind(&state_str)
         .bind(task.context_id())
+        .bind(&manifest_json)
         .bind(tenant)
         .bind(task.id())
         .bind(owner)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(A2aStorageError::TaskNotFound(task.id().to_string()));
         }
+        Self::apply_artifact_plan(&mut tx, tenant, task.id(), &plan).await?;
+        tx.commit()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         Ok(())
     }
 
@@ -359,15 +538,34 @@ impl A2aTaskStorage for SqliteA2aStorage {
         task_id: &str,
         owner: &str,
     ) -> Result<bool, A2aStorageError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         let result =
             sqlx::query("DELETE FROM a2a_tasks WHERE tenant = ? AND task_id = ? AND owner = ?")
                 .bind(tenant)
                 .bind(task_id)
                 .bind(owner)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
-        Ok(result.rows_affected() > 0)
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+        // Remove separated artifact bodies in the same transaction so a
+        // recreated task id cannot inherit ghost artifacts.
+        sqlx::query("DELETE FROM a2a_task_artifacts WHERE tenant = ? AND task_id = ?")
+            .bind(tenant)
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        Ok(true)
     }
 
     async fn list_tasks(&self, filter: TaskFilter) -> Result<TaskListPage, A2aStorageError> {
@@ -417,7 +615,7 @@ impl A2aTaskStorage for SqliteA2aStorage {
             };
             (
                 format!(
-                    "SELECT task_json, updated_at FROM a2a_tasks WHERE {where_clause} \
+                    "SELECT task_json, updated_at, artifact_manifest, task_id FROM a2a_tasks WHERE {where_clause} \
                      AND (updated_at < ? OR (updated_at = ? AND task_id < ?)) \
                      ORDER BY updated_at DESC, task_id DESC LIMIT ?"
                 ),
@@ -426,17 +624,18 @@ impl A2aTaskStorage for SqliteA2aStorage {
         } else {
             (
                 format!(
-                    "SELECT task_json, updated_at FROM a2a_tasks WHERE {where_clause} \
+                    "SELECT task_json, updated_at, artifact_manifest, task_id FROM a2a_tasks WHERE {where_clause} \
                      ORDER BY updated_at DESC, task_id DESC LIMIT ?"
                 ),
                 None,
             )
         };
 
-        let mut select_query =
-            sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(select_sql))
-                .bind(tenant)
-                .bind(owner);
+        let mut select_query = sqlx::query_as::<_, (String, String, Option<String>, String)>(
+            sqlx::AssertSqlSafe(select_sql),
+        )
+        .bind(tenant)
+        .bind(owner);
         if let Some(ref ctx) = filter.context_id {
             select_query = select_query.bind(ctx);
         }
@@ -448,23 +647,38 @@ impl A2aTaskStorage for SqliteA2aStorage {
         }
         select_query = select_query.bind(page_size);
 
-        let rows: Vec<(String, String)> = select_query
+        let rows: Vec<(String, String, Option<String>, String)> = select_query
             .fetch_all(&self.pool)
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
+        // When artifacts are excluded (the default), the blob already
+        // carries no artifact bodies for separated rows, and trimming
+        // clears any inline bodies on legacy rows — so no artifact fetch
+        // is issued. When artifacts are requested, each separated row is
+        // rehydrated from its records.
         let include_artifacts = filter.include_artifacts.unwrap_or(false);
-        let tasks_with_times: Vec<(Task, String)> = rows
-            .iter()
-            .filter_map(|(json, updated_at)| {
-                Self::task_from_json(json).ok().map(|t| {
-                    (
-                        Self::trim_task(t, filter.history_length, include_artifacts),
-                        updated_at.clone(),
-                    )
-                })
-            })
-            .collect();
+        let mut tasks_with_times: Vec<(Task, String)> = Vec::with_capacity(rows.len());
+        for (json, updated_at, manifest_json, row_task_id) in &rows {
+            let task = if include_artifacts {
+                match self
+                    .rehydrate_task(tenant, row_task_id, json, manifest_json.clone())
+                    .await
+                {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                }
+            } else {
+                match Self::task_from_json(json) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                }
+            };
+            tasks_with_times.push((
+                Self::trim_task(task, filter.history_length, include_artifacts),
+                updated_at.clone(),
+            ));
+        }
 
         let tasks: Vec<Task> = tasks_with_times.iter().map(|(t, _)| t.clone()).collect();
 
@@ -492,10 +706,25 @@ impl A2aTaskStorage for SqliteA2aStorage {
         owner: &str,
         new_status: TaskStatus,
     ) -> Result<Task, A2aStorageError> {
-        let task = self
-            .get_task(tenant, task_id, owner, None)
-            .await?
-            .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?;
+        // Status transitions operate on the raw stored blob: they never
+        // touch artifact records (new-layout blobs are already
+        // artifact-free; legacy blobs keep their inline artifacts), so a
+        // transition is cheap regardless of artifact size. The returned
+        // task is rehydrated so callers still observe artifacts.
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT task_json, artifact_manifest FROM a2a_tasks \
+             WHERE tenant = ? AND task_id = ? AND owner = ?",
+        )
+        .bind(tenant)
+        .bind(task_id)
+        .bind(owner)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+        let (blob, manifest_json) =
+            row.ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?;
+        let task = Self::task_from_json(&blob)?;
 
         let current_state = task
             .status()
@@ -520,9 +749,24 @@ impl A2aTaskStorage for SqliteA2aStorage {
         let mut proto = task.as_proto().clone();
         proto.status = Some(new_status.into_proto());
         let updated = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+        let new_blob = Self::task_to_json(&updated)?;
+        let state_str = Self::status_state_str(&updated);
 
-        self.update_task(tenant, owner, updated.clone()).await?;
-        Ok(updated)
+        sqlx::query(
+            "UPDATE a2a_tasks SET task_json = ?, status_state = ?, updated_at = datetime('now')
+             WHERE tenant = ? AND task_id = ? AND owner = ?",
+        )
+        .bind(&new_blob)
+        .bind(&state_str)
+        .bind(tenant)
+        .bind(task_id)
+        .bind(owner)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
+        self.rehydrate_task(tenant, task_id, &new_blob, manifest_json)
+            .await
     }
 
     async fn append_message(
@@ -1125,6 +1369,27 @@ impl A2aEventStore for SqliteA2aStorage {
                     break;
                 }
             }
+
+            // Reap artifact bodies orphaned by the task deletions above.
+            // Not counted in `deleted`: they are sub-records of tasks
+            // already tallied, and the returned total is tasks + events.
+            loop {
+                let n = sqlx::query(
+                    "DELETE FROM a2a_task_artifacts WHERE rowid IN \
+                     (SELECT a.rowid FROM a2a_task_artifacts a \
+                      LEFT JOIN a2a_tasks t \
+                        ON a.tenant = t.tenant AND a.task_id = t.task_id \
+                      WHERE t.task_id IS NULL LIMIT ?)",
+                )
+                .bind(batch)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?
+                .rows_affected();
+                if n < batch as u64 {
+                    break;
+                }
+            }
         }
 
         Ok(deleted)
@@ -1148,8 +1413,10 @@ impl A2aAtomicStore for SqliteA2aStorage {
         task: Task,
         events: Vec<StreamEvent>,
     ) -> Result<(Task, Vec<u64>), A2aStorageError> {
-        let task_json = Self::task_to_json(&task)?;
+        let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
+        let plan = super::artifacts::reconcile(&artifacts, &[])?;
+        let manifest_json = super::artifacts::manifest_to_json(&plan.manifest)?;
 
         let mut tx = self
             .pool
@@ -1159,18 +1426,20 @@ impl A2aAtomicStore for SqliteA2aStorage {
 
         // Insert task
         sqlx::query(
-            "INSERT INTO a2a_tasks (tenant, task_id, owner, task_json, context_id, status_state, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+            "INSERT INTO a2a_tasks (tenant, task_id, owner, task_json, context_id, status_state, artifact_manifest, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
         )
         .bind(tenant)
         .bind(task.id())
         .bind(owner)
-        .bind(&task_json)
+        .bind(&blob)
         .bind(task.context_id())
         .bind(&state_str)
+        .bind(&manifest_json)
         .execute(&mut *tx)
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        Self::apply_artifact_plan(&mut tx, tenant, task.id(), &plan).await?;
 
         // Append events with sequence allocation
         let mut sequences = Vec::with_capacity(events.len());
@@ -1239,9 +1508,12 @@ impl A2aAtomicStore for SqliteA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        // Read current task within transaction
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT task_json FROM a2a_tasks WHERE tenant = ? AND task_id = ? AND owner = ?",
+        // Read current task within transaction. The blob is used raw:
+        // status transitions never rewrite artifact records, so the
+        // separated layout's stripped blob stays stripped.
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT task_json, artifact_manifest FROM a2a_tasks \
+             WHERE tenant = ? AND task_id = ? AND owner = ?",
         )
         .bind(tenant)
         .bind(task_id)
@@ -1250,8 +1522,8 @@ impl A2aAtomicStore for SqliteA2aStorage {
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        let task = match row {
-            Some((json,)) => Self::task_from_json(&json)?,
+        let (task, manifest_json) = match row {
+            Some((json, manifest_json)) => (Self::task_from_json(&json)?, manifest_json),
             None => return Err(A2aStorageError::TaskNotFound(task_id.to_string())),
         };
 
@@ -1425,7 +1697,14 @@ impl A2aAtomicStore for SqliteA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        Ok((updated_task, sequences))
+        // The write kept the blob artifact-free for separated rows;
+        // rehydrate the returned task so callers (push dispatch,
+        // yielded-result handlers) observe its artifacts.
+        let new_blob = Self::task_to_json(&updated_task)?;
+        let rehydrated = self
+            .rehydrate_task(tenant, task_id, &new_blob, manifest_json)
+            .await?;
+        Ok((rehydrated, sequences))
     }
 
     async fn update_task_with_events(
@@ -1435,7 +1714,7 @@ impl A2aAtomicStore for SqliteA2aStorage {
         task: Task,
         events: Vec<StreamEvent>,
     ) -> Result<Vec<u64>, A2aStorageError> {
-        let task_json = Self::task_to_json(&task)?;
+        let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
 
         let mut tx = self
@@ -1444,20 +1723,29 @@ impl A2aAtomicStore for SqliteA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
+        let stored = Self::fetch_manifest(&mut tx, tenant, task.id())
+            .await?
+            .unwrap_or_default();
+        let plan = super::artifacts::reconcile(&artifacts, &stored)?;
+        let manifest_json = super::artifacts::manifest_to_json(&plan.manifest)?;
+
         // Terminal-preservation CAS: the UPDATE's
         // WHERE clause excludes terminal status_state values. If the
         // persisted row is terminal the update matches zero rows;
         // a follow-up SELECT disambiguates "task missing" vs "already
-        // terminal" so the caller gets the right error.
+        // terminal" so the caller gets the right error. Artifact records
+        // are reconciled only after the CAS passes, so a rejected write
+        // leaves no artifact rows behind.
         let result = sqlx::query(
             "UPDATE a2a_tasks
-               SET task_json = ?, status_state = ?, context_id = ?, updated_at = datetime('now')
+               SET task_json = ?, status_state = ?, context_id = ?, artifact_manifest = ?, updated_at = datetime('now')
              WHERE tenant = ? AND task_id = ? AND owner = ?
                AND status_state NOT IN ('Completed', 'Failed', 'Canceled', 'Rejected')",
         )
-        .bind(&task_json)
+        .bind(&blob)
         .bind(&state_str)
         .bind(task.context_id())
+        .bind(&manifest_json)
         .bind(tenant)
         .bind(task.id())
         .bind(owner)
@@ -1485,6 +1773,7 @@ impl A2aAtomicStore for SqliteA2aStorage {
                 None => Err(A2aStorageError::TaskNotFound(task.id().to_string())),
             };
         }
+        Self::apply_artifact_plan(&mut tx, tenant, task.id(), &plan).await?;
 
         // Append events
         let mut sequences = Vec::with_capacity(events.len());
@@ -2338,6 +2627,226 @@ mod tests {
     #[tokio::test]
     async fn test_artifact_chunk_semantics() {
         parity_tests::test_artifact_chunk_semantics(&storage().await).await;
+    }
+
+    // Artifact storage separation contract scenarios
+
+    #[tokio::test]
+    async fn test_artifact_separation_roundtrip() {
+        parity_tests::test_artifact_separation_roundtrip(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_artifact_chunks_survive_status_transition() {
+        parity_tests::test_artifact_chunks_survive_status_transition(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_artifact_removal_via_full_task_write() {
+        parity_tests::test_artifact_removal_via_full_task_write(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_artifact_mutation_bumps_list_order() {
+        parity_tests::test_artifact_mutation_bumps_list_order(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_include_artifacts_branches() {
+        parity_tests::test_list_include_artifacts_branches(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_create_task_with_artifacts() {
+        parity_tests::test_create_task_with_artifacts(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_task_removes_artifact_records() {
+        parity_tests::test_delete_task_removes_artifact_records(&storage().await).await;
+    }
+
+    /// Backend shape assertion: artifact bodies live in
+    /// a2a_task_artifacts, the task blob carries none, and a status
+    /// transition rewrites neither the artifact row nor its timestamp.
+    #[tokio::test]
+    async fn test_status_transition_does_not_rewrite_artifact_row() {
+        let s = storage().await;
+        s.create_task("default", "owner", make_task_sep("shape-1", "ctx"))
+            .await
+            .unwrap();
+        s.append_artifact(
+            "default",
+            "shape-1",
+            "owner",
+            Artifact::new("art-1", vec![turul_a2a_types::Part::text("body")]),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // The task blob carries no artifact bodies; the manifest is set.
+        let (blob, manifest): (String, Option<String>) = sqlx::query_as(
+            "SELECT task_json, artifact_manifest FROM a2a_tasks WHERE task_id = 'shape-1'",
+        )
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+        let blob_task: turul_a2a_proto::Task = serde_json::from_str(&blob).unwrap();
+        assert!(
+            blob_task.artifacts.is_empty(),
+            "separated layout must not keep artifact bodies in task_json"
+        );
+        assert!(manifest.is_some(), "separated row must carry a manifest");
+
+        // The artifact body row exists.
+        let (body_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM a2a_task_artifacts WHERE task_id = 'shape-1'")
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(body_count, 1);
+
+        // Capture the artifact row's updated_at, then transition status.
+        let (before,): (String,) = sqlx::query_as(
+            "SELECT updated_at FROM a2a_task_artifacts WHERE task_id = 'shape-1' AND artifact_id = 'art-1'",
+        )
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+
+        s.update_task_status(
+            "default",
+            "shape-1",
+            "owner",
+            TaskStatus::new(TaskState::Working),
+        )
+        .await
+        .unwrap();
+
+        let (after,): (String,) = sqlx::query_as(
+            "SELECT updated_at FROM a2a_task_artifacts WHERE task_id = 'shape-1' AND artifact_id = 'art-1'",
+        )
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            before, after,
+            "a status transition must not rewrite the artifact row"
+        );
+    }
+
+    fn make_task_sep(id: &str, ctx: &str) -> Task {
+        Task::new(id, TaskStatus::new(TaskState::Submitted)).with_context_id(ctx)
+    }
+
+    /// A pre-0.1.30 task row stores its artifacts inline in task_json with
+    /// no manifest. It must read correctly, keep its inline artifacts
+    /// through a status transition (no migration on status), and migrate
+    /// to the separated layout on the first full-task write.
+    #[tokio::test]
+    async fn test_legacy_inline_artifact_row_reads_and_migrates() {
+        let s = storage().await;
+
+        // Seed a legacy row directly: inline artifact in task_json, NULL
+        // manifest (the artifact_manifest column is simply omitted).
+        let mut legacy = make_task_sep("legacy-1", "ctx");
+        legacy.push_text_artifact("art-legacy", "Result", "legacy body");
+        let legacy_json = SqliteA2aStorage::task_to_json(&legacy).unwrap();
+        sqlx::query(
+            "INSERT INTO a2a_tasks (tenant, task_id, owner, task_json, context_id, status_state, updated_at) \
+             VALUES ('default', 'legacy-1', 'owner', ?, 'ctx', 'Submitted', datetime('now'))",
+        )
+        .bind(&legacy_json)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+
+        // Legacy read returns the inline artifact.
+        let task = s
+            .get_task("default", "legacy-1", "owner", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.artifacts().len(), 1);
+        assert_eq!(task.artifacts()[0].artifact_id, "art-legacy");
+
+        // Status transition preserves inline artifacts and stays legacy:
+        // no separated rows, manifest still NULL.
+        s.update_task_status(
+            "default",
+            "legacy-1",
+            "owner",
+            TaskStatus::new(TaskState::Working),
+        )
+        .await
+        .unwrap();
+        let (manifest_after_status,): (Option<String>,) =
+            sqlx::query_as("SELECT artifact_manifest FROM a2a_tasks WHERE task_id = 'legacy-1'")
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert!(
+            manifest_after_status.is_none(),
+            "status transition must not migrate a legacy row"
+        );
+        let (sep_rows,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM a2a_task_artifacts WHERE task_id = 'legacy-1'")
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            sep_rows, 0,
+            "legacy row must not have separated artifact rows yet"
+        );
+        let task = s
+            .get_task("default", "legacy-1", "owner", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            task.artifacts().len(),
+            1,
+            "artifact survives status transition"
+        );
+
+        // First full-task write migrates to the separated layout.
+        s.update_task("default", "owner", task).await.unwrap();
+        let (manifest_after_write,): (Option<String>,) =
+            sqlx::query_as("SELECT artifact_manifest FROM a2a_tasks WHERE task_id = 'legacy-1'")
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert!(
+            manifest_after_write.is_some(),
+            "full-task write must migrate the row to the separated layout"
+        );
+        let (sep_rows,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM a2a_task_artifacts WHERE task_id = 'legacy-1'")
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(sep_rows, 1, "artifact migrated to a separated row");
+        let (migrated_blob,): (String,) =
+            sqlx::query_as("SELECT task_json FROM a2a_tasks WHERE task_id = 'legacy-1'")
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        let migrated_task: turul_a2a_proto::Task = serde_json::from_str(&migrated_blob).unwrap();
+        assert!(
+            migrated_task.artifacts.is_empty(),
+            "migrated blob must carry no artifact bodies"
+        );
+
+        // Read parity holds after migration.
+        let task = s
+            .get_task("default", "legacy-1", "owner", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.artifacts().len(), 1);
+        assert_eq!(task.artifacts()[0].artifact_id, "art-legacy");
     }
 
     #[tokio::test]

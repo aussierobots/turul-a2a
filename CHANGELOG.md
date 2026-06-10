@@ -4,6 +4,26 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.30] — 2026-06-10
+
+### Changed
+
+- Storage backends now persist task artifacts as separate records instead of inlining them in the task blob (see ADR-027). Status transitions no longer rewrite artifact bodies: on every persistent backend a `submitted → working → completed` step writes only the small task record, not the (potentially large) artifacts. On DynamoDB this removes the dominant write-amplification term — a task carrying a 100 KB artifact previously rewrote that artifact on every status step, in a transactional (double-WCU) put. Read shape is unchanged: `get_task` and `list_tasks` return byte-identical `Task` values, with artifacts rehydrated transparently.
+
+### Added
+
+- New artifact storage per backend: SQLite/PostgreSQL gain an `a2a_task_artifacts` table; DynamoDB stores artifact items in the existing events table under an `art|`-namespaced partition key carrying the task TTL. Both are created/used automatically — **no operator action and no data migration**. Pre-existing tasks keep their inline artifacts and read correctly; they migrate to the separated layout the first time the task is written in full.
+- `list_tasks` with `includeArtifacts = false` (the default) no longer reads artifact bodies at all, lowering read cost on artifact-heavy tables.
+
+### Compatibility
+
+- Backward-compatible patch. Wire contract is unchanged; no adopter code changes. The persisted storage **layout** changes: SQL backends auto-create a new table, DynamoDB writes artifact items under a new partition namespace. Reads remain backward compatible with pre-0.1.30 rows.
+- **Rollback caveat:** a task written under 0.1.30 stores its artifacts as separate records with an artifact-free task blob. Rolling a deployment back to a pre-0.1.30 release would read those tasks without their artifacts (the old code only reads inline bodies). Deployments with short task TTLs carry low exposure; if you must roll back with long-lived tasks present, expect artifact-less reads for tasks written under 0.1.30 until they age out.
+
+### Verification
+
+- In-memory and SQLite artifact-separation parity suites pass live, plus a SQLite shape assertion that a status transition does not rewrite the artifact row. DynamoDB verified live against DynamoDB Local: all artifact-separation scenarios pass, including a shape assertion that the task item carries no artifact bodies and a status transition leaves the artifact item untouched. PostgreSQL has the analogous implementation and is compile-verified; no live PostgreSQL was available this cycle.
+
 ## [0.1.29] — 2026-06-02
 
 ### Fixed

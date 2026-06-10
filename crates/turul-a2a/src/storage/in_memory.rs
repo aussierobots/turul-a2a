@@ -553,12 +553,16 @@ impl A2aTaskStorage for InMemoryA2aStorage {
                 .find(|a| a.artifact_id == artifact.as_proto().artifact_id)
             {
                 existing.parts.extend(artifact.into_proto().parts);
+                // An artifact mutation is a task update: bump updated_at
+                // so ListTasks `updated_at DESC` reflects it.
+                stored.updated_at = now_iso();
                 return Ok(());
             }
         }
 
         // No existing or append=false: add/replace
         stored.task.append_artifact(artifact);
+        stored.updated_at = now_iso();
         Ok(())
     }
 
@@ -1814,6 +1818,43 @@ mod tests {
     #[tokio::test]
     async fn test_artifact_chunk_semantics() {
         parity_tests::test_artifact_chunk_semantics(&storage()).await;
+    }
+
+    // Artifact storage separation contract scenarios
+
+    #[tokio::test]
+    async fn test_artifact_separation_roundtrip() {
+        parity_tests::test_artifact_separation_roundtrip(&storage()).await;
+    }
+
+    #[tokio::test]
+    async fn test_artifact_chunks_survive_status_transition() {
+        parity_tests::test_artifact_chunks_survive_status_transition(&storage()).await;
+    }
+
+    #[tokio::test]
+    async fn test_artifact_removal_via_full_task_write() {
+        parity_tests::test_artifact_removal_via_full_task_write(&storage()).await;
+    }
+
+    #[tokio::test]
+    async fn test_artifact_mutation_bumps_list_order() {
+        parity_tests::test_artifact_mutation_bumps_list_order(&storage()).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_include_artifacts_branches() {
+        parity_tests::test_list_include_artifacts_branches(&storage()).await;
+    }
+
+    #[tokio::test]
+    async fn test_create_task_with_artifacts() {
+        parity_tests::test_create_task_with_artifacts(&storage()).await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_task_removes_artifact_records() {
+        parity_tests::test_delete_task_removes_artifact_records(&storage()).await;
     }
 
     // Event store parity tests

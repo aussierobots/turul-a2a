@@ -4373,3 +4373,324 @@ pub async fn test_late_create_config_stamps_advanced_sequence(
         eligible.configs.iter().map(|c| &c.id).collect::<Vec<_>>()
     );
 }
+
+// =========================================================
+// Artifact storage separation contract scenarios.
+// These assert observable behavior only: backends are free to
+// store artifact bodies inline (in-memory) or as separate
+// records (SQLite, PostgreSQL, DynamoDB); reads must be
+// indistinguishable either way.
+// =========================================================
+
+fn artifact_text(artifact: &turul_a2a_proto::Artifact, part_idx: usize) -> &str {
+    match artifact.parts[part_idx].content.as_ref().unwrap() {
+        turul_a2a_proto::part::Content::Text(t) => t,
+        other => panic!("expected text part, got {other:?}"),
+    }
+}
+
+/// Large artifact + multiple status transitions: the artifact must
+/// survive every transition byte-identically and the task record
+/// rewrite cost must not depend on it (asserted per-backend; here we
+/// pin the observable contract).
+pub async fn test_artifact_separation_roundtrip(storage: &dyn A2aTaskStorage) {
+    let big = "x".repeat(64 * 1024);
+    storage
+        .create_task("default", "owner", make_task("sep-1", "ctx-sep"))
+        .await
+        .unwrap();
+    storage
+        .append_artifact(
+            "default",
+            "sep-1",
+            "owner",
+            make_artifact("art-big", &big),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+    for state in [TaskState::Working, TaskState::Completed] {
+        storage
+            .update_task_status("default", "sep-1", "owner", TaskStatus::new(state))
+            .await
+            .unwrap();
+    }
+
+    let task = storage
+        .get_task("default", "sep-1", "owner", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        task.status().unwrap().state().unwrap(),
+        TaskState::Completed
+    );
+    assert_eq!(task.artifacts().len(), 1);
+    assert_eq!(task.artifacts()[0].artifact_id, "art-big");
+    assert_eq!(artifact_text(&task.artifacts()[0], 0), big);
+}
+
+/// Chunked artifact assembled via append=true stays intact across a
+/// status transition.
+pub async fn test_artifact_chunks_survive_status_transition(storage: &dyn A2aTaskStorage) {
+    storage
+        .create_task("default", "owner", make_task("sep-chunk-1", "ctx"))
+        .await
+        .unwrap();
+    storage
+        .append_artifact(
+            "default",
+            "sep-chunk-1",
+            "owner",
+            make_artifact("art-1", "chunk-1"),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    storage
+        .append_artifact(
+            "default",
+            "sep-chunk-1",
+            "owner",
+            make_artifact("art-1", "chunk-2"),
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+    storage
+        .update_task_status(
+            "default",
+            "sep-chunk-1",
+            "owner",
+            TaskStatus::new(TaskState::Working),
+        )
+        .await
+        .unwrap();
+
+    let task = storage
+        .get_task("default", "sep-chunk-1", "owner", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.artifacts().len(), 1);
+    assert_eq!(task.artifacts()[0].parts.len(), 2);
+    assert_eq!(artifact_text(&task.artifacts()[0], 0), "chunk-1");
+    assert_eq!(artifact_text(&task.artifacts()[0], 1), "chunk-2");
+}
+
+/// Full-task write with a smaller artifact set removes the absent
+/// artifact (replace semantics).
+pub async fn test_artifact_removal_via_full_task_write(storage: &dyn A2aTaskStorage) {
+    storage
+        .create_task("default", "owner", make_task("sep-rm-1", "ctx"))
+        .await
+        .unwrap();
+    for (id, text) in [("art-1", "keep"), ("art-2", "drop")] {
+        storage
+            .append_artifact(
+                "default",
+                "sep-rm-1",
+                "owner",
+                make_artifact(id, text),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    let task = storage
+        .get_task("default", "sep-rm-1", "owner", None)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut proto = task.into_proto();
+    proto.artifacts.retain(|a| a.artifact_id == "art-1");
+    let updated = Task::try_from(proto).unwrap();
+    storage
+        .update_task("default", "owner", updated)
+        .await
+        .unwrap();
+
+    let task = storage
+        .get_task("default", "sep-rm-1", "owner", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.artifacts().len(), 1);
+    assert_eq!(task.artifacts()[0].artifact_id, "art-1");
+}
+
+/// An artifact mutation is a task update: it must bump the task's
+/// `updated_at` so ListTasks `updated_at DESC` ordering reflects it.
+/// The sleep clears second-resolution timestamp columns.
+pub async fn test_artifact_mutation_bumps_list_order(storage: &dyn A2aTaskStorage) {
+    storage
+        .create_task("default", "owner-lo", make_task("lo-old", "ctx-lo"))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    storage
+        .create_task("default", "owner-lo", make_task("lo-new", "ctx-lo"))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    storage
+        .append_artifact(
+            "default",
+            "lo-old",
+            "owner-lo",
+            make_artifact("art-1", "bump"),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let page = storage
+        .list_tasks(TaskFilter {
+            tenant: Some("default".into()),
+            owner: Some("owner-lo".into()),
+            context_id: Some("ctx-lo".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let ids: Vec<&str> = page.tasks.iter().map(|t| t.id()).collect();
+    assert_eq!(
+        ids,
+        vec!["lo-old", "lo-new"],
+        "artifact append must move lo-old to the top of updated_at DESC"
+    );
+}
+
+/// Both branches of `TaskFilter.include_artifacts`: true rehydrates
+/// full bodies, false (and unset, the default) trims them.
+pub async fn test_list_include_artifacts_branches(storage: &dyn A2aTaskStorage) {
+    storage
+        .create_task("default", "owner-ia", make_task("ia-1", "ctx-ia"))
+        .await
+        .unwrap();
+    storage
+        .append_artifact(
+            "default",
+            "ia-1",
+            "owner-ia",
+            make_artifact("art-1", "body"),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let base = TaskFilter {
+        tenant: Some("default".into()),
+        owner: Some("owner-ia".into()),
+        context_id: Some("ctx-ia".into()),
+        ..Default::default()
+    };
+
+    let with = storage
+        .list_tasks(TaskFilter {
+            include_artifacts: Some(true),
+            ..base.clone()
+        })
+        .await
+        .unwrap();
+    assert_eq!(with.tasks.len(), 1);
+    assert_eq!(with.tasks[0].artifacts().len(), 1);
+    assert_eq!(artifact_text(&with.tasks[0].artifacts()[0], 0), "body");
+
+    let without = storage
+        .list_tasks(TaskFilter {
+            include_artifacts: Some(false),
+            ..base.clone()
+        })
+        .await
+        .unwrap();
+    assert!(without.tasks[0].artifacts().is_empty());
+
+    let default = storage.list_tasks(base).await.unwrap();
+    assert!(default.tasks[0].artifacts().is_empty());
+}
+
+/// A task created with artifacts already present reads back
+/// identically, before and after a status transition.
+pub async fn test_create_task_with_artifacts(storage: &dyn A2aTaskStorage) {
+    let mut task = make_task("sep-create-1", "ctx");
+    task.push_text_artifact("art-born", "Result", "born with task");
+    storage.create_task("default", "owner", task).await.unwrap();
+
+    let fetched = storage
+        .get_task("default", "sep-create-1", "owner", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.artifacts().len(), 1);
+    assert_eq!(fetched.artifacts()[0].artifact_id, "art-born");
+
+    storage
+        .update_task_status(
+            "default",
+            "sep-create-1",
+            "owner",
+            TaskStatus::new(TaskState::Working),
+        )
+        .await
+        .unwrap();
+
+    let fetched = storage
+        .get_task("default", "sep-create-1", "owner", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.artifacts().len(), 1);
+    assert_eq!(artifact_text(&fetched.artifacts()[0], 0), "born with task");
+}
+
+/// delete_task removes artifact records with the task: recreating the
+/// same task id must not resurrect ghost artifacts.
+pub async fn test_delete_task_removes_artifact_records(storage: &dyn A2aTaskStorage) {
+    storage
+        .create_task("default", "owner", make_task("sep-del-1", "ctx"))
+        .await
+        .unwrap();
+    storage
+        .append_artifact(
+            "default",
+            "sep-del-1",
+            "owner",
+            make_artifact("art-ghost", "should not survive delete"),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        storage
+            .delete_task("default", "sep-del-1", "owner")
+            .await
+            .unwrap()
+    );
+
+    storage
+        .create_task("default", "owner", make_task("sep-del-1", "ctx"))
+        .await
+        .unwrap();
+    let task = storage
+        .get_task("default", "sep-del-1", "owner", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        task.artifacts().is_empty(),
+        "recreated task must not inherit artifacts from its deleted predecessor"
+    );
+}
