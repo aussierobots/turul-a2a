@@ -1,3 +1,8 @@
+// The artifact-separation helpers are consumed only by the persistent
+// backends (SQLite, PostgreSQL, DynamoDB); the in-memory backend stores
+// whole tasks and needs none of them. Gate the module so a default build
+// (in-memory only) does not carry it as dead code.
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "dynamodb"))]
 pub(crate) mod artifacts;
 pub mod atomic;
 pub mod error;

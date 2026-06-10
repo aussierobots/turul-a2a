@@ -4,6 +4,12 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.31] — 2026-06-10
+
+### Fixed
+
+- A default-feature build of `turul-a2a` (in-memory backend only) emitted dead-code warnings for the internal artifact-separation helpers, which are consumed solely by the feature-gated SQLite/PostgreSQL/DynamoDB backends. The module is now gated to those features, so a default build is warning-free. No runtime or API change; dependents never saw these warnings (cargo suppresses dependency warnings).
+
 ## [0.1.30] — 2026-06-10
 
 ### Changed
