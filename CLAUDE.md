@@ -82,7 +82,7 @@ The workspace publishes 6 crates. Publishing is irreversible (yank only hides). 
 2. **Write the CHANGELOG entry.**
 3. **Run the pre-publish gate:**
    - `cargo test --workspace` green
-   - `cargo clippy --workspace --all-targets -- -D warnings` clean
+   - `cargo clippy --workspace --all-targets -- -D warnings` clean — run this on **default features** exactly as written. A run with extra `--features` added is a *supplement*, never a substitute: enabling a feature can mark a feature-gated module as "used" and hide dead-code warnings that a default-feature consumer (and the `cargo publish` build) will surface. A module consumed only by feature-gated backends must itself be gated on those features so a default build carries no dead code.
    - `cargo fmt --all -- --check` clean
    - `cargo doc --no-deps --workspace` no warnings
    - `cargo package -p <crate> --no-verify --allow-dirty` warning-free for every publish crate

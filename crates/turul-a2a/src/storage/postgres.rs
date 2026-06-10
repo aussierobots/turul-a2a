@@ -2811,6 +2811,12 @@ mod tests {
         parity_tests::test_atomic_update_task_with_events(&s, &s, &s).await;
     }
 
+    #[tokio::test]
+    async fn test_atomic_terminal_with_new_artifact_in_one_call() {
+        let s = storage().await;
+        parity_tests::test_atomic_terminal_with_new_artifact_in_one_call(&s, &s, &s).await;
+    }
+
     // Terminal-write CAS parity tests.
 
     #[tokio::test]

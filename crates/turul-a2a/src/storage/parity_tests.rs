@@ -1243,6 +1243,84 @@ pub async fn test_atomic_update_task_with_events(
     assert_eq!(stored_events.len(), 2);
 }
 
+/// A single `update_task_with_events` call that introduces a new,
+/// non-trivial artifact while driving the task straight to a terminal
+/// state, with the matching working+completed events in the same call.
+/// This is the artifact-separation exercise of the atomic terminal-CAS
+/// write path: the new artifact must be reconciled into a durable record
+/// inside the same transaction as the terminal status, and read back
+/// byte-identically afterwards.
+pub async fn test_atomic_terminal_with_new_artifact_in_one_call(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+) {
+    tasks
+        .create_task("default", "owner-1", make_task("at-term-art-1", "ctx-1"))
+        .await
+        .unwrap();
+
+    let body = "y".repeat(48 * 1024);
+    let mut updated = tasks
+        .get_task("default", "at-term-art-1", "owner-1", None)
+        .await
+        .unwrap()
+        .unwrap();
+    updated.set_status(TaskStatus::new(TaskState::Working));
+    updated.push_text_artifact("art-final", "Result", &body);
+    updated.complete();
+
+    let evts = vec![
+        make_status_event_for("at-term-art-1", "ctx-1", "TASK_STATE_WORKING"),
+        make_status_event_for("at-term-art-1", "ctx-1", "TASK_STATE_COMPLETED"),
+    ];
+    let seqs = atomic
+        .update_task_with_events("default", "owner-1", updated, evts)
+        .await
+        .unwrap();
+    assert_eq!(seqs.len(), 2);
+
+    let fetched = tasks
+        .get_task("default", "at-term-art-1", "owner-1", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fetched.status().unwrap().state().unwrap(),
+        TaskState::Completed
+    );
+    assert_eq!(fetched.artifacts().len(), 1);
+    assert_eq!(fetched.artifacts()[0].artifact_id, "art-final");
+    assert_eq!(artifact_text(&fetched.artifacts()[0], 0), body);
+
+    let stored_events = events
+        .get_events_after("default", "at-term-art-1", 0)
+        .await
+        .unwrap();
+    assert_eq!(stored_events.len(), 2);
+
+    // A second terminal write must be rejected — the artifact reconcile
+    // does not weaken the single-terminal-writer guarantee.
+    let mut again = fetched;
+    again.push_text_artifact("art-late", "Result", "too late");
+    let reattempt = atomic
+        .update_task_with_events(
+            "default",
+            "owner-1",
+            again,
+            vec![make_status_event_for(
+                "at-term-art-1",
+                "ctx-1",
+                "TASK_STATE_COMPLETED",
+            )],
+        )
+        .await;
+    assert!(
+        reattempt.is_err(),
+        "a second terminal write must be rejected even when it carries a new artifact"
+    );
+}
+
 /// RYW-001: Read-your-writes across `A2aAtomicStore` and `A2aTaskStorage`.
 ///
 /// Walks the exact sequence the send-message handler uses — the path
