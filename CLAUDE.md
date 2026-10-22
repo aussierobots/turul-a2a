@@ -142,12 +142,13 @@ Google well-known types (`google.protobuf.Struct`, `Value`, `Timestamp`) mapped 
 
 ### Server Wiring: Push Delivery Is Strict Opt-In (0.1.5+)
 
-`.storage(storage)` wires storage traits only, even though all four first-party backends implement `A2aPushDeliveryStore` on the same struct (ADR-009 same-backend requirement). Push delivery is opt-in at **both** levels:
+`.storage(storage)` wires storage traits only, even though all four first-party backends implement `A2aPushDeliveryStore` on the same struct (ADR-009 same-backend requirement). Push is opt-in at **three** points:
 
+- **Agent card**: `capabilities.pushNotifications = true` (`AgentCardBuilder::push_notifications(true)`). Without it every push-config operation, and any inline `taskPushNotificationConfig`, is refused with `PushNotificationNotSupportedError` (A2A v1.0.1 §3.3.4).
 - **Storage**: `InMemoryA2aStorage::new().with_push_dispatch_enabled(true)` (and equivalents per backend) so atomic commits write the pending-dispatch marker.
 - **Builder**: `.push_delivery_store(storage.clone())` to register the consumer.
 
-The builder rejects inconsistent configurations (ADR-013 §4.3). Non-push adopters need neither call.
+The builder rejects inconsistent storage/builder configurations (ADR-013 §4.3); it does not cross-check the card flag. Non-push adopters need none of the three. The same rule applies to the other capability flags: `streaming` gates SendStreamingMessage/SubscribeToTask and `extendedAgentCard` gates GetExtendedAgentCard, and an unset flag means unsupported.
 
 ### Multi-Instance Streaming
 

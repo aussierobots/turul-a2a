@@ -20,8 +20,9 @@ storage abstraction with four parity-proven backends.
 
 ## Storage wiring
 
-Push delivery is strict opt-in at both levels:
+Push is strict opt-in at three points:
 
+- **Agent card**: declare `capabilities.pushNotifications = true` (`AgentCardBuilder::push_notifications(true)`); otherwise push-config operations and inline push configs return `PushNotificationNotSupportedError` (A2A v1.0.1 §3.3.4).
 - **Storage**: `InMemoryA2aStorage::new().with_push_dispatch_enabled(true)` (and equivalents per backend) so atomic commits write the pending-dispatch marker.
 - **Builder**: `.push_delivery_store(storage.clone())` to register the consumer.
 
