@@ -494,6 +494,79 @@ async fn grpc_extended_agent_card_receives_caller_claims() {
     );
 }
 
+/// Completes with one artifact whose text is the claims the executor saw.
+struct ClaimsEchoExecutor;
+
+#[async_trait]
+impl AgentExecutor for ClaimsEchoExecutor {
+    async fn execute(
+        &self,
+        _task: &mut Task,
+        _message: &Message,
+        ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        let seen = ctx
+            .claims
+            .as_ref()
+            .map_or("none".to_string(), |c| c.to_string());
+        let artifact = Artifact::new("claims", vec![Part::text(seen)]);
+        ctx.events.emit_artifact(artifact, false, true).await?;
+        ctx.events.complete(None).await?;
+        Ok(())
+    }
+
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        CompletingExecutor.agent_card()
+    }
+}
+
+/// The executor sees the authenticated caller's claims on gRPC sends,
+/// exactly as on HTTP.
+#[tokio::test]
+async fn grpc_send_passes_caller_claims_to_the_executor() {
+    let h = Harness::start_with_middleware(ClaimsEchoExecutor, vec![Arc::new(WithClaims)]).await;
+    let mut client = h.client().await;
+    let expected = serde_json::json!({"sub": "grpc-user"}).to_string();
+    let text_of = |artifact: &turul_a2a_proto::Artifact| match artifact.parts[0].content.as_ref() {
+        Some(turul_a2a_proto::part::Content::Text(t)) => t.clone(),
+        other => panic!("expected a text part, got {other:?}"),
+    };
+
+    let resp = client
+        .send_message(Request::new(turul_a2a_proto::SendMessageRequest {
+            tenant: String::new(),
+            message: Some(simple_message("who am i")),
+            configuration: None,
+            metadata: None,
+        }))
+        .await
+        .expect("send")
+        .into_inner();
+    let task = match resp.payload {
+        Some(turul_a2a_proto::send_message_response::Payload::Task(t)) => t,
+        other => panic!("expected a task, got {other:?}"),
+    };
+    assert_eq!(text_of(&task.artifacts[0]), expected, "unary send");
+
+    let mut stream = client
+        .send_streaming_message(Request::new(turul_a2a_proto::SendMessageRequest {
+            tenant: String::new(),
+            message: Some(simple_message("who am i")),
+            configuration: None,
+            metadata: None,
+        }))
+        .await
+        .expect("stream")
+        .into_inner();
+    let mut seen = None;
+    while let Some(item) = stream.message().await.expect("stream item") {
+        if let Some(turul_a2a_proto::stream_response::Payload::ArtifactUpdate(u)) = item.payload {
+            seen = u.artifact.as_ref().map(text_of);
+        }
+    }
+    assert_eq!(seen.as_deref(), Some(expected.as_str()), "streaming send");
+}
+
 #[tokio::test]
 async fn grpc_extended_agent_card_not_configured() {
     // CompletingExecutor does not override extended_agent_card, so

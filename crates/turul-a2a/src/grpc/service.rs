@@ -74,6 +74,14 @@ fn owner_from<T>(req: &Request<T>) -> String {
         .unwrap_or_else(|| "anonymous".to_string())
 }
 
+/// The caller's auth claims, as the HTTP handlers pass them to the
+/// executor (`ExecutionContext::claims`).
+fn claims_from<T>(req: &Request<T>) -> Option<serde_json::Value> {
+    req.extensions()
+        .get::<RequestContext>()
+        .and_then(|ctx| ctx.identity.claims().cloned())
+}
+
 /// Convert a serde_json::Error at the adapter boundary into a
 /// `tonic::Status`. Adapter-layer JSON failures are internal: the core
 /// handler produced a Value it was meant to produce, and we failed to
@@ -147,10 +155,9 @@ impl pb::grpc::A2aService for GrpcService {
         crate::profile_dispatch::check_skill_invocation_body(&echoed, &body)
             .map_err(a2a_to_status)?;
 
-        // gRPC auth claims are not yet wired. Pass None for now; executors
-        // observe `ctx.claims = None` on this path.
+        let claims = claims_from(&request);
         let value =
-            router::core_send_message(self.state.clone(), &tenant, &owner, None, &echoed, body)
+            router::core_send_message(self.state.clone(), &tenant, &owner, claims, &echoed, body)
                 .await
                 .map_err(a2a_to_status)?
                 .0;
@@ -371,10 +378,12 @@ impl pb::grpc::A2aService for GrpcService {
         crate::profile_dispatch::check_skill_invocation_body(&echoed, &body)
             .map_err(a2a_to_status)?;
 
+        let claims = claims_from(&request);
         let stream = crate::grpc::streaming::handle_send_streaming_message(
             self.state.clone(),
             tenant,
             owner,
+            claims,
             &echoed,
             body,
         )
