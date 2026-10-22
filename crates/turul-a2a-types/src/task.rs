@@ -31,6 +31,19 @@ impl TaskState {
     pub fn is_terminal(&self) -> bool {
         crate::state_machine::is_terminal(*self)
     }
+
+    /// The proto enum value name of this state (`"TASK_STATE_COMPLETED"`,
+    /// ...): the name used on the JSON wire and in persisted records.
+    pub fn wire_name(self) -> &'static str {
+        pb::TaskState::from(self).as_str_name()
+    }
+
+    /// Parse a proto enum value name produced by [`TaskState::wire_name`].
+    /// Returns `None` for unknown names and for `TASK_STATE_UNSPECIFIED`,
+    /// which is not an application state.
+    pub fn from_wire_name(name: &str) -> Option<Self> {
+        pb::TaskState::from_str_name(name).and_then(|s| Self::try_from(s).ok())
+    }
 }
 
 impl TryFrom<pb::TaskState> for TaskState {
@@ -399,6 +412,33 @@ mod tests {
         assert!(TaskState::Submitted.can_transition_to(TaskState::Working));
         assert!(!TaskState::Submitted.can_transition_to(TaskState::Completed));
         assert!(!TaskState::Completed.can_transition_to(TaskState::Working));
+    }
+
+    #[test]
+    fn wire_name_is_the_proto_json_enum_name() {
+        let cases = [
+            (TaskState::Submitted, "TASK_STATE_SUBMITTED"),
+            (TaskState::Working, "TASK_STATE_WORKING"),
+            (TaskState::Completed, "TASK_STATE_COMPLETED"),
+            (TaskState::Failed, "TASK_STATE_FAILED"),
+            (TaskState::Canceled, "TASK_STATE_CANCELED"),
+            (TaskState::InputRequired, "TASK_STATE_INPUT_REQUIRED"),
+            (TaskState::Rejected, "TASK_STATE_REJECTED"),
+            (TaskState::AuthRequired, "TASK_STATE_AUTH_REQUIRED"),
+        ];
+        for (state, name) in cases {
+            assert_eq!(state.wire_name(), name);
+            assert_eq!(TaskState::from_wire_name(name), Some(state));
+            let json = serde_json::to_value(TaskStatus::new(state)).unwrap();
+            assert_eq!(json["state"], name, "JSON wire name for {state:?}");
+        }
+    }
+
+    #[test]
+    fn from_wire_name_rejects_unspecified_and_unknown() {
+        assert_eq!(TaskState::from_wire_name("TASK_STATE_UNSPECIFIED"), None);
+        assert_eq!(TaskState::from_wire_name("Completed"), None);
+        assert_eq!(TaskState::from_wire_name("TASK_STATE_RUNNING"), None);
     }
 
     #[test]

@@ -68,12 +68,18 @@ pub fn validate_transition(from: TaskState, to: TaskState) -> Result<(), A2aType
     }
 }
 
+/// The terminal states: a task in one of these accepts no further
+/// transitions.
+pub const TERMINAL_STATES: [TaskState; 4] = [
+    TaskState::Completed,
+    TaskState::Failed,
+    TaskState::Canceled,
+    TaskState::Rejected,
+];
+
 /// Returns `true` if the state is terminal (no further transitions allowed).
 pub fn is_terminal(state: TaskState) -> bool {
-    matches!(
-        state,
-        TaskState::Completed | TaskState::Failed | TaskState::Canceled | TaskState::Rejected
-    )
+    TERMINAL_STATES.contains(&state)
 }
 
 #[cfg(test)]
