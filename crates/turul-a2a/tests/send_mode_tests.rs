@@ -15,18 +15,23 @@
 //!   text, not a silently-stuck task.
 //! - `REJECTED` via `sink.reject(...)` persists as `TASK_STATE_REJECTED`
 //!   distinct from FAILED.
-//! - Blocking send's two-deadline timeout: cooperative and abort-
-//!   fallback paths both return within `soft + grace + slack`, with
-//!   the appropriate terminal, and the last-moment cooperative race
-//!   preserves the executor's terminal via `TerminalStateAlreadySet`.
+//! - Blocking send's two-deadline timeout: the cooperative path returns
+//!   inside the cooperative window, the abort fallback returns at the
+//!   hard deadline with FAILED, and a terminal committed by another
+//!   writer during the window wins over the framework's FAILED via
+//!   `TerminalStateAlreadySet`.
+//! - Blocking send returns as soon as the task reaches an interrupted
+//!   state (INPUT_REQUIRED / AUTH_REQUIRED), on HTTP and JSON-RPC.
 //! - `returnImmediately = true` returns the task before the executor
 //!   reaches terminal.
+//!
+//! Timing assertions run on tokio's paused clock, so each bound names
+//! the code path taken rather than racing the wall clock.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::Notify;
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
 use turul_a2a::middleware::MiddlewareStack;
@@ -42,7 +47,11 @@ use turul_a2a_types::{Artifact, Message, Part, Role, Task, TaskState};
 // ---------------------------------------------------------------------------
 
 fn make_state(executor: Arc<dyn AgentExecutor>) -> AppState {
-    let storage = Arc::new(InMemoryA2aStorage::new());
+    state_on(InMemoryA2aStorage::new(), executor)
+}
+
+fn state_on(storage: InMemoryA2aStorage, executor: Arc<dyn AgentExecutor>) -> AppState {
+    let storage = Arc::new(storage);
     AppState {
         executor,
         task_storage: storage.clone(),
@@ -110,7 +119,7 @@ fn agent_text(text: &str) -> Message {
 }
 
 // ---------------------------------------------------------------------------
-// #1 — long-running sink-driven executor completes
+// Long-running sink-driven executor completes
 // ---------------------------------------------------------------------------
 
 struct SinkDrivenCompleter {
@@ -138,10 +147,10 @@ impl AgentExecutor for SinkDrivenCompleter {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn blocking_send_long_running_sink_driven_completes() {
     let state = make_state(Arc::new(SinkDrivenCompleter { delay_ms: 50 }));
-    let start = std::time::Instant::now();
+    let start = tokio::time::Instant::now();
     let axum::Json(v) =
         core_send_message(state.clone(), "", "owner-1", None, send_request_body("hi"))
             .await
@@ -150,7 +159,7 @@ async fn blocking_send_long_running_sink_driven_completes() {
     let task = task_from_response(v);
     assert!(
         elapsed >= Duration::from_millis(100),
-        "wall clock should include both delays: {elapsed:?}"
+        "blocking send must wait out both executor delays: {elapsed:?}"
     );
     assert_eq!(
         task.status().unwrap().state().unwrap(),
@@ -160,7 +169,7 @@ async fn blocking_send_long_running_sink_driven_completes() {
 }
 
 // ---------------------------------------------------------------------------
-// #9 — direct-task-mutation executor still works
+// Direct-task-mutation executor still works
 // (detection rule routes the terminal through CAS — no
 // update_task_with_events bypass).
 // ---------------------------------------------------------------------------
@@ -274,7 +283,7 @@ async fn blocking_send_direct_task_mutation_still_terminates_via_cas() {
 }
 
 // ---------------------------------------------------------------------------
-// #10 — executor returning Err → framework FAILED
+// Executor returning Err → framework FAILED
 // ---------------------------------------------------------------------------
 
 struct ErrReturner;
@@ -329,7 +338,7 @@ async fn blocking_send_executor_err_commits_failed() {
 }
 
 // ---------------------------------------------------------------------------
-// #14 — sink.reject → TASK_STATE_REJECTED (distinct
+// `sink.reject` → TASK_STATE_REJECTED (distinct
 // from FAILED on the wire — proto enum value 7, not 4).
 // ---------------------------------------------------------------------------
 
@@ -375,7 +384,7 @@ async fn blocking_send_executor_rejects_via_sink_reject() {
 }
 
 // ---------------------------------------------------------------------------
-// #11(a) — cooperative two-deadline: executor observes
+// Cooperative two-deadline: executor observes
 // cancellation within grace window and emits CANCELED.
 // ---------------------------------------------------------------------------
 
@@ -409,14 +418,12 @@ impl AgentExecutor for CooperativeCancelLoop {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn blocking_send_two_deadline_cooperative_returns_canceled() {
-    let state = fast_timeout_state(
-        Arc::new(CooperativeCancelLoop),
-        Duration::from_millis(200),
-        Duration::from_millis(500),
-    );
-    let start = std::time::Instant::now();
+    let soft = Duration::from_millis(200);
+    let grace = Duration::from_millis(500);
+    let state = fast_timeout_state(Arc::new(CooperativeCancelLoop), soft, grace);
+    let start = tokio::time::Instant::now();
     let axum::Json(v) = core_send_message(state, "", "owner-coop", None, send_request_body("x"))
         .await
         .expect("blocking send returns within grace window");
@@ -424,18 +431,20 @@ async fn blocking_send_two_deadline_cooperative_returns_canceled() {
     let task = task_from_response(v);
     assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Canceled);
     assert!(
-        elapsed < Duration::from_millis(900),
-        "cooperative path must return within soft + grace + slack, got {elapsed:?}"
+        elapsed >= soft && elapsed < soft + grace,
+        "cooperative path returns inside the cooperative window, got {elapsed:?}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// #11(b) — abort fallback: executor ignores cancellation
+// Abort fallback: executor ignores cancellation
 // and would sleep past the hard deadline. Framework force-commits
 // FAILED and aborts the spawned JoinHandle.
 // ---------------------------------------------------------------------------
 
 struct IgnoresCancellation;
+
+const IGNORES_CANCELLATION_SLEEP: Duration = Duration::from_secs(10);
 
 #[async_trait]
 impl AgentExecutor for IgnoresCancellation {
@@ -446,7 +455,7 @@ impl AgentExecutor for IgnoresCancellation {
         _ctx: &ExecutionContext,
     ) -> Result<(), A2aError> {
         // Deliberately ignore cancellation. Sleep past hard deadline.
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(IGNORES_CANCELLATION_SLEEP).await;
         Ok(())
     }
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
@@ -485,14 +494,12 @@ impl AgentExecutor for IgnoresCancellationWithDropProbe {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn blocking_send_two_deadline_abort_fallback_returns_failed() {
-    let state = fast_timeout_state(
-        Arc::new(IgnoresCancellation),
-        Duration::from_millis(150),
-        Duration::from_millis(200),
-    );
-    let start = std::time::Instant::now();
+    let soft = Duration::from_millis(150);
+    let grace = Duration::from_millis(200);
+    let state = fast_timeout_state(Arc::new(IgnoresCancellation), soft, grace);
+    let start = tokio::time::Instant::now();
     let axum::Json(v) = core_send_message(state, "", "owner-abort", None, send_request_body("x"))
         .await
         .expect("blocking send force-commits FAILED");
@@ -500,8 +507,8 @@ async fn blocking_send_two_deadline_abort_fallback_returns_failed() {
     let task = task_from_response(v);
     assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Failed);
     assert!(
-        elapsed < Duration::from_millis(800),
-        "hard-deadline must fire within soft + grace + slack, got {elapsed:?}"
+        elapsed >= soft + grace && elapsed < IGNORES_CANCELLATION_SLEEP,
+        "FAILED is committed at the hard deadline, without waiting for the executor; got {elapsed:?}"
     );
     let pb_status = task.status().unwrap();
     let msg = pb_status
@@ -535,7 +542,7 @@ async fn blocking_send_two_deadline_abort_fallback_returns_failed() {
 /// Verified via a `Drop`-flag guard inside the executor body: if the
 /// abort reaches the task, the `tokio::time::sleep(30s)` yield point
 /// wakes and the future drops, flipping the flag.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn blocking_send_hard_timeout_actually_aborts_executor() {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let executor = Arc::new(IgnoresCancellationWithDropProbe {
@@ -556,9 +563,9 @@ async fn blocking_send_hard_timeout_actually_aborts_executor() {
     // drops (via abort), the Sender drops, and `rx` resolves —
     // either Ok(()) on explicit send (we never send) or Err(_) on
     // Sender-dropped. Both outcomes prove the future was dropped.
-    // A bounded timeout guards against regression: if abort doesn't
-    // reach the task, the Sender is still live inside a zombie
-    // future and `rx` hangs until the outer timeout fires.
+    // On the paused clock the 2s timeout fires long before the
+    // executor's 30s sleep: if abort doesn't reach the task, the
+    // Sender is still live inside a zombie future and the timeout wins.
     let drop_observed = tokio::time::timeout(Duration::from_secs(2), rx)
         .await
         .expect(
@@ -572,28 +579,32 @@ async fn blocking_send_hard_timeout_actually_aborts_executor() {
 }
 
 // ---------------------------------------------------------------------------
-// #11(c) — abort-vs-cooperative race, executor wins
-// at the last moment via Notify-gated cancelled() call. Persisted
-// terminal is CANCELED (not FAILED); the framework's hard-deadline
-// force-FAILED commit received `TerminalStateAlreadySet` and re-read
-// the real terminal.
+// The hard deadline's FAILED loses the terminal CAS. The
+// executor ignores cancellation; during the cooperative window a
+// CancelTask on another instance (sharing the store) force-commits
+// CANCELED. That commit does not fire this instance's yielded signal,
+// so the blocking send reaches the hard deadline, its FAILED write gets
+// `TerminalStateAlreadySet`, and it returns the persisted CANCELED.
 // ---------------------------------------------------------------------------
 
-struct LastMomentCancel {
-    fire: Arc<Notify>,
+/// Reports when it observes the cancellation token, then ignores it.
+struct ObservesThenIgnoresCancel {
+    observed: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>,
 }
 
 #[async_trait]
-impl AgentExecutor for LastMomentCancel {
+impl AgentExecutor for ObservesThenIgnoresCancel {
     async fn execute(
         &self,
-        _task: &mut Task,
+        task: &mut Task,
         _msg: &Message,
         ctx: &ExecutionContext,
     ) -> Result<(), A2aError> {
-        // Wait for the test to release us, then emit CANCELED.
-        self.fire.notified().await;
-        ctx.events.cancelled(Some("last-ditch".into())).await?;
+        ctx.cancellation.cancelled().await;
+        if let Some(tx) = self.observed.lock().expect("observed mutex").take() {
+            let _ = tx.send(task.id().to_string());
+        }
+        std::future::pending::<()>().await;
         Ok(())
     }
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
@@ -601,45 +612,84 @@ impl AgentExecutor for LastMomentCancel {
     }
 }
 
-#[tokio::test]
-async fn blocking_send_two_deadline_last_moment_executor_wins_cas() {
-    let fire = Arc::new(Notify::new());
-    let executor = Arc::new(LastMomentCancel { fire: fire.clone() });
-    let state = fast_timeout_state(
-        executor,
-        Duration::from_millis(80),
-        Duration::from_millis(80),
+#[tokio::test(start_paused = true)]
+async fn blocking_send_hard_deadline_loses_cas_to_concurrent_cancel_returns_canceled() {
+    let soft = Duration::from_millis(80);
+    let grace = Duration::from_millis(80);
+    let storage = InMemoryA2aStorage::new();
+    let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+    let executor = Arc::new(ObservesThenIgnoresCancel {
+        observed: std::sync::Mutex::new(Some(observed_tx)),
+    });
+    let mut state_a = state_on(storage.clone(), executor);
+    state_a.runtime_config.blocking_task_timeout = soft;
+    state_a.runtime_config.timeout_abort_grace = grace;
+
+    // Instance B shares the store; its cancel grace ends inside A's
+    // cooperative window.
+    let mut state_b = state_on(storage.clone(), Arc::new(SlowCompleter));
+    state_b.runtime_config.cancel_handler_grace = grace / 4;
+    state_b.runtime_config.cancel_handler_poll_interval = grace / 8;
+
+    let start = tokio::time::Instant::now();
+    let send = tokio::spawn(core_send_message(
+        state_a,
+        "",
+        "owner-race",
+        None,
+        send_request_body("x"),
+    ));
+
+    let task_id = observed_rx.await.expect("soft deadline trips the token");
+    let axum::Json(cancelled) =
+        turul_a2a::router::core_cancel_task(state_b, "", "owner-race", &task_id)
+            .await
+            .expect("cancel on B force-commits CANCELED");
+    assert_eq!(cancelled["status"]["state"], "TASK_STATE_CANCELED");
+    assert!(
+        start.elapsed() < soft + grace,
+        "B's CANCELED lands before A's hard deadline"
     );
 
-    // Drive the race from a background task: fire the notify just
-    // before the hard deadline would elapse, giving the executor's
-    // cancelled() commit a chance to win the CAS.
-    let fire_clone = fire.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(140)).await;
-        fire_clone.notify_waiters();
-    });
-
-    let axum::Json(v) = core_send_message(state, "", "owner-race", None, send_request_body("x"))
+    let axum::Json(v) = send
         .await
-        .expect("blocking send resolves either way");
+        .expect("send task")
+        .expect("blocking send returns the persisted terminal");
+    let elapsed = start.elapsed();
     let task = task_from_response(v);
-    let state_val = task.status().unwrap().state().unwrap();
-    // The race is inherently non-deterministic — either CANCELED (the
-    // executor won) or FAILED (the framework forced the timeout).
-    // Crucially, exactly one terminal event persists and the
-    // response matches the persisted value. No silent double-write.
+    assert_eq!(
+        task.status().unwrap().state().unwrap(),
+        TaskState::Canceled,
+        "the earlier CANCELED wins; the hard deadline's FAILED is discarded"
+    );
     assert!(
-        matches!(state_val, TaskState::Canceled | TaskState::Failed),
-        "terminal must be exactly one of CANCELED or FAILED, got {state_val:?}"
+        elapsed >= soft + grace,
+        "the send returned through the hard-deadline path, got {elapsed:?}"
+    );
+
+    use turul_a2a::storage::A2aEventStore;
+    let terminals: Vec<TaskState> = storage
+        .get_events_after("", &task_id, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, e)| e.task_state())
+        .filter(|s| turul_a2a_types::state_machine::is_terminal(*s))
+        .collect();
+    assert_eq!(
+        terminals,
+        vec![TaskState::Canceled],
+        "no FAILED ever persists"
     );
 }
 
 // ---------------------------------------------------------------------------
-// #2 — returnImmediately=true returns non-terminal task
+// `returnImmediately = true` returns a non-terminal task
 // ---------------------------------------------------------------------------
 
 struct SlowCompleter;
+
+const SLOW_COMPLETER_DELAY: Duration = Duration::from_millis(300);
 
 #[async_trait]
 impl AgentExecutor for SlowCompleter {
@@ -649,7 +699,7 @@ impl AgentExecutor for SlowCompleter {
         _msg: &Message,
         ctx: &ExecutionContext,
     ) -> Result<(), A2aError> {
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(SLOW_COMPLETER_DELAY).await;
         ctx.events.complete(None).await?;
         Ok(())
     }
@@ -658,10 +708,10 @@ impl AgentExecutor for SlowCompleter {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn non_blocking_send_return_immediately_returns_before_terminal() {
     let state = make_state(Arc::new(SlowCompleter));
-    let start = std::time::Instant::now();
+    let start = tokio::time::Instant::now();
     let axum::Json(v) = core_send_message(
         state.clone(),
         "",
@@ -674,7 +724,7 @@ async fn non_blocking_send_return_immediately_returns_before_terminal() {
     let elapsed = start.elapsed();
     let task = task_from_response(v);
     assert!(
-        elapsed < Duration::from_millis(150),
+        elapsed < SLOW_COMPLETER_DELAY,
         "returnImmediately=true must not block for the executor: {elapsed:?}"
     );
     let state_val = task.status().unwrap().state().unwrap();
@@ -698,4 +748,113 @@ async fn non_blocking_send_return_immediately_returns_before_terminal() {
         }
     }
     panic!("task never reached COMPLETED");
+}
+
+// ---------------------------------------------------------------------------
+// Blocking send returns on an interrupted state (A2A v1.0.1 §3.2.2: a
+// blocking send MUST wait until the task reaches a terminal state or an
+// interrupted state, INPUT_REQUIRED / AUTH_REQUIRED). The executor stays
+// alive after the interrupt, so only the interrupt can end the wait; on
+// the paused clock a send that waited for anything else would reach the
+// blocking timeout and come back FAILED.
+// ---------------------------------------------------------------------------
+
+/// Raises an interrupted state through the sink, then stays running.
+struct InterruptsAndWaits {
+    state: TaskState,
+}
+
+#[async_trait]
+impl AgentExecutor for InterruptsAndWaits {
+    async fn execute(
+        &self,
+        _task: &mut Task,
+        _msg: &Message,
+        ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        match self.state {
+            TaskState::InputRequired => {
+                ctx.events
+                    .require_input(Some(agent_text("which file?")))
+                    .await?;
+            }
+            TaskState::AuthRequired => {
+                ctx.events
+                    .require_auth(Some(agent_text("sign in to continue")))
+                    .await?;
+            }
+            other => panic!("not an interrupted state: {other:?}"),
+        }
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        turul_a2a_proto::AgentCard::default()
+    }
+}
+
+/// Blocking `SendMessage` over the HTTP+JSON or JSON-RPC binding; returns
+/// the `task` from the response.
+async fn blocking_send_over(state: AppState, jsonrpc: bool) -> serde_json::Value {
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let send: serde_json::Value = serde_json::from_str(&send_request_body("help")).unwrap();
+    let (path, body) = if jsonrpc {
+        let rpc = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": send,
+        });
+        ("/jsonrpc", rpc)
+    } else {
+        ("/message:send", send)
+    };
+    let req = http::Request::post(path)
+        .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = turul_a2a::router::build_router(state)
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let response = if jsonrpc { &v["result"] } else { &v };
+    response
+        .get("task")
+        .unwrap_or_else(|| panic!("response carries a task: {v}"))
+        .clone()
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocking_send_returns_on_interrupted_state_over_http_and_jsonrpc() {
+    for interrupted in [TaskState::InputRequired, TaskState::AuthRequired] {
+        for jsonrpc in [false, true] {
+            let state = make_state(Arc::new(InterruptsAndWaits { state: interrupted }));
+            let timeout = state.runtime_config.blocking_task_timeout;
+            let start = tokio::time::Instant::now();
+            let task = blocking_send_over(state, jsonrpc).await;
+            let elapsed = start.elapsed();
+            let binding = if jsonrpc { "JSON-RPC" } else { "HTTP" };
+
+            let wire_state = match interrupted {
+                TaskState::InputRequired => "TASK_STATE_INPUT_REQUIRED",
+                _ => "TASK_STATE_AUTH_REQUIRED",
+            };
+            assert_eq!(
+                task["status"]["state"], wire_state,
+                "{binding}: blocking send must return the interrupted task: {task}"
+            );
+            assert!(
+                task["status"]["message"]["parts"][0]["text"].is_string(),
+                "{binding}: the interrupt's message is part of the latest status: {task}"
+            );
+            assert!(
+                elapsed < timeout,
+                "{binding}: returned on the interrupt, not the blocking timeout ({elapsed:?})"
+            );
+        }
+    }
 }

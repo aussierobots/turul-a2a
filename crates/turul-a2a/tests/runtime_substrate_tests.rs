@@ -236,11 +236,12 @@ async fn supervisor_sentinel_drops_on_panic_still_cleans_up() {
     let key = make_key("tenant-panic", "task-panic");
 
     // Spawned task that will never exit on its own — relies on abort.
-    let (_trap_tx, trap_rx) = oneshot::channel::<()>();
+    // `trap_tx.closed()` resolves once the task's future (holding
+    // `trap_rx`) has been dropped, i.e. once the abort has taken effect.
+    let (mut trap_tx, trap_rx) = oneshot::channel::<()>();
     let spawned = tokio::spawn(async move {
         let _ = trap_rx.await;
     });
-    let abort_handle = spawned.abort_handle();
 
     let (yielded_tx, _yielded_rx) = oneshot::channel::<Task>();
     let handle = Arc::new(InFlightHandle::new(
@@ -277,12 +278,11 @@ async fn supervisor_sentinel_drops_on_panic_still_cleans_up() {
         "registry entry must be removed on sentinel Drop during panic unwind"
     );
 
-    // The spawned task was aborted by the sentinel; is_finished returns true
-    // as soon as abort() is called (even before the task has actually unwound).
-    assert!(
-        abort_handle.is_finished(),
-        "spawned task must be aborted by sentinel during panic cleanup"
-    );
+    // The sentinel aborted the spawned task: its future is dropped. The
+    // timeout is a hang guard; a task left running never drops `trap_rx`.
+    tokio::time::timeout(std::time::Duration::from_secs(5), trap_tx.closed())
+        .await
+        .expect("spawned task must be aborted by sentinel during panic cleanup");
 }
 
 /// Test 4 (observability contract): sentinel Drop during panic unwind emits a
