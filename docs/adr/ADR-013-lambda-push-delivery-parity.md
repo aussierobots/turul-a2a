@@ -76,6 +76,13 @@
   contract change). §10.8, §10.9 and §10.11 gained tests; the crate
   README now states the `with_push_dispatch_enabled(true)` requirement
   §10.11 asks for.
+- **2026-10-22** — §6.3: the two columns are part of the bootstrap
+  `CREATE TABLE` statements, not `ALTER TABLE` migrations; pre-existing
+  rows are no longer defaulted or backfilled, because stores from
+  earlier releases are re-created (ADR-003). The DynamoDB eligibility
+  scan drops its `attribute_not_exists(registeredAfterEventSequence)`
+  branch; the §12 "legacy configs are permissive" risk and the §13
+  pre-migration-default question are removed with it.
 
 ## 1. Context
 
@@ -457,8 +464,8 @@ flight when the config CAS succeeded. The existing
 
 **`a2a_tasks` gains `latest_event_sequence`:**
 
-- SQL: `ALTER TABLE a2a_tasks ADD COLUMN latest_event_sequence
-  BIGINT NOT NULL DEFAULT 0;`
+- SQL: column `latest_event_sequence BIGINT NOT NULL DEFAULT 0` in
+  the `a2a_tasks` `CREATE TABLE`.
 - DynamoDB: new attribute `latestEventSequence` (Number).
 - In-memory: new field on `StoredTask`.
 
@@ -479,27 +486,19 @@ the existing task + event writes. ONLY the marker write on
 
 **`a2a_push_configs` gains `registered_after_event_sequence`:**
 
-- SQL: `ALTER TABLE a2a_push_configs ADD COLUMN
-  registered_after_event_sequence BIGINT NOT NULL DEFAULT 0;`
-  Index on `(tenant, task_id, registered_after_event_sequence)`
-  for fast eligibility scans.
+- SQL: column `registered_after_event_sequence BIGINT NOT NULL
+  DEFAULT 0` in the `a2a_push_configs` `CREATE TABLE`. Index on
+  `(tenant, task_id, registered_after_event_sequence)` for fast
+  eligibility scans.
 - DynamoDB: new attribute `registeredAfterEventSequence` (Number).
 - In-memory: new field on `StoredPushConfig`.
 
-**Pre-migration rows** (tasks and configs existing before this
-ADR lands) have both new columns defaulted to 0. For `a2a_tasks`,
-the default is harmless: the first post-migration commit updates
-`latest_event_sequence` to the correct value (max of previous 0
-and the new event's sequence equals the new sequence; subsequent
-commits extend correctly). For `a2a_push_configs`, the default
-means legacy configs have `registered_after_event_sequence = 0`
-— eligible for any event with sequence > 0 (i.e., all real
-events). This is permissive by design: legacy configs predate the
-causal floor and the framework does not retroactively invent a
-registration sequence for them. Operators who need strict causal
-semantics on legacy configs should run a one-off backfill script
-that sets `registered_after_event_sequence = latest_event_sequence`
-per `(tenant, task_id)` at migration time.
+**Stores written before these columns** are not migrated or read
+(ADR-003): operators re-create persistent stores. Every config row and
+item carries `registered_after_event_sequence` /
+`registeredAfterEventSequence` from its `create_config` CAS, so the
+eligibility predicate is the strict `registered_after < seq` with no
+absent-attribute branch.
 
 ### 6.4 `create_config` CAS
 
@@ -815,12 +814,6 @@ amendments across four coordinated changes:
   later. Cost: one integer update per commit tx — negligible.
   Push-enabled commits additionally write one marker row per
   terminal StatusUpdate.
-- **Legacy configs are permissive.** Pre-migration
-  `a2a_push_configs` rows have `registered_after_event_sequence = 0`
-  and are eligible for any real event. This is documented migration
-  behaviour, not a framework guarantee. Operators who need strict
-  §8 semantics on legacy data run a one-off backfill as described
-  in §6.3.
 - **CAS retry storm.** Very-high-frequency event commits on a
   single task could starve `create_config` against
   `a2a_tasks.latest_event_sequence`. Bounded in practice — the
@@ -837,11 +830,6 @@ amendments across four coordinated changes:
   PushNotificationConfigs`) need the unfiltered list; fan-out
   needs the event-sequence-filtered list. Two methods, two
   purposes.
-- Should the pre-migration `registered_after_event_sequence = 0`
-  default be treated as "always eligible" (rev 4 choice) or
-  "never eligible"? Rev 4 picks permissive to avoid breaking
-  existing deployments; adopters who need strict causal semantics
-  on legacy configs run the backfill script in §6.3.
 - Should the CAS retry budget on `create_config` be surfaced to
   the adopter via `RuntimeConfig`? Rev 4 hardcodes a bounded
   default; if CAS-starvation proves real in production workloads,
@@ -877,7 +865,7 @@ amendments across four coordinated changes:
   `find_terminal_event_sequence` is not added.
 - **Schema additions:** `a2a_tasks.latest_event_sequence` and
   `a2a_push_configs.registered_after_event_sequence`. Both integer
-  columns, DEFAULT 0 on migration. No GSI required.
+  columns, DEFAULT 0, in the bootstrap `CREATE TABLE`. No GSI required.
 - **Non-push deployments:** no marker writes, no pending_dispatch
   table required, no push_dispatch flag needed. `a2a_tasks.
   latest_event_sequence` IS maintained on every commit regardless of

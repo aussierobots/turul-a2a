@@ -1,6 +1,6 @@
 # ADR-027: Artifact Storage Separation for Task Stores
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-10-22: the manifest is mandatory; the legacy inline-artifact layout is neither read nor migrated)
 - **Date:** 2026-06-10
 
 ## Context
@@ -24,9 +24,9 @@ Artifact bodies are persisted as **separate artifact records**, one per `artifac
 
 The persisted task record gains a sibling field; the blob is **not** repurposed:
 
-- The task blob (`taskJson` / `task_json`) remains a **pure serialized proto `Task`** — reads continue to deserialize it directly, exactly as today. Under the new layout its `artifacts` list is simply empty.
+- The task blob (`taskJson` / `task_json`) remains a **pure serialized proto `Task`** — reads continue to deserialize it directly, exactly as today. Its `artifacts` list is always empty.
 - The **artifact manifest** — the list of `(artifact_id, content_fingerprint)` pairs — is a **separate attribute/column** next to the blob (`artifactManifest` on the DynamoDB item, `artifact_manifest` on the SQL row), in the same position as existing sibling metadata like `statusState`. It is internal storage state and never appears in the wire model.
-- **Layout discriminator:** manifest attribute/column **absent/NULL** ⇒ legacy record (artifacts inline in the blob, if any). Manifest **present** (even as an empty list) ⇒ new layout (blob artifacts empty; bodies in artifact records). No version sniffing inside the blob, no envelope wrapper — a wrapped `StoredTask` envelope was considered and rejected because it would change the meaning of the existing blob and force shape-sniffing on every legacy read.
+- **The manifest is mandatory.** Every task record carries it, as an empty list when the task has no artifacts. The SQL column is `NOT NULL` with no default (every write binds it); on DynamoDB the single task-item builder (`DynamoDbA2aStorage::build_task_item`) takes the manifest as a required argument, so every task write carries the attribute. A task record without a manifest is a **storage error** (a corrupt record, or one written by a release before this layout) on every read and write path — never read as a task with inline artifacts. There is one layout; no discriminator, no version sniffing inside the blob, no envelope wrapper (a wrapped `StoredTask` envelope was considered and rejected because it would change the meaning of the blob).
 
 Observable behavior is unchanged:
 
@@ -44,11 +44,9 @@ All paths that accept a full `Task` — `create_task`, `create_task_with_events`
 
 The manifest makes diffing free: no pre-read of artifact bodies, no reliance on inspecting the accompanying event vector. An unchanged 104 KB artifact costs zero artifact-record writes on subsequent task updates.
 
-### 3. Status transitions never write artifact bodies (new-layout tasks)
+### 3. Status transitions never write artifact bodies
 
-For any task under the new layout (manifest present), `update_task_status` and `update_task_status_with_events` construct the new task record from the stored one with only the status replaced; the task record contains no artifact bodies **by construction**, so the status paths cannot rewrite them. No special-casing, no partial-update machinery. This removes the dominant write-amplification term for every task created or fully rewritten after the upgrade.
-
-**Legacy records are the explicit exception** (see §9): a legacy task's status transition copies its inline artifacts forward unchanged and stays write-amplified until the task is fully rewritten or reaped. Migrating inline artifacts during a status transition was considered and rejected: it would put large artifact-record writes (and the transaction-size cap) into the hot status path to serve a transient population — terminal legacy tasks never receive another status write, and live-at-upgrade tasks drain within their task TTL (24 h default on DynamoDB).
+For every task, `update_task_status` and `update_task_status_with_events` construct the new task record from the stored one with only the status replaced; the task record contains no artifact bodies **by construction**, so the status paths cannot rewrite them. No special-casing, no partial-update machinery. This removes the dominant write-amplification term for every task.
 
 The internal validation read on these paths needs only the stored status and manifest; implementations MAY skip rehydrating artifact bodies for validation. The **returned** `Task` keeps `get_task` parity (artifacts included), so callers see no change.
 
@@ -80,16 +78,12 @@ Contract uniformity is required; **layout uniformity is not.**
   - **Namespace collision-freedom by key alphabet, not by id restriction.** Every existing record kind in the events table derives its `pk` from `task_key = {tenant}#{task_id}` and therefore contains at least one literal `#` (push markers/configs/deliveries live in their own tables). Artifact `pk`s use an encoding that contains **no raw `#`**: `art|{enc(tenant)}|{enc(task_id)}`, where `enc` percent-escapes `%`, `|`, and `#` in each component. The two key sets are disjoint by construction for *every* possible tenant/task-id string, and the escaping is injective so artifact keys cannot collide with each other. No task-id validation, no narrowing of the protocol id space, no re-encoding of existing task/event keys. (An earlier draft rejected ids containing `#` at the DynamoDB backend; rejected as backend-specific semantics on a protocol-level string.)
   - **List rehydration:** `list_tasks` with `include_artifacts = true` rehydrates from manifest keys via `BatchGetItem` per page (full keys are known from each task's manifest). Cost scales with the artifact bytes the caller asked for — inherent to the request, and strictly no worse than today's scan of inline bodies. With `include_artifacts = false` (and unset), listing never touches artifact records at all.
   - **Deletion:** `delete_task` deletes the artifact partition's items alongside the task item: one `Query` for keys, then looped `BatchWriteItem` deletes (25 per batch, retrying unprocessed items), **artifacts first, task item last**. Any artifact-cleanup failure surfaces as an `Err` — never a silent partial success behind the `bool` return — leaving the task item intact so the call is safely retryable. The only state an interrupted delete can produce is a manifest entry with no record; rehydration treats that as an absent artifact (degraded read of a task that was being deleted, logged). Leaving artifact items to TTL — the current precedent for event items — was rejected because `task_ttl_seconds = 0` (no expiry) would orphan them forever; events keep their existing TTL-reaping behavior unchanged.
-- **SQLite / PostgreSQL:** a new `a2a_task_artifacts` table (`tenant`, `task_id`, `artifact_id`, `artifact_json`, `fingerprint`, timestamps; PK `(tenant, task_id, artifact_id)`), created by the existing startup `CREATE TABLE IF NOT EXISTS` migration path — zero operator action. Both SQL backends move together; they are twin implementations and must not drift. `delete_task` and `cleanup_expired()` (ADR-026) delete artifact rows in the same transaction/statement batch as the task rows.
+- **SQLite / PostgreSQL:** a new `a2a_task_artifacts` table (`tenant`, `task_id`, `artifact_id`, `artifact_json`, `fingerprint`, timestamps; PK `(tenant, task_id, artifact_id)`), created by the startup `CREATE TABLE IF NOT EXISTS` bootstrap (skipped under `assume_schema_initialized`, ADR-019). Both SQL backends move together; they are twin implementations and must not drift. `delete_task` and `cleanup_expired()` (ADR-026) delete artifact rows in the same transaction/statement batch as the task rows.
 - **In-memory:** layout unchanged (whole-`Task` map). It has no write-amplification to fix; restructuring it would be speculative complexity. It satisfies the contract trivially and runs all parity scenarios.
 
-### 9. Backward compatibility and migration
+### 9. Stores written before this layout
 
-No offline migration. Read and write rules:
-
-- **Read (rehydration):** artifacts = artifact records ∪ inline-blob artifacts, deduplicated by `artifact_id`, **records win**. A legacy task (artifacts inline, no manifest) reads identically to today.
-- **Write-through migration:** a full-task write under the new code persists artifact records and strips inline bodies **in the same atomic write**. Stripping inline bodies in any write that does not also persist the records is forbidden — a crash between the two would lose artifacts.
-- A legacy task that only ever receives status transitions keeps its inline artifacts indefinitely: status paths copy the stored blob's artifact section forward unchanged. Such tasks **remain write-amplified** until a full-task write migrates them or retention reaps them — the deliberate trade pinned in §3, correct and safe, never lossy.
+Stores written by a release before this layout (artifacts inline in the blob, no manifest) are **not migrated or read** (ADR-003): operators re-create persistent stores. There is no read-time union of inline and separated artifacts, no write-through migration on a full-task write, and no status-path carry-forward of inline bodies. A task record without a manifest is a storage error (§1). The SQL bootstrap creates the current schema only; it does not alter an existing table, so a store created by an earlier release is dropped and re-created, not reused.
 
 Rollback note: a deployment rolled back to a pre-ADR-027 release reads tasks whose blobs lack artifact bodies and would return artifact-less tasks. Operators pinning task TTLs measured in hours (the DynamoDB default is 24 h) carry low exposure; the CHANGELOG entry must state the rollback caveat explicitly.
 
@@ -106,7 +100,7 @@ Scenario/parity first (`parity_tests.rs`, every function takes trait objects and
 3. Chunked `append_artifact` then status transition → chunks intact, order preserved.
 4. `update_task_with_events` carrying status + new artifact + terminal in one call (extends AT-004) → artifacts and events both durable.
 5. Artifact replace/removal via full-task write → removed artifact absent on read.
-6. Legacy inline-blob task (seeded through a backend test hook) → reads correctly; status transition preserves inline artifacts; first full-task write migrates it.
+6. A task record without a manifest (seeded directly in each persistent backend's tests; the in-memory backend has no record layout) → `get_task`, `update_task_status` and `update_task` return a storage error; the record is never read as a task with inline artifacts.
 7. Artifact, history and full-task writes that keep the status leave the task's `list_tasks` position unchanged; a status write moves it to the top (`test_list_orders_by_status_timestamp`).
 8. `list_tasks` with `include_artifacts = true` → every page entry rehydrates full artifact bodies; with `include_artifacts = false`/unset → trimmed shape unchanged (both branches of `TaskFilter.include_artifacts`).
 9. Fingerprint determinism: encode/decode round-trip yields the identical fingerprint, and semantically equal artifacts built with different map insertion orders fingerprint identically (no spurious rewrites).
@@ -121,7 +115,7 @@ Then backend-specific **shape** assertions (not consumed-capacity numbers, which
 
 ### 12. Versioning and CHANGELOG
 
-Runtime-behavior and storage-layout change with operator-facing notes (new SQL table auto-created; DynamoDB artifact partitions in the events table; rollback caveat). The repo convention is "patch = compatible runtime, minor = contract change". The wire contract is unchanged, but the **persisted storage layout** changes in a way an operator can observe on rollback — if the persisted layout is treated as part of the operator contract (the rollback caveat suggests it is), minor would be the natural classification. **The maintainer has explicitly classified this release as a patch bump** (compatible runtime: wire contract unchanged, reads remain backward compatible, no adopter code changes), accepting the rollback caveat as a documented operational note rather than a contract break. The CHANGELOG entry must state: what changed for operators (write-cost reduction, new artifact records), that the wire contract is unchanged, the rollback caveat, and a `### Verification` line for the parity suite + live-backend gates.
+Runtime-behavior and storage-layout change with operator-facing notes (new SQL table auto-created; DynamoDB artifact partitions in the events table; rollback caveat). The repo convention is "patch = compatible runtime, minor = contract change". The wire contract is unchanged, but the **persisted storage layout** changes in a way an operator can observe on rollback — if the persisted layout is treated as part of the operator contract (the rollback caveat suggests it is), minor would be the natural classification. **The maintainer has explicitly classified this release as a patch bump** (compatible runtime: wire contract unchanged, reads remain backward compatible, no adopter code changes), accepting the rollback caveat as a documented operational note rather than a contract break. (From 0.1.36, stores written before this layout are not read at all; see §9.) The CHANGELOG entry must state: what changed for operators (write-cost reduction, new artifact records), that the wire contract is unchanged, the rollback caveat, and a `### Verification` line for the parity suite + live-backend gates.
 
 ## Consequences
 
@@ -143,3 +137,4 @@ Runtime-behavior and storage-layout change with operator-facing notes (new SQL t
 ## Revision log
 
 - 2026-10-22 — §5 and test-plan item 7: `list_tasks` orders by status timestamp (A2A v1.0.1 §3.1.4), not `updated_at`; artifact writes no longer move a task in the listing. `updated_at` is kept as the retention basis only.
+- 2026-10-22 — The legacy layout is deleted. The manifest is mandatory (SQL `NOT NULL`; DynamoDB attribute written by the one task-item builder); a record without one is a storage error. §1 drops the layout discriminator, §3 drops the legacy status-path exception, §9 replaces read-union and write-through migration with "earlier stores are not migrated or read" (ADR-003), and test-plan item 6 asserts the storage error instead of the legacy read. The SQL bootstrap no longer runs additive `ALTER TABLE` steps.

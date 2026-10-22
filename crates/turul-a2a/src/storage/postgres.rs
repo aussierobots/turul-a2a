@@ -23,7 +23,7 @@ pub struct PostgresConfig {
     pub database_url: String,
     pub max_connections: u32,
     /// When true, [`PostgresA2aStorage::new`] skips DDL bootstrap (no
-    /// `CREATE TABLE`, no `ALTER TABLE`, no `CREATE INDEX`) and trusts
+    /// `CREATE TABLE`, no `CREATE INDEX`) and trusts
     /// the operator-provisioned schema. Default `false` preserves the
     /// auto-bootstrap behavior. Adopters who set this flag own forward
     /// migrations on every release that changes the schema (see
@@ -85,6 +85,9 @@ impl PostgresA2aStorage {
     }
 
     async fn create_tables(&self) -> Result<(), A2aStorageError> {
+        // artifact_manifest lists the task's artifacts in order (a JSON
+        // array, possibly empty). The bodies live in a2a_task_artifacts;
+        // task_json carries none.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS a2a_tasks (
                 tenant TEXT NOT NULL DEFAULT '',
@@ -95,6 +98,8 @@ impl PostgresA2aStorage {
                 status_state TEXT NOT NULL DEFAULT '',
                 status_timestamp TEXT COLLATE \"C\" NOT NULL,
                 cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                latest_event_sequence BIGINT NOT NULL DEFAULT 0,
+                artifact_manifest JSONB NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (tenant, task_id)
@@ -103,36 +108,6 @@ impl PostgresA2aStorage {
         .execute(&self.pool)
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
-
-        // Migration: add updated_at column if not present (for existing tables)
-        let _ = sqlx::query(
-            "ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
-        )
-        .execute(&self.pool)
-        .await;
-
-        // Migration: add cancel_requested column if not present.
-        let _ = sqlx::query(
-            "ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT FALSE",
-        )
-        .execute(&self.pool)
-        .await;
-
-        // unconditional latest_event_sequence column.
-        let _ = sqlx::query(
-            "ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS latest_event_sequence BIGINT NOT NULL DEFAULT 0",
-        )
-        .execute(&self.pool)
-        .await;
-
-        // Artifact-separation manifest column. NULL marks a legacy row
-        // whose artifacts (if any) are inline in task_json; a non-NULL
-        // value (JSON array, possibly empty) marks the separated layout
-        // where artifact bodies live in a2a_task_artifacts.
-        let _ =
-            sqlx::query("ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS artifact_manifest JSONB")
-                .execute(&self.pool)
-                .await;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS a2a_task_artifacts (
@@ -163,15 +138,6 @@ impl PostgresA2aStorage {
         .execute(&self.pool)
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
-
-        // additive migration; default 0 is permissive
-        // for legacy configs by design.
-        let _ = sqlx::query(
-            "ALTER TABLE a2a_push_configs \
-             ADD COLUMN IF NOT EXISTS registered_after_event_sequence BIGINT NOT NULL DEFAULT 0",
-        )
-        .execute(&self.pool)
-        .await;
 
         let _ = sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_a2a_push_configs_eligibility \
@@ -258,7 +224,7 @@ impl PostgresA2aStorage {
             .unwrap_or_default()
     }
 
-    fn trim_task(task: Task, history_length: Option<i32>, include_artifacts: bool) -> Task {
+    fn trim_task(task: Task, history_length: Option<i32>) -> Task {
         let mut proto = task.into_proto();
         if let Some(0) = history_length {
             proto.history.clear();
@@ -268,9 +234,6 @@ impl PostgresA2aStorage {
             let n = n as usize;
             let start = proto.history.len().saturating_sub(n);
             proto.history = proto.history[start..].to_vec();
-        }
-        if !include_artifacts {
-            proto.artifacts.clear();
         }
         Task::try_from(proto)
             .unwrap_or_else(|_| Task::new("err", TaskStatus::new(TaskState::Failed)))
@@ -331,14 +294,14 @@ impl PostgresA2aStorage {
         Ok(())
     }
 
-    /// Read the stored manifest for a task. `None` marks a legacy row
-    /// (NULL manifest) or a missing row.
+    /// Read the stored manifest for a task. A missing row reconciles
+    /// against an empty prior set.
     async fn fetch_manifest(
         conn: &mut sqlx::PgConnection,
         tenant: &str,
         task_id: &str,
-    ) -> Result<Option<Vec<super::artifacts::ManifestEntry>>, A2aStorageError> {
-        let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(
+    ) -> Result<Vec<super::artifacts::ManifestEntry>, A2aStorageError> {
+        let row: Option<(serde_json::Value,)> = sqlx::query_as(
             "SELECT artifact_manifest FROM a2a_tasks WHERE tenant = $1 AND task_id = $2",
         )
         .bind(tenant)
@@ -347,29 +310,23 @@ impl PostgresA2aStorage {
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         match row {
-            Some((Some(value),)) => {
-                let manifest = serde_json::from_value(value)
-                    .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
-                Ok(Some(manifest))
-            }
-            _ => Ok(None),
+            Some((value,)) => serde_json::from_value(value)
+                .map_err(|e| A2aStorageError::SerializationError(e.to_string())),
+            None => Ok(Vec::new()),
         }
     }
 
-    /// Reassemble a full task from its stored blob and manifest. A NULL
-    /// manifest is a legacy row whose artifacts are already inline.
+    /// Reassemble a full task from its artifact-free stored blob and its
+    /// manifest, fetching the artifact bodies the manifest names.
     async fn rehydrate_task(
         &self,
         tenant: &str,
         task_id: &str,
         blob: &serde_json::Value,
-        manifest: Option<serde_json::Value>,
+        manifest: serde_json::Value,
     ) -> Result<Task, A2aStorageError> {
-        let manifest: Vec<super::artifacts::ManifestEntry> = match manifest {
-            None => return Self::task_from_json(blob),
-            Some(value) => serde_json::from_value(value)
-                .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?,
-        };
+        let manifest: Vec<super::artifacts::ManifestEntry> = serde_json::from_value(manifest)
+            .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
         let mut proto: turul_a2a_proto::Task = serde_json::from_value(blob.clone())
             .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
         if !manifest.is_empty() {
@@ -447,7 +404,7 @@ impl A2aTaskStorage for PostgresA2aStorage {
         owner: &str,
         history_length: Option<i32>,
     ) -> Result<Option<Task>, A2aStorageError> {
-        let row: Option<(serde_json::Value, Option<serde_json::Value>)> = sqlx::query_as(
+        let row: Option<(serde_json::Value, serde_json::Value)> = sqlx::query_as(
             "SELECT task_json, artifact_manifest FROM a2a_tasks \
              WHERE tenant = $1 AND task_id = $2 AND owner = $3",
         )
@@ -463,7 +420,7 @@ impl A2aTaskStorage for PostgresA2aStorage {
                 let task = self
                     .rehydrate_task(tenant, task_id, &json, manifest)
                     .await?;
-                Ok(Some(Self::trim_task(task, history_length, true)))
+                Ok(Some(Self::trim_task(task, history_length)))
             }
             None => Ok(None),
         }
@@ -485,9 +442,7 @@ impl A2aTaskStorage for PostgresA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        let stored = Self::fetch_manifest(&mut tx, tenant, task.id())
-            .await?
-            .unwrap_or_default();
+        let stored = Self::fetch_manifest(&mut tx, tenant, task.id()).await?;
         let plan = super::artifacts::reconcile(&artifacts, &stored)?;
         let manifest = serde_json::to_value(&plan.manifest)
             .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
@@ -615,12 +570,12 @@ impl A2aTaskStorage for PostgresA2aStorage {
              WHERE {where_clause}{cursor_clause} \
              ORDER BY status_timestamp DESC, task_id DESC LIMIT ${next}"
         );
-        let mut query = sqlx::query_as::<
-            _,
-            (serde_json::Value, String, Option<serde_json::Value>, String),
-        >(sqlx::AssertSqlSafe(select_sql))
-        .bind(tenant)
-        .bind(owner);
+        let mut query =
+            sqlx::query_as::<_, (serde_json::Value, String, serde_json::Value, String)>(
+                sqlx::AssertSqlSafe(select_sql),
+            )
+            .bind(tenant)
+            .bind(owner);
         for value in &values {
             query = query.bind(value);
         }
@@ -629,7 +584,7 @@ impl A2aTaskStorage for PostgresA2aStorage {
         }
         query = query.bind(i64::from(page_size) + 1);
 
-        let mut rows: Vec<(serde_json::Value, String, Option<serde_json::Value>, String)> = query
+        let mut rows: Vec<(serde_json::Value, String, serde_json::Value, String)> = query
             .fetch_all(&self.pool)
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
@@ -637,8 +592,7 @@ impl A2aTaskStorage for PostgresA2aStorage {
         rows.truncate(page_size as usize);
 
         // Artifacts are fetched only when requested. Excluded listings
-        // never read artifact rows: separated blobs carry no bodies, and
-        // trimming clears any inline bodies on legacy rows.
+        // never read artifact rows: the stored blobs carry no bodies.
         let include_artifacts = filter.include_artifacts.unwrap_or(false);
         let mut tasks: Vec<Task> = Vec::with_capacity(rows.len());
         for (json, _, manifest, row_task_id) in &rows {
@@ -656,11 +610,7 @@ impl A2aTaskStorage for PostgresA2aStorage {
                     Err(_) => continue,
                 }
             };
-            tasks.push(Self::trim_task(
-                task,
-                filter.history_length,
-                include_artifacts,
-            ));
+            tasks.push(Self::trim_task(task, filter.history_length));
         }
 
         let next_page_token = match rows.last() {
@@ -683,12 +633,11 @@ impl A2aTaskStorage for PostgresA2aStorage {
         owner: &str,
         new_status: TaskStatus,
     ) -> Result<Task, A2aStorageError> {
-        // Status transitions operate on the raw stored blob: they never
-        // touch artifact records (separated blobs are already
-        // artifact-free; legacy blobs keep their inline artifacts), so a
-        // transition is cheap regardless of artifact size. The returned
+        // Status transitions operate on the raw, artifact-free stored
+        // blob: they never touch artifact records, so a transition is
+        // cheap regardless of artifact size. The returned
         // task is rehydrated so callers still observe artifacts.
-        let row: Option<(serde_json::Value, Option<serde_json::Value>)> = sqlx::query_as(
+        let row: Option<(serde_json::Value, serde_json::Value)> = sqlx::query_as(
             "SELECT task_json, artifact_manifest FROM a2a_tasks \
              WHERE tenant = $1 AND task_id = $2 AND owner = $3",
         )
@@ -1495,8 +1444,8 @@ impl A2aAtomicStore for PostgresA2aStorage {
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         // The blob is used raw: status transitions never rewrite artifact
-        // records, so the separated layout's stripped blob stays stripped.
-        let row: Option<(serde_json::Value, Option<serde_json::Value>)> = sqlx::query_as(
+        // records, so the stripped blob stays stripped.
+        let row: Option<(serde_json::Value, serde_json::Value)> = sqlx::query_as(
             "SELECT task_json, artifact_manifest FROM a2a_tasks \
              WHERE tenant = $1 AND task_id = $2 AND owner = $3",
         )
@@ -1686,9 +1635,9 @@ impl A2aAtomicStore for PostgresA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        // The write kept the blob artifact-free for separated rows;
-        // rehydrate the returned task so callers (push dispatch,
-        // yielded-result handlers) observe its artifacts.
+        // The write kept the blob artifact-free; rehydrate the returned
+        // task so callers (push dispatch, yielded-result handlers) observe
+        // its artifacts.
         let new_blob = Self::task_to_json(&updated_task)?;
         let rehydrated = self
             .rehydrate_task(tenant, task_id, &new_blob, manifest_json)
@@ -1713,9 +1662,7 @@ impl A2aAtomicStore for PostgresA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        let stored = Self::fetch_manifest(&mut tx, tenant, task.id())
-            .await?
-            .unwrap_or_default();
+        let stored = Self::fetch_manifest(&mut tx, tenant, task.id()).await?;
         let plan = super::artifacts::reconcile(&artifacts, &stored)?;
         let manifest = serde_json::to_value(&plan.manifest)
             .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
@@ -2655,7 +2602,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (blob, manifest): (serde_json::Value, Option<serde_json::Value>) = sqlx::query_as(
+        let (blob, manifest): (serde_json::Value, serde_json::Value) = sqlx::query_as(
             "SELECT task_json, artifact_manifest FROM a2a_tasks WHERE task_id = 'pg-shape-1'",
         )
         .fetch_one(&s.pool)
@@ -2663,7 +2610,7 @@ mod tests {
         .unwrap();
         let blob_task: turul_a2a_proto::Task = serde_json::from_value(blob).unwrap();
         assert!(blob_task.artifacts.is_empty());
-        assert!(manifest.is_some());
+        assert_eq!(manifest.as_array().map(Vec::len), Some(1));
 
         let (before,): (String,) = sqlx::query_as(
             "SELECT updated_at::text FROM a2a_task_artifacts WHERE task_id = 'pg-shape-1' AND artifact_id = 'art-1'",
@@ -2731,104 +2678,77 @@ mod tests {
         assert!(!ts.is_empty());
     }
 
-    /// A pre-0.1.30 task row stores its artifacts inline in task_json with
-    /// NULL manifest. It must read correctly, keep its inline artifacts
-    /// through a status transition (no migration on status), and migrate
-    /// to the separated layout on the first full-task write.
+    /// A task row without an artifact manifest (a store this release did
+    /// not write) is a storage error, never read as a task whose artifacts
+    /// sit inline in `task_json`. The fresh schema cannot hold such a row,
+    /// so the test shadows `a2a_tasks` with a session-local temporary
+    /// table that has a nullable manifest column; the single-connection
+    /// pool keeps every query on that session.
     #[tokio::test]
-    async fn test_legacy_inline_artifact_row_reads_and_migrates() {
-        let s = storage().await;
-
-        let mut legacy =
-            Task::new("pg-legacy-1", TaskStatus::new(TaskState::Submitted)).with_context_id("ctx");
-        legacy.push_text_artifact("art-legacy", "Result", "legacy body");
-        let legacy_json = PostgresA2aStorage::task_to_json(&legacy).unwrap();
+    async fn test_task_row_without_manifest_is_storage_error() {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost/a2a_test".into());
+        let s = PostgresA2aStorage::new(PostgresConfig {
+            database_url: url,
+            max_connections: 1,
+            assume_schema_initialized: true,
+        })
+        .await
+        .unwrap();
         sqlx::query(
-            "INSERT INTO a2a_tasks (tenant, task_id, owner, task_json, context_id, status_state, status_timestamp, updated_at) \
-             VALUES ('default', 'pg-legacy-1', 'owner', $1, 'ctx', 'TASK_STATE_SUBMITTED', '', NOW())",
+            "CREATE TEMP TABLE a2a_tasks (
+                tenant TEXT NOT NULL DEFAULT '',
+                task_id TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                task_json JSONB NOT NULL,
+                context_id TEXT NOT NULL DEFAULT '',
+                status_state TEXT NOT NULL DEFAULT '',
+                status_timestamp TEXT COLLATE \"C\" NOT NULL,
+                cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                latest_event_sequence BIGINT NOT NULL DEFAULT 0,
+                artifact_manifest JSONB,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (tenant, task_id)
+            )",
         )
-        .bind(&legacy_json)
         .execute(&s.pool)
         .await
         .unwrap();
 
-        // Legacy read returns the inline artifact.
-        let task = s
-            .get_task("default", "pg-legacy-1", "owner", None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(task.artifacts().len(), 1);
-        assert_eq!(task.artifacts()[0].artifact_id, "art-legacy");
-
-        // Status transition preserves inline artifacts and stays legacy.
-        s.update_task_status(
-            "default",
-            "pg-legacy-1",
-            "owner",
-            TaskStatus::new(TaskState::Working),
+        let mut task = Task::new("pg-no-manifest-1", TaskStatus::new(TaskState::Submitted))
+            .with_context_id("ctx");
+        task.push_text_artifact("art-inline", "Result", "inline body");
+        sqlx::query(
+            "INSERT INTO a2a_tasks (tenant, task_id, owner, task_json, context_id, status_state, status_timestamp) \
+             VALUES ('default', 'pg-no-manifest-1', 'owner', $1, 'ctx', 'TASK_STATE_SUBMITTED', '')",
         )
+        .bind(PostgresA2aStorage::task_to_json(&task).unwrap())
+        .execute(&s.pool)
         .await
         .unwrap();
-        let (manifest_after_status,): (Option<serde_json::Value>,) =
-            sqlx::query_as("SELECT artifact_manifest FROM a2a_tasks WHERE task_id = 'pg-legacy-1'")
-                .fetch_one(&s.pool)
-                .await
-                .unwrap();
-        assert!(
-            manifest_after_status.is_none(),
-            "status transition must not migrate a legacy row"
-        );
-        let (sep_rows,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM a2a_task_artifacts WHERE task_id = 'pg-legacy-1'")
-                .fetch_one(&s.pool)
-                .await
-                .unwrap();
-        assert_eq!(
-            sep_rows, 0,
-            "legacy row must not have separated artifact rows yet"
-        );
 
-        // First full-task write migrates to the separated layout.
-        let task = s
-            .get_task("default", "pg-legacy-1", "owner", None)
-            .await
-            .unwrap()
-            .unwrap();
-        s.update_task("default", "owner", task).await.unwrap();
-        let (manifest_after_write,): (Option<serde_json::Value>,) =
-            sqlx::query_as("SELECT artifact_manifest FROM a2a_tasks WHERE task_id = 'pg-legacy-1'")
-                .fetch_one(&s.pool)
-                .await
-                .unwrap();
         assert!(
-            manifest_after_write.is_some(),
-            "full-task write must migrate the row to the separated layout"
+            s.get_task("default", "pg-no-manifest-1", "owner", None)
+                .await
+                .is_err(),
+            "a manifest-less row must not read as a task"
         );
-        let (sep_rows,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM a2a_task_artifacts WHERE task_id = 'pg-legacy-1'")
-                .fetch_one(&s.pool)
-                .await
-                .unwrap();
-        assert_eq!(sep_rows, 1, "artifact migrated to a separated row");
-        let (migrated_blob,): (serde_json::Value,) =
-            sqlx::query_as("SELECT task_json FROM a2a_tasks WHERE task_id = 'pg-legacy-1'")
-                .fetch_one(&s.pool)
-                .await
-                .unwrap();
-        let migrated_task: turul_a2a_proto::Task = serde_json::from_value(migrated_blob).unwrap();
         assert!(
-            migrated_task.artifacts.is_empty(),
-            "migrated blob must carry no artifact bodies"
-        );
-
-        let task = s
-            .get_task("default", "pg-legacy-1", "owner", None)
+            s.update_task_status(
+                "default",
+                "pg-no-manifest-1",
+                "owner",
+                TaskStatus::new(TaskState::Working),
+            )
             .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(task.artifacts().len(), 1);
-        assert_eq!(task.artifacts()[0].artifact_id, "art-legacy");
+            .is_err(),
+            "a status transition must not proceed on a manifest-less row"
+        );
+        assert!(
+            s.update_task("default", "owner", task).await.is_err(),
+            "a full-task write must not proceed on a manifest-less row"
+        );
     }
 
     #[tokio::test]

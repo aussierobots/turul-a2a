@@ -549,8 +549,19 @@ impl DynamoDbA2aStorage {
         Ok(())
     }
 
-    /// Read the stored artifact manifest for a task. An absent attribute
-    /// (legacy item) reconciles against an empty prior set.
+    /// The artifact manifest of a stored task item. Every task item this
+    /// backend writes carries one; an item without it is not readable.
+    fn stored_manifest(
+        item: &std::collections::HashMap<String, AttributeValue>,
+    ) -> Result<&str, A2aStorageError> {
+        item.get("artifactManifest")
+            .and_then(|v| v.as_s().ok())
+            .map(String::as_str)
+            .ok_or_else(|| A2aStorageError::DatabaseError("Missing artifact_manifest".into()))
+    }
+
+    /// Read the stored artifact manifest for a task. A missing item
+    /// reconciles against an empty prior set.
     async fn fetch_stored_manifest(
         &self,
         tenant: &str,
@@ -563,34 +574,26 @@ impl DynamoDbA2aStorage {
             .consistent_read(true)
             .table_name(&self.config.tasks_table)
             .key("pk", AttributeValue::S(pk))
-            .projection_expression("artifactManifest")
+            .projection_expression("pk, artifactManifest")
             .send()
             .await
             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
-        let manifest_json = out.item.and_then(|i| {
-            i.get("artifactManifest")
-                .and_then(|v| v.as_s().ok())
-                .cloned()
-        });
-        match manifest_json {
-            Some(json) => super::artifacts::manifest_from_json(&json),
+        match out.item {
+            Some(item) => super::artifacts::manifest_from_json(Self::stored_manifest(&item)?),
             None => Ok(Vec::new()),
         }
     }
 
-    /// Reassemble a full task from its stored blob and manifest string.
-    /// A missing manifest is a legacy item whose artifacts are inline.
+    /// Reassemble a full task from its artifact-free stored blob and its
+    /// manifest, fetching the artifact bodies the manifest names.
     async fn rehydrate_task(
         &self,
         tenant: &str,
         task_id: &str,
         blob: &str,
-        manifest_json: Option<&str>,
+        manifest_json: &str,
     ) -> Result<Task, A2aStorageError> {
-        let manifest = match manifest_json {
-            None => return Self::task_from_json(blob),
-            Some(json) => super::artifacts::manifest_from_json(json)?,
-        };
+        let manifest = super::artifacts::manifest_from_json(manifest_json)?;
         let mut proto: turul_a2a_proto::Task = serde_json::from_str(blob)
             .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
         if !manifest.is_empty() {
@@ -854,6 +857,7 @@ impl DynamoDbA2aStorage {
         context_id: &str,
         state_str: &str,
         task_json: &str,
+        artifact_manifest: &str,
         latest_event_sequence: Option<u64>,
         ttl: Option<AttributeValue>,
     ) -> std::collections::HashMap<String, AttributeValue> {
@@ -871,6 +875,10 @@ impl DynamoDbA2aStorage {
             AttributeValue::S(state_str.to_string()),
         );
         item.insert("taskJson".into(), AttributeValue::S(task_json.to_string()));
+        item.insert(
+            "artifactManifest".into(),
+            AttributeValue::S(artifact_manifest.to_string()),
+        );
         item.insert("updatedAt".into(), AttributeValue::S(Self::now_iso()));
         if let Some(seq) = latest_event_sequence {
             item.insert(
@@ -925,7 +933,7 @@ impl DynamoDbA2aStorage {
             .unwrap_or_default()
     }
 
-    fn trim_task(task: Task, history_length: Option<i32>, include_artifacts: bool) -> Task {
+    fn trim_task(task: Task, history_length: Option<i32>) -> Task {
         let mut proto = task.into_proto();
         if let Some(0) = history_length {
             proto.history.clear();
@@ -935,9 +943,6 @@ impl DynamoDbA2aStorage {
             let n = n as usize;
             let start = proto.history.len().saturating_sub(n);
             proto.history = proto.history[start..].to_vec();
-        }
-        if !include_artifacts {
-            proto.artifacts.clear();
         }
         Task::try_from(proto)
             .unwrap_or_else(|_| Task::new("err", TaskStatus::new(TaskState::Failed)))
@@ -963,7 +968,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         let plan = super::artifacts::reconcile(&artifacts, &[])?;
         let manifest_json = super::artifacts::manifest_to_json(&plan.manifest)?;
 
-        let mut item = Self::build_task_item(
+        let item = Self::build_task_item(
             &pk,
             tenant,
             task.id(),
@@ -971,10 +976,10 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             task.context_id(),
             state_str,
             &blob,
+            &manifest_json,
             None,
             Self::ttl_epoch(self.config.task_ttl_seconds),
         );
-        item.insert("artifactManifest".into(), AttributeValue::S(manifest_json));
 
         if plan.writes.is_empty() {
             // No artifact bodies to write — a plain PutItem keeps the
@@ -1063,11 +1068,10 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .and_then(|v| v.as_s().ok())
             .ok_or_else(|| A2aStorageError::DatabaseError("Missing task_json".into()))?;
 
-        let manifest_json = item.get("artifactManifest").and_then(|v| v.as_s().ok());
         let task = self
-            .rehydrate_task(tenant, task_id, json, manifest_json.map(|s| s.as_str()))
+            .rehydrate_task(tenant, task_id, json, Self::stored_manifest(&item)?)
             .await?;
-        Ok(Some(Self::trim_task(task, history_length, true)))
+        Ok(Some(Self::trim_task(task, history_length)))
     }
 
     async fn update_task(
@@ -1087,7 +1091,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
 
         // Conditional write: only succeeds if the item exists AND owner matches.
         // This prevents ownership transfer and ensures isolation.
-        let mut item = Self::build_task_item(
+        let item = Self::build_task_item(
             &pk,
             tenant,
             task.id(),
@@ -1095,10 +1099,10 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             task.context_id(),
             state_str,
             &blob,
+            &manifest_json,
             None,
             Self::ttl_epoch(self.config.task_ttl_seconds),
         );
-        item.insert("artifactManifest".into(), AttributeValue::S(manifest_json));
 
         let artifact_items = if plan.writes.is_empty() && plan.deletes.is_empty() {
             Vec::new()
@@ -1252,27 +1256,24 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         }
 
         // Status timestamp DESC, task_id DESC. The task is parsed from
-        // the (possibly artifact-free) blob; the manifest is carried so a
-        // requested page can rehydrate bodies.
-        let mut tasks_with_keys: Vec<(Task, String, Option<String>)> = items
-            .iter()
-            .filter_map(|item| {
-                let task = item
-                    .get("taskJson")
-                    .and_then(|v| v.as_s().ok())
-                    .and_then(|json| Self::task_from_json(json).ok())?;
-                let manifest_json = item
-                    .get("artifactManifest")
-                    .and_then(|v| v.as_s().ok())
-                    .cloned();
-                Some((task, manifest_json))
-            })
-            .filter(|(task, _)| filter.admits_status_time(task))
-            .map(|(task, manifest_json)| {
-                let key = super::status_time::sort_key(&task);
-                (task, key, manifest_json)
-            })
-            .collect();
+        // the artifact-free blob; the manifest is carried so a requested
+        // page can rehydrate bodies.
+        let mut tasks_with_keys: Vec<(Task, String, &str)> = Vec::with_capacity(items.len());
+        for item in &items {
+            let Some(task) = item
+                .get("taskJson")
+                .and_then(|v| v.as_s().ok())
+                .and_then(|json| Self::task_from_json(json).ok())
+            else {
+                continue;
+            };
+            if !filter.admits_status_time(&task) {
+                continue;
+            }
+            let manifest_json = Self::stored_manifest(item)?;
+            let key = super::status_time::sort_key(&task);
+            tasks_with_keys.push((task, key, manifest_json));
+        }
         tasks_with_keys.sort_by(|(a_task, a_key, _), (b_task, b_key, _)| {
             b_key.cmp(a_key).then_with(|| b_task.id().cmp(a_task.id()))
         });
@@ -1289,24 +1290,19 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         };
 
         // Artifacts are fetched only when requested. Excluded listings
-        // never read artifact items: separated blobs carry no bodies, and
-        // trimming clears any inline bodies on legacy rows.
+        // never read artifact items: the stored blobs carry no bodies.
         let include_artifacts = filter.include_artifacts.unwrap_or(false);
         let end_idx = (start_idx + page_size as usize).min(tasks_with_keys.len());
         let mut page_tasks: Vec<Task> = Vec::with_capacity(end_idx - start_idx);
         for (task, _, manifest_json) in &tasks_with_keys[start_idx..end_idx] {
             let task = if include_artifacts {
                 let blob = Self::task_to_json(task)?;
-                self.rehydrate_task(tenant, task.id(), &blob, manifest_json.as_deref())
+                self.rehydrate_task(tenant, task.id(), &blob, manifest_json)
                     .await?
             } else {
                 task.clone()
             };
-            page_tasks.push(Self::trim_task(
-                task,
-                filter.history_length,
-                include_artifacts,
-            ));
+            page_tasks.push(Self::trim_task(task, filter.history_length));
         }
 
         let next_page_token = if end_idx < tasks_with_keys.len() {
@@ -1334,9 +1330,8 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         // Status transitions operate on the raw stored item via an
         // UpdateItem that rewrites only the status fields. The manifest
         // and latestEventSequence are left untouched, so artifact records
-        // are never rewritten (separated blobs stay artifact-free; legacy
-        // blobs keep their inline artifacts). The returned task is
-        // rehydrated so callers still observe artifacts.
+        // are never rewritten and the blob stays artifact-free. The
+        // returned task is rehydrated so callers still observe artifacts.
         let pk = Self::task_key(tenant, task_id);
         let out = self
             .client
@@ -1364,10 +1359,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .get("taskJson")
             .and_then(|v| v.as_s().ok())
             .ok_or_else(|| A2aStorageError::DatabaseError("Missing task_json".into()))?;
-        let manifest_json = item
-            .get("artifactManifest")
-            .and_then(|v| v.as_s().ok())
-            .cloned();
+        let manifest_json = Self::stored_manifest(&item)?;
         let task = Self::task_from_json(blob)?;
 
         let current_state = task
@@ -1428,7 +1420,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
 
-        self.rehydrate_task(tenant, task_id, &new_blob, manifest_json.as_deref())
+        self.rehydrate_task(tenant, task_id, &new_blob, manifest_json)
             .await
     }
 
@@ -1923,17 +1915,13 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
         let page_size = super::filter::push_config_page_size(page_size);
 
         // Scan with filter on tenant + taskId + strict registeredAfter
-        // upper bound. Pre-migration rows have the attribute absent;
-        // default-0 semantics require `attribute_not_exists(...)` to
-        // count as 0 < event_sequence when event_sequence > 0.
+        // upper bound.
         let result = self
             .client
             .scan()
             .table_name(&self.config.push_configs_table)
             .filter_expression(
-                "tenant = :t AND taskId = :tid AND \
-                 (registeredAfterEventSequence < :seq OR \
-                  attribute_not_exists(registeredAfterEventSequence))",
+                "tenant = :t AND taskId = :tid AND registeredAfterEventSequence < :seq",
             )
             .expression_attribute_values(":t", AttributeValue::S(tenant.to_string()))
             .expression_attribute_values(":tid", AttributeValue::S(task_id.to_string()))
@@ -2165,7 +2153,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             // puts + counter write. The task put carries
             // `latestEventSequence` directly so one Put covers the
             // causal-floor maintenance, plus the artifact manifest.
-            let mut task_item = Self::build_task_item(
+            let task_item = Self::build_task_item(
                 &pk,
                 tenant,
                 task.id(),
@@ -2173,12 +2161,9 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 task.context_id(),
                 state_str,
                 &blob,
+                &manifest_json,
                 Some(allocation.latest()),
                 Self::ttl_epoch(self.config.task_ttl_seconds),
-            );
-            task_item.insert(
-                "artifactManifest".into(),
-                AttributeValue::S(manifest_json.clone()),
             );
             let task_put = aws_sdk_dynamodb::types::Put::builder()
                 .table_name(&self.config.tasks_table)
@@ -2255,8 +2240,8 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         loop {
             // Read the raw item (consistent) for validation. The blob is used
             // raw: status transitions never rewrite artifact records, so the
-            // separated layout's stripped blob stays stripped and the manifest
-            // is carried forward unchanged.
+            // stripped blob stays stripped and the manifest is carried
+            // forward unchanged.
             let read = self
                 .client
                 .get_item()
@@ -2281,10 +2266,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 .get("taskJson")
                 .and_then(|v| v.as_s().ok())
                 .ok_or_else(|| A2aStorageError::DatabaseError("Missing task_json".into()))?;
-            let manifest_json = item
-                .get("artifactManifest")
-                .and_then(|v| v.as_s().ok())
-                .cloned();
+            let manifest_json = Self::stored_manifest(&item)?;
             // The task's causal floor; the Put below must not regress it.
             let prior_latest = match item.get("latestEventSequence") {
                 Some(AttributeValue::N(n)) => n
@@ -2319,8 +2301,8 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 },
             )?;
 
-            // Build updated task from the raw (artifact-free for separated)
-            // blob, changing only status.
+            // Build updated task from the raw, artifact-free blob, changing
+            // only status.
             let mut proto = task.as_proto().clone();
             proto.status = Some(status_proto.clone());
             let mut updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
@@ -2344,7 +2326,9 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             // committed a terminal for this pk — the condition-expression
             // rejects our write atomically at the backend, preserving the
             // single-terminal-writer invariant.
-            let mut task_item = Self::build_task_item(
+            // The stored manifest is carried across the status write so
+            // the artifact bodies remain reachable.
+            let task_item = Self::build_task_item(
                 &pk,
                 tenant,
                 task_id,
@@ -2352,18 +2336,10 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 updated_task.context_id(),
                 state_str,
                 &task_json,
+                manifest_json,
                 Some(prior_latest.max(allocation.latest())),
                 Self::ttl_epoch(self.config.task_ttl_seconds),
             );
-            // Preserve the artifact manifest across the status write so the
-            // separated layout's bodies remain reachable. Absent for legacy
-            // items (their artifacts stay inline in the blob).
-            if let Some(ref manifest) = manifest_json {
-                task_item.insert(
-                    "artifactManifest".into(),
-                    AttributeValue::S(manifest.clone()),
-                );
-            }
             let mut items = vec![
                 aws_sdk_dynamodb::types::TransactWriteItem::builder()
                     .put(
@@ -2436,12 +2412,11 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 .await
             {
                 Ok(_) => {
-                    // The write kept the blob artifact-free for separated
-                    // rows; rehydrate the returned task so callers (push
-                    // dispatch, yielded-result handlers) observe its
-                    // artifacts.
+                    // The write kept the blob artifact-free; rehydrate the
+                    // returned task so callers (push dispatch, yielded-result
+                    // handlers) observe its artifacts.
                     let rehydrated = self
-                        .rehydrate_task(tenant, task_id, &task_json, manifest_json.as_deref())
+                        .rehydrate_task(tenant, task_id, &task_json, manifest_json)
                         .await?;
                     return Ok((rehydrated, allocation.sequences));
                 }
@@ -2523,7 +2498,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             // whose persisted statusState is already terminal, protecting
             // against full-task replacement clobbering a concurrent
             // terminal commit.
-            let mut task_item = Self::build_task_item(
+            let task_item = Self::build_task_item(
                 &pk,
                 tenant,
                 &task_id,
@@ -2531,10 +2506,10 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 task.context_id(),
                 state_str,
                 &blob,
+                &manifest_json,
                 Some(prior_latest.max(allocation.latest())),
                 Self::ttl_epoch(self.config.task_ttl_seconds),
             );
-            task_item.insert("artifactManifest".into(), AttributeValue::S(manifest_json));
             let task_put = aws_sdk_dynamodb::types::Put::builder()
                 .table_name(&self.config.tasks_table)
                 .set_item(Some(task_item))
@@ -4905,41 +4880,30 @@ mod tests {
         );
     }
 
-    /// A pre-0.1.30 task item stores its artifacts inline in taskJson with
-    /// no artifactManifest attribute. It must read correctly, keep its
-    /// inline artifacts through a status transition (no migration on
-    /// status), and migrate to the separated layout on a full-task write.
+    /// A task item without an `artifactManifest` attribute (an item this
+    /// release did not write) is a storage error, never read as a task
+    /// whose artifacts sit inline in `taskJson`.
     #[tokio::test]
-    async fn test_legacy_inline_artifact_item_reads_and_migrates() {
+    async fn test_task_item_without_manifest_is_storage_error() {
         skip_unless_dynamodb_env!(s);
         let tenant = s.scoped_tenant("default");
 
-        // Seed a legacy item directly: inline artifact in taskJson, no
-        // artifactManifest attribute.
-        let mut legacy =
-            Task::new("ddb-legacy-1", TaskStatus::new(TaskState::Submitted)).with_context_id("ctx");
-        legacy.push_text_artifact("art-legacy", "Result", "legacy body");
-        let pk = DynamoDbA2aStorage::task_key(&tenant, "ddb-legacy-1");
-        let legacy_json = DynamoDbA2aStorage::task_to_json(&legacy).unwrap();
-        let item = std::collections::HashMap::from([
-            ("pk".to_string(), AttributeValue::S(pk.clone())),
-            ("tenant".to_string(), AttributeValue::S(tenant.clone())),
-            (
-                "taskId".to_string(),
-                AttributeValue::S("ddb-legacy-1".into()),
-            ),
-            ("owner".to_string(), AttributeValue::S("owner".into())),
-            ("contextId".to_string(), AttributeValue::S("ctx".into())),
-            (
-                "statusState".to_string(),
-                AttributeValue::S("Submitted".into()),
-            ),
-            ("taskJson".to_string(), AttributeValue::S(legacy_json)),
-            (
-                "updatedAt".to_string(),
-                AttributeValue::S(DynamoDbA2aStorage::now_iso()),
-            ),
-        ]);
+        let mut task = Task::new("ddb-no-manifest-1", TaskStatus::new(TaskState::Submitted))
+            .with_context_id("ctx");
+        task.push_text_artifact("art-inline", "Result", "inline body");
+        let mut item = DynamoDbA2aStorage::build_task_item(
+            &DynamoDbA2aStorage::task_key(&tenant, "ddb-no-manifest-1"),
+            &tenant,
+            "ddb-no-manifest-1",
+            "owner",
+            "ctx",
+            TaskState::Submitted.wire_name(),
+            &DynamoDbA2aStorage::task_to_json(&task).unwrap(),
+            "[]",
+            None,
+            None,
+        );
+        item.remove("artifactManifest");
         s.inner
             .client
             .put_item()
@@ -4949,87 +4913,29 @@ mod tests {
             .await
             .unwrap();
 
-        // Legacy read returns the inline artifact.
-        let task = s
-            .inner
-            .get_task(&tenant, "ddb-legacy-1", "owner", None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(task.artifacts().len(), 1);
-        assert_eq!(task.artifacts()[0].artifact_id, "art-legacy");
-
-        // Status transition preserves inline artifacts and stays legacy.
-        s.inner
-            .update_task_status(
-                &tenant,
-                "ddb-legacy-1",
-                "owner",
-                TaskStatus::new(TaskState::Working),
-            )
-            .await
-            .unwrap();
-        let after_status = s
-            .inner
-            .client
-            .get_item()
-            .table_name(&s.inner.config.tasks_table)
-            .key("pk", AttributeValue::S(pk.clone()))
-            .send()
-            .await
-            .unwrap()
-            .item
-            .unwrap();
         assert!(
-            !after_status.contains_key("artifactManifest"),
-            "status transition must not migrate a legacy item"
+            s.inner
+                .get_task(&tenant, "ddb-no-manifest-1", "owner", None)
+                .await
+                .is_err(),
+            "a manifest-less item must not read as a task"
         );
-        let task = s
-            .inner
-            .get_task(&tenant, "ddb-legacy-1", "owner", None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            task.artifacts().len(),
-            1,
-            "artifact survives status transition"
-        );
-
-        // First full-task write migrates to the separated layout.
-        s.inner.update_task(&tenant, "owner", task).await.unwrap();
-        let after_write = s
-            .inner
-            .client
-            .get_item()
-            .table_name(&s.inner.config.tasks_table)
-            .key("pk", AttributeValue::S(pk))
-            .send()
-            .await
-            .unwrap()
-            .item
-            .unwrap();
         assert!(
-            after_write.contains_key("artifactManifest"),
-            "full-task write must migrate the item to the separated layout"
+            s.inner
+                .update_task_status(
+                    &tenant,
+                    "ddb-no-manifest-1",
+                    "owner",
+                    TaskStatus::new(TaskState::Working),
+                )
+                .await
+                .is_err(),
+            "a status transition must not proceed on a manifest-less item"
         );
-        let blob = after_write
-            .get("taskJson")
-            .and_then(|v| v.as_s().ok())
-            .unwrap();
-        let blob_task: turul_a2a_proto::Task = serde_json::from_str(blob).unwrap();
         assert!(
-            blob_task.artifacts.is_empty(),
-            "migrated blob carries no artifact bodies"
+            s.inner.update_task(&tenant, "owner", task).await.is_err(),
+            "a full-task write must not proceed on a manifest-less item"
         );
-        let task = s
-            .inner
-            .get_task(&tenant, "ddb-legacy-1", "owner", None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(task.artifacts().len(), 1);
-        assert_eq!(task.artifacts()[0].artifact_id, "art-legacy");
     }
 
     #[tokio::test]
@@ -5460,6 +5366,7 @@ mod tests {
             "ctx-1",
             "Working",
             "{\"id\":\"task-1\"}",
+            "[]",
             Some(5),
             Some(ttl_attr.clone()),
         );
@@ -5474,6 +5381,11 @@ mod tests {
             "{\"id\":\"task-1\"}",
         );
         assert_eq!(item.get("ttl"), Some(&ttl_attr), "ttl must be persisted");
+        assert_eq!(
+            item.get("artifactManifest"),
+            Some(&AttributeValue::S("[]".into())),
+            "artifactManifest must be persisted"
+        );
         match item.get("latestEventSequence") {
             Some(AttributeValue::N(v)) => assert_eq!(v, "5"),
             other => panic!("missing/wrong latestEventSequence: {other:?}"),
@@ -5490,6 +5402,7 @@ mod tests {
             "c",
             "Submitted",
             "{}",
+            "[]",
             None,
             None,
         );

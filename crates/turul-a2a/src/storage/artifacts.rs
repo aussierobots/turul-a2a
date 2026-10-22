@@ -5,8 +5,9 @@
 //! fingerprint)` pairs — next to the task blob and store each artifact
 //! body as its own record. The manifest preserves the artifact order of
 //! the original task so rehydrated reads are byte-identical to the
-//! pre-separation wire shape. A task record without a manifest is a
-//! legacy record whose artifacts (if any) are inline in the blob.
+//! pre-separation wire shape. Every task record carries a manifest
+//! (possibly empty) and an artifact-free blob; a record without a
+//! manifest is a storage error.
 //!
 //! The fingerprint is a SHA-256 over an explicitly canonicalized proto
 //! JSON form of the artifact. Determinism is a property of the
