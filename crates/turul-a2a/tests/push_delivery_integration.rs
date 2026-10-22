@@ -1799,11 +1799,23 @@ async fn seed_task_and_config(
 }
 
 /// Worker with a target lookup on `store`, 500 ms between attempts so
-/// the test can delete something after the first POST.
+/// the test can delete something after the first POST. The config cache
+/// keeps its default, so these tests pin that a deletion made straight
+/// in storage is seen at the next attempt without any invalidation.
 fn live_worker(store: &Arc<InMemoryA2aStorage>) -> Arc<PushDeliveryWorker> {
+    live_worker_with_cache(store, None)
+}
+
+fn live_worker_with_cache(
+    store: &Arc<InMemoryA2aStorage>,
+    config_cache_ttl: Option<Duration>,
+) -> Arc<PushDeliveryWorker> {
     let cfg = test_config(5, |c| {
         c.backoff_base = Duration::from_millis(500);
         c.backoff_cap = Duration::from_millis(500);
+        if let Some(ttl) = config_cache_ttl {
+            c.config_cache_ttl = ttl;
+        }
     });
     Arc::new(
         PushDeliveryWorker::new(store.clone(), cfg, None, "instance-live".into())
@@ -1909,6 +1921,60 @@ async fn task_deleted_mid_retry_abandons_without_another_post() {
     assert_eq!(posts, 1, "no POST after the task was deleted");
 }
 
+/// With the config cache on, a config confirmed present is not re-read
+/// within the TTL: a deletion made straight in storage (as another
+/// instance would) does not stop the next attempt. Invalidating the
+/// task's cached configs — what a deletion through this server does —
+/// makes the following attempt re-read, find the config gone and
+/// abandon.
+#[tokio::test]
+async fn cached_config_is_trusted_until_invalidated() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(InMemoryA2aStorage::new());
+    let cfg = seed_task_and_config(&store, &format!("{}/webhook", server.uri())).await;
+    let worker = live_worker_with_cache(&store, Some(Duration::from_secs(3600)));
+    let target =
+        PushTarget::from_config(LIVE_TENANT, LIVE_OWNER, &cfg.task_id, 1, &cfg).expect("target");
+
+    let delivery = {
+        let worker = worker.clone();
+        let target = target.clone();
+        tokio::spawn(async move { worker.deliver(&target, b"{}").await })
+    };
+    wait_until(Duration::from_secs(3), "the first POST", || async {
+        request_count(&server).await == 1
+    })
+    .await;
+    store
+        .delete_config(LIVE_TENANT, &cfg.task_id, &cfg.id)
+        .await
+        .expect("delete config");
+    wait_until(
+        Duration::from_secs(3),
+        "a POST from the cached config",
+        || async { request_count(&server).await == 2 },
+    )
+    .await;
+    worker.invalidate_push_configs(LIVE_TENANT, &cfg.task_id);
+
+    let report = delivery.await.expect("delivery task");
+    assert_eq!(
+        report,
+        DeliveryReport::Abandoned(AbandonedReason::ConfigDeleted)
+    );
+    assert_eq!(
+        request_count(&server).await,
+        2,
+        "no POST after invalidation"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Cross-instance coordination.
 // ---------------------------------------------------------------------------
@@ -2011,6 +2077,163 @@ async fn expired_claim_is_resumed_by_another_instance_within_the_budget() {
     assert_eq!(failed[0].last_http_status, Some(500));
     assert!(store.list_reclaimable_claims(16).await.unwrap().is_empty());
     drop(server);
+}
+
+// ---------------------------------------------------------------------------
+// Failed-delivery retention. A delivery that gives up stays listed until
+// its retention ends; the storage cleanup entry point then removes it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn failed_delivery_is_removed_by_cleanup_once_retention_ends() {
+    use turul_a2a::storage::A2aEventStore;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(InMemoryA2aStorage::new());
+    let kept = PushDeliveryWorker::new(
+        store.clone(),
+        test_config(3, |c| {
+            c.failed_delivery_retention = Duration::from_secs(3600)
+        }),
+        None,
+        "instance-kept".into(),
+    )
+    .expect("worker");
+    let expiring = PushDeliveryWorker::new(
+        store.clone(),
+        test_config(3, |c| c.failed_delivery_retention = Duration::ZERO),
+        None,
+        "instance-expiring".into(),
+    )
+    .expect("worker");
+    let kept_target = sentinel_target(&server.uri());
+    let expiring_target = sentinel_target(&server.uri());
+
+    for (worker, target) in [(&kept, &kept_target), (&expiring, &expiring_target)] {
+        assert_eq!(
+            worker.deliver(target, b"{}").await,
+            DeliveryReport::GaveUp(GaveUpReason::NonRetryableHttpStatus)
+        );
+    }
+    let listed = |failed: Vec<FailedDelivery>| {
+        let mut ids: Vec<String> = failed.into_iter().map(|f| f.task_id).collect();
+        ids.sort();
+        ids
+    };
+    let failed = store
+        .list_failed_deliveries(&kept_target.tenant, SystemTime::UNIX_EPOCH, 10)
+        .await
+        .unwrap();
+    let mut both = vec![kept_target.task_id.clone(), expiring_target.task_id.clone()];
+    both.sort();
+    assert_eq!(listed(failed), both, "both are listed until cleanup runs");
+
+    assert_eq!(store.cleanup_expired().await.unwrap(), 1);
+    let failed = store
+        .list_failed_deliveries(&kept_target.tenant, SystemTime::UNIX_EPOCH, 10)
+        .await
+        .unwrap();
+    assert_eq!(listed(failed), vec![kept_target.task_id.clone()]);
+}
+
+// ---------------------------------------------------------------------------
+// Read timeout. A receiver that accepts the request and then stays silent
+// fails the attempt after `read_timeout`, well inside `request_timeout`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn read_timeout_bounds_a_silent_receiver() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(InMemoryA2aStorage::new());
+    let worker = PushDeliveryWorker::new(
+        store.clone(),
+        test_config(1, |c| {
+            c.read_timeout = Duration::from_millis(200);
+            c.request_timeout = Duration::from_secs(30);
+        }),
+        None,
+        "instance-read-timeout".into(),
+    )
+    .expect("worker");
+    let target = sentinel_target(&server.uri());
+
+    let started = std::time::Instant::now();
+    let report = worker.deliver(&target, b"{}").await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        report,
+        DeliveryReport::GaveUp(GaveUpReason::MaxAttemptsExhausted)
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "bounded by read_timeout, not the 5s response delay: {elapsed:?}"
+    );
+    let failed = store
+        .list_failed_deliveries(&target.tenant, SystemTime::UNIX_EPOCH, 10)
+        .await
+        .unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].last_error_class, DeliveryErrorClass::Timeout);
+}
+
+// ---------------------------------------------------------------------------
+// TLS handshake failure. A receiver that cannot complete a TLS handshake
+// (rejected certificate, or no TLS on the port) is a misconfiguration
+// that retrying does not fix: the delivery gives up on the first
+// attempt with `TlsRejected`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tls_handshake_failure_gives_up_without_retry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    // Answers every connection in plaintext, so the client's TLS
+    // handshake fails on the first record it reads.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let accepted = connections.clone();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            accepted.fetch_add(1, Ordering::SeqCst);
+            let _ = socket
+                .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            let _ = socket.shutdown().await;
+        }
+    });
+
+    let store = Arc::new(InMemoryA2aStorage::new());
+    let worker = fast_worker(store.clone(), 5);
+    let mut target = sentinel_target("https://127.0.0.1");
+    target.url = Url::parse(&format!("https://127.0.0.1:{port}/webhook")).unwrap();
+
+    let report = worker.deliver(&target, b"{}").await;
+    assert_eq!(report, DeliveryReport::GaveUp(GaveUpReason::TlsRejected));
+    assert_eq!(connections.load(Ordering::SeqCst), 1, "no retry");
+
+    let failed = store
+        .list_failed_deliveries(&target.tenant, SystemTime::UNIX_EPOCH, 10)
+        .await
+        .unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].last_error_class, DeliveryErrorClass::TlsRejected);
+    assert_eq!(failed[0].delivery_attempt_count, 1);
+    assert_eq!(failed[0].last_http_status, None);
 }
 
 // ---------------------------------------------------------------------------

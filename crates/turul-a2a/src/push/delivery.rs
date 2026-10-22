@@ -39,9 +39,10 @@
 //!   pinning the validated IP, so the TCP connect cannot be swapped
 //!   to a different host between validation and dial.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use rand::RngExt;
 use url::Url;
@@ -60,9 +61,19 @@ use crate::storage::{A2aPushNotificationStorage, A2aStorageError, A2aTaskStorage
 /// (A2A v1.0.1 §4.3.3).
 pub const PUSH_CONTENT_TYPE: &str = "application/a2a+json";
 
+/// Longest failed-delivery retention honoured; a longer one (such as
+/// `Duration::MAX` meaning "keep") is clamped to it. 1000 years keeps
+/// the give-up time plus the retention representable as a `SystemTime`
+/// on every platform and as microseconds since the epoch in an `i64`,
+/// the storage backends' column type.
+pub const MAX_FAILED_DELIVERY_RETENTION: Duration = Duration::from_secs(1000 * 365 * 24 * 60 * 60);
+
 /// Runtime-configurable delivery parameters.
 ///
-/// Defaults: 8 attempts, exponential backoff from a 2s base capped at 60s.
+/// Defaults: 8 attempts (the first immediate), waits doubling from a
+/// 2s base and capped at 60s, ±25% jitter — 2+4+8+16+32+60+60 = 182s,
+/// a retry horizon of about 3 minutes. These are also the defaults of
+/// the server builders' `push_*` settings.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct PushDeliveryConfig {
@@ -70,14 +81,25 @@ pub struct PushDeliveryConfig {
     pub backoff_base: Duration,
     pub backoff_cap: Duration,
     pub backoff_jitter: f32,
+    /// Bound on the whole POST: connect, send and the full response.
     pub request_timeout: Duration,
     pub connect_timeout: Duration,
-    /// Accepted but currently unused: the read phase is bounded by
-    /// `request_timeout`.
+    /// Longest the POST waits for the receiver's response with nothing
+    /// arriving (status line and headers, then each body read).
     pub read_timeout: Duration,
     pub claim_expiry: Duration,
     pub max_payload_bytes: usize,
     pub allow_insecure_urls: bool,
+    /// How long a push config confirmed present by the pre-attempt
+    /// check is trusted without re-reading storage. Default `ZERO`:
+    /// re-read before every attempt, so a deletion made anywhere stops
+    /// the delivery at its next attempt. A non-zero TTL lets a deletion
+    /// made outside this worker's server go unseen for up to the TTL.
+    pub config_cache_ttl: Duration,
+    /// How long a failed-delivery record is kept after the delivery
+    /// gives up; see [`DeliveryOutcome::GaveUp`]. Values above
+    /// [`MAX_FAILED_DELIVERY_RETENTION`] are clamped to it.
+    pub failed_delivery_retention: Duration,
 }
 
 impl Default for PushDeliveryConfig {
@@ -93,6 +115,29 @@ impl Default for PushDeliveryConfig {
             claim_expiry: Duration::from_secs(600),
             max_payload_bytes: 1024 * 1024,
             allow_insecure_urls: false,
+            config_cache_ttl: Duration::ZERO,
+            failed_delivery_retention: Duration::from_secs(7 * 24 * 60 * 60),
+        }
+    }
+}
+
+impl PushDeliveryConfig {
+    /// The delivery parameters a server builder's `push_*` settings
+    /// select.
+    pub fn from_runtime_config(runtime: &crate::server::RuntimeConfig) -> Self {
+        Self {
+            max_attempts: runtime.push_max_attempts as u32,
+            backoff_base: runtime.push_backoff_base,
+            backoff_cap: runtime.push_backoff_cap,
+            backoff_jitter: runtime.push_backoff_jitter,
+            request_timeout: runtime.push_request_timeout,
+            connect_timeout: runtime.push_connect_timeout,
+            read_timeout: runtime.push_read_timeout,
+            claim_expiry: runtime.push_claim_expiry,
+            max_payload_bytes: runtime.push_max_payload_bytes,
+            allow_insecure_urls: runtime.allow_insecure_push_urls,
+            config_cache_ttl: runtime.push_config_cache_ttl,
+            failed_delivery_retention: runtime.push_failed_delivery_retention,
         }
     }
 }
@@ -149,9 +194,16 @@ impl PushDnsResolver for TokioDnsResolver {
 }
 
 /// The config and task stores the worker re-reads before every POST
-/// attempt, so a delivery stops as soon as its push config or task is
+/// attempt, so a delivery stops once its push config or task is
 /// deleted. A2A v1.0.1 §3.1.10: "No further notifications will be sent
 /// to the configured webhook after deletion."
+///
+/// With a non-zero [`PushDeliveryConfig::config_cache_ttl`] a config
+/// found present is trusted for the TTL without re-reading. A deletion
+/// through the server that owns this worker drops the cached entries
+/// for that task at once (see
+/// [`PushDeliveryWorker::invalidate_push_configs`]); a deletion made
+/// anywhere else is seen within the TTL.
 #[derive(Clone)]
 pub struct DeliveryTargetLookup {
     pub push_storage: Arc<dyn A2aPushNotificationStorage>,
@@ -162,13 +214,23 @@ impl DeliveryTargetLookup {
     /// `Some(reason)` when the config or the task is gone. A read
     /// error is not evidence of deletion: the attempt proceeds and the
     /// next attempt checks again.
-    async fn gone(&self, target: &PushTarget) -> Option<AbandonedReason> {
-        if let Ok(None) = self
-            .push_storage
-            .get_config(&target.tenant, &target.task_id, &target.config_id)
-            .await
-        {
-            return Some(AbandonedReason::ConfigDeleted);
+    async fn gone(
+        &self,
+        target: &PushTarget,
+        cache: &PushConfigCache,
+        ttl: Duration,
+    ) -> Option<AbandonedReason> {
+        if !cache.is_fresh(target, ttl) {
+            let generation = cache.generation();
+            match self
+                .push_storage
+                .get_config(&target.tenant, &target.task_id, &target.config_id)
+                .await
+            {
+                Ok(None) => return Some(AbandonedReason::ConfigDeleted),
+                Ok(Some(_)) => cache.record_present(target, ttl, generation),
+                Err(_) => {}
+            }
         }
         if let Ok(None) = self
             .task_storage
@@ -178,6 +240,75 @@ impl DeliveryTargetLookup {
             return Some(AbandonedReason::TaskDeleted);
         }
         None
+    }
+}
+
+/// Push configs confirmed present, keyed by task then config id, with
+/// the time each was confirmed. Only presence is cached — a missing
+/// config abandons the delivery, so there is nothing to re-check — and
+/// so a config create can never make an entry stale; only a delete can.
+#[derive(Default)]
+struct PushConfigCache {
+    state: Mutex<PushConfigCacheState>,
+}
+
+#[derive(Default)]
+struct PushConfigCacheState {
+    /// Bumped by every invalidation. A storage read that started
+    /// before an invalidation may have seen the config before it was
+    /// deleted, so its result is not cached.
+    generation: u64,
+    by_task: HashMap<(String, String), HashMap<String, Instant>>,
+}
+
+impl PushConfigCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PushConfigCacheState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn is_fresh(&self, target: &PushTarget, ttl: Duration) -> bool {
+        self.lock()
+            .by_task
+            .get(&(target.tenant.clone(), target.task_id.clone()))
+            .and_then(|configs| configs.get(&target.config_id))
+            .is_some_and(|confirmed| confirmed.elapsed() < ttl)
+    }
+
+    /// Read before the storage read whose result is passed to
+    /// [`Self::record_present`].
+    fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+
+    /// Cache that `target`'s config was found present by a read that
+    /// started at `read_generation`, unless an invalidation has run
+    /// since.
+    fn record_present(&self, target: &PushTarget, ttl: Duration, read_generation: u64) {
+        if ttl.is_zero() {
+            return;
+        }
+        let mut state = self.lock();
+        if state.generation != read_generation {
+            return;
+        }
+        // Drop expired entries so the map holds only live deliveries.
+        state.by_task.retain(|_, configs| {
+            configs.retain(|_, confirmed| confirmed.elapsed() < ttl);
+            !configs.is_empty()
+        });
+        state
+            .by_task
+            .entry((target.tenant.clone(), target.task_id.clone()))
+            .or_default()
+            .insert(target.config_id.clone(), Instant::now());
+    }
+
+    fn invalidate(&self, tenant: &str, task_id: &str) {
+        let mut state = self.lock();
+        state.generation = state.generation.wrapping_add(1);
+        state
+            .by_task
+            .remove(&(tenant.to_string(), task_id.to_string()));
     }
 }
 
@@ -194,6 +325,8 @@ pub struct PushDeliveryWorker {
     /// driven directly, without a dispatcher, has no stores to read).
     /// Set through [`Self::with_target_lookup`].
     pub(crate) target_lookup: Option<DeliveryTargetLookup>,
+    /// Shared by every clone of this worker.
+    config_cache: Arc<PushConfigCache>,
 }
 
 impl PushDeliveryWorker {
@@ -205,7 +338,8 @@ impl PushDeliveryWorker {
     ///
     /// Per-attempt client config:
     /// - Connect timeout: `connect_timeout`.
-    /// - Read / total timeout: `request_timeout`.
+    /// - Read timeout (receiver silent): `read_timeout`.
+    /// - Total timeout: `request_timeout`.
     /// - Redirects: none (HTTP redirects are SSRF risk on push delivery).
     pub fn new(
         push_delivery_store: Arc<dyn A2aPushDeliveryStore>,
@@ -220,7 +354,15 @@ impl PushDeliveryWorker {
             outbound_validator,
             instance_id,
             target_lookup: None,
+            config_cache: Arc::default(),
         })
+    }
+
+    /// Forget the cached presence of every push config of a task, so
+    /// the next attempt of any delivery for it re-reads storage. Call
+    /// after deleting one of the task's push configs.
+    pub fn invalidate_push_configs(&self, tenant: &str, task_id: &str) {
+        self.config_cache.invalidate(tenant, task_id);
     }
 
     /// Re-read the push config and task before every POST attempt and
@@ -254,11 +396,11 @@ impl PushDeliveryWorker {
                 .persist_terminal(
                     target,
                     &claim,
-                    DeliveryOutcome::GaveUp {
-                        reason: GaveUpReason::PayloadTooLarge,
-                        last_error_class: DeliveryErrorClass::PayloadTooLarge,
-                        last_http_status: None,
-                    },
+                    self.gave_up(
+                        GaveUpReason::PayloadTooLarge,
+                        DeliveryErrorClass::PayloadTooLarge,
+                        None,
+                    ),
                 )
                 .await;
         }
@@ -280,18 +422,20 @@ impl PushDeliveryWorker {
                     .persist_terminal(
                         target,
                         &claim,
-                        DeliveryOutcome::GaveUp {
-                            reason: GaveUpReason::MaxAttemptsExhausted,
-                            last_error_class: DeliveryErrorClass::Timeout,
-                            last_http_status: None,
-                        },
+                        self.gave_up(
+                            GaveUpReason::MaxAttemptsExhausted,
+                            DeliveryErrorClass::Timeout,
+                            None,
+                        ),
                     )
                     .await;
             }
 
             // Config / task still exist.
             if let Some(lookup) = &self.target_lookup
-                && let Some(reason) = lookup.gone(target).await
+                && let Some(reason) = lookup
+                    .gone(target, &self.config_cache, self.config.config_cache_ttl)
+                    .await
             {
                 return self
                     .persist_terminal(target, &claim, DeliveryOutcome::Abandoned { reason })
@@ -342,11 +486,11 @@ impl PushDeliveryWorker {
                         .persist_terminal(
                             target,
                             &claim,
-                            DeliveryOutcome::GaveUp {
-                                reason: GaveUpReason::SsrfBlocked,
-                                last_error_class: DeliveryErrorClass::SSRFBlocked,
-                                last_http_status: None,
-                            },
+                            self.gave_up(
+                                GaveUpReason::SsrfBlocked,
+                                DeliveryErrorClass::SSRFBlocked,
+                                None,
+                            ),
                         )
                         .await;
                 }
@@ -403,14 +547,21 @@ impl PushDeliveryWorker {
                     // `NonRetryableHttpStatus` (not `MaxAttemptsExhausted`)
                     // because the retry budget was never consumed — the
                     // receiver rejected the payload outright.
-                    DeliveryOutcome::GaveUp {
-                        reason: GaveUpReason::NonRetryableHttpStatus,
-                        last_error_class: DeliveryErrorClass::HttpError4xx {
+                    self.gave_up(
+                        GaveUpReason::NonRetryableHttpStatus,
+                        DeliveryErrorClass::HttpError4xx {
                             status: status.as_u16(),
                         },
-                        last_http_status: Some(status.as_u16()),
-                    }
+                        Some(status.as_u16()),
+                    )
                 }
+                // A TLS handshake failure is a receiver misconfiguration
+                // that retrying within the horizon does not fix.
+                Err(DeliveryErrorClass::TlsRejected) => self.gave_up(
+                    GaveUpReason::TlsRejected,
+                    DeliveryErrorClass::TlsRejected,
+                    None,
+                ),
                 Err(err_class) => DeliveryOutcome::Retry {
                     next_attempt_at: SystemTime::now() + self.backoff_for(new_count),
                     http_status: None,
@@ -466,11 +617,11 @@ impl PushDeliveryWorker {
                             .persist_terminal(
                                 target,
                                 &claim,
-                                DeliveryOutcome::GaveUp {
-                                    reason: GaveUpReason::MaxAttemptsExhausted,
-                                    last_error_class: error_class,
-                                    last_http_status: http_status,
-                                },
+                                self.gave_up(
+                                    GaveUpReason::MaxAttemptsExhausted,
+                                    error_class,
+                                    http_status,
+                                ),
                             )
                             .await;
                     }
@@ -478,6 +629,26 @@ impl PushDeliveryWorker {
                     continue;
                 }
             }
+        }
+    }
+
+    /// A final failure, retained for `failed_delivery_retention` from
+    /// now.
+    fn gave_up(
+        &self,
+        reason: GaveUpReason,
+        last_error_class: DeliveryErrorClass,
+        last_http_status: Option<u16>,
+    ) -> DeliveryOutcome {
+        DeliveryOutcome::GaveUp {
+            reason,
+            last_error_class,
+            last_http_status,
+            retained_until: SystemTime::now()
+                + self
+                    .config
+                    .failed_delivery_retention
+                    .min(MAX_FAILED_DELIVERY_RETENTION),
         }
     }
 
@@ -644,6 +815,7 @@ impl PushDeliveryWorker {
 
         let client = reqwest::Client::builder()
             .connect_timeout(self.config.connect_timeout)
+            .read_timeout(self.config.read_timeout)
             .timeout(self.config.request_timeout)
             .redirect(reqwest::redirect::Policy::none())
             .resolve(&host, pinned)
@@ -682,17 +854,10 @@ impl PushDeliveryWorker {
 
         match resp {
             Ok(r) => Ok(r.status()),
-            Err(e) => {
-                if e.is_timeout() {
-                    Err(DeliveryErrorClass::Timeout)
-                } else if e.is_connect() {
-                    Err(DeliveryErrorClass::NetworkError)
-                } else if e.to_string().to_lowercase().contains("tls") {
-                    Err(DeliveryErrorClass::TlsRejected)
-                } else {
-                    Err(DeliveryErrorClass::NetworkError)
-                }
-            }
+            // TLS first: a handshake failure also reports `is_connect`.
+            Err(e) if is_tls_failure(&e) => Err(DeliveryErrorClass::TlsRejected),
+            Err(e) if e.is_timeout() => Err(DeliveryErrorClass::Timeout),
+            Err(_) => Err(DeliveryErrorClass::NetworkError),
         }
     }
 
@@ -712,6 +877,27 @@ impl PushDeliveryWorker {
         let final_ms = (target as i64).saturating_add(offset).max(0) as u64;
         Duration::from_millis(final_ms)
     }
+}
+
+/// Whether `err`, or any error in its source chain, is a TLS handshake
+/// failure (certificate rejected, receiver not speaking TLS). The TLS
+/// stream reports these as a `rustls::Error` wrapped in one or more
+/// `io::Error`s. `io::Error::source` skips the error it wraps, so the
+/// walk steps into each `io::Error`'s wrapped error explicitly.
+fn is_tls_failure(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(e) = current {
+        if e.is::<rustls::Error>() {
+            return true;
+        }
+        current = match e.downcast_ref::<std::io::Error>() {
+            Some(io) => io
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static)),
+            None => e.source(),
+        };
+    }
+    false
 }
 
 enum ClaimFailure {
@@ -816,6 +1002,53 @@ mod tests {
         ));
     }
 
+    /// Every push setting of the builders' runtime config reaches the
+    /// worker's delivery config.
+    #[test]
+    fn runtime_config_maps_onto_delivery_config() {
+        let runtime = crate::server::RuntimeConfig {
+            push_max_attempts: 3,
+            push_read_timeout: Duration::from_millis(250),
+            push_config_cache_ttl: Duration::from_secs(9),
+            push_failed_delivery_retention: Duration::from_secs(60),
+            allow_insecure_push_urls: true,
+            ..Default::default()
+        };
+        let cfg = PushDeliveryConfig::from_runtime_config(&runtime);
+        assert_eq!(cfg.max_attempts, 3);
+        assert_eq!(cfg.read_timeout, Duration::from_millis(250));
+        assert_eq!(cfg.config_cache_ttl, Duration::from_secs(9));
+        assert_eq!(cfg.failed_delivery_retention, Duration::from_secs(60));
+        assert!(cfg.allow_insecure_urls);
+    }
+
+    /// The runtime config's push defaults are the delivery config's.
+    #[test]
+    fn runtime_config_push_defaults_are_delivery_defaults() {
+        let from_runtime =
+            PushDeliveryConfig::from_runtime_config(&crate::server::RuntimeConfig::default());
+        assert_eq!(
+            format!("{from_runtime:?}"),
+            format!("{:?}", PushDeliveryConfig::default())
+        );
+    }
+
+    #[test]
+    fn certificate_rejection_is_a_tls_failure() {
+        // The shape the TLS stream reports: the rustls error inside two
+        // layers of `io::Error`.
+        let cert = std::io::Error::other(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+        ));
+        assert!(is_tls_failure(&cert));
+        assert!(is_tls_failure(&rustls::Error::InvalidCertificate(
+            rustls::CertificateError::Expired
+        )));
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert!(!is_tls_failure(&refused));
+    }
+
     /// A plain `http://` URL with insecure URLs disallowed is never
     /// POSTed: the delivery is abandoned as `NonHttpsUrlInProduction`
     /// and, being abandoned rather than failed, is not listed as a
@@ -842,5 +1075,63 @@ mod tests {
         assert!(failed.is_empty(), "abandoned is not a failed delivery");
         // The row is terminal: the delivery cannot be claimed again.
         assert!(matches!(w.claim(&t).await, Err(ClaimFailure::AlreadyHeld)));
+    }
+
+    /// A2A v1.0.1 §3.1.10: "No further notifications will be sent to the
+    /// configured webhook after deletion." The default re-reads the
+    /// config before every attempt, so a deletion made anywhere is seen.
+    #[test]
+    fn default_config_cache_is_off() {
+        assert_eq!(
+            PushDeliveryConfig::default().config_cache_ttl,
+            Duration::ZERO
+        );
+    }
+
+    /// A read that started before an invalidation may have seen the
+    /// config before it was deleted; its result must not be cached, or
+    /// the deleted config would be trusted for a whole TTL.
+    #[test]
+    fn presence_read_before_invalidation_is_not_cached() {
+        let cache = PushConfigCache::default();
+        let t = target("https://example.com/hook");
+        let ttl = Duration::from_secs(3600);
+
+        let read_generation = cache.generation();
+        cache.invalidate(&t.tenant, &t.task_id);
+        cache.record_present(&t, ttl, read_generation);
+        assert!(!cache.is_fresh(&t, ttl), "stale read was cached");
+
+        let read_generation = cache.generation();
+        cache.record_present(&t, ttl, read_generation);
+        assert!(cache.is_fresh(&t, ttl), "current read is cached");
+        cache.invalidate(&t.tenant, &t.task_id);
+        assert!(!cache.is_fresh(&t, ttl), "invalidation drops the entry");
+    }
+
+    /// A retention meaning "keep" (`Duration::MAX`) is clamped rather
+    /// than overflowing, and the result still fits the backends'
+    /// microsecond `i64` columns.
+    #[test]
+    fn huge_failed_delivery_retention_is_clamped() {
+        let cfg = PushDeliveryConfig {
+            failed_delivery_retention: Duration::MAX,
+            ..Default::default()
+        };
+        let w = worker_with_store(Arc::new(InMemoryA2aStorage::new()), cfg);
+        let before = SystemTime::now();
+        let DeliveryOutcome::GaveUp { retained_until, .. } = w.gave_up(
+            GaveUpReason::MaxAttemptsExhausted,
+            DeliveryErrorClass::Timeout,
+            None,
+        ) else {
+            panic!("gave_up returns GaveUp");
+        };
+        assert!(retained_until >= before + MAX_FAILED_DELIVERY_RETENTION);
+        let micros = retained_until
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        assert!(micros <= i64::MAX as u128, "fits an i64 microsecond column");
     }
 }

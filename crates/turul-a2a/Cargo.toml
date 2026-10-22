@@ -55,6 +55,8 @@ aws-config = { workspace = true, optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 # Push delivery worker: outbound HTTP client.
 reqwest = { workspace = true }
+# Push delivery worker: classify TLS handshake failures as permanent.
+rustls = { workspace = true }
 # Retry jitter (push delivery).
 rand = { workspace = true }
 # gRPC transport; optional — activated by `grpc` feature.

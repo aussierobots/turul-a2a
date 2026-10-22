@@ -1295,6 +1295,27 @@ impl A2aEventStore for PostgresA2aStorage {
         let batch = self.retention.batch() as i64;
         let mut deleted: u64 = 0;
 
+        // Failed push deliveries past their retention, independent of
+        // the task and event TTLs.
+        let now_micros = pg_systime_to_micros(std::time::SystemTime::now());
+        loop {
+            let n = sqlx::query(
+                "DELETE FROM a2a_push_deliveries WHERE ctid IN \
+                 (SELECT ctid FROM a2a_push_deliveries \
+                  WHERE status = 'GaveUp' AND expires_at_micros < $1 LIMIT $2)",
+            )
+            .bind(now_micros)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?
+            .rows_affected();
+            deleted += n;
+            if n < batch as u64 {
+                break;
+            }
+        }
+
         if self.retention.event_ttl_seconds > 0 {
             let interval = format!("{} seconds", self.retention.event_ttl_seconds);
             loop {
@@ -1860,8 +1881,6 @@ enum PgErrorClassWire {
     HttpError429,
     SSRFBlocked,
     PayloadTooLarge,
-    ConfigDeleted,
-    TaskDeleted,
     TlsRejected,
 }
 impl From<DeliveryErrorClass> for PgErrorClassWire {
@@ -1874,8 +1893,6 @@ impl From<DeliveryErrorClass> for PgErrorClassWire {
             DeliveryErrorClass::HttpError429 => Self::HttpError429,
             DeliveryErrorClass::SSRFBlocked => Self::SSRFBlocked,
             DeliveryErrorClass::PayloadTooLarge => Self::PayloadTooLarge,
-            DeliveryErrorClass::ConfigDeleted => Self::ConfigDeleted,
-            DeliveryErrorClass::TaskDeleted => Self::TaskDeleted,
             DeliveryErrorClass::TlsRejected => Self::TlsRejected,
         }
     }
@@ -1890,8 +1907,6 @@ impl From<PgErrorClassWire> for DeliveryErrorClass {
             PgErrorClassWire::HttpError429 => DeliveryErrorClass::HttpError429,
             PgErrorClassWire::SSRFBlocked => DeliveryErrorClass::SSRFBlocked,
             PgErrorClassWire::PayloadTooLarge => DeliveryErrorClass::PayloadTooLarge,
-            PgErrorClassWire::ConfigDeleted => DeliveryErrorClass::ConfigDeleted,
-            PgErrorClassWire::TaskDeleted => DeliveryErrorClass::TaskDeleted,
             PgErrorClassWire::TlsRejected => DeliveryErrorClass::TlsRejected,
         }
     }
@@ -2221,13 +2236,17 @@ impl A2aPushDeliveryStore for PostgresA2aStorage {
                 reason,
                 last_error_class,
                 last_http_status,
+                retained_until,
             } => {
+                // A terminal row is never re-claimed, so its expiry now
+                // marks the end of the failed-delivery retention.
                 sqlx::query(
                     "UPDATE a2a_push_deliveries SET status = 'GaveUp', \
                         gave_up_at_micros = $1, gave_up_reason = $2, \
                         last_error_class = $3, last_http_status = $4, \
                         first_attempted_at_micros = COALESCE(first_attempted_at_micros, $5), \
-                        last_attempted_at_micros = COALESCE(last_attempted_at_micros, $1) \
+                        last_attempted_at_micros = COALESCE(last_attempted_at_micros, $1), \
+                        expires_at_micros = $10 \
                      WHERE tenant = $6 AND task_id = $7 AND event_sequence = $8 AND config_id = $9",
                 )
                 .bind(now_micros)
@@ -2239,6 +2258,7 @@ impl A2aPushDeliveryStore for PostgresA2aStorage {
                 .bind(task_id)
                 .bind(event_sequence as i64)
                 .bind(config_id)
+                .bind(pg_systime_to_micros(retained_until))
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
@@ -2466,6 +2486,10 @@ mod tests {
         .unwrap();
 
         // Clean tables for test isolation
+        sqlx::query("DELETE FROM a2a_push_deliveries")
+            .execute(&storage.pool)
+            .await
+            .unwrap();
         sqlx::query("DELETE FROM a2a_task_events")
             .execute(&storage.pool)
             .await
@@ -3060,6 +3084,12 @@ mod tests {
     async fn test_push_claim_terminal_gaveup_blocks_reclaim() {
         let s = storage().await;
         parity_tests::test_push_claim_terminal_gaveup_blocks_reclaim(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_reaps_failed_deliveries_past_retention() {
+        let s = storage().await;
+        parity_tests::test_cleanup_reaps_failed_deliveries_past_retention(&s, &s).await;
     }
 
     #[tokio::test]

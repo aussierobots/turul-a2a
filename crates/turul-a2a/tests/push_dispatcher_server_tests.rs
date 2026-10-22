@@ -48,6 +48,61 @@ impl AgentExecutor for DummyExecutor {
     }
 }
 
+/// Executor whose card advertises push notification support.
+struct PushCapableExecutor;
+
+#[async_trait]
+impl AgentExecutor for PushCapableExecutor {
+    async fn execute(
+        &self,
+        _task: &mut Task,
+        _msg: &Message,
+        _ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        Ok(())
+    }
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        turul_a2a_proto::AgentCard {
+            capabilities: Some(turul_a2a_proto::AgentCapabilities {
+                push_notifications: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+}
+
+/// Register a push config through the HTTP CRUD surface; panics unless
+/// the server accepts it.
+async fn create_push_config(router: &axum::Router, task_id: &str, config_id: &str, url: &str) {
+    let body = serde_json::json!({ "id": config_id, "taskId": task_id, "url": url });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/tasks/{task_id}/pushNotificationConfigs"))
+        .header("content-type", "application/json")
+        .header("A2A-Version", "1.0")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.status().is_success(),
+        "create push config: {}",
+        resp.status()
+    );
+}
+
+/// Cancel a task through the HTTP surface; panics unless it succeeds.
+async fn cancel_task(router: &axum::Router, task_id: &str) {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/tasks/{task_id}:cancel"))
+        .header("A2A-Version", "1.0")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "cancel must succeed");
+}
+
 /// Wait until wiremock has recorded `expected` requests (polling up to
 /// `deadline`), then hold a quiet window and assert the count is still
 /// exactly `expected` — a duplicate POST arriving late fails the test.
@@ -884,4 +939,148 @@ fn push_and_streaming_card() -> turul_a2a_proto::AgentCard {
         }),
         ..Default::default()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Outbound URL allowlist installed on the server builder.
+// ---------------------------------------------------------------------------
+
+/// The builder's validator reaches the delivery worker: a webhook URL
+/// it refuses is never POSTed and is recorded as an SSRF-blocked failed
+/// delivery, while an allowed URL on the same task is delivered.
+#[tokio::test]
+async fn builder_outbound_url_validator_refuses_unlisted_webhooks() {
+    use turul_a2a::push::{A2aPushDeliveryStore, DeliveryErrorClass};
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+
+    let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
+    let server = A2aServer::builder()
+        .executor(PushCapableExecutor)
+        .storage(storage.clone())
+        .push_delivery_store(storage.clone())
+        .allow_insecure_push_urls(true)
+        .outbound_url_validator(Arc::new(|url: &url::Url| {
+            if url.path() == "/allowed" {
+                Ok(())
+            } else {
+                Err("not on the allowlist".into())
+            }
+        }))
+        .cancel_handler_grace(Duration::from_millis(50))
+        .cancel_handler_poll_interval(Duration::from_millis(10))
+        .push_max_attempts(1)
+        .push_backoff_cap(Duration::from_millis(10))
+        .push_claim_expiry(Duration::from_secs(5))
+        .build()
+        .expect("server build");
+    let router = server.into_router();
+
+    let task_id = "task-server-push-allowlist";
+    seed_working_task(&storage, task_id).await;
+    create_push_config(
+        &router,
+        task_id,
+        "cfg-allowed",
+        &format!("{}/allowed", mock.uri()),
+    )
+    .await;
+    create_push_config(
+        &router,
+        task_id,
+        "cfg-refused",
+        &format!("{}/refused", mock.uri()),
+    )
+    .await;
+    cancel_task(&router, task_id).await;
+
+    let reqs = await_exactly_n_requests(&mock, 1, Duration::from_secs(3)).await;
+    assert_eq!(reqs[0].url.path(), "/allowed");
+
+    let failed = storage
+        .list_failed_deliveries("", std::time::SystemTime::UNIX_EPOCH, 10)
+        .await
+        .unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].config_id, "cfg-refused");
+    assert_eq!(failed[0].last_error_class, DeliveryErrorClass::SSRFBlocked);
+    assert_eq!(failed[0].delivery_attempt_count, 0, "never POSTed");
+}
+
+// ---------------------------------------------------------------------------
+// Push-config cache invalidation on delete through the server.
+// ---------------------------------------------------------------------------
+
+/// With a config cache TTL far longer than the test, deleting the push
+/// config through the server's HTTP surface still stops an in-flight
+/// delivery at its next attempt (A2A v1.0.1 §3.1.10): the delete drops
+/// the cached config, so the worker re-reads and abandons.
+#[tokio::test]
+async fn deleting_a_config_through_the_server_stops_a_cached_delivery() {
+    use turul_a2a::push::A2aPushDeliveryStore;
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock)
+        .await;
+
+    let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
+    let server = A2aServer::builder()
+        .executor(PushCapableExecutor)
+        .storage(storage.clone())
+        .push_delivery_store(storage.clone())
+        .allow_insecure_push_urls(true)
+        .cancel_handler_grace(Duration::from_millis(50))
+        .cancel_handler_poll_interval(Duration::from_millis(10))
+        .push_max_attempts(5)
+        .push_backoff_base(Duration::from_millis(500))
+        .push_backoff_cap(Duration::from_millis(500))
+        .push_backoff_jitter(0.0)
+        .push_claim_expiry(Duration::from_secs(30))
+        .push_config_cache_ttl(Duration::from_secs(3600))
+        .build()
+        .expect("server build");
+    let router = server.into_router();
+
+    let task_id = "task-server-push-cache";
+    seed_working_task(&storage, task_id).await;
+    create_push_config(
+        &router,
+        task_id,
+        "cfg-cached",
+        &format!("{}/hook", mock.uri()),
+    )
+    .await;
+    cancel_task(&router, task_id).await;
+    await_exactly_n_requests(&mock, 1, Duration::from_secs(3)).await;
+
+    let delete = Request::builder()
+        .method(Method::DELETE)
+        .uri(format!(
+            "/tasks/{task_id}/pushNotificationConfigs/cfg-cached"
+        ))
+        .header("A2A-Version", "1.0")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(delete).await.unwrap();
+    assert!(resp.status().is_success(), "delete: {}", resp.status());
+
+    // Two more backoff periods: an uninvalidated cache would POST again.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let posted = mock.received_requests().await.unwrap().len();
+    assert_eq!(posted, 1, "no POST after the config was deleted");
+    assert!(
+        storage
+            .list_failed_deliveries("", std::time::SystemTime::UNIX_EPOCH, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an abandoned delivery is not a failed delivery"
+    );
 }

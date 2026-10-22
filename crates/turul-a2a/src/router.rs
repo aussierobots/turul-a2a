@@ -1847,6 +1847,11 @@ pub(crate) async fn core_delete_push_config(
         .delete_config(tenant, task_id, config_id)
         .await
         .map_err(A2aError::from)?;
+    // In-flight deliveries on this instance stop at their next attempt
+    // instead of trusting a cached copy of the deleted config.
+    if let Some(dispatcher) = &state.push_dispatcher {
+        dispatcher.invalidate_push_configs(tenant, task_id);
+    }
 
     Ok(Json(serde_json::json!({})))
 }

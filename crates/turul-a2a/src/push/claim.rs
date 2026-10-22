@@ -227,11 +227,13 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     ///   **not** changed (it was advanced by the preceding
     ///   `record_attempt_started`). The caller schedules the retry
     ///   at `next_attempt_at`; the store does not dispatch retries.
-    /// - `GaveUp { reason, last_error_class, last_http_status }` →
-    ///   status transitions to `GaveUp`; the failure record is
-    ///   retained until the backend expires it (DynamoDB item TTL)
-    ///   or the operator removes it; the framework never prunes it.
-    ///   `list_failed_deliveries` surfaces it.
+    /// - `GaveUp { reason, last_error_class, last_http_status,
+    ///   retained_until }` → status transitions to `GaveUp`;
+    ///   `list_failed_deliveries` surfaces it. The record is kept
+    ///   until `retained_until`: after that
+    ///   [`crate::storage::A2aEventStore::cleanup_expired`] deletes it
+    ///   (SQL and in-memory backends), and DynamoDB sets the item's
+    ///   `ttl` attribute to it so the engine expires it.
     /// - `Abandoned { reason }` → status transitions to `Abandoned`;
     ///   the row is retained for audit. `list_failed_deliveries`
     ///   does NOT surface `Abandoned` rows — nothing failed on the
@@ -452,10 +454,10 @@ pub struct DeliveryClaim {
 ///   store does not distinguish "POST in flight" from "retry
 ///   scheduled" — those are worker-local states.
 /// - `Succeeded` — delivery confirmed (2xx / 3xx).
-/// - `GaveUp` — final failure after `push_max_attempts` OR a
-///   pre-POST rejection that operators should see
-///   (`SsrfBlocked`, `PayloadTooLarge`, `TlsRejected`). Row
-///   retained for operator inspection.
+/// - `GaveUp` — final failure: `push_max_attempts` spent, a
+///   pre-POST rejection (`SsrfBlocked`, `PayloadTooLarge`), or a
+///   permanent receiver failure (`NonRetryableHttpStatus`,
+///   `TlsRejected`). Row retained for operator inspection.
 /// - `Abandoned` — terminal but not failed (config deleted, task
 ///   deleted, non-HTTPS URL in production). Row retained; not
 ///   surfaced by `list_failed_deliveries`.
@@ -490,8 +492,8 @@ pub enum DeliveryOutcome {
     /// before the POST.
     ///
     /// `http_status` is present on HTTP-error retries (429, 5xx,
-    /// 408) and absent on pre-HTTP failures (DNS, connect, SSRF,
-    /// TLS). `error_class` is the classified failure reason —
+    /// 408) and absent on transport failures (DNS, connect,
+    /// timeout). `error_class` is the classified failure reason —
     /// enum-only by construction.
     Retry {
         next_attempt_at: SystemTime,
@@ -509,6 +511,10 @@ pub enum DeliveryOutcome {
         reason: GaveUpReason,
         last_error_class: DeliveryErrorClass,
         last_http_status: Option<u16>,
+        /// When the failed-delivery record may be removed: the
+        /// time of giving up plus the deployment's failed-delivery
+        /// retention.
+        retained_until: SystemTime,
     },
 
     /// Terminal but not failed — delivery abandoned without a final
@@ -548,10 +554,12 @@ pub enum GaveUpReason {
     /// POST attempted; operators see it here to adjust the limit or
     /// investigate the oversized task.
     PayloadTooLarge,
-    /// TLS handshake rejected by the destination (cert invalid,
-    /// protocol mismatch). Treated as a final failure rather than a
-    /// transient retry, since TLS misconfiguration rarely resolves
-    /// on its own.
+    /// The TLS handshake with the receiver failed: its certificate
+    /// was rejected, or it does not speak TLS on that port. Recorded
+    /// on the first occurrence without retrying — a certificate or
+    /// protocol misconfiguration does not fix itself within the retry
+    /// horizon. `last_error_class` is
+    /// [`DeliveryErrorClass::TlsRejected`].
     TlsRejected,
 }
 
@@ -598,11 +606,9 @@ pub enum DeliveryErrorClass {
     SSRFBlocked,
     /// Serialised Task body exceeds `push_max_payload_bytes`.
     PayloadTooLarge,
-    /// Push config for this delivery no longer exists in storage.
-    ConfigDeleted,
-    /// Task for this delivery no longer exists in storage.
-    TaskDeleted,
-    /// TLS handshake failed (cert invalid, protocol mismatch).
+    /// TLS handshake failed: certificate rejected, or the receiver
+    /// does not speak TLS. Permanent; the delivery gives up with
+    /// [`GaveUpReason::TlsRejected`] without retrying.
     TlsRejected,
 }
 

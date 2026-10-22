@@ -123,25 +123,28 @@ pub struct RuntimeConfig {
 }
 
 impl Default for RuntimeConfig {
+    /// Push delivery defaults are those of
+    /// [`crate::push::delivery::PushDeliveryConfig::default`].
     fn default() -> Self {
+        let push = crate::push::delivery::PushDeliveryConfig::default();
         Self {
             blocking_task_timeout: Duration::from_secs(30),
             timeout_abort_grace: Duration::from_secs(5),
             cancel_handler_grace: Duration::from_secs(5),
             cancel_handler_poll_interval: Duration::from_millis(100),
             cross_instance_cancel_poll_interval: Duration::from_secs(1),
-            push_max_attempts: 8,
-            push_backoff_base: Duration::from_secs(2),
-            push_backoff_cap: Duration::from_secs(60),
-            push_backoff_jitter: 0.25,
-            push_request_timeout: Duration::from_secs(30),
-            push_connect_timeout: Duration::from_secs(5),
-            push_read_timeout: Duration::from_secs(30),
-            push_claim_expiry: Duration::from_secs(10 * 60),
-            push_config_cache_ttl: Duration::from_secs(5),
-            push_failed_delivery_retention: Duration::from_secs(7 * 24 * 60 * 60),
-            push_max_payload_bytes: 1024 * 1024,
-            allow_insecure_push_urls: false,
+            push_max_attempts: push.max_attempts as usize,
+            push_backoff_base: push.backoff_base,
+            push_backoff_cap: push.backoff_cap,
+            push_backoff_jitter: push.backoff_jitter,
+            push_request_timeout: push.request_timeout,
+            push_connect_timeout: push.connect_timeout,
+            push_read_timeout: push.read_timeout,
+            push_claim_expiry: push.claim_expiry,
+            push_config_cache_ttl: push.config_cache_ttl,
+            push_failed_delivery_retention: push.failed_delivery_retention,
+            push_max_payload_bytes: push.max_payload_bytes,
+            allow_insecure_push_urls: push.allow_insecure_urls,
             push_reclaim_sweep_interval: Duration::from_secs(60),
             push_reclaim_sweep_batch: 64,
             maintenance_interval: None,
@@ -162,6 +165,7 @@ pub struct A2aServerBuilder {
     bind_addr: SocketAddr,
     middleware: Vec<Arc<dyn A2aMiddleware>>,
     runtime_config: RuntimeConfig,
+    outbound_url_validator: Option<crate::push::ssrf::OutboundUrlValidator>,
 }
 
 impl A2aServerBuilder {
@@ -177,6 +181,7 @@ impl A2aServerBuilder {
             bind_addr: ([0, 0, 0, 0], 3000).into(),
             middleware: vec![],
             runtime_config: RuntimeConfig::default(),
+            outbound_url_validator: None,
         }
     }
 
@@ -250,7 +255,8 @@ impl A2aServerBuilder {
         self
     }
 
-    /// Total per-request timeout for a push POST.
+    /// Total per-request timeout for a push POST: connect, send and
+    /// the full response.
     pub fn push_request_timeout(mut self, d: Duration) -> Self {
         self.runtime_config.push_request_timeout = d;
         self
@@ -262,10 +268,12 @@ impl A2aServerBuilder {
         self
     }
 
-    /// Read-phase timeout for a push POST.
-    ///
-    /// Accepted but currently has no effect: the whole POST, including
-    /// the read phase, is bounded by [`Self::push_request_timeout`].
+    /// Longest the push POST waits for the receiver's response with
+    /// nothing arriving — the status line and headers, then each read
+    /// of the body. A receiver that accepts the connection and stalls
+    /// fails the attempt with a `Timeout` error class after this long,
+    /// independent of [`Self::push_connect_timeout`]; the attempt as a
+    /// whole stays bounded by [`Self::push_request_timeout`].
     pub fn push_read_timeout(mut self, d: Duration) -> Self {
         self.runtime_config.push_read_timeout = d;
         self
@@ -279,22 +287,40 @@ impl A2aServerBuilder {
         self
     }
 
-    /// Push-config cache TTL inside the delivery worker.
+    /// How long the delivery worker trusts that a push config still
+    /// exists without re-reading storage. Before each POST attempt the
+    /// worker checks that the config and task still exist and abandons
+    /// the delivery if either is gone; a config found present is
+    /// trusted for this long. Default `Duration::ZERO`: re-read before
+    /// every attempt, so a deletion made anywhere stops delivery at the
+    /// next attempt.
     ///
-    /// Accepted but currently has no effect: the delivery path has no
-    /// config cache and lists configs from storage on every terminal
-    /// event.
+    /// With a non-zero TTL, deleting a push config through this server
+    /// drops the cached entries for its task at once, but a deletion
+    /// made through another instance (or another Lambda function) can
+    /// be followed by POSTs for up to the TTL, which A2A v1.0.1 §3.1.10
+    /// ("No further notifications will be sent to the configured
+    /// webhook after deletion") does not allow. Only set it for a
+    /// single-instance deployment.
     pub fn push_config_cache_ttl(mut self, d: Duration) -> Self {
         self.runtime_config.push_config_cache_ttl = d;
         self
     }
 
-    /// Retention for failed push delivery records (operator inspection).
+    /// The minimum time a failed push delivery stays listed by
+    /// `list_failed_deliveries` after it gives up. Default 7 days;
+    /// values above
+    /// [`MAX_FAILED_DELIVERY_RETENTION`](crate::push::delivery::MAX_FAILED_DELIVERY_RETENTION)
+    /// (1000 years) are
+    /// clamped to it.
     ///
-    /// Accepted but currently has no effect: the framework never prunes
-    /// claim rows. DynamoDB expires them through its own
-    /// `push_delivery_ttl_seconds` item TTL; the SQL and in-memory
-    /// backends keep them until the operator removes them.
+    /// On the SQL and in-memory backends the record is removed only
+    /// when the storage cleanup entry point (`cleanup_expired`, run by
+    /// [`Self::maintenance`] or a scheduled handler) runs after the
+    /// retention has passed; without it the record is kept. On DynamoDB
+    /// `cleanup_expired` does not remove it: the record's `ttl`
+    /// attribute is set to the end of the retention and the table's TTL
+    /// expires it.
     pub fn push_failed_delivery_retention(mut self, d: Duration) -> Self {
         self.runtime_config.push_failed_delivery_retention = d;
         self
@@ -314,6 +340,23 @@ impl A2aServerBuilder {
         self
     }
 
+    /// Operator allowlist for push webhook URLs.
+    ///
+    /// Called with each webhook URL on every delivery attempt, before
+    /// DNS resolution. Returning `Err` refuses the delivery: nothing is
+    /// resolved or POSTed, and the delivery is recorded as a failed
+    /// delivery with error class `SSRFBlocked`. The reason string is
+    /// not persisted. Runs in addition to the built-in scheme and
+    /// private-address checks, not instead of them. Takes effect only
+    /// when push delivery is wired (`push_delivery_store`).
+    pub fn outbound_url_validator(
+        mut self,
+        validator: crate::push::ssrf::OutboundUrlValidator,
+    ) -> Self {
+        self.outbound_url_validator = Some(validator);
+        self
+    }
+
     /// Interval between reclaim-and-redispatch sweeps. Default 60s.
     pub fn push_reclaim_sweep_interval(mut self, d: Duration) -> Self {
         self.runtime_config.push_reclaim_sweep_interval = d;
@@ -329,7 +372,9 @@ impl A2aServerBuilder {
     /// Enable the opt-in retention-maintenance loop.
     ///
     /// `A2aServer::run` spawns a background task that calls
-    /// `cleanup_expired` on the storage backend every `interval`.
+    /// `cleanup_expired` on the storage backend every `interval`. Each
+    /// call also removes failed push-delivery records past
+    /// [`Self::push_failed_delivery_retention`].
     /// Disabled by default — without this call the server never deletes
     /// on a timer.
     ///
@@ -562,25 +607,15 @@ impl A2aServerBuilder {
                 // the full worker tuning; the dispatcher closes the
                 // commit-to-POST loop so every terminal status commit
                 // fans out to registered push configs.
-                let delivery_cfg = crate::push::delivery::PushDeliveryConfig {
-                    max_attempts: self.runtime_config.push_max_attempts as u32,
-                    backoff_base: self.runtime_config.push_backoff_base,
-                    backoff_cap: self.runtime_config.push_backoff_cap,
-                    backoff_jitter: self.runtime_config.push_backoff_jitter,
-                    request_timeout: self.runtime_config.push_request_timeout,
-                    connect_timeout: self.runtime_config.push_connect_timeout,
-                    read_timeout: self.runtime_config.push_read_timeout,
-                    claim_expiry: self.runtime_config.push_claim_expiry,
-                    max_payload_bytes: self.runtime_config.push_max_payload_bytes,
-                    allow_insecure_urls: self.runtime_config.allow_insecure_push_urls,
-                    ..crate::push::delivery::PushDeliveryConfig::default()
-                };
+                let delivery_cfg = crate::push::delivery::PushDeliveryConfig::from_runtime_config(
+                    &self.runtime_config,
+                );
 
                 let instance_id = format!("a2a-server-{}", uuid::Uuid::now_v7());
                 let worker = crate::push::delivery::PushDeliveryWorker::new(
                     push_delivery.clone(),
                     delivery_cfg,
-                    None,
+                    self.outbound_url_validator.clone(),
                     instance_id,
                 )
                 .map_err(|e| A2aError::Internal(format!("push worker build failed: {e}")))?;

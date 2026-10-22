@@ -89,6 +89,8 @@ http-body-util = "0.1"
 # Auth / JWT
 jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
+# The TLS stack under reqwest; named directly only to recognise handshake errors.
+rustls = { version = "0.23", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 
 # Local-environment loading for example agents — opt-in per crate

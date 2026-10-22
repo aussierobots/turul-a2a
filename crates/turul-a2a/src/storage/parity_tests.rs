@@ -3184,6 +3184,7 @@ pub async fn test_push_claim_terminal_gaveup_blocks_reclaim(store: &dyn A2aPushD
                 reason: GaveUpReason::MaxAttemptsExhausted,
                 last_error_class: DeliveryErrorClass::HttpError5xx { status: 503 },
                 last_http_status: Some(503),
+                retained_until: SystemTime::now() + Duration::from_secs(3600),
             },
         )
         .await
@@ -3206,6 +3207,97 @@ pub async fn test_push_claim_terminal_gaveup_blocks_reclaim(store: &dyn A2aPushD
     assert_eq!(failed.len(), 1, "GaveUp surfaces in failed list");
     assert_eq!(failed[0].task_id, task_id);
     assert_eq!(failed[0].config_id, config_id);
+}
+
+/// A failed-delivery record is kept until its `retained_until`, then
+/// `cleanup_expired` removes it and counts it. A record still inside
+/// its retention survives, and so does a non-terminal claim whose claim
+/// expiry has passed — that is a delivery to resume, not a failure
+/// record.
+///
+/// Call with a store whose task and event retention is disabled, so
+/// the returned count is failed-delivery records only.
+pub async fn test_cleanup_reaps_failed_deliveries_past_retention(
+    store: &dyn A2aPushDeliveryStore,
+    events: &dyn A2aEventStore,
+) {
+    let (tenant, expired_task, seq, config_id) = push_tuple("ret-001");
+    let kept_task = format!("task-ret-kept-{}", uuid::Uuid::now_v7());
+    let stuck_task = format!("task-ret-stuck-{}", uuid::Uuid::now_v7());
+    let now = SystemTime::now();
+
+    for (task_id, retained_until) in [
+        (&expired_task, now - Duration::from_secs(1)),
+        (&kept_task, now + Duration::from_secs(3600)),
+    ] {
+        let claim = store
+            .claim_delivery(
+                &tenant,
+                task_id,
+                seq,
+                &config_id,
+                "A",
+                "owner-x",
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim");
+        store
+            .record_delivery_outcome(
+                &tenant,
+                task_id,
+                seq,
+                &config_id,
+                "A",
+                claim.generation,
+                DeliveryOutcome::GaveUp {
+                    reason: GaveUpReason::MaxAttemptsExhausted,
+                    last_error_class: DeliveryErrorClass::HttpError5xx { status: 503 },
+                    last_http_status: Some(503),
+                    retained_until,
+                },
+            )
+            .await
+            .expect("GaveUp commit");
+    }
+    store
+        .claim_delivery(
+            &tenant,
+            &stuck_task,
+            seq,
+            &config_id,
+            "A",
+            "owner-x",
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("claim");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let deleted = events.cleanup_expired().await.expect("cleanup");
+    assert_eq!(deleted, 1, "only the record past its retention is removed");
+
+    let failed = store
+        .list_failed_deliveries(&tenant, SystemTime::UNIX_EPOCH, 100)
+        .await
+        .expect("list");
+    let failed_tasks: Vec<&str> = failed.iter().map(|f| f.task_id.as_str()).collect();
+    assert_eq!(failed_tasks, vec![kept_task.as_str()]);
+
+    let reclaimable = store
+        .list_reclaimable_claims(100)
+        .await
+        .expect("reclaimable");
+    assert!(
+        reclaimable.iter().any(|c| c.task_id == stuck_task),
+        "an expired non-terminal claim is not a failed-delivery record"
+    );
+
+    assert_eq!(
+        events.cleanup_expired().await.expect("cleanup"),
+        0,
+        "idempotent"
+    );
 }
 
 /// PD-CLAIM-005: `record_delivery_outcome(Abandoned { .. })`
@@ -3687,6 +3779,7 @@ pub async fn test_push_list_failed_filters_and_orders(store: &dyn A2aPushDeliver
                     reason: GaveUpReason::MaxAttemptsExhausted,
                     last_error_class: DeliveryErrorClass::HttpError5xx { status: 502 },
                     last_http_status: Some(502),
+                    retained_until: SystemTime::now() + Duration::from_secs(3600),
                 },
             )
             .await
@@ -3815,6 +3908,7 @@ pub async fn test_push_list_failed_is_tenant_scoped(store: &dyn A2aPushDeliveryS
                     reason: GaveUpReason::MaxAttemptsExhausted,
                     last_error_class: DeliveryErrorClass::Timeout,
                     last_http_status: None,
+                    retained_until: SystemTime::now() + Duration::from_secs(3600),
                 },
             )
             .await
@@ -3881,6 +3975,7 @@ pub async fn test_push_failed_delivery_diagnostics_roundtrip(store: &dyn A2aPush
                 reason: GaveUpReason::MaxAttemptsExhausted,
                 last_error_class: DeliveryErrorClass::HttpError5xx { status: 503 },
                 last_http_status: Some(503),
+                retained_until: SystemTime::now() + Duration::from_secs(3600),
             },
         )
         .await
@@ -4003,6 +4098,7 @@ pub async fn test_push_attempt_started_rejected_after_terminal(store: &dyn A2aPu
             reason: GaveUpReason::MaxAttemptsExhausted,
             last_error_class: DeliveryErrorClass::HttpError5xx { status: 503 },
             last_http_status: Some(503),
+            retained_until: SystemTime::now() + Duration::from_secs(3600),
         },
     )
     .await;
@@ -4149,6 +4245,7 @@ pub async fn test_push_outcome_does_not_overwrite_terminal(store: &dyn A2aPushDe
                 reason: GaveUpReason::MaxAttemptsExhausted,
                 last_error_class: DeliveryErrorClass::Timeout,
                 last_http_status: None,
+                retained_until: SystemTime::now() + Duration::from_secs(3600),
             },
         )
         .await
@@ -4171,6 +4268,7 @@ pub async fn test_push_outcome_does_not_overwrite_terminal(store: &dyn A2aPushDe
             reason: GaveUpReason::MaxAttemptsExhausted,
             last_error_class: DeliveryErrorClass::HttpError5xx { status: 502 },
             last_http_status: Some(502),
+            retained_until: SystemTime::now() + Duration::from_secs(3600),
         },
     )
     .await;
