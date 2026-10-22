@@ -129,17 +129,54 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            if let Err(err) = check_request(&req) {
-                let response = if crate::jsonrpc::is_jsonrpc_path(req.uri().path()) {
+            let legacy = is_legacy_request(&req);
+            let response = match check_request(&req) {
+                Err(err) if crate::jsonrpc::is_jsonrpc_path(req.uri().path()) => {
                     axum::Json(err.to_jsonrpc_error(None)).into_response()
-                } else {
-                    err.into_response()
-                };
-                return Ok(response);
-            }
-            inner.call(req).await
+                }
+                Err(err) => err.into_response(),
+                Ok(()) => inner.call(req).await?,
+            };
+            Ok(if legacy {
+                response
+            } else {
+                with_a2a_media_type(response)
+            })
         })
     }
+}
+
+/// Whether the request speaks the legacy 0.3 protocol: possible only when
+/// the HTTP transports serve it, and then an absent, empty or `0.3`
+/// version selects it.
+fn is_legacy_request<B>(req: &Request<B>) -> bool {
+    HTTP_SERVES_V03
+        && requested_version(req)
+            .as_deref()
+            .is_none_or(|v| v.trim().is_empty() || is_legacy_version(v))
+}
+
+/// Label a JSON response with the registered A2A media type (spec Section
+/// 11.1: `application/a2a+json` SHOULD be used for requests and
+/// responses). Event streams and other media types are left alone.
+fn with_a2a_media_type(mut response: Response<Body>) -> Response<Body> {
+    let is_json = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|essence| {
+            essence
+                .trim()
+                .eq_ignore_ascii_case(protocol::MEDIA_TYPE_JSON)
+        });
+    if is_json {
+        response.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static(protocol::MEDIA_TYPE_A2A_JSON),
+        );
+    }
+    response
 }
 
 fn check_request<B>(req: &Request<B>) -> Result<(), A2aError> {

@@ -356,3 +356,62 @@ async fn get_requests_do_not_need_content_type() {
     let (status, _) = json_response(router, req).await;
     assert_eq!(status, 200, "GET requests should not require Content-Type");
 }
+
+/// Spec Section 11.1: `application/a2a+json` SHOULD be used for responses.
+/// JSON responses (success and error) carry it; event streams keep
+/// `text/event-stream`.
+#[tokio::test]
+async fn json_responses_use_the_a2a_media_type() {
+    let content_type = |resp: &axum::response::Response| {
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    };
+    let router = build_router(test_state());
+    let req = Request::post("/message:send")
+        .header("a2a-version", "1.0")
+        .header("content-type", "application/json")
+        .body(Body::from(send_body()))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(content_type(&resp), "application/a2a+json");
+
+    let router = build_router(test_state());
+    let req = Request::get("/tasks/nope")
+        .header("a2a-version", "1.0")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 404);
+    assert_eq!(content_type(&resp), "application/a2a+json");
+
+    let router = build_router(test_state());
+    let req = Request::post("/jsonrpc")
+        .header("a2a-version", "1.0")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"nope"}}"#,
+        ))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(content_type(&resp), "application/a2a+json");
+}
+
+/// With `compat-v03`, a v0.3 request (no `A2A-Version`) keeps the
+/// `application/json` responses those clients were written against.
+#[cfg(feature = "compat-v03")]
+#[tokio::test]
+async fn legacy_v03_responses_keep_application_json() {
+    let router = build_router(test_state());
+    let req = Request::get("/tasks/nope").body(Body::empty()).unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json")
+    );
+}
