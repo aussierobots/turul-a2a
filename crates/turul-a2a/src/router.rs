@@ -965,8 +965,7 @@ pub async fn core_send_message(
                     tenant = tenant,
                     owner = owner,
                     task_id = %task_id,
-                    "ADR-017 Bug 2 compensation: transitioning task to FAILED \
-                     after inline push config registration failure"
+                    "inline push config registration failed: transitioning task to FAILED"
                 );
                 let reason_msg = Message::new(
                     uuid::Uuid::now_v7().to_string(),
@@ -1004,8 +1003,9 @@ pub async fn core_send_message(
                         owner = owner,
                         task_id = %task_id,
                         error = %compensate_err,
-                        "ADR-017 Bug 2 compensation failed: task may remain \
-                         in WORKING without a callback until supervisor sweep"
+                        "transitioning task to FAILED after inline push config registration \
+                         failure itself failed: task may remain in WORKING without a callback \
+                         until supervisor sweep"
                     );
                 }
                 state.event_broker.notify(&task_id).await;
@@ -1045,7 +1045,7 @@ pub async fn core_send_message(
                     owner = owner,
                     task_id = %task_id,
                     queue_kind = queue.kind(),
-                    "ADR-018 enqueue failed: transitioning task to FAILED"
+                    "durable executor enqueue failed: transitioning task to FAILED"
                 );
                 let reason_msg = Message::new(
                     uuid::Uuid::now_v7().to_string(),
@@ -1076,8 +1076,8 @@ pub async fn core_send_message(
                         owner = owner,
                         task_id = %task_id,
                         error = %compensate_err,
-                        "ADR-018 FAILED-compensation itself failed: task may \
-                         remain in WORKING until supervisor sweep"
+                        "transitioning task to FAILED after enqueue failure itself failed: \
+                         task may remain in WORKING until supervisor sweep"
                     );
                 }
                 state.event_broker.notify(&task_id).await;

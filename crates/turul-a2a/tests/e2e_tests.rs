@@ -381,11 +381,8 @@ async fn e2e_streaming_event_sequence() {
 // =========================================================
 // E2E-06: Subscribe on live non-terminal task
 //
-// D3 note: Subscribe reads from the durable event store. Non-streaming
-// /message:send does not write events to the store in D3 scope. This test
-// verifies that subscribe works with tasks that DO have stored events
-// (created via atomic store). A future iteration may wire non-streaming
-// paths through atomic store too.
+// Subscribe reads from the durable event store; this test seeds the task
+// and its events through the atomic store.
 // =========================================================
 
 #[tokio::test]

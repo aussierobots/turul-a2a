@@ -367,7 +367,7 @@ async fn string_id_preserved() {
 }
 
 // =========================================================
-// [P1] Notifications (no id) must not receive a response
+// Notifications (no id) must not receive a response
 // =========================================================
 
 #[tokio::test]
@@ -424,7 +424,7 @@ async fn notification_error_still_suppressed() {
 }
 
 // =========================================================
-// [P2] Non-object params must be rejected as invalid params
+// Non-object params must be rejected as invalid params
 // =========================================================
 
 #[tokio::test]

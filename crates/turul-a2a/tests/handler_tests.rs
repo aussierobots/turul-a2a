@@ -456,7 +456,7 @@ async fn well_known_agent_card_has_all_required_fields() {
 }
 
 // =========================================================
-// [P1] Tenant isolation — tenant from path actually scopes data
+// Tenant isolation — tenant from path actually scopes data
 // =========================================================
 
 #[tokio::test]
@@ -553,7 +553,7 @@ async fn tenant_prefixed_cancel_scopes_to_tenant() {
 }
 
 // =========================================================
-// [P2] ListTasks status filter — actually narrows results
+// ListTasks status filter — actually narrows results
 // =========================================================
 
 #[tokio::test]
@@ -618,7 +618,7 @@ async fn list_tasks_invalid_status_returns_400() {
 }
 
 // =========================================================
-// [P2] Push config list pagination through HTTP
+// Push config list pagination through HTTP
 // =========================================================
 
 #[tokio::test]
