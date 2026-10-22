@@ -331,6 +331,39 @@ async fn extended_agent_card_requires_authenticated_identity() {
 }
 
 #[tokio::test]
+async fn extended_agent_card_served_to_claims_less_api_key_identity() {
+    // API-key auth authenticates without JWT claims; the extended card is
+    // gated on authentication, not on the presence of claims.
+    let mut keys = HashMap::new();
+    keys.insert("key-1".to_string(), "api-owner".to_string());
+    let api_key = turul_a2a_auth::ApiKeyMiddleware::new(
+        Arc::new(turul_a2a_auth::StaticApiKeyLookup::new(keys)),
+        "X-API-Key",
+    );
+    let mut state = state_no_auth();
+    state.middleware_stack = Arc::new(MiddlewareStack::new(vec![Arc::new(api_key)]));
+
+    let router = build_router(state.clone());
+    let req = Request::get("/extendedAgentCard")
+        .header("x-api-key", "key-1")
+        .header("a2a-version", "1.0")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = json_response(router, req).await;
+    assert_eq!(status, 200, "claims-less authenticated caller: {body}");
+    assert_eq!(body["name"], "Auth Test Agent (Extended)");
+
+    let router = build_router(state);
+    let req = Request::get("/extendedAgentCard")
+        .header("a2a-version", "1.0")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, body) = response_with_headers(router, req).await;
+    assert_eq!(status, 401);
+    assert_eq!(body, serde_json::json!({"error": "missing_credential"}));
+}
+
+#[tokio::test]
 async fn authenticated_owner_flows_to_storage() {
     let state = state_with_auth();
 

@@ -4550,11 +4550,17 @@ name = "turul-a2a-auth"
 version = "0.1.35"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
+ "axum",
+ "base64 0.23.1",
+ "http 1.5.0",
+ "http-body-util",
  "jsonwebtoken",
  "serde",
  "serde_json",
  "static_assertions",
  "tokio",
+ "tower",
  "tracing",
  "turul-a2a",
  "turul-a2a-proto",

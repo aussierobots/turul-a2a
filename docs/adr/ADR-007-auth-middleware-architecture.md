@@ -75,11 +75,11 @@ Authentication state is a type-level distinction, not a magic string comparison.
 
 ### 4. AnyOfMiddleware Failure Precedence
 
-When all children fail: Internal short-circuits (fatal), then Forbidden(403) > HttpChallenge(401+WWW-Authenticate) > Unauthenticated(401). Ties broken by registration order. WWW-Authenticate headers merged from all HttpChallenge errors.
+When all children fail: Internal short-circuits (fatal), then Forbidden(403) > HttpChallenge(401+WWW-Authenticate) > Unauthenticated(401). Ties broken by registration order. Exactly one error is selected; its kind alone determines the single `WWW-Authenticate` challenge, built at the transport boundary (ADR-016). Child challenges are never merged.
 
 ### 5. Local JWT Validator
 
-`crates/turul-jwt-validator/` is a local workspace crate. Design sourced from `turul-mcp-oauth::jwt` (read-only reference). Supports RS256+ES256, JWKS caching, kid-miss refetch. No cross-repo dependencies or changes.
+Originally a local workspace crate; now consumed as the published `turul-jwt-validator` crate. Design sourced from `turul-mcp-oauth::jwt` (read-only reference). Supports RS256+ES256, JWKS caching, kid-miss refetch. No cross-repo dependencies or changes.
 
 **Provenance note:** This crate's design originates from `turul-mcp-framework/crates/turul-mcp-oauth/src/jwt.rs`. Future extraction to a shared crate used by both MCP and A2A is a separate follow-up ADR.
 
@@ -102,3 +102,7 @@ If Lambda uses API Gateway authorizers instead of (or in addition to) applicatio
 - AgentCard always reflects actual auth configuration — scheme definitions match enforcement.
 - No transport auth leaks into the protocol error model.
 - The local JWT validator is an explicit fork boundary with documented provenance. Security patches must be applied here independently until a shared crate is extracted.
+
+## Revision log
+
+- **2026-10-22** — §4: ADR-016 superseded merging `WWW-Authenticate` headers from every failing `HttpChallenge` child with precedence selection — one error is selected and the transport builds its single challenge from the selected kind. Text updated to what ships. §5: the validator is the published `turul-jwt-validator` crate, not a workspace member.

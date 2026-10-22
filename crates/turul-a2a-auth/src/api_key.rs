@@ -203,7 +203,28 @@ mod tests {
         let mw = middleware();
         let mut ctx = RequestContext::new();
         let err = mw.before_request(&mut ctx).await.unwrap_err();
-        assert!(matches!(err, MiddlewareError::Unauthenticated(_)));
+        assert!(
+            matches!(
+                err,
+                MiddlewareError::Unauthenticated(AuthFailureKind::MissingCredential)
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_key_header_is_missing_credential() {
+        let mw = middleware();
+        let mut ctx = RequestContext::new();
+        ctx.headers.insert("x-api-key", "".parse().unwrap());
+        let err = mw.before_request(&mut ctx).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MiddlewareError::Unauthenticated(AuthFailureKind::MissingCredential)
+            ),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -212,7 +233,13 @@ mod tests {
         let mut ctx = RequestContext::new();
         ctx.headers.insert("x-api-key", "bad-key".parse().unwrap());
         let err = mw.before_request(&mut ctx).await.unwrap_err();
-        assert!(matches!(err, MiddlewareError::Unauthenticated(_)));
+        assert!(
+            matches!(
+                err,
+                MiddlewareError::Unauthenticated(AuthFailureKind::InvalidApiKey)
+            ),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -222,7 +249,13 @@ mod tests {
         ctx.headers
             .insert("x-api-key", "empty-owner-key".parse().unwrap());
         let err = mw.before_request(&mut ctx).await.unwrap_err();
-        assert!(matches!(err, MiddlewareError::Unauthenticated(_)));
+        assert!(
+            matches!(
+                err,
+                MiddlewareError::Unauthenticated(AuthFailureKind::EmptyPrincipal)
+            ),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -232,7 +265,13 @@ mod tests {
         ctx.headers
             .insert("x-api-key", "whitespace-key".parse().unwrap());
         let err = mw.before_request(&mut ctx).await.unwrap_err();
-        assert!(matches!(err, MiddlewareError::Unauthenticated(_)));
+        assert!(
+            matches!(
+                err,
+                MiddlewareError::Unauthenticated(AuthFailureKind::EmptyPrincipal)
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

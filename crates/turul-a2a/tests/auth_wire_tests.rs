@@ -1,8 +1,8 @@
-//! wire-surface E2E tests.
+//! Auth-failure wire-surface E2E tests.
 //!
 //! Covers body + WWW-Authenticate contract for Bearer and API-key auth
 //! failure paths. Complements `auth_tests.rs` by asserting on the
-//! -locked wire shape end-to-end.
+//! fixed wire shape end-to-end.
 
 use std::sync::Arc;
 
@@ -83,7 +83,7 @@ async fn bearer_invalid_token_emits_kind_body_and_rfc6750_challenge() {
 }
 
 #[tokio::test]
-async fn bearer_missing_credential_emits_invalid_request() {
+async fn bearer_missing_credential_emits_bare_challenge() {
     let router = router_with_failing_middleware(Arc::new(|| {
         MiddlewareError::HttpChallenge(AuthFailureKind::MissingCredential)
     }));
@@ -99,7 +99,9 @@ async fn bearer_missing_credential_emits_invalid_request() {
         .unwrap()
         .to_str()
         .unwrap();
-    assert_eq!(www, "Bearer realm=\"a2a\", error=\"invalid_request\"");
+    // RFC 6750 Section 3.1: a request with no credentials gets the
+    // challenge without an error code.
+    assert_eq!(www, "Bearer realm=\"a2a\"");
 }
 
 #[tokio::test]
@@ -171,7 +173,12 @@ async fn charset_safety_no_quote_or_backslash_in_www_authenticate() {
             router_with_failing_middleware(Arc::new(move || MiddlewareError::HttpChallenge(kind)));
         let req = Request::post("/message:send").body(Body::empty()).unwrap();
         let resp = router.oneshot(req).await.unwrap();
-        let (status, headers, _body) = drain_body(resp).await;
+        let (status, headers, body) = drain_body(resp).await;
+        assert_eq!(
+            body,
+            serde_json::json!({"error": kind.body_string()}),
+            "body for {kind:?}"
+        );
         // RFC 6750 §3: scope rejection is 403 with a Bearer challenge.
         // All other Bearer challenges are 401.
         let expected_status = match kind {
@@ -191,7 +198,7 @@ async fn charset_safety_no_quote_or_backslash_in_www_authenticate() {
         // error_description, so there's nothing dynamic to contain one.
         // Normative check: the header matches the fixed shape exactly.
         let expected = match kind {
-            AuthFailureKind::MissingCredential => "Bearer realm=\"a2a\", error=\"invalid_request\"",
+            AuthFailureKind::MissingCredential => "Bearer realm=\"a2a\"",
             AuthFailureKind::InvalidToken | AuthFailureKind::EmptyPrincipal => {
                 "Bearer realm=\"a2a\", error=\"invalid_token\""
             }
