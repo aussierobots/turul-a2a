@@ -933,9 +933,35 @@ impl A2aServer {
         (augmented, true)
     }
 
-    /// Run the server.
+    /// Bind the configured address without serving yet.
+    ///
+    /// The returned [`BoundA2aServer`] holds the listening socket, so
+    /// [`BoundA2aServer::local_addr`] reports the address actually bound —
+    /// including the OS-assigned port when the builder was given port 0 —
+    /// before any request is served. Connections that arrive between
+    /// `bind` and [`BoundA2aServer::run`] wait in the listen backlog.
+    pub async fn bind(self) -> Result<BoundA2aServer, A2aError> {
+        let listener = tokio::net::TcpListener::bind(self.bind_addr)
+            .await
+            .map_err(|e| A2aError::Internal(format!("Failed to bind: {e}")))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| A2aError::Internal(format!("Failed to read bound address: {e}")))?;
+        tracing::info!("A2A server listening on {}", local_addr);
+        Ok(BoundA2aServer {
+            server: self,
+            listener,
+            local_addr,
+        })
+    }
+
+    /// Bind the configured address and serve until the server exits.
     pub async fn run(self) -> Result<(), A2aError> {
-        let bind_addr = self.bind_addr;
+        self.bind().await?.run().await
+    }
+
+    /// Serve on an already-bound listener until the server exits.
+    async fn serve(self, listener: tokio::net::TcpListener) -> Result<(), A2aError> {
         // Capture substrate refs for the cross-instance cancel poller
         // before `into_router` consumes `self`. The poller uses the same
         // Arcs for `in_flight` and `cancellation_supervisor` as the
@@ -956,10 +982,6 @@ impl A2aServer {
         let maintenance_interval = self.state.runtime_config.maintenance_interval;
 
         let app = self.into_router();
-        let listener = tokio::net::TcpListener::bind(bind_addr)
-            .await
-            .map_err(|e| A2aError::Internal(format!("Failed to bind: {e}")))?;
-        tracing::info!("A2A server listening on {}", bind_addr);
 
         // Spawn the supervisor poll loop. A shutdown token lets us stop
         // the poller when the server exits; for now axum::serve runs to
@@ -1125,6 +1147,26 @@ impl A2aServer {
 
         serve_result.map_err(|e| A2aError::Internal(format!("Server error: {e}")))?;
         Ok(())
+    }
+}
+
+/// An [`A2aServer`] that holds its listening socket but is not serving
+/// yet, returned by [`A2aServer::bind`].
+pub struct BoundA2aServer {
+    server: A2aServer,
+    listener: tokio::net::TcpListener,
+    local_addr: SocketAddr,
+}
+
+impl BoundA2aServer {
+    /// The address the listening socket is bound to.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Serve on the bound socket until the server exits.
+    pub async fn run(self) -> Result<(), A2aError> {
+        self.server.serve(self.listener).await
     }
 }
 
