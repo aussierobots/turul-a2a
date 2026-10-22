@@ -129,39 +129,60 @@ impl EventSequenceAllocation {
         self.sequences.last().copied().unwrap_or(self.observed)
     }
 
-    /// Append the counter write to `items`, returning its index for
-    /// [`lost_sequence_race`].
-    fn attach_counter(
+    /// Append the allocation's event puts and its counter write to
+    /// `items`, returning their positions for [`lost_sequence_race`].
+    fn attach(
         &mut self,
         items: &mut Vec<aws_sdk_dynamodb::types::TransactWriteItem>,
-    ) -> Option<usize> {
+        event_items: Vec<aws_sdk_dynamodb::types::TransactWriteItem>,
+    ) -> Option<SequenceItems> {
+        let events_start = items.len();
+        items.extend(event_items);
+        let events = events_start..items.len();
         self.counter_write.take().map(|write| {
             items.push(write);
-            items.len() - 1
+            SequenceItems {
+                events,
+                counter: items.len() - 1,
+            }
         })
     }
 }
 
+/// Positions of an allocation's event puts and counter write within one
+/// `TransactWriteItems` request.
+struct SequenceItems {
+    events: std::ops::Range<usize>,
+    counter: usize,
+}
+
 /// True when a sequence-allocating transaction was cancelled only because
-/// another writer advanced the task's sequence counter first (the counter
-/// condition failed) or a concurrent transaction held its items. No other
-/// item's condition may have failed: owner, terminal-state and event-key
-/// conditions are definitive answers, not races.
+/// another writer advanced the task's sequence counter first, or a
+/// concurrent transaction held its items.
+///
+/// A writer that read the counter before a competing commit fails both the
+/// counter condition and the `attribute_not_exists` condition of the event
+/// put at the sequence the winner took, so an event-put failure alongside a
+/// counter failure is still a lost race. An event-put failure while the
+/// counter condition held means an event already occupies a sequence the
+/// counter has not reached — a definitive failure, as is any failed
+/// condition on another item (task owner, terminal state).
 fn lost_sequence_race(
     reasons: &[aws_sdk_dynamodb::types::CancellationReason],
-    counter_index: Option<usize>,
+    sequence_items: Option<&SequenceItems>,
 ) -> bool {
-    let Some(counter_index) = counter_index else {
+    let Some(SequenceItems { events, counter }) = sequence_items else {
         return false;
     };
     let code = |i: usize| reasons.get(i).and_then(|r| r.code());
-    let other_condition_failed =
-        (0..reasons.len()).any(|i| i != counter_index && code(i) == Some("ConditionalCheckFailed"));
-    let raced = code(counter_index) == Some("ConditionalCheckFailed")
+    let final_condition_failed = (0..reasons.len()).any(|i| {
+        i != *counter && !events.contains(&i) && code(i) == Some("ConditionalCheckFailed")
+    });
+    let raced = code(*counter) == Some("ConditionalCheckFailed")
         || reasons
             .iter()
             .any(|r| r.code() == Some("TransactionConflict"));
-    raced && !other_condition_failed
+    raced && !final_condition_failed
 }
 
 /// Cancellation reasons of a `TransactWriteItems` failure; empty for any
@@ -615,8 +636,8 @@ impl DynamoDbA2aStorage {
     /// sequence `n` never later finds a committed event below `n`.
     ///
     /// `ttl` is refreshed on every write and is never earlier than the
-    /// event rows written in the same transaction, so the counter outlives
-    /// the events it numbers.
+    /// event rows written in the same transaction (absent when those rows
+    /// never expire), so the counter outlives the events it numbers.
     pub(crate) fn build_sequence_counter_update(
         events_table: &str,
         pk: &str,
@@ -675,6 +696,19 @@ impl DynamoDbA2aStorage {
         }
     }
 
+    /// Lifetime of the sequence counter item: `None` (never expires) when
+    /// either the events or the task never expire (a TTL of 0), otherwise
+    /// the longer of the two. A counter that expired while its events
+    /// remained would restart numbering below them and block the task's
+    /// next event.
+    fn sequence_counter_ttl_seconds(event_ttl_seconds: u64, task_ttl_seconds: u64) -> Option<u64> {
+        if event_ttl_seconds == 0 || task_ttl_seconds == 0 {
+            None
+        } else {
+            Some(event_ttl_seconds.max(task_ttl_seconds))
+        }
+    }
+
     /// The single per-task event-sequence allocator. Every path that
     /// commits events reads the counter here, numbers its events from the
     /// returned allocation, and attaches the allocation's counter write to
@@ -690,11 +724,11 @@ impl DynamoDbA2aStorage {
         let counter_write = if count == 0 {
             None
         } else {
-            let ttl = Self::ttl_epoch(
-                self.config
-                    .event_ttl_seconds
-                    .max(self.config.task_ttl_seconds),
-            );
+            let ttl = Self::sequence_counter_ttl_seconds(
+                self.config.event_ttl_seconds,
+                self.config.task_ttl_seconds,
+            )
+            .and_then(Self::ttl_epoch);
             Some(Self::build_sequence_counter_update(
                 &self.config.events_table,
                 pk,
@@ -1960,8 +1994,9 @@ impl A2aEventStore for DynamoDbA2aStorage {
         let mut retry = SequenceCommitRetry::default();
         loop {
             let mut allocation = self.allocate_event_sequences(&pk, 1).await?;
-            let mut items = self.event_transact_items(&pk, &allocation.sequences, &events)?;
-            let counter_index = allocation.attach_counter(&mut items);
+            let mut items = Vec::new();
+            let event_items = self.event_transact_items(&pk, &allocation.sequences, &events)?;
+            let sequence_items = allocation.attach(&mut items, event_items);
             match self
                 .client
                 .transact_write_items()
@@ -1970,7 +2005,9 @@ impl A2aEventStore for DynamoDbA2aStorage {
                 .await
             {
                 Ok(_) => return Ok(allocation.latest()),
-                Err(err) if lost_sequence_race(cancellation_reasons(&err), counter_index) => {
+                Err(err)
+                    if lost_sequence_race(cancellation_reasons(&err), sequence_items.as_ref()) =>
+                {
                     retry.backoff(&pk).await?
                 }
                 Err(err) => return Err(A2aStorageError::DatabaseError(format!("{err:?}"))),
@@ -2126,8 +2163,8 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 1 + events.len() + usize::from(allocation.counter_write.is_some()),
             )?;
             items.extend(artifact_items);
-            items.extend(self.event_transact_items(&pk, &allocation.sequences, &events)?);
-            let counter_index = allocation.attach_counter(&mut items);
+            let event_items = self.event_transact_items(&pk, &allocation.sequences, &events)?;
+            let sequence_items = allocation.attach(&mut items, event_items);
 
             match self
                 .client
@@ -2137,7 +2174,9 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 .await
             {
                 Ok(_) => return Ok((task, allocation.sequences)),
-                Err(err) if lost_sequence_race(cancellation_reasons(&err), counter_index) => {
+                Err(err)
+                    if lost_sequence_race(cancellation_reasons(&err), sequence_items.as_ref()) =>
+                {
                     retry.backoff(&pk).await?
                 }
                 Err(err) => return Err(A2aStorageError::DatabaseError(format!("{err:?}"))),
@@ -2322,7 +2361,8 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                     )
                     .build(),
             ];
-            items.extend(self.event_transact_items(&pk, &allocation.sequences, &events)?);
+            let event_items = self.event_transact_items(&pk, &allocation.sequences, &events)?;
+            let sequence_items = allocation.attach(&mut items, event_items);
 
             // When the push_dispatch opt-in is on, add a Put for the
             // pending-dispatch marker inside the same TransactWriteItems.
@@ -2363,7 +2403,6 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                     );
                 }
             }
-            let counter_index = allocation.attach_counter(&mut items);
 
             let err = match self
                 .client
@@ -2382,7 +2421,9 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                         .await?;
                     return Ok((rehydrated, allocation.sequences));
                 }
-                Err(err) if lost_sequence_race(cancellation_reasons(&err), counter_index) => {
+                Err(err)
+                    if lost_sequence_race(cancellation_reasons(&err), sequence_items.as_ref()) =>
+                {
                     retry.backoff(&pk).await?;
                     continue;
                 }
@@ -2499,8 +2540,8 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 1 + events.len() + usize::from(allocation.counter_write.is_some()),
             )?;
             items.extend(artifact_items);
-            items.extend(self.event_transact_items(&pk, &allocation.sequences, &events)?);
-            let counter_index = allocation.attach_counter(&mut items);
+            let event_items = self.event_transact_items(&pk, &allocation.sequences, &events)?;
+            let sequence_items = allocation.attach(&mut items, event_items);
 
             let err = match self
                 .client
@@ -2510,7 +2551,9 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 .await
             {
                 Ok(_) => return Ok(allocation.sequences),
-                Err(err) if lost_sequence_race(cancellation_reasons(&err), counter_index) => {
+                Err(err)
+                    if lost_sequence_race(cancellation_reasons(&err), sequence_items.as_ref()) =>
+                {
                     retry.backoff(&pk).await?;
                     continue;
                 }
@@ -5484,18 +5527,22 @@ mod tests {
             .collect()
     }
 
+    fn items(events: std::ops::Range<usize>, counter: usize) -> SequenceItems {
+        SequenceItems { events, counter }
+    }
+
     #[test]
     fn counter_condition_failure_alone_is_a_lost_race() {
         let r = reasons(&["None", "None", "ConditionalCheckFailed"]);
-        assert!(lost_sequence_race(&r, Some(2)));
+        assert!(lost_sequence_race(&r, Some(&items(1..2, 2))));
     }
 
     #[test]
     fn transaction_conflict_is_a_lost_race() {
         let r = reasons(&["TransactionConflict", "None", "None"]);
-        assert!(lost_sequence_race(&r, Some(2)));
+        assert!(lost_sequence_race(&r, Some(&items(1..2, 2))));
         let r = reasons(&["None", "None", "TransactionConflict"]);
-        assert!(lost_sequence_race(&r, Some(2)));
+        assert!(lost_sequence_race(&r, Some(&items(1..2, 2))));
     }
 
     #[test]
@@ -5503,22 +5550,102 @@ mod tests {
         // Owner or terminal-state condition on the task item failed: a
         // definitive rejection even if the counter also moved.
         let r = reasons(&["ConditionalCheckFailed", "None", "ConditionalCheckFailed"]);
-        assert!(!lost_sequence_race(&r, Some(2)));
+        assert!(!lost_sequence_race(&r, Some(&items(1..2, 2))));
         let r = reasons(&["ConditionalCheckFailed", "None", "None"]);
-        assert!(!lost_sequence_race(&r, Some(2)));
+        assert!(!lost_sequence_race(&r, Some(&items(1..2, 2))));
     }
 
     #[test]
     fn event_key_collision_is_not_a_lost_race() {
+        // The counter condition held, yet an event already occupies the
+        // allocated sequence: retrying would allocate the same sequence.
         let r = reasons(&["None", "ConditionalCheckFailed", "None"]);
-        assert!(!lost_sequence_race(&r, Some(2)));
+        assert!(!lost_sequence_race(&r, Some(&items(1..2, 2))));
+    }
+
+    #[test]
+    fn event_key_and_counter_failure_is_a_lost_race() {
+        // A writer that read the counter before a competing commit fails
+        // both its event put (the winner took that sequence) and the
+        // counter condition.
+        let r = reasons(&["ConditionalCheckFailed", "ConditionalCheckFailed"]);
+        assert!(lost_sequence_race(&r, Some(&items(0..1, 1))));
+        let r = reasons(&["None", "ConditionalCheckFailed", "ConditionalCheckFailed"]);
+        assert!(lost_sequence_race(&r, Some(&items(1..2, 2))));
+    }
+
+    #[test]
+    fn marker_condition_failure_is_not_a_lost_race() {
+        // Items outside the allocation's event puts carry definitive
+        // conditions even when they sit after the counter.
+        let r = reasons(&[
+            "None",
+            "None",
+            "ConditionalCheckFailed",
+            "ConditionalCheckFailed",
+        ]);
+        assert!(!lost_sequence_race(&r, Some(&items(1..2, 2))));
     }
 
     #[test]
     fn transaction_without_counter_never_retries() {
         let r = reasons(&["TransactionConflict"]);
         assert!(!lost_sequence_race(&r, None));
-        assert!(!lost_sequence_race(&[], Some(0)));
+        assert!(!lost_sequence_race(&[], Some(&items(0..0, 0))));
+    }
+
+    #[test]
+    fn attach_records_event_and_counter_positions() {
+        let put = || {
+            aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                .condition_check(
+                    aws_sdk_dynamodb::types::ConditionCheck::builder()
+                        .table_name("t")
+                        .key("pk", AttributeValue::S("p".into()))
+                        .condition_expression("attribute_exists(pk)")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+        };
+        let mut allocation = EventSequenceAllocation {
+            observed: 0,
+            sequences: vec![1, 2],
+            counter_write: Some(put()),
+        };
+        let mut items = vec![put()];
+        let positions = allocation.attach(&mut items, vec![put(), put()]).unwrap();
+        assert_eq!(positions.events, 1..3);
+        assert_eq!(positions.counter, 3);
+        assert_eq!(items.len(), 4);
+
+        let mut empty = EventSequenceAllocation {
+            observed: 4,
+            sequences: vec![],
+            counter_write: None,
+        };
+        assert!(empty.attach(&mut items, vec![]).is_none());
+    }
+
+    #[test]
+    fn sequence_counter_never_expires_when_events_or_task_never_expire() {
+        assert_eq!(
+            DynamoDbA2aStorage::sequence_counter_ttl_seconds(0, 3600),
+            None
+        );
+        assert_eq!(
+            DynamoDbA2aStorage::sequence_counter_ttl_seconds(3600, 0),
+            None
+        );
+        assert_eq!(DynamoDbA2aStorage::sequence_counter_ttl_seconds(0, 0), None);
+        assert_eq!(
+            DynamoDbA2aStorage::sequence_counter_ttl_seconds(60, 3600),
+            Some(3600)
+        );
+        assert_eq!(
+            DynamoDbA2aStorage::sequence_counter_ttl_seconds(7200, 3600),
+            Some(7200)
+        );
     }
 
     // =========================================================
