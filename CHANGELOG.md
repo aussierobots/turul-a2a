@@ -26,11 +26,11 @@ A minor-version bump because this release breaks public APIs and the wire contra
 - **Timestamps** are serialised RFC 3339 with `Z`, for example `2026-10-22T10:11:13.794556Z` (previously `+00:00`), and are now present on every status. Generated `google.protobuf.Timestamp` fields have the type `turul_a2a_proto::Timestamp`.
 - **Auth failure bodies** (401/403) now carry a code and a human-readable message, as every A2A error must:
   - HTTP is `{"error":{"code","status","message","details":[ErrorInfo]}}`;
-  - on `/jsonrpc` it is a JSON-RPC error with custom code -32040 (unauthenticated) or -32041 (forbidden);
+  - on `/jsonrpc` (and the v0.3 root path under `compat-v03`) it is a JSON-RPC error with custom code -32040 (unauthenticated) or -32041 (forbidden);
   - on gRPC the Status message is readable.
 
   The stable kind moves from the bare `"error"` string to `ErrorInfo.reason` (upper snake case, for example `INVALID_TOKEN`) in the `turul-a2a` domain. A request with no credentials gets a bare `WWW-Authenticate` challenge with no `error` code (RFC 6750 §3.1).
-- **JSON responses are labelled `application/a2a+json`** (spec §11.1); v0.3 requests under `compat-v03` keep `application/json`.
+- **JSON responses are labelled `application/a2a+json`** (spec §11.1); v0.3 requests under `compat-v03` and the well-known agent card keep `application/json`.
 - **Message parts are checked against `AgentCard.defaultInputModes`:** a part whose `mediaType` is set and not accepted is refused with `ContentTypeNotSupportedError` before any task is created. `*/*` and `type/*` act as wildcards; untyped parts, and agents that declare no input modes, are unaffected. Agents that receive typed parts must list those types.
 - **Source-level API changes:**
   - `A2aStorageError::TerminalState` and `InvalidTransition` carry the task id;
@@ -40,6 +40,7 @@ A minor-version bump because this release breaks public APIs and the wire contra
   - `DeliveryErrorClass::{ConfigDeleted, TaskDeleted}` are removed (deletion is `AbandonedReason`);
   - `turul_a2a::streaming::replay`, `turul_a2a::storage::terminal_cas`, `grpc::streaming::LAST_EVENT_ID_METADATA`, `push::ssrf_decide` / `push::ssrf::decide` (use `ssrf::check_url` + `ssrf::pick_destination`), `compat_v03::root_post_compat_mode` and `in_flight::poll_once_for_tests` are removed;
   - `DeliveryTargetLookup` is `#[non_exhaustive]`; build it with `DeliveryTargetLookup::new`;
+  - `AuthFailureKind::body_string` and `MiddlewareError::wire_body_string` are replaced by `reason()`, which returns the upper-case `ErrorInfo.reason`;
   - `turul-a2a-patterns` `SkillCard` no longer implements `Serialize`/`Deserialize`, and `SkillCard::parse` is the only constructor;
   - client `ListTasksParams` gained fields, so struct literals need `..Default::default()`.
 - **turul-a2a-client SSE** yields `Err(A2aClientError::Json)` for an event that is not JSON, where before it was silently skipped.
@@ -107,7 +108,7 @@ A minor-version bump because this release breaks public APIs and the wire contra
 
 ### Verification
 
-Workspace tests (1,182) passed with default features and with gRPC + SQS. Storage parity passed on in-memory, SQLite (88), PostgreSQL (87) and DynamoDB Local (108). New cross-transport stream-contract and capability suites cover HTTP, JSON-RPC and gRPC. Clippy `-D warnings` is clean on eight feature sets on nightly and stable. `cargo doc` and `cargo package` of all seven publish crates are clean.
+Workspace tests (1,189) passed with default features and with gRPC + SQS. Storage parity passed on in-memory, SQLite (88), PostgreSQL (87) and DynamoDB Local (108). New cross-transport stream-contract and capability suites cover HTTP, JSON-RPC and gRPC. Clippy `-D warnings` is clean on eight feature sets on nightly and stable. `cargo doc` and `cargo package` of all seven publish crates are clean.
 
 ## [0.1.32] — 2026-06-10
 

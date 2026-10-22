@@ -22,7 +22,7 @@ Add an opt-in field `assume_schema_initialized: bool` (default `false`) to `Post
 
 When `assume_schema_initialized: true`:
 
-- **Operator owns provisioning.** Tables must exist with the schema shipped by the matching `turul-a2a` release **before** the process starts. The canonical schema is `create_tables()` in the respective backend module. (A separate, checked-in migration directory is a follow-up — see "Follow-ups" below.)
+- **Operator owns provisioning.** Tables must exist with the schema shipped by the matching `turul-a2a` release **before** the process starts. The canonical schema is `create_tables()` in the respective backend module; no migration files are shipped.
 - **Operator owns schema changes.** The runtime never alters an existing schema (since 2026-10-22 it does not do so even without the flag: `create_tables()` only creates missing tables). When a release changes the schema its CHANGELOG says so, and stores written by earlier releases are re-created rather than migrated.
 - **Runtime role can be narrowed.** Postgres: `INSERT, UPDATE, DELETE, SELECT` on the six `a2a_*` tables; no `CREATE`, `ALTER`, or `DROP` on the schema. SQLite: filesystem read+write on the database file; the file can be owned by a different user that performs the bootstrap.
 
@@ -65,3 +65,4 @@ PostgresConfig {
 
 - 2026-05-18 — Initial acceptance.
 - 2026-10-22 — `create_tables()` is CREATE-only: the additive `ALTER TABLE` steps were deleted when releases stopped reading stores written by earlier releases (see ADR-003). The silent-migration concern is resolved; migration files are not shipped.
+- 2026-10-23 — Removed the dangling reference to a migration-directory follow-up; the canonical schema is `create_tables()` and no migration files are shipped.

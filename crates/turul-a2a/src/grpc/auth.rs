@@ -149,8 +149,8 @@ fn check_a2a_version<B>(req: &Request<B>) -> Result<(), crate::error::A2aError> 
 /// Wire surface parity with the HTTP path: the `grpc-message` is the same
 /// human-readable [`MiddlewareError::message`], and `Status.details` carry
 /// the stable kind as an `ErrorInfo` reason in the turul auth domain.
-/// `Internal(msg)` deliberately collapses to the fixed `internal_error`
-/// kind — the inner String payload is never exposed on the wire.
+/// `Internal(msg)` deliberately collapses to the fixed `INTERNAL_ERROR`
+/// reason — the inner String payload is never exposed on the wire.
 ///
 /// Status-code mapping:
 /// - `Unauthenticated` / `HttpChallenge(*)` → `UNAUTHENTICATED`
@@ -174,7 +174,7 @@ fn middleware_error_to_grpc_response(err: &MiddlewareError) -> Response<Body> {
         MiddlewareError::Internal(_) => Code::Internal,
     };
     let details = ErrorDetails::with_error_info(
-        err.wire_body_string().to_ascii_uppercase(),
+        err.reason(),
         turul_a2a_types::wire::errors::AUTH_ERROR_DOMAIN,
         [],
     );

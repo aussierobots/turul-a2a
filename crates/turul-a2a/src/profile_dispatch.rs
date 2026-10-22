@@ -193,7 +193,6 @@ pub use turul_a2a_types::wire::protocol::EXTENSIONS_PARAM as A2A_EXTENSIONS_HEAD
 pub fn activated_from_headers(headers: &axum::http::HeaderMap) -> HashSet<String> {
     let raw = headers
         .get(A2A_EXTENSIONS_HEADER)
-        .or_else(|| headers.get("A2A-Extensions"))
         .and_then(|v| v.to_str().ok());
     parse_a2a_extensions(raw)
 }

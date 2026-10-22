@@ -129,8 +129,17 @@ build time.
 | Empty principal claim | 401 | `error="invalid_token"` |
 | Required scope missing (Bearer) | 403 | `error="insufficient_scope"` |
 
-Errors are emitted at the transport layer (outside `A2aError`) so they
-never leak through the JSON-RPC envelope.
+Errors are emitted at the transport layer, before any A2A handler runs,
+and never carry validator internals. Every failure body has a code, a
+fixed message and a `google.rpc.ErrorInfo` whose `reason` is the stable
+kind (`MISSING_CREDENTIAL`, `INVALID_TOKEN`, `INVALID_API_KEY`,
+`EMPTY_PRINCIPAL`, `INSUFFICIENT_SCOPE`) in the `turul-a2a` domain:
+
+- HTTP+JSON: `{"error": {"code", "status", "message", "details": [ErrorInfo]}}`
+- JSON-RPC: an error with code -32040 (401) or -32041 (403) and the
+  `ErrorInfo` in `error.data`
+- gRPC: `UNAUTHENTICATED` / `PERMISSION_DENIED` with the `ErrorInfo` in
+  the status details
 
 ## Examples
 

@@ -11,7 +11,7 @@ A review of the middleware module surfaced five additional cleanup candidates th
 
 1. `RequestContext::bearer_token: Option<String>` is a public field that duplicates `headers["Authorization"]`. The only consumer is `BearerMiddleware::before_request`; the field is extracted in two transport layers (HTTP and gRPC) and stuffed onto the struct, then read once. Two sources of truth for the same value.
 2. `RequestContext::extensions: HashMap<String, serde_json::Value>` is a public field with **zero non-test consumers** across the workspace. The only writers are `AnyOfMiddleware`'s per-attempt clone (`stack.rs:67`, `:74`) and the bare-init paths in transport layers. `AnyOfMiddleware` clones the map for every child attempt, paying allocation cost for data nobody reads. Adopters who want to thread typed data through have to serde-roundtrip into `Value`; the standard Rust pattern (`http::Extensions` / TypeMap) is better.
-3. `MiddlewareError::Internal(String)` drops the originating error chain. No `source()`, no boxed `dyn Error`. An internal middleware failure (JWKS fetch died, DB lookup panicked) becomes a stringified message; the wire surface collapses it to `"internal_error"` (correct per ADR-016), but the *logs* lose the chain too.
+3. `MiddlewareError::Internal(String)` drops the originating error chain. No `source()`, no boxed `dyn Error`. An internal middleware failure (JWKS fetch died, DB lookup panicked) becomes a stringified message; the wire surface collapses it to the fixed `INTERNAL_ERROR` reason (correct per ADR-016), but the *logs* lose the chain too.
 4. The `A2aMiddleware` trait name reads as generic but the contract is specifically auth-oriented (`before_request` only, failure surface shaped for 401/403 + `WWW-Authenticate`). The 0.1.20 documentation tightening makes this explicit in prose; the type name still suggests broader applicability.
 5. The `compat-v03` Cargo feature gates the A2A-Version header requirement at compile time (`transport.rs`). A runtime `RuntimeConfig` switch would let one binary serve mixed-client deployments without recompilation.
 
@@ -41,7 +41,7 @@ Per-item impact:
 
 1. **Drop `RequestContext::bearer_token`.** Re-extract from `headers["Authorization"]` via the existing `extract_bearer_token` helper inside `BearerMiddleware::before_request`. Eliminates the two-sources-of-truth issue. `RequestContext::from_headers` (shipped in 0.1.20) becomes a four-field struct.
 2. **Drop `RequestContext::extensions`.** Field has zero non-test consumers. Adopter middleware that needs typed cross-layer state can attach it via `Request::extensions_mut()` (`http::Extensions`, TypeMap-typed) in a sibling Tower layer.
-3. **Reshape `MiddlewareError::Internal`.** Change variant from `Internal(String)` to `Internal(Box<dyn std::error::Error + Send + Sync>)`. Wire body remains `"internal_error"` per ADR-016 — the inner error is for logs / `source()` chains only, never on the wire.
+3. **Reshape `MiddlewareError::Internal`.** Change variant from `Internal(String)` to `Internal(Box<dyn std::error::Error + Send + Sync>)`. The wire reason remains `INTERNAL_ERROR` per ADR-016 — the inner error is for logs / `source()` chains only, never on the wire.
 
 ### Explicitly deferred or off the table
 
@@ -91,3 +91,7 @@ Until then 0.1.x continues with non-breaking adds and runtime alignment fixes.
 
 - When 0.2.0 ships, re-run the downstream impact survey to confirm the rename and `compat-v03` decisions still hold.
 - If a non-auth `A2aMiddleware` adopter appears between now and 0.2.0, escalate item #4 from "deferred indefinitely" to "scheduled for 0.2.0 or a later minor" with explicit migration tooling.
+
+## Revision log
+
+- 2026-10-23 — Wire references restated: auth failures now carry the kind as an `ErrorInfo.reason` (`INTERNAL_ERROR` for `Internal`), per ADR-016.

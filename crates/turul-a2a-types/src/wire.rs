@@ -118,6 +118,8 @@ pub mod errors {
     pub const JSONRPC_EXTENDED_AGENT_CARD_NOT_CONFIGURED: i32 = -32007;
     pub const JSONRPC_EXTENSION_SUPPORT_REQUIRED: i32 = -32008;
     pub const JSONRPC_VERSION_NOT_SUPPORTED: i32 = -32009;
+    /// JSON-RPC 2.0 "Internal error".
+    pub const JSONRPC_INTERNAL_ERROR: i32 = -32603;
 
     /// JSON-RPC codes for transport authentication failures. The A2A spec
     /// leaves these to the implementation ("JSON-RPC custom error"); they

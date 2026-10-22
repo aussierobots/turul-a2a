@@ -215,31 +215,6 @@ impl Default for InMemoryA2aStorage {
     }
 }
 
-/// Apply history_length trimming to a task clone.
-fn trim_history(task: &Task, history_length: Option<i32>) -> Task {
-    match history_length {
-        Some(0) => {
-            // Clone task, clear history
-            let mut proto = task.as_proto().clone();
-            proto.history.clear();
-            // Safe: original task had valid state, clearing history doesn't invalidate
-            Task::try_from(proto).unwrap_or_else(|_| task.clone())
-        }
-        Some(n) if n > 0 => {
-            let n = n as usize;
-            let history = task.history();
-            if history.len() <= n {
-                return task.clone();
-            }
-            let mut proto = task.as_proto().clone();
-            let start = proto.history.len().saturating_sub(n);
-            proto.history = proto.history[start..].to_vec();
-            Task::try_from(proto).unwrap_or_else(|_| task.clone())
-        }
-        _ => task.clone(), // None = no limit
-    }
-}
-
 /// Apply include_artifacts filtering.
 fn strip_artifacts(task: &Task, include: bool) -> Task {
     if include {
@@ -287,9 +262,10 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         let tasks = self.tasks.read().await;
         let key = (tenant.to_string(), task_id.to_string());
         match tasks.get(&key) {
-            Some(stored) if stored.owner == owner => {
-                Ok(Some(trim_history(&stored.task, history_length)))
-            }
+            Some(stored) if stored.owner == owner => Ok(Some(super::trim_history(
+                stored.task.clone(),
+                history_length,
+            ))),
             _ => Ok(None), // Not found or wrong owner — same result per spec
         }
     }
@@ -408,7 +384,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         let page_tasks: Vec<Task> = filtered[start_idx..end_idx]
             .iter()
             .map(|(_, s)| {
-                let t = trim_history(&s.task, filter.history_length);
+                let t = super::trim_history(s.task.clone(), filter.history_length);
                 strip_artifacts(&t, filter.include_artifacts.unwrap_or(false))
             })
             .collect();

@@ -1,8 +1,9 @@
 //! Middleware error types — transport-level only, never in A2aError.
 //!
 //! Every auth-failure variant carries an [`AuthFailureKind`]; the transport
-//! boundary maps that kind to both the JSON body string and (for Bearer
-//! challenges) the RFC 6750 `error=` code in `WWW-Authenticate`. No
+//! boundary maps that kind to both the `google.rpc.ErrorInfo` reason of the
+//! error body and (for Bearer challenges) the RFC 6750 `error=` code in
+//! `WWW-Authenticate`. No
 //! validator internals, no Debug-formatted enum names, no
 //! `error_description`.
 
@@ -35,15 +36,15 @@ pub enum AuthFailureKind {
 }
 
 impl AuthFailureKind {
-    /// Stable snake_case identifier emitted as the JSON body `error` value.
-    /// This string is part of the wire contract and must not change.
-    pub fn body_string(self) -> &'static str {
+    /// Stable `ErrorInfo.reason` for this kind (upper snake case). Part of
+    /// the wire contract on every transport; must not change.
+    pub fn reason(self) -> &'static str {
         match self {
-            Self::MissingCredential => "missing_credential",
-            Self::InvalidToken => "invalid_token",
-            Self::InvalidApiKey => "invalid_api_key",
-            Self::EmptyPrincipal => "empty_principal",
-            Self::InsufficientScope => "insufficient_scope",
+            Self::MissingCredential => "MISSING_CREDENTIAL",
+            Self::InvalidToken => "INVALID_TOKEN",
+            Self::InvalidApiKey => "INVALID_API_KEY",
+            Self::EmptyPrincipal => "EMPTY_PRINCIPAL",
+            Self::InsufficientScope => "INSUFFICIENT_SCOPE",
         }
     }
 
@@ -129,18 +130,16 @@ impl MiddlewareError {
         }
     }
 
-    /// Stable wire string for the error body / message. Single source of
-    /// truth for the snake_case identifier surfaced to clients across both
-    /// HTTP (JSON body `error` field) and gRPC (`Status::message()`)
-    /// transports.
+    /// `ErrorInfo.reason` surfaced on every transport (HTTP+JSON and
+    /// JSON-RPC bodies, gRPC status details).
     ///
-    /// `Internal` collapses to the fixed `"internal_error"` literal —
-    /// the inner `String` payload is intentionally NOT exposed on the
-    /// wire (would leak validator internals, DB errors, etc.).
-    pub fn wire_body_string(&self) -> &'static str {
+    /// `Internal` collapses to the fixed `"INTERNAL_ERROR"` — the inner
+    /// `String` payload is intentionally NOT exposed on the wire (would
+    /// leak validator internals, DB errors, etc.).
+    pub fn reason(&self) -> &'static str {
         match self.kind() {
-            Some(kind) => kind.body_string(),
-            None => "internal_error",
+            Some(kind) => kind.reason(),
+            None => "INTERNAL_ERROR",
         }
     }
 
@@ -172,7 +171,7 @@ impl MiddlewareError {
         use turul_a2a_types::wire::errors;
         serde_json::json!({
             "@type": errors::ERROR_INFO_TYPE,
-            "reason": self.wire_body_string().to_ascii_uppercase(),
+            "reason": self.reason(),
             "domain": errors::AUTH_ERROR_DOMAIN,
         })
     }
@@ -197,7 +196,7 @@ impl MiddlewareError {
         let code = match self.http_status() {
             401 => errors::JSONRPC_UNAUTHENTICATED,
             403 => errors::JSONRPC_PERMISSION_DENIED,
-            _ => -32603,
+            _ => errors::JSONRPC_INTERNAL_ERROR,
         };
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -216,23 +215,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn body_strings_are_stable() {
+    fn reasons_are_stable() {
         assert_eq!(
-            AuthFailureKind::MissingCredential.body_string(),
-            "missing_credential"
+            AuthFailureKind::MissingCredential.reason(),
+            "MISSING_CREDENTIAL"
         );
-        assert_eq!(AuthFailureKind::InvalidToken.body_string(), "invalid_token");
+        assert_eq!(AuthFailureKind::InvalidToken.reason(), "INVALID_TOKEN");
+        assert_eq!(AuthFailureKind::InvalidApiKey.reason(), "INVALID_API_KEY");
+        assert_eq!(AuthFailureKind::EmptyPrincipal.reason(), "EMPTY_PRINCIPAL");
         assert_eq!(
-            AuthFailureKind::InvalidApiKey.body_string(),
-            "invalid_api_key"
-        );
-        assert_eq!(
-            AuthFailureKind::EmptyPrincipal.body_string(),
-            "empty_principal"
+            AuthFailureKind::InsufficientScope.reason(),
+            "INSUFFICIENT_SCOPE"
         );
         assert_eq!(
-            AuthFailureKind::InsufficientScope.body_string(),
-            "insufficient_scope"
+            MiddlewareError::Internal("db down".into()).reason(),
+            "INTERNAL_ERROR"
         );
     }
 

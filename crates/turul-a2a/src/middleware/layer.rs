@@ -105,21 +105,23 @@ where
 ///   Section 3.1), otherwise with the fixed `error=` code.
 ///   `error_description` is intentionally omitted to prevent leaking
 ///   validator internals.
-/// - `Internal` is not auth-failure and uses the fixed `internal_error`
+/// - `Internal` is not auth-failure and uses the fixed `INTERNAL_ERROR`
 ///   kind.
 fn middleware_error_to_response(err: &MiddlewareError, path: &str) -> Response<Body> {
     let status = axum::http::StatusCode::from_u16(err.http_status())
         .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
 
-    let body = if path == crate::jsonrpc::JSONRPC_PATH {
+    let body = if crate::jsonrpc::is_jsonrpc_path(path) {
         err.jsonrpc_body()
     } else {
         err.http_body()
     };
 
+    // Plain JSON: the transport layer relabels it `application/a2a+json`
+    // unless the request speaks the legacy 0.3 protocol.
     let mut builder = Response::builder().status(status).header(
         http::header::CONTENT_TYPE,
-        turul_a2a_types::wire::protocol::MEDIA_TYPE_A2A_JSON,
+        turul_a2a_types::wire::protocol::MEDIA_TYPE_JSON,
     );
 
     if let MiddlewareError::HttpChallenge(kind) = err

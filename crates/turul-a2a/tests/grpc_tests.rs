@@ -814,7 +814,7 @@ async fn drive_get_task_err(err: MiddlewareError) -> Status {
 fn assert_grpc_auth_kind(s: &Status, kind: &str) {
     assert!(!s.message().is_empty());
     let info = s.get_details_error_info().expect("ErrorInfo");
-    assert_eq!(info.reason, kind.to_ascii_uppercase());
+    assert_eq!(info.reason, kind);
     assert_eq!(info.domain, "turul-a2a");
 }
 
@@ -825,7 +825,7 @@ async fn grpc_auth_message_invalid_api_key() {
     ))
     .await;
     assert_eq!(s.code(), tonic::Code::Unauthenticated);
-    assert_grpc_auth_kind(&s, "invalid_api_key");
+    assert_grpc_auth_kind(&s, "INVALID_API_KEY");
 }
 
 #[tokio::test]
@@ -835,32 +835,32 @@ async fn grpc_auth_message_invalid_token() {
     ))
     .await;
     assert_eq!(s.code(), tonic::Code::Unauthenticated);
-    assert_grpc_auth_kind(&s, "invalid_token");
+    assert_grpc_auth_kind(&s, "INVALID_TOKEN");
 }
 
 #[tokio::test]
 async fn grpc_auth_message_insufficient_scope_is_permission_denied() {
     // HTTP returns 403 here per RFC 6750 §3. gRPC has no direct 403 — the
-    // closest code is PERMISSION_DENIED (same as Forbidden(*)). The body
-    // string stays parity with HTTP.
+    // closest code is PERMISSION_DENIED (same as Forbidden(*)). The
+    // `ErrorInfo.reason` matches HTTP.
     let s = drive_get_task_err(MiddlewareError::HttpChallenge(
         turul_a2a::middleware::AuthFailureKind::InsufficientScope,
     ))
     .await;
     assert_eq!(s.code(), tonic::Code::PermissionDenied);
-    assert_grpc_auth_kind(&s, "insufficient_scope");
+    assert_grpc_auth_kind(&s, "INSUFFICIENT_SCOPE");
 }
 
 #[tokio::test]
 async fn grpc_auth_internal_never_leaks_inner_string() {
     // Regression: the inner String on `MiddlewareError::Internal(_)`
     // MUST NOT reach the wire. The gRPC layer must collapse it to the
-    // fixed body string "internal_error" rather than formatting the
-    // Debug-form of the error.
+    // fixed `INTERNAL_ERROR` reason rather than formatting the Debug-form
+    // of the error.
     let secret = "secret-jwks-fetch-failed-https://internal.example/jwks";
     let s = drive_get_task_err(MiddlewareError::Internal(secret.into())).await;
     assert_eq!(s.code(), tonic::Code::Internal);
-    assert_grpc_auth_kind(&s, "internal_error");
+    assert_grpc_auth_kind(&s, "INTERNAL_ERROR");
     assert!(
         !s.message().contains("secret"),
         "Internal payload must never leak: got {:?}",

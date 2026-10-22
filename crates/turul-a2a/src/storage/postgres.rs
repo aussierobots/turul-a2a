@@ -25,9 +25,8 @@ pub struct PostgresConfig {
     /// When true, [`PostgresA2aStorage::new`] skips DDL bootstrap (no
     /// `CREATE TABLE`, no `CREATE INDEX`) and trusts
     /// the operator-provisioned schema. Default `false` preserves the
-    /// auto-bootstrap behavior. Adopters who set this flag own forward
-    /// migrations on every release that changes the schema (see
-    /// CHANGELOG).
+    /// auto-bootstrap behavior. Stores are not migrated: a release that
+    /// changes the schema needs the store re-created (see CHANGELOG).
     pub assume_schema_initialized: bool,
 }
 
@@ -224,21 +223,6 @@ impl PostgresA2aStorage {
             .unwrap_or_default()
     }
 
-    fn trim_task(task: Task, history_length: Option<i32>) -> Task {
-        let mut proto = task.into_proto();
-        if let Some(0) = history_length {
-            proto.history.clear();
-        } else if let Some(n) = history_length
-            && n > 0
-        {
-            let n = n as usize;
-            let start = proto.history.len().saturating_sub(n);
-            proto.history = proto.history[start..].to_vec();
-        }
-        Task::try_from(proto)
-            .unwrap_or_else(|_| Task::new("err", TaskStatus::new(TaskState::Failed)))
-    }
-
     /// Serialize a task with its artifact bodies stripped out, returning
     /// the artifact-free JSONB blob and the removed artifacts.
     fn split_task(
@@ -420,7 +404,7 @@ impl A2aTaskStorage for PostgresA2aStorage {
                 let task = self
                     .rehydrate_task(tenant, task_id, &json, manifest)
                     .await?;
-                Ok(Some(Self::trim_task(task, history_length)))
+                Ok(Some(super::trim_history(task, history_length)))
             }
             None => Ok(None),
         }
@@ -610,7 +594,7 @@ impl A2aTaskStorage for PostgresA2aStorage {
                     Err(_) => continue,
                 }
             };
-            tasks.push(Self::trim_task(task, filter.history_length));
+            tasks.push(super::trim_history(task, filter.history_length));
         }
 
         let next_page_token = match rows.last() {

@@ -4,8 +4,10 @@
 - **Date**: 2026-04-24
 - **Supersedes / Amends**: complements ADR-004 (A2A protocol error model) and
   ADR-007 (auth middleware). Transport auth failures remain outside the
-  `A2aError` / `google.rpc.ErrorInfo` model per ADR-007 — this ADR tightens
-  the already-transport-only surface, it does not change which layer owns it.
+  `A2aError` model per ADR-007; their bodies reuse the
+  `google.rpc.ErrorInfo` detail shape in the `turul-a2a` domain (§2.2).
+  This ADR tightens the already-transport-only surface, it does not change
+  which layer owns it.
 
 ## 1. Context
 
@@ -138,9 +140,10 @@ an actual code path in 0.1.11. Deliberately coarse because:
 Richer per-reason observability is addressable as a separate concern
 (see §2.6 — adopter-scoped hook, not public wire).
 
-Each variant maps to a stable wire-kind string (`snake_case`):
-`missing_credential`, `invalid_token`, `invalid_api_key`,
-`empty_principal`, `insufficient_scope`.
+Each variant maps to a stable `ErrorInfo.reason` (upper snake case,
+`AuthFailureKind::reason`): `MISSING_CREDENTIAL`, `INVALID_TOKEN`,
+`INVALID_API_KEY`, `EMPTY_PRINCIPAL`, `INSUFFICIENT_SCOPE`;
+`MiddlewareError::Internal` collapses to `INTERNAL_ERROR`.
 
 ### 2.2 Error body — all schemes, all failures
 
@@ -150,7 +153,8 @@ Each variant maps to a stable wire-kind string (`snake_case`):
 > human-readable message (spec "Error Payload Structure"), and names a
 > "JSON-RPC custom error" for authentication failures on JSON-RPC.
 
-HTTP+JSON (every path except the JSON-RPC endpoint):
+HTTP+JSON (every path except the JSON-RPC endpoint, which is `/jsonrpc`
+and, under `compat-v03`, also `/`):
 
 ```json
 { "error": { "code": 401, "status": "UNAUTHENTICATED",
@@ -312,10 +316,11 @@ contract.
 
 ## 4. Test obligations
 
-1. **Body mapping**: unit test asserting every `AuthFailureKind`
-   variant serializes to its documented wire string
-   (`missing_credential`, `invalid_token`, `invalid_api_key`,
-   `empty_principal`, `insufficient_scope`).
+1. **Reason mapping**: unit test asserting every `AuthFailureKind`
+   variant maps to its documented `ErrorInfo.reason`
+   (`MISSING_CREDENTIAL`, `INVALID_TOKEN`, `INVALID_API_KEY`,
+   `EMPTY_PRINCIPAL`, `INSUFFICIENT_SCOPE`; `INTERNAL_ERROR` for
+   `Internal`).
 2. **WWW-Authenticate mapping**: unit test asserting each variant's
    RFC 6750 code when emitted through a Bearer challenge, or header
    absence when emitted through an API-key rejection. Assert no
@@ -340,16 +345,18 @@ contract.
 5. **Type-level guard**: compile-fail or `static_assertions::assert_not_impl_all!`
    for `ApiKeyMiddleware`, `BearerMiddleware`, `StaticApiKeyLookup` not
    implementing `Debug`.
-6. **End-to-end Bearer auth failure**: 401 with body
-   `{"error": "invalid_token"}` and header
+6. **End-to-end Bearer auth failure**: 401 with an error body whose
+   `ErrorInfo.reason` is `INVALID_TOKEN` and header
    `WWW-Authenticate: Bearer realm="a2a", error="invalid_token"`
    (no `error_description`, no validator internals). A request with no
-   Bearer token gets 401, body `{"error": "missing_credential"}` and the
-   bare `WWW-Authenticate: Bearer realm="a2a"`. A valid token lacking a
-   required scope gets 403, body `{"error": "insufficient_scope"}` and
-   `error="insufficient_scope"`.
-7. **End-to-end API-key auth failure**: 401 with body
-   `{"error": "invalid_api_key"}` and no `WWW-Authenticate` header.
+   Bearer token gets 401, reason `MISSING_CREDENTIAL` and the bare
+   `WWW-Authenticate: Bearer realm="a2a"`. A valid token lacking a
+   required scope gets 403, reason `INSUFFICIENT_SCOPE` and
+   `error="insufficient_scope"`. On the JSON-RPC endpoint the same
+   failures are JSON-RPC errors (-32040 / -32041) with the reason in
+   `error.data[]`; on gRPC the reason is in the status details.
+7. **End-to-end API-key auth failure**: 401 with reason
+   `INVALID_API_KEY` and no `WWW-Authenticate` header.
 8. **Charset safety**: property test that emitted `WWW-Authenticate`
    values never contain `"` or `\` (RFC 6750 §3 compliance).
 
@@ -361,7 +368,8 @@ contract.
   becomes `{"error": "<kind_string>"}`. Adopters pattern-matching on
   the old `message` text will break. That text was `format!("{err:?}")`
   of an internal enum and was never documented as stable. Migration
-  is a grep-and-update.
+  is a grep-and-update. (Superseded by the §2.2 amendment: the kind now
+  travels as `ErrorInfo.reason` inside an AIP-193 / JSON-RPC error.)
 - `WWW-Authenticate: Bearer realm="a2a", error="invalid_token", error_description="..."`
   becomes `WWW-Authenticate: Bearer realm="a2a", error="invalid_token"`.
   Adopters logging `error_description` for debugging lose it. That
@@ -374,7 +382,8 @@ contract.
 
 ### 5.2 Wire invariants after this ADR
 
-- `AuthFailureKind` → body string: stable across minor releases.
+- `AuthFailureKind` → `ErrorInfo.reason` (`AuthFailureKind::reason`,
+  `MiddlewareError::reason` for `Internal`): stable across minor releases.
 - RFC 6750 mapping for Bearer: stable across minor releases.
 - `RequestContext::Debug` never prints bearer tokens, sensitive
   header values, or extensions values.
@@ -461,7 +470,8 @@ any affected adopter sees them.
 
 ## 8. Revision log
 
-- **2026-10-22** — A missing credential on a Bearer path now emits the
+- 2026-04-24 — Initial acceptance.
+- 2026-10-22 — A missing credential on a Bearer path now emits the
   bare challenge `WWW-Authenticate: Bearer realm="a2a"` with no `error=`
   code (RFC 6750 §3.1), replacing `error="invalid_request"`.
   `AuthFailureKind::bearer_rfc6750_code` returns `None` for
@@ -469,6 +479,18 @@ any affected adopter sees them.
   header value. `InsufficientScope` is produced by
   `BearerMiddleware::with_required_scopes`, no longer reserved. Test
   obligation 6 extended accordingly.
+- 2026-10-22 — §2.2: the error body carries a code and a human-readable
+  message as A2A v1.0.1 requires — AIP-193 on HTTP+JSON, a JSON-RPC custom
+  error (-32040 / -32041) on the JSON-RPC endpoint, and the same message
+  on gRPC; the stable kind becomes the `ErrorInfo.reason` in the
+  `turul-a2a` domain.
+- 2026-10-23 — One owner for the reason: `AuthFailureKind::reason` and
+  `MiddlewareError::reason` (fixed upper-case strings) feed the HTTP,
+  JSON-RPC and gRPC bodies; `body_string` / `wire_body_string` are
+  deleted. Under `compat-v03` the v0.3 JSON-RPC root path also gets the
+  JSON-RPC envelope, and auth-failure media types follow the transport
+  layer (`application/json` for v0.3 requests). §2.1, §5.2 and test
+  obligations 1 and 6–7 restated in terms of `ErrorInfo.reason`.
 
 ## 9. References
 
@@ -481,9 +503,3 @@ any affected adopter sees them.
 - `crates/turul-a2a/src/middleware/error.rs`
 - `crates/turul-a2a-auth/src/bearer.rs`
 - `crates/turul-a2a-auth/src/api_key.rs`
-
-## Revision log
-
-- 2026-04-24 — Initial acceptance.
-- 2026-10-22 — A request with no credentials gets a bare `WWW-Authenticate` challenge with no `error` code (RFC 6750 §3.1).
-- 2026-10-22 — §2.2: the error body carries a code and a human-readable message as A2A v1.0.1 requires — AIP-193 on HTTP+JSON, a JSON-RPC custom error (-32040 / -32041) on the JSON-RPC endpoint, and the same message on gRPC; the stable kind becomes the `ErrorInfo.reason` in the `turul-a2a` domain.

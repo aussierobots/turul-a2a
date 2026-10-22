@@ -129,7 +129,9 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            let legacy = is_legacy_request(&req);
+            // Discovery documents keep `application/json` whatever the
+            // request version, so every client generation reads them alike.
+            let relabel = !is_legacy_request(&req) && !super::is_bypass_path(req.uri().path());
             let response = match check_request(&req) {
                 Err(err) if crate::jsonrpc::is_jsonrpc_path(req.uri().path()) => {
                     axum::Json(err.to_jsonrpc_error(None)).into_response()
@@ -137,10 +139,10 @@ where
                 Err(err) => err.into_response(),
                 Ok(()) => inner.call(req).await?,
             };
-            Ok(if legacy {
-                response
-            } else {
+            Ok(if relabel {
                 with_a2a_media_type(response)
+            } else {
+                response
             })
         })
     }

@@ -932,21 +932,6 @@ impl DynamoDbA2aStorage {
             .map(TaskState::wire_name)
             .unwrap_or_default()
     }
-
-    fn trim_task(task: Task, history_length: Option<i32>) -> Task {
-        let mut proto = task.into_proto();
-        if let Some(0) = history_length {
-            proto.history.clear();
-        } else if let Some(n) = history_length
-            && n > 0
-        {
-            let n = n as usize;
-            let start = proto.history.len().saturating_sub(n);
-            proto.history = proto.history[start..].to_vec();
-        }
-        Task::try_from(proto)
-            .unwrap_or_else(|_| Task::new("err", TaskStatus::new(TaskState::Failed)))
-    }
 }
 
 #[async_trait]
@@ -1071,7 +1056,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         let task = self
             .rehydrate_task(tenant, task_id, json, Self::stored_manifest(&item)?)
             .await?;
-        Ok(Some(Self::trim_task(task, history_length)))
+        Ok(Some(super::trim_history(task, history_length)))
     }
 
     async fn update_task(
@@ -1302,7 +1287,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             } else {
                 task.clone()
             };
-            page_tasks.push(Self::trim_task(task, filter.history_length));
+            page_tasks.push(super::trim_history(task, filter.history_length));
         }
 
         let next_page_token = if end_idx < tasks_with_keys.len() {

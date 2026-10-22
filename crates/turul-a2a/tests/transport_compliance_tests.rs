@@ -400,6 +400,30 @@ async fn json_responses_use_the_a2a_media_type() {
     assert_eq!(content_type(&resp), "application/a2a+json");
 }
 
+/// The well-known agent card is version-independent: it is
+/// `application/json` with or without `A2A-Version`, whatever the features.
+#[tokio::test]
+async fn agent_card_is_plain_json_for_every_client() {
+    for version in [None, Some("1.0")] {
+        let mut req = Request::get("/.well-known/agent-card.json");
+        if let Some(v) = version {
+            req = req.header("a2a-version", v);
+        }
+        let resp = build_router(test_state())
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{version:?}");
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "{version:?}"
+        );
+    }
+}
+
 /// With `compat-v03`, a v0.3 request (no `A2A-Version`) keeps the
 /// `application/json` responses those clients were written against.
 #[cfg(feature = "compat-v03")]

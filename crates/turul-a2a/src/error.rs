@@ -82,7 +82,7 @@ impl A2aError {
             Self::ExtensionSupportRequired { .. } => errors::JSONRPC_EXTENSION_SUPPORT_REQUIRED,
             Self::VersionNotSupported { .. } => errors::JSONRPC_VERSION_NOT_SUPPORTED,
             Self::InvalidRequest { .. } => -32602, // Invalid params
-            Self::Internal(_) => -32603,           // Internal error
+            Self::Internal(_) => errors::JSONRPC_INTERNAL_ERROR,
         }
     }
 

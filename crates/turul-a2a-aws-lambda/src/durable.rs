@@ -423,10 +423,14 @@ mod handle_http_event_value_tests {
     }
 
     fn apigw_v2_agent_card_get() -> serde_json::Value {
+        apigw_v2_get("/.well-known/agent-card.json")
+    }
+
+    fn apigw_v2_get(path: &str) -> serde_json::Value {
         serde_json::json!({
             "version": "2.0",
-            "routeKey": "GET /.well-known/agent-card.json",
-            "rawPath": "/.well-known/agent-card.json",
+            "routeKey": format!("GET {path}"),
+            "rawPath": path,
             "rawQueryString": "",
             "headers": {"accept": "application/json", "a2a-version": "1.0"},
             "requestContext": {
@@ -436,13 +440,13 @@ mod handle_http_event_value_tests {
                 "domainPrefix": "fake",
                 "http": {
                     "method": "GET",
-                    "path": "/.well-known/agent-card.json",
+                    "path": path,
                     "protocol": "HTTP/1.1",
                     "sourceIp": "127.0.0.1",
                     "userAgent": "test"
                 },
                 "requestId": "rid",
-                "routeKey": "GET /.well-known/agent-card.json",
+                "routeKey": format!("GET {path}"),
                 "stage": "$default",
                 "time": "01/Jan/2026:00:00:00 +0000",
                 "timeEpoch": 1_735_689_600_000i64
@@ -467,6 +471,28 @@ mod handle_http_event_value_tests {
             body.contains("\"name\""),
             "agent card shape in body: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn handle_http_event_value_a2a_json_response_is_text() {
+        let handler = build_handler();
+        let resp_json = handler
+            .handle_http_event_value(apigw_v2_get("/tasks"))
+            .await
+            .expect("ok");
+        let resp: ApiGatewayV2httpResponse = serde_json::from_value(resp_json).unwrap();
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(
+            resp.headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/a2a+json")
+        );
+        assert!(!resp.is_base64_encoded, "a2a+json body must not be base64");
+        assert!(matches!(
+            resp.body,
+            Some(aws_lambda_events::encodings::Body::Text(_))
+        ));
     }
 
     #[tokio::test]

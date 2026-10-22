@@ -265,7 +265,7 @@ async fn auth_middleware_rejects_unauthenticated_http() {
         .unwrap();
     let (status, _headers, body) = response_with_headers(router, req).await;
     assert_eq!(status, 401, "Unauthenticated should return 401");
-    assert_auth_body(&body, "invalid_token");
+    assert_auth_body(&body, "INVALID_TOKEN");
 }
 
 #[tokio::test]
@@ -278,7 +278,41 @@ async fn auth_middleware_rejects_unauthenticated_jsonrpc() {
         .unwrap();
     let (status, _, body) = response_with_headers(router, req).await;
     assert_eq!(status, 401, "JSON-RPC without auth should get HTTP 401");
-    assert_jsonrpc_auth_error(&body, -32040, "invalid_token");
+    assert_jsonrpc_auth_error(&body, -32040, "INVALID_TOKEN");
+}
+
+#[tokio::test]
+async fn jsonrpc_auth_failure_is_labelled_a2a_json() {
+    let router = build_router(state_with_auth());
+    let req = Request::post("/jsonrpc")
+        .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
+        .body(Body::from(jrpc_body("ListTasks", 1)))
+        .unwrap();
+    let (_, headers, _) = response_with_headers(router, req).await;
+    assert_eq!(
+        headers.get("content-type").and_then(|v| v.to_str().ok()),
+        Some("application/a2a+json")
+    );
+}
+
+/// Under `compat-v03` the root path `/` is a JSON-RPC endpoint, so a v0.3
+/// auth failure there is a JSON-RPC error labelled `application/json`.
+#[cfg(feature = "compat-v03")]
+#[tokio::test]
+async fn v03_root_jsonrpc_auth_failure_is_jsonrpc_envelope() {
+    let router = build_router(state_with_auth());
+    let req = Request::post("/")
+        .header("content-type", "application/json")
+        .body(Body::from(jrpc_body("tasks/get", 1)))
+        .unwrap();
+    let (status, headers, body) = response_with_headers(router, req).await;
+    assert_eq!(status, 401);
+    assert_jsonrpc_auth_error(&body, -32040, "INVALID_TOKEN");
+    assert_eq!(
+        headers.get("content-type").and_then(|v| v.to_str().ok()),
+        Some("application/json")
+    );
 }
 
 #[tokio::test]
@@ -351,7 +385,7 @@ async fn extended_agent_card_served_to_claims_less_api_key_identity() {
         .unwrap();
     let (status, _, body) = response_with_headers(router, req).await;
     assert_eq!(status, 401);
-    assert_auth_body(&body, "missing_credential");
+    assert_auth_body(&body, "MISSING_CREDENTIAL");
 }
 
 /// The executor builds the extended card for the authenticated caller:
@@ -430,7 +464,7 @@ async fn jsonrpc_unauthenticated_is_http_401_with_a_jsonrpc_error() {
     // A2A: auth failures on JSON-RPC are a "JSON-RPC custom error"; the
     // HTTP status and challenge still apply.
     assert_eq!(status, 401);
-    assert_jsonrpc_auth_error(&body, -32040, "invalid_token");
+    assert_jsonrpc_auth_error(&body, -32040, "INVALID_TOKEN");
 }
 
 #[tokio::test]
@@ -546,8 +580,7 @@ fn assert_auth_body(body: &serde_json::Value, kind: &str) {
         "message: {body}"
     );
     assert_eq!(
-        body["error"]["details"][0]["reason"],
-        kind.to_ascii_uppercase(),
+        body["error"]["details"][0]["reason"], kind,
         "reason: {body}"
     );
     assert_eq!(
@@ -567,9 +600,5 @@ fn assert_jsonrpc_auth_error(body: &serde_json::Value, code: i64, kind: &str) {
             .is_some_and(|m| !m.is_empty()),
         "{body}"
     );
-    assert_eq!(
-        body["error"]["data"][0]["reason"],
-        kind.to_ascii_uppercase(),
-        "{body}"
-    );
+    assert_eq!(body["error"]["data"][0]["reason"], kind, "{body}");
 }
