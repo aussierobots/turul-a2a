@@ -53,6 +53,8 @@ This refines ADR-010 §5. The `CancelTask` handler **waits** up to a configurabl
    - `Err(TerminalStateAlreadySet { current_state })`: executor or another path committed first. Handler reads current task via `get_task` and returns that snapshot (may be CANCELED, COMPLETED, FAILED, or REJECTED). Handler does not retry.
    - `Err(other)`: storage error. Handler returns 500 with the error, but the marker remains set so any in-flight executor can still resolve cleanly in the background.
 
+**Request metadata**: `CancelTaskRequest.metadata` (`a2a.proto`: "a flexible key-value map for passing additional context or parameters") has no behaviour defined by the A2A v1.0.1 spec (§3.1.5 lists only the task id as the operative input). The framework accepts it on HTTP+JSON (request body), JSON-RPC (`params.metadata`) and gRPC alike, does not interpret it, and does not forward it to the executor; a request with metadata cancels exactly as one without.
+
 **Why blocking**: clients expect `CancelTask` to reflect the cancel's effect in its response. A non-blocking handler returning a still-`WORKING` task forces every adopter to write poll-until-terminal logic for a basic cancel. Blocking up to 5 seconds is well within normal HTTP request timeouts and gives a 99th-percentile UX that's consistent with the proto's `return_immediately = false` default for `SendMessage`.
 
 **Configuration**:
@@ -107,7 +109,7 @@ impl Drop for SupervisorSentinel {
 
 The supervisor task body runs "above" the sentinel. If the body completes normally (executor exited, state inspected, yielded fired), the sentinel's drop still runs and does cleanup — which is idempotent because the handle is already finished and the registry entry may already have been removed. If the body panics, the sentinel's drop is the floor — the executor gets aborted, the registry entry is removed, and the panic is caught by tokio's default (task aborts, does not propagate to the server).
 
-**Observability**: supervisor panics MUST be logged at ERROR level with task_id context and MUST increment a `framework.supervisor_panics` metric. Panics indicate framework bugs and should surface loudly — they are not normal operation. See R5 for the full policy.
+**Observability**: supervisor panics MUST emit an ERROR-level structured tracing event at target `turul_a2a::supervisor_panic` with `tenant` and `task_id` fields. Panics indicate framework bugs and should surface loudly — they are not normal operation. The framework exports no metric for this; deployments that want a counter derive it from the tracing event. See R5 for the full policy.
 
 This pattern guarantees: *a supervisor panic leaks nothing, aborts the executor, and makes noise.*
 
@@ -266,30 +268,30 @@ pub trait A2aCancellationSupervisor: Send + Sync {
 
 ### 11. Required Tests Before GREEN
 
-These gate ADR-012 acceptance and phase-1 completion.
+These gate ADR-012 acceptance. Timing assertions run on tokio's paused clock, so a bound such as "before the grace window" states which code path returned, not a wall-clock race.
 
 1. **Same-instance cancel trips executor token**
-   Executor loops checking `ctx.cancellation.is_cancelled()` with 50ms tick. Handler calls `CancelTask`. Assert: executor observes within 100ms, emits `sink.cancelled(Some(reason))`, terminal event is `CANCELED`, handler returns within `cancel_handler_grace` (well before, typically <500ms).
+   Executor started by a non-blocking send waits on `ctx.cancellation`, then acknowledges with `sink.cancelled(Some(reason))`. `CancelTask` on the same instance. Assert: the handler returns the CANCELED task carrying the executor's reason (not the framework's message-less commit), before `cancel_handler_grace` elapses; exactly one terminal event persists.
 
 2. **Cross-instance cancel via storage marker**
-   Two-instance setup sharing storage. Executor on instance A (long-running, cooperative). Handler's `CancelTask` arrives on instance B. Assert: marker written on B (visible via storage read from A), A's supervisor polls within `cross_instance_cancel_poll_interval`, trips A's local token, A's executor observes and emits CANCELED, handler on B observes terminal via its grace-wait poll, returns CANCELED task. Total wall-clock within 2×poll interval + cooperation + storage roundtrip. Under default 1s poll: ≤2.5s typical.
+   Two `AppState`s sharing storage. Executor on instance A (cooperative), with A's `run_cross_instance_cancel_poller` running. Instance B, whose in-flight registry is empty, runs the full `CancelTask` handler. Assert: B returns the CANCELED task carrying A's executor reason — A's poller observed B's marker, tripped A's token, A committed the terminal, and B's grace-wait poll observed it — before B's grace elapses; exactly one terminal event persists.
 
 3. **Cancel on orphaned task (no in-flight)**
    Create task in WORKING state directly in storage (simulating crashed executor). No executor running. Client calls `CancelTask`. Assert: handler writes marker, enters grace, no executor responds, grace expires, framework commits CANCELED via atomic store, handler returns CANCELED task. Wall-clock approximately `cancel_handler_grace`.
 
 4. **Cancel-vs-complete race**
-   Executor configured to emit `complete()` at exactly T=100ms after start. Test harness sends `CancelTask` at T=50ms (handler's grace is default 5s). Two sub-cases via gated executor:
-   - **Cancel wins**: executor slows (channel-gated), handler grace expires, framework commits CANCELED, later executor complete attempt returns `EventSink is closed`.
-   - **Complete wins**: executor emits complete() before handler's grace expires, handler observes terminal=COMPLETED via poll, returns COMPLETED task. Handler's grace-end CANCELED attempt (if it fires at all due to timing) receives `TerminalStateAlreadySet{current_state: "TASK_STATE_COMPLETED"}` and is discarded.
+   Two deterministic sub-cases:
+   - **Cancel wins**: the executor ignores the token and is held on a test channel past the grace window. The framework commits CANCELED (no message); the test then opens the channel and the executor's `complete()` returns `EventSink is closed`. Exactly one terminal (CANCELED) persists.
+   - **Complete wins**: the executor answers the token trip with `complete()`, so COMPLETED lands during the handler's grace wait. The handler returns the COMPLETED task before its grace elapses and never writes CANCELED; the only terminal event is COMPLETED.
 
 5. **Cancel-vs-cancel idempotency**
    Two simultaneous `CancelTask` handlers on the same task (possibly on different instances). Executor emits CANCELED naturally at T=100ms. Assert: both handlers return the same CANCELED task. No duplicate terminal events in the event store. Second marker write is a no-op.
 
 6. **Cancel on terminal task returns TaskNotCancelable**
-   Pre-existing behavior preserved — task already COMPLETED, cancel request returns `TaskNotCancelable` (400 HTTP, −32002 JSON-RPC) with `google.rpc.ErrorInfo.reason = "TASK_NOT_CANCELABLE"`. Marker is not set. This test already exists (handler_tests); confirm it still passes.
+   For each terminal state (COMPLETED, FAILED, CANCELED, REJECTED — A2A v1.0.1 §3.1.5 "already completed, failed, or canceled"), on HTTP (400), JSON-RPC (−32002) and gRPC (`FAILED_PRECONDITION`), each with `google.rpc.ErrorInfo.reason = "TASK_NOT_CANCELABLE"`. A second cancel after a successful one is included. The handler never attempts the marker write (asserted through a storage wrapper counting `set_cancel_requested` calls).
 
 7. **Cancel by wrong owner returns TaskNotFound**
-   Owner A creates task. Owner B's `CancelTask` returns 404 `TaskNotFound` (not 403 — consistent with anti-enumeration auth pattern). Marker is not set.
+   Owner A creates task. Owner B's `CancelTask` returns 404 `TaskNotFound` (not 403 — consistent with anti-enumeration auth pattern). No marker write is attempted and the supervisor read of A's live task stays false.
 
 8. **Batch `supervisor_list_cancel_requested` parity**
    For each of in-memory, SQLite, PostgreSQL, DynamoDB: set cancel-requested on a subset of N=20 tasks across 2 tenants. Call `supervisor_list_cancel_requested(tenant_A, all_20_ids)` — returns exactly the tenant_A subset with marker set. Terminal tasks with marker set are excluded. Storage parity test.
@@ -298,25 +300,27 @@ These gate ADR-012 acceptance and phase-1 completion.
    Task in COMPLETED state. `set_cancel_requested` → returns `A2aStorageError::TaskNotCancelable` (or equivalent terminal error). Marker remains false in storage.
 
 10. **Blocking send interaction**
-    Executor cooperative. Blocking send in flight (configured with 10s timeout). Client sends `CancelTask` at T=100ms. Assert: blocking send returns CANCELED task at ~T=200ms (executor observed, emitted cancelled, yielded fired). CancelTask handler also returns CANCELED at ~T=200ms. No deadlock, no cross-talk between yielded signal and handler grace wait.
+    Cooperative executor reports its task id once running. Blocking send in flight (10s timeout). `CancelTask` on the same task. Assert: both calls return the CANCELED task carrying the executor's reason; the handler returns before its grace and the send before its blocking timeout; exactly one terminal event persists. No deadlock, no cross-talk between the yielded signal and the handler's grace wait.
 
 11. **Streaming subscriber sees terminal CANCELED**
-    Executor cooperative, SSE subscriber attached. Client cancels. Assert: subscriber receives the final `TaskStatusUpdateEvent` with `state = TASK_STATE_CANCELED` + SSE stream closes cleanly. Sequence number is strictly greater than any prior event. Replay from before the cancel also includes the terminal event.
+    Subscriber attached to a WORKING task; the test reads its opening Task snapshot before cancelling. Assert: the next and last event is the `TaskStatusUpdateEvent` with `state = TASK_STATE_CANCELED`, after which the SSE stream closes. In the durable store the CANCELED event's sequence is strictly greater than every earlier event, and reading the events after the pre-cancel sequence returns exactly that terminal.
 
 12. **Cross-instance poll load under N in-flight tasks**
-    Benchmark-style test (may be feature-gated): spawn N=100 in-flight tasks on one instance, verify that supervisor polling does not exceed 1 storage query per tenant per `cross_instance_cancel_poll_interval`. Regression test for poll efficiency.
+    N=100 in-flight tasks across two tenants on one instance, a subset with the marker set. The real poller runs three ticks on the paused clock against a supervisor that counts calls. Assert: exactly one `supervisor_list_cancel_requested` query per tenant per tick (six in total), no per-task `supervisor_get_cancel_requested` reads, and exactly the marked tasks' tokens tripped.
 
 13. **Supervisor panic cleanup via SupervisorSentinel**
-    Test hook: supervisor wrapped with a deliberate panic injector that panics at a controlled point (mid-loop, before observing executor exit). Spawn an executor that sleeps for 10s. Trigger the supervisor panic. Assert:
-    - The `framework.supervisor_panics` metric incremented by 1.
-    - An ERROR-level log entry was emitted with the task_id + tenant.
-    - The in-flight registry entry for this task was removed within 100ms of the panic.
-    - The executor's `JoinHandle` was aborted (it does not continue sleeping; `is_finished()` returns true after abort unwind).
-    - The server remains healthy — a subsequent unrelated request succeeds.
-    - A subsequent `GetTask` on the task returns a non-terminal snapshot (the executor was aborted mid-run; nothing committed a terminal). A subsequent `CancelTask` on that task takes the §5 orphan-cancel path and resolves it to CANCELED.
+    The production supervisor body has no panic site of its own, so the test runs a supervisor-shaped task — `SupervisorSentinel` held, then `panic!` — over a real WORKING task and a real in-flight handle whose executor never returns. Assert:
+    - The ERROR tracing event at `turul_a2a::supervisor_panic` carries task_id + tenant (asserted in `runtime_substrate_tests.rs` with a capturing subscriber).
+    - The in-flight registry entry for this task is removed.
+    - The executor was aborted: its future is dropped (awaited through a drop probe, not read from `is_finished()` immediately after `abort()`).
+    - The server remains healthy — a subsequent unrelated `GetTask` succeeds.
+    - `GetTask` on the task returns a WORKING snapshot (nothing committed a terminal). A subsequent `CancelTask` takes the §5 orphan-cancel path and resolves it to CANCELED with no message.
 
 14. **Supervisor-unscoped reads are not on `A2aTaskStorage`**
-    Compile-time test: handler code path attempts to call `supervisor_get_cancel_requested` via `Arc<dyn A2aTaskStorage>`. Assert: code does not compile (method is on `A2aCancellationSupervisor`, not `A2aTaskStorage`). This is a structural guarantee, verified once by a build-time negative test (e.g., `trybuild`) or inspection of the public handler API surface.
+    Compile-time test: handler code path attempts to call `supervisor_get_cancel_requested` via `Arc<dyn A2aTaskStorage>`. Assert: code does not compile (method is on `A2aCancellationSupervisor`, not `A2aTaskStorage`). Verified by a `compile_fail` doctest on the trait.
+
+15. **Cancel acceptance and lookup on every transport**
+    On HTTP, JSON-RPC and gRPC: an unknown task id returns `TaskNotFound` (404 / −32001 / `NOT_FOUND`); a request carrying `metadata` cancels exactly as one without (§2, request metadata). Through the handler: INPUT_REQUIRED and AUTH_REQUIRED tasks are cancelable (interrupted states are not terminal).
 
 ### 12. What Changes in Existing Code
 
@@ -330,7 +334,7 @@ These gate ADR-012 acceptance and phase-1 completion.
 - `crates/turul-a2a/src/server/in_flight.rs` (added by ADR-010): cross-instance poll loop in the supervisor; `SupervisorSentinel` drop-guard (§3).
 - `crates/turul-a2a/src/server/builder.rs`: new config fields `cancel_handler_grace`, `cancel_handler_poll_interval`, `cross_instance_cancel_poll_interval`.
 - `crates/turul-a2a/src/server/state.rs`: new `cancellation_supervisor: Arc<dyn A2aCancellationSupervisor>` field on `AppState`, wired by the builder from the same backend instance that satisfies `A2aTaskStorage`. Handler code paths do NOT see this field on `AppState`'s public surface.
-- `framework.supervisor_panics` metric registered at startup (or structured log field, per deployment telemetry preference).
+- Supervisor-panic observability is the ERROR tracing event at `turul_a2a::supervisor_panic` (§3); no metric is registered.
 
 **Modified**:
 - `crates/turul-a2a/src/router.rs`: `core_cancel_task` rewritten for the sequence in §2. Validation, marker write, local wake-up, grace wait with poll, race-aware fallback. The current direct-atomic-write is replaced.
@@ -357,7 +361,7 @@ These gate ADR-012 acceptance and phase-1 completion.
 
 1. **`SupervisorSentinel` drop-guard** (§3): the supervisor task body is wrapped around a sentinel whose `Drop` impl runs on all exit paths — normal completion, error, AND panic unwind. The sentinel aborts the executor's `JoinHandle` (if still running) and removes the in-flight registry entry. This is the floor: a panicked supervisor still cleans up via unwind semantics.
 
-2. **Panic is a framework invariant violation, surfaced loudly**: supervisor panics are logged at ERROR level with task_id + tenant context; a `framework.supervisor_panics` metric is incremented. Deployments SHOULD alert on this metric being non-zero. The process does not crash (tokio's default catches panics at the task boundary) but the panic is not hidden.
+2. **Panic is a framework invariant violation, surfaced loudly**: supervisor panics emit an ERROR-level tracing event at `turul_a2a::supervisor_panic` with task_id + tenant fields. Deployments SHOULD alert on that event. The process does not crash (tokio's default catches panics at the task boundary) but the panic is not hidden.
 
 3. **Storage state handling after supervisor panic**: the sentinel does NOT fire `yielded` from its drop path — a panicked context is untrusted for that delicate signal. Blocking sends still waiting on `yielded` fall through to their own `blocking_task_timeout`-based fallback (ADR-010 §4.1 timeout path), which ALSO runs via a sentinel so that the blocking send's own cleanup is panic-safe. If the task is non-terminal at the time of supervisor panic, subsequent `CancelTask` or `GetTask` calls see the non-terminal state; the §5 orphan-cancel path can finalize it.
 
@@ -403,3 +407,4 @@ Taken together: panicked supervisors do not leak registry entries, do not leave 
 ## Revision log
 
 - 2026-10-22 — HTTP status for `TaskNotCancelable` updated 409 → 400 to follow the A2A v1.0.1 error-mapping table (see ADR-004). No behavioural change to the cancellation contract.
+- 2026-10-22 — Amended to what ships and what the tests prove. Supervisor-panic observability is the ERROR tracing event at `turul_a2a::supervisor_panic`; the `framework.supervisor_panics` metric was never implemented and is removed (§3, §12, R5, test #13). `CancelTaskRequest.metadata` recorded as accepted and not interpreted on every transport (§2). Required tests restated as implemented: #1, #2 (instance B runs the full handler over A's live executor), #4 (both sub-cases forced), #6 (every terminal state, all transports, no marker write), #7, #10, #11 (store sequence check; no resume), #12 (bounded correctness test of one batch query per tenant per tick, replacing the benchmark wording), #13 (tracing event, awaited abort, full follow-up), #14 (doctest), new #15 (TaskNotFound and metadata on every transport, interrupted states cancelable).
