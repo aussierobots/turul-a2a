@@ -1,10 +1,11 @@
-//! A2A v0.3 compatibility layer for a2a-sdk 0.3.x clients.
+//! A2A v0.3 wire compatibility for Strands Agents clients.
 //!
 //! turul-a2a is canonically A2A v1.0 (proto-defined PascalCase methods,
 //! `/message:send` HTTP paths, `A2A-Version: 1.0` header).
 //!
-//! This module provides narrowly scoped, **conditional** compatibility for
-//! a2a-sdk 0.3.x clients (used by Strands Agents SDK) which speak A2A v0.3.
+//! The `compat-v03` feature exists for Strands Agents clients, which pin
+//! `a2a-sdk >=0.3,<0.4` and therefore speak the A2A v0.3 wire. This module
+//! provides narrowly scoped, **conditional** compatibility for them.
 //!
 //! ## Detection
 //!
@@ -29,12 +30,6 @@
 //! - Dual-part response artifacts: data + text parts
 //!
 //! These are safe because they do not alter valid v1.0 behavior.
-//!
-//! ## Removal condition
-//!
-//! When a2a-sdk ships v1.0 support (tracks
-//! <https://github.com/google/a2a-sdk-python>), this module can be removed
-//! and the v0.3 route alias in `router.rs` deleted.
 //!
 //! ## Scope
 //!
@@ -251,6 +246,8 @@ fn normalize_task_state_enums(value: &mut serde_json::Value) {
                         "TASK_STATE_CANCELED" => "canceled",
                         "TASK_STATE_FAILED" => "failed",
                         "TASK_STATE_INPUT_REQUIRED" => "input-required",
+                        "TASK_STATE_REJECTED" => "rejected",
+                        "TASK_STATE_AUTH_REQUIRED" => "auth-required",
                         other => other,
                     };
                     *state = serde_json::Value::String(normalized.to_string());
@@ -454,6 +451,76 @@ mod tests {
         });
         maybe_normalize_params(&mut params, CompatMode::V03);
         assert_eq!(params["message"]["role"], "ROLE_USER");
+    }
+
+    // -- Response normalization (V03 only) ----------------------------------
+
+    #[test]
+    fn v03_compat_every_task_state_maps_to_v03_name() {
+        for (v10, v03) in [
+            ("TASK_STATE_SUBMITTED", "submitted"),
+            ("TASK_STATE_WORKING", "working"),
+            ("TASK_STATE_COMPLETED", "completed"),
+            ("TASK_STATE_CANCELED", "canceled"),
+            ("TASK_STATE_FAILED", "failed"),
+            ("TASK_STATE_INPUT_REQUIRED", "input-required"),
+            ("TASK_STATE_REJECTED", "rejected"),
+            ("TASK_STATE_AUTH_REQUIRED", "auth-required"),
+        ] {
+            let mut value = serde_json::json!({"status": {"state": v10}});
+            normalize_task_state_enums(&mut value);
+            assert_eq!(value["status"]["state"], v03, "{v10}");
+        }
+    }
+
+    #[test]
+    fn v03_compat_response_flattens_task_and_normalizes_enums() {
+        let mut response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"task": {
+                "id": "t-1",
+                "status": {"state": "TASK_STATE_AUTH_REQUIRED"},
+                "history": [{"messageId": "m", "role": "ROLE_USER", "parts": []}],
+            }},
+        });
+        maybe_normalize_response(&mut response, CompatMode::V03);
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "id": "t-1",
+                    "status": {"state": "auth-required"},
+                    "history": [{"messageId": "m", "role": "user", "parts": []}],
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn v03_compat_response_untouched_in_v10_mode() {
+        let original = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"task": {"id": "t-1", "status": {"state": "TASK_STATE_REJECTED"}}},
+        });
+        let mut response = original.clone();
+        maybe_normalize_response(&mut response, CompatMode::V10);
+        assert_eq!(response, original);
+    }
+
+    #[test]
+    fn v03_compat_error_response_has_no_result_to_rewrite() {
+        let original = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32001, "message": "Task not found"},
+        });
+        let mut response = original.clone();
+        maybe_normalize_response(&mut response, CompatMode::V03);
+        assert_eq!(response, original);
     }
 
     #[test]

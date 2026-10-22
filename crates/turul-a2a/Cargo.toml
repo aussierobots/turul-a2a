@@ -14,9 +14,9 @@ readme = "README.md"
 [features]
 default = ["in-memory"]
 in-memory = []
-# A2A v0.3 compatibility path for a2a-sdk 0.3.x / Strands clients.
-# Opt-in: enables method normalization, root POST route, optional A2A-Version header.
-# Removal condition: when a2a-sdk ships v1.0 support.
+# A2A v0.3 wire compatibility for Strands Agents clients, which pin
+# a2a-sdk >=0.3,<0.4. Opt-in: enables method normalization, root POST
+# route, optional A2A-Version header.
 compat-v03 = []
 sqlite = ["sqlx", "dep:sha2"]
 postgres = ["sqlx", "dep:sha2"]

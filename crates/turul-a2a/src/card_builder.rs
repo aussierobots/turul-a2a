@@ -316,6 +316,17 @@ mod tests {
         assert!(card.skills.is_empty(), "Empty skills should be allowed");
     }
 
+    /// A missing REQUIRED field is an `InvalidRequest` naming that field.
+    fn assert_missing(result: Result<turul_a2a_proto::AgentCard, A2aError>, field: &str) {
+        match result {
+            Err(A2aError::InvalidRequest { message }) => assert!(
+                message.contains(field),
+                "error must name `{field}`: {message}"
+            ),
+            other => panic!("expected InvalidRequest naming `{field}`, got {other:?}"),
+        }
+    }
+
     #[test]
     fn missing_description_fails() {
         let result = AgentCardBuilder::new("test", "1.0.0")
@@ -323,7 +334,7 @@ mod tests {
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
             .build();
-        assert!(result.is_err());
+        assert_missing(result, "description");
     }
 
     #[test]
@@ -333,7 +344,7 @@ mod tests {
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
             .build();
-        assert!(result.is_err());
+        assert_missing(result, "supported_interface");
     }
 
     #[test]
@@ -343,7 +354,7 @@ mod tests {
             .url("http://localhost", "JSONRPC", "1.0")
             .default_output_modes(vec!["text/plain"])
             .build();
-        assert!(result.is_err());
+        assert_missing(result, "default_input_modes");
     }
 
     #[test]
@@ -353,7 +364,7 @@ mod tests {
             .url("http://localhost", "JSONRPC", "1.0")
             .default_input_modes(vec!["text/plain"])
             .build();
-        assert!(result.is_err());
+        assert_missing(result, "default_output_modes");
     }
 
     #[test]

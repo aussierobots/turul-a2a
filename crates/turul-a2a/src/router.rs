@@ -126,9 +126,8 @@ pub fn build_router(state: AppState) -> Router {
         post(crate::jsonrpc::jsonrpc_dispatch_handler),
     );
 
-    // A2A v0.3 compat: root POST route for a2a-sdk 0.3.x clients that POST
-    // to the agent card URL (base URL) rather than /message:send.
-    // Removal condition: when a2a-sdk supports v1.0 routing.
+    // A2A v0.3 compat: root POST route for v0.3-wire clients (Strands
+    // Agents, a2a-sdk 0.3.x) that POST JSON-RPC to the agent card URL.
     #[cfg(feature = "compat-v03")]
     let router = router.route("/", post(crate::jsonrpc::jsonrpc_dispatch_handler));
 
