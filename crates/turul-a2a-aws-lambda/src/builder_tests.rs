@@ -42,6 +42,31 @@ impl AgentExecutor for DummyExecutor {
     }
 }
 
+/// Like [`DummyExecutor`], but its card declares push notifications, so
+/// push-config CRUD is allowed (A2A v1.0.1 §3.3.4).
+struct PushCapableExecutor;
+
+#[async_trait]
+impl AgentExecutor for PushCapableExecutor {
+    async fn execute(
+        &self,
+        _task: &mut Task,
+        _msg: &Message,
+        _ctx: &turul_a2a::executor::ExecutionContext,
+    ) -> Result<(), A2aError> {
+        Ok(())
+    }
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        turul_a2a_proto::AgentCard {
+            capabilities: Some(turul_a2a_proto::AgentCapabilities {
+                push_notifications: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+}
+
 /// Stand-in second-backend type used to exercise same-backend enforcement.
 /// Implements every storage trait so we can plug it into the individual
 /// setters while reporting a distinct `backend_name`.
@@ -828,7 +853,7 @@ async fn lambda_builder_outbound_url_validator_refuses_unlisted_webhooks() {
     cfg.push_backoff_cap = Duration::from_millis(10);
     cfg.push_claim_expiry = Duration::from_secs(5);
     let handler = LambdaA2aHandler::builder()
-        .executor(DummyExecutor)
+        .executor(PushCapableExecutor)
         .storage(storage.clone())
         .push_delivery_store(storage.clone())
         .runtime_config(cfg)

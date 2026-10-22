@@ -286,6 +286,7 @@ fn queued_executor_job_wire_shape_is_stable() {
         keys,
         [
             "accepted_output_modes",
+            "activated_extensions",
             "claims",
             "context_id",
             "enqueued_at_micros",
