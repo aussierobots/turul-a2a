@@ -83,7 +83,8 @@ impl AgentExecutor for CompletingExecutor {
     }
 }
 
-/// As above but also returns an extended agent card.
+/// As above but also returns an extended agent card, whose description
+/// reports the claims it was built for.
 struct ExtendedCardExecutor;
 
 #[async_trait]
@@ -104,9 +105,14 @@ impl AgentExecutor for ExtendedCardExecutor {
 
     fn extended_agent_card(
         &self,
-        _claims: Option<&serde_json::Value>,
+        claims: Option<&serde_json::Value>,
     ) -> Option<turul_a2a_proto::AgentCard> {
-        Some(minimal_card(Some("Extended")))
+        let mut card = minimal_card(Some("Extended"));
+        card.description = format!(
+            "claims: {}",
+            claims.map_or("none".to_string(), |c| c.to_string())
+        );
+        Some(card)
     }
 }
 
@@ -453,6 +459,39 @@ async fn grpc_extended_agent_card_success() {
         .expect("ok")
         .into_inner();
     assert!(card.name.contains("Extended"));
+    assert_eq!(card.description, "claims: none", "anonymous caller");
+}
+
+/// Authenticates every call with fixed claims.
+struct WithClaims;
+
+#[async_trait]
+impl A2aMiddleware for WithClaims {
+    async fn before_request(&self, ctx: &mut RequestContext) -> Result<(), MiddlewareError> {
+        ctx.identity = turul_a2a::middleware::AuthIdentity::Authenticated {
+            owner: "grpc-user".into(),
+            claims: Some(serde_json::json!({"sub": "grpc-user"})),
+        };
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn grpc_extended_agent_card_receives_caller_claims() {
+    let h = Harness::start_with_middleware(ExtendedCardExecutor, vec![Arc::new(WithClaims)]).await;
+    let mut client = h.client().await;
+
+    let card = client
+        .get_extended_agent_card(Request::new(turul_a2a_proto::GetExtendedAgentCardRequest {
+            tenant: String::new(),
+        }))
+        .await
+        .expect("ok")
+        .into_inner();
+    assert_eq!(
+        card.description,
+        format!("claims: {}", serde_json::json!({"sub": "grpc-user"}))
+    );
 }
 
 #[tokio::test]

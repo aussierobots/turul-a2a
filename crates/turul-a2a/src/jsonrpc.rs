@@ -409,7 +409,9 @@ async fn dispatch(
         methods::GET_TASK => dispatch_get_task(state, tenant, owner, params).await,
         methods::LIST_TASKS => dispatch_list_tasks(state, tenant, owner, params).await,
         methods::CANCEL_TASK => dispatch_cancel_task(state, tenant, owner, params).await,
-        methods::GET_EXTENDED_AGENT_CARD => dispatch_get_extended_agent_card(state).await,
+        methods::GET_EXTENDED_AGENT_CARD => {
+            dispatch_get_extended_agent_card(state, claims.as_ref()).await
+        }
         methods::CREATE_TASK_PUSH_NOTIFICATION_CONFIG => {
             dispatch_create_push_config(state, tenant, owner, params).await
         }
@@ -504,17 +506,20 @@ async fn dispatch_subscribe_to_task(
 }
 
 /// SSE whose every `data:` line is
-/// `{"jsonrpc":"2.0","result":{StreamResponse},"id":request_id}`.
+/// `{"jsonrpc":"2.0","result":{StreamResponse},"id":request_id}`; an
+/// error that ends the stream is sent as a final JSON-RPC error response
+/// with the same id.
 fn jsonrpc_sse_response(
     stream: crate::streaming::task_stream::TaskEventStream,
     request_id: Value,
 ) -> axum::response::Response {
-    crate::router::sse_response(stream, move |result| {
-        json!({
+    crate::router::sse_response(stream, move |item| match item {
+        Ok(result) => json!({
             "jsonrpc": "2.0",
             "result": result,
             "id": request_id,
-        })
+        }),
+        Err(e) => e.to_jsonrpc_error(Some(&request_id)),
     })
 }
 
@@ -605,8 +610,11 @@ async fn dispatch_cancel_task(
     Ok(response)
 }
 
-async fn dispatch_get_extended_agent_card(state: AppState) -> Result<Value, A2aError> {
-    let card = crate::router::core_get_extended_agent_card(&state)?;
+async fn dispatch_get_extended_agent_card(
+    state: AppState,
+    claims: Option<&serde_json::Value>,
+) -> Result<Value, A2aError> {
+    let card = crate::router::core_get_extended_agent_card(&state, claims)?;
     Ok(serde_json::to_value(card).unwrap_or_default())
 }
 

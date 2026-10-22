@@ -58,14 +58,17 @@ The proto field is `optional int32 history_length` (`proto/a2a.proto:150-154`) w
 - **Unset (`None`)** — the client does not impose a limit; return the full history.
 - **`Some(0)`** — the client requests no messages; `trim_task` calls `history.clear()`.
 - **`Some(n)` where `n > 0`** — return the last `n` messages.
+- **`Some(n)` where `n < 0`** — an invalid request, refused before any write (A2A v1.0.1's validation-error example rejects `historyLength=-5`). The same check, `router::checked_history_length`, guards GetTask and ListTasks.
 
-`core_send_message` preserves this tri-state exactly. Extraction is:
+`core_send_message` and `open_send_stream` preserve the tri-state exactly. Extraction is:
 
 ```rust
-let history_length: Option<i32> = request
-    .configuration
-    .as_ref()
-    .and_then(|c| c.history_length);
+let history_length = checked_history_length(
+    request
+        .configuration
+        .as_ref()
+        .and_then(|c| c.history_length),
+)?;
 ```
 
 The value is threaded into `get_task(tenant, task_id, owner, history_length)` on both send-response paths. The return-immediately re-read (`router.rs:938-944`) and the blocking response (currently returning the task straight from `yielded_rx`) both re-read from storage so `trim_task` is invoked consistently. The extra round-trip on the blocking path is negligible — the caller has already waited for the executor; one storage read is noise. No new storage-trait surface required; the plumbing is reused verbatim from `GetTask`.
@@ -92,7 +95,7 @@ Explicitly deferred:
 - Proto `a2a.proto:155-160`: `return_immediately` is a server capability, not a MUST-accept. The MUST clause applies only to `false`. `UnsupportedOperationError` is the correct reason code — same surface the Lambda adapter already uses for terminal `:subscribe`.
 - Proto `a2a.proto:147-149`: `task_push_notification_config` SHOULD be honored when present on `SendMessage`. Silent drop is a latent interoperability bug.
 - Proto `a2a.proto:154`: `history_length` is a response-shape hint; the `trim_task` helper is already the normative implementation on `GetTask`.
-- ADR-004: `UnsupportedOperation` maps to HTTP 400 / JSON-RPC -32004 / gRPC `INVALID_ARGUMENT` with `google.rpc.ErrorInfo reason=UNSUPPORTED_OPERATION`.
+- ADR-004: `UnsupportedOperation` maps to HTTP 400 / JSON-RPC -32004 / gRPC `FAILED_PRECONDITION` (A2A v1.0.1 §5.4) with `google.rpc.ErrorInfo reason=UNSUPPORTED_OPERATION`.
 - ADR-008: Lambda is request/response only; persistent background executors are out of scope.
 - ADR-010 §4.2: non-blocking send is a runtime capability the server MAY advertise.
 - ADR-011 §R1: push-config URL MUST be validated at CRUD time (this ADR tightens it to "before any task persists").
@@ -176,3 +179,5 @@ Adopters on Lambda:
 
 - 2026-10-22 — Bug 1: recorded the spec justification for refusing `return_immediately` on Lambda (A2A v1.0.1 §3.3.2 "a specific aspect of it is not supported") and that ADR-018's durable executor turns the capability back on. Bug 2: inline push config now also honoured on `SendStreamingMessage` (§3.2.2, "operates independently of execution mode") through helpers shared with `SendMessage`; the compensation returns the original storage error unchanged. Test obligations renamed to the tests that exist, the Lambda gate tested through `LambdaA2aServerBuilder::build`, `history_length` tests moved onto real continuations, gRPC inline-config tests added. Migration text corrected to the actual status-message wording.
 - 2026-10-22 — Step 1 gains the capability check: an inline push config on an agent whose card does not declare `capabilities.pushNotifications = true` is refused with `PushNotificationNotSupportedError` before any write, on blocking and streaming sends and every transport (A2A v1.0.1 §3.3.4). Test: `capability_tests::inline_push_config_requires_push_capability_and_persists_nothing` (plus its gRPC and Lambda variants).
+- 2026-10-22 — Bug 3: a negative `historyLength` is an invalid request, refused before any write on SendMessage and SendStreamingMessage on every transport; one check (`checked_history_length`) also guards GetTask and ListTasks.
+- 2026-10-22 — Compliance: the gRPC code for `UnsupportedOperation` corrected from `INVALID_ARGUMENT` to `FAILED_PRECONDITION`, the A2A v1.0.1 §5.4 mapping that `wire::errors::GRPC_UNSUPPORTED_OPERATION` already implements.

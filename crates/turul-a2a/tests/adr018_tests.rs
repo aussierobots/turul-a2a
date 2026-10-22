@@ -237,23 +237,19 @@ fn queued_executor_job_envelope_roundtrip_preserves_claims() {
         "iss": "https://auth.example.test",
         "exp": 1_900_000_000i64,
     });
-    let job = QueuedExecutorJob {
-        version: QueuedExecutorJob::VERSION,
-        tenant: "tenant-a".into(),
-        owner: "user-123".into(),
-        task_id: "task-x".into(),
-        context_id: "ctx-y".into(),
-        message: turul_a2a_proto::Message {
+    let mut job = QueuedExecutorJob::new(
+        "tenant-a",
+        "user-123",
+        "task-x",
+        "ctx-y",
+        turul_a2a_proto::Message {
             message_id: "m1".into(),
             role: turul_a2a_proto::Role::User.into(),
             ..Default::default()
         },
-        claims: Some(claims.clone()),
-        accepted_output_modes: vec![],
-        request_metadata: None,
-        activated_extensions: vec![],
-        enqueued_at_micros: 123_456_789,
-    };
+        123_456_789,
+    );
+    job.claims = Some(claims.clone());
     let encoded = serde_json::to_string(&job).unwrap();
     let decoded: QueuedExecutorJob = serde_json::from_str(&encoded).unwrap();
     assert_eq!(decoded.version, QueuedExecutorJob::VERSION);
@@ -263,6 +259,53 @@ fn queued_executor_job_envelope_roundtrip_preserves_claims() {
     assert_eq!(decoded.context_id, "ctx-y");
     assert_eq!(decoded.claims, Some(claims));
     assert_eq!(decoded.enqueued_at_micros, 123_456_789);
+}
+
+/// The envelope's wire shape: one snake_case member per field, and an
+/// envelope enqueued before `accepted_output_modes` / `request_metadata`
+/// existed still decodes, with both empty.
+#[test]
+fn queued_executor_job_wire_shape_is_stable() {
+    let job = QueuedExecutorJob::new(
+        "t",
+        "o",
+        "task",
+        "ctx",
+        turul_a2a_proto::Message::default(),
+        7,
+    );
+    let encoded = serde_json::to_value(&job).unwrap();
+    let mut keys: Vec<&str> = encoded
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "accepted_output_modes",
+            "claims",
+            "context_id",
+            "enqueued_at_micros",
+            "message",
+            "owner",
+            "request_metadata",
+            "task_id",
+            "tenant",
+            "version",
+        ]
+    );
+    assert_eq!(encoded["version"], QueuedExecutorJob::VERSION);
+
+    let older = serde_json::json!({
+        "version": 1, "tenant": "t", "owner": "o", "task_id": "task",
+        "context_id": "ctx", "message": {}, "claims": null, "enqueued_at_micros": 7,
+    });
+    let decoded: QueuedExecutorJob = serde_json::from_value(older).unwrap();
+    assert!(decoded.accepted_output_modes.is_empty());
+    assert_eq!(decoded.request_metadata, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -639,17 +682,7 @@ async fn durable_path_preserves_text_task_id_and_context_id_across_enqueue_deque
         in_flight: state.in_flight.clone(),
         push_dispatcher: state.push_dispatcher.clone(),
     };
-    let scope = SpawnScope {
-        tenant: job.tenant.clone(),
-        owner: job.owner.clone(),
-        task_id: job.task_id.clone(),
-        context_id: job.context_id.clone(),
-        message: Message::try_from(job.message.clone()).expect("message round-trips"),
-        claims: job.claims.clone(),
-        accepted_output_modes: job.accepted_output_modes.clone(),
-        request_metadata: job.request_metadata.clone(),
-        activated_extensions: job.activated_extensions.clone(),
-    };
+    let scope = SpawnScope::from_queued_job(&job).expect("message round-trips");
     run_queued_executor_job(deps, scope).await;
 
     // Read the terminal task. Artifact must contain the exact probe

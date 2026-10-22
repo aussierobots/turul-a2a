@@ -17,7 +17,8 @@ use tower::ServiceExt;
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::AgentExecutor;
 use turul_a2a::router::{AppState, build_router};
-use turul_a2a::storage::InMemoryA2aStorage;
+use turul_a2a::storage::{A2aEventStore, A2aStorageError, InMemoryA2aStorage};
+use turul_a2a::streaming::StreamEvent;
 use turul_a2a_types::{Message, Task};
 
 /// Executor that completes the task and produces one artifact.
@@ -419,4 +420,108 @@ async fn subscribe_non_terminal_task_returns_sse_opening_with_task_snapshot() {
         "sub-happy-1",
         "Task snapshot should contain the task ID"
     );
+}
+
+// =========================================================
+// A storage error after the stream opened
+// =========================================================
+
+/// Event store whose reads fail once the stream is open: sequence
+/// lookups and appends work, `get_events_after` does not.
+struct FailingEventReads {
+    inner: InMemoryA2aStorage,
+}
+
+#[async_trait::async_trait]
+impl A2aEventStore for FailingEventReads {
+    fn backend_name(&self) -> &'static str {
+        "failing-event-reads"
+    }
+
+    async fn append_event(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        event: StreamEvent,
+    ) -> Result<u64, A2aStorageError> {
+        self.inner.append_event(tenant, task_id, event).await
+    }
+
+    async fn get_events_after(
+        &self,
+        _tenant: &str,
+        _task_id: &str,
+        _after_sequence: u64,
+    ) -> Result<Vec<(u64, StreamEvent)>, A2aStorageError> {
+        Err(A2aStorageError::DatabaseError(
+            "event store unavailable".into(),
+        ))
+    }
+
+    async fn latest_sequence(&self, tenant: &str, task_id: &str) -> Result<u64, A2aStorageError> {
+        self.inner.latest_sequence(tenant, task_id).await
+    }
+
+    async fn cleanup_expired(&self) -> Result<u64, A2aStorageError> {
+        self.inner.cleanup_expired().await
+    }
+}
+
+fn failing_reads_router() -> axum::Router {
+    let mut state = test_state();
+    let storage = InMemoryA2aStorage::new();
+    state.task_storage = Arc::new(storage.clone());
+    state.atomic_store = Arc::new(storage.clone());
+    state.event_store = Arc::new(FailingEventReads { inner: storage });
+    build_router(state)
+}
+
+/// The error the failing read surfaces as.
+fn read_failure() -> A2aError {
+    A2aStorageError::DatabaseError("event store unavailable".into()).into()
+}
+
+/// HTTP+SSE: after the snapshot, the stream carries one final frame with
+/// the AIP-193 error object an HTTP error response would carry, then
+/// closes — it does not end silently.
+#[tokio::test]
+async fn http_stream_ends_with_error_frame_on_storage_failure() {
+    let router = failing_reads_router();
+    let frames = closed_stream(&router, &send_message_body("sse-err", "hello")).await;
+    assert_eq!(frames.len(), 2, "snapshot, then the error: {frames:?}");
+    assert!(frames[0].get("task").is_some(), "{frames:?}");
+    assert_eq!(frames[1], read_failure().to_http_error_body());
+    assert_eq!(frames[1]["error"]["code"], 500);
+    assert_eq!(frames[1]["error"]["status"], "INTERNAL");
+}
+
+/// JSON-RPC: the final frame is a JSON-RPC error response carrying the
+/// request id, then the stream closes.
+#[tokio::test]
+async fn jsonrpc_stream_ends_with_error_envelope_on_storage_failure() {
+    let router = failing_reads_router();
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "SendStreamingMessage",
+        "params": serde_json::from_str::<serde_json::Value>(&send_message_body("rpc-err", "hi")).unwrap(),
+    });
+    let req = Request::post("/jsonrpc")
+        .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let frames = common::read_sse(resp.into_body(), Duration::from_secs(5))
+        .await
+        .closed();
+    assert_eq!(frames.len(), 2, "snapshot, then the error: {frames:?}");
+    assert!(frames[0]["result"].get("task").is_some(), "{frames:?}");
+    assert_eq!(
+        frames[1],
+        read_failure().to_jsonrpc_error(Some(&serde_json::json!(7)))
+    );
+    assert_eq!(frames[1]["error"]["code"], -32603);
+    assert!(frames[1].get("result").is_none(), "{frames:?}");
 }

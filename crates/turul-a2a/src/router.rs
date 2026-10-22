@@ -383,8 +383,10 @@ async fn agent_card_handler(State(state): State<AppState>) -> impl IntoResponse 
 
 async fn extended_agent_card_handler(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
 ) -> Result<impl IntoResponse, A2aError> {
-    let card = serde_json::to_value(core_get_extended_agent_card(&state)?).unwrap_or_default();
+    let card = serde_json::to_value(core_get_extended_agent_card(&state, ctx.identity.claims())?)
+        .unwrap_or_default();
     #[cfg(feature = "compat-v03")]
     let card = crate::compat_v03::inject_agent_card_compat(card);
     Ok(Json(card))
@@ -396,6 +398,7 @@ async fn extended_agent_card_handler(
 /// executor supplies no extended card (A2A v1.0.1 §3.3.4).
 pub(crate) fn core_get_extended_agent_card(
     state: &AppState,
+    claims: Option<&serde_json::Value>,
 ) -> Result<turul_a2a_proto::AgentCard, A2aError> {
     crate::capability::require(
         state.executor.as_ref(),
@@ -403,7 +406,7 @@ pub(crate) fn core_get_extended_agent_card(
     )?;
     state
         .executor
-        .extended_agent_card(None)
+        .extended_agent_card(claims)
         .ok_or(A2aError::ExtendedAgentCardNotConfigured)
 }
 
@@ -468,10 +471,12 @@ pub(crate) async fn open_send_stream(
         })?;
     let (accepted_output_modes, request_metadata, activated_extensions) =
         executor_request_inputs(&request, activated_extensions);
-    let history_length = request
-        .configuration
-        .as_ref()
-        .and_then(|c| c.history_length);
+    let history_length = checked_history_length(
+        request
+            .configuration
+            .as_ref()
+            .and_then(|c| c.history_length),
+    )?;
     let proto_message = request.message.ok_or(A2aError::InvalidRequest {
         message: "message field is required".into(),
     })?;
@@ -596,7 +601,7 @@ pub(crate) async fn core_send_streaming_message(
     body: String,
 ) -> Result<axum::response::Response, A2aError> {
     let stream = open_send_stream(state, tenant, owner, claims, activated_extensions, body).await?;
-    Ok(sse_response(stream, |item| item))
+    Ok(sse_response(stream, http_sse_frame))
 }
 
 pub(crate) async fn core_subscribe_to_task(
@@ -606,30 +611,35 @@ pub(crate) async fn core_subscribe_to_task(
     task_id: &str,
 ) -> Result<axum::response::Response, A2aError> {
     let stream = open_subscribe_stream(state, tenant, owner, task_id).await?;
-    Ok(sse_response(stream, |item| item))
+    Ok(sse_response(stream, http_sse_frame))
+}
+
+/// HTTP+SSE frame: the `StreamResponse` JSON itself, or for an error the
+/// AIP-193 error object an HTTP error response carries.
+fn http_sse_frame(item: Result<serde_json::Value, A2aError>) -> serde_json::Value {
+    item.unwrap_or_else(|e| e.to_http_error_body())
 }
 
 /// Encode a task stream as SSE. Each item becomes one event whose
-/// `data:` is `wrap` applied to the `StreamResponse` JSON
-/// (`{"task": …}` / `{"statusUpdate": …}` / `{"artifactUpdate": …}`).
-/// A storage error ends the stream.
+/// `data:` is `frame` applied to the `StreamResponse` JSON
+/// (`{"task": …}` / `{"statusUpdate": …}` / `{"artifactUpdate": …}`),
+/// or to the error that ended the stream. The core stream stops after an
+/// error, so its error frame is the last one.
 pub(crate) fn sse_response(
     stream: TaskEventStream,
-    wrap: impl Fn(serde_json::Value) -> serde_json::Value + Send + 'static,
+    frame: impl Fn(Result<serde_json::Value, A2aError>) -> serde_json::Value + Send + 'static,
 ) -> axum::response::Response {
     use tokio_stream::StreamExt;
 
-    let events = stream.items.map_while(move |item| {
-        let body = match item.ok()? {
+    let events = stream.items.map(move |item| {
+        let body = item.map(|item| match item {
             StreamItem::Task(task) => {
                 serde_json::json!({"task": serde_json::to_value(&task).unwrap_or_default()})
             }
             StreamItem::Event(event) => serde_json::to_value(&event).unwrap_or_default(),
-        };
-        let data = serde_json::to_string(&wrap(body)).unwrap_or_default();
-        Some(Ok::<_, std::convert::Infallible>(
-            Event::default().data(data),
-        ))
+        });
+        let data = serde_json::to_string(&frame(body)).unwrap_or_default();
+        Ok::<_, std::convert::Infallible>(Event::default().data(data))
     });
     Sse::new(events)
         .keep_alive(KeepAlive::default())
@@ -715,12 +725,9 @@ impl ListTasksQuery {
             .status_timestamp_after
             .as_ref()
             .map(|ts| {
-                u32::try_from(ts.nanos)
-                    .ok()
-                    .filter(|nanos| *nanos < 1_000_000_000)
-                    .and_then(|nanos| chrono::DateTime::from_timestamp(ts.seconds, nanos))
+                chrono::DateTime::<chrono::Utc>::try_from(*ts)
                     .map(|at| at.to_rfc3339())
-                    .ok_or_else(|| A2aError::InvalidRequest {
+                    .map_err(|_| A2aError::InvalidRequest {
                         message: "statusTimestampAfter is out of range".into(),
                     })
             })
@@ -1101,10 +1108,12 @@ pub async fn core_send_message(
     // Some(n>0)=last n (a2a.proto:150-154). Do NOT collapse Some(0) to
     // None; the storage layer's `trim_task` already differentiates
     // (e.g., storage/postgres.rs:212-222).
-    let history_length: Option<i32> = request
-        .configuration
-        .as_ref()
-        .and_then(|c| c.history_length);
+    let history_length = checked_history_length(
+        request
+            .configuration
+            .as_ref()
+            .and_then(|c| c.history_length),
+    )?;
 
     let inline_push_config = inline_push_config(&state, request.configuration.as_ref())?;
 
@@ -1419,6 +1428,7 @@ pub(crate) async fn core_list_tasks(
     owner: &str,
     query: &ListTasksQuery,
 ) -> Result<Json<serde_json::Value>, A2aError> {
+    let history_length = checked_history_length(query.history_length)?;
     let status = match &query.status {
         Some(s) => Some(
             TaskState::from_wire_name(s).ok_or_else(|| A2aError::InvalidRequest {
@@ -1446,7 +1456,7 @@ pub(crate) async fn core_list_tasks(
         page_size: query.page_size,
         // proto3 leaves an unset string empty: "" asks for the first page.
         page_token: query.page_token.clone().filter(|t| !t.is_empty()),
-        history_length: query.history_length,
+        history_length,
         status_timestamp_after,
         include_artifacts: query.include_artifacts,
     };
@@ -1457,6 +1467,20 @@ pub(crate) async fn core_list_tasks(
         .await
         .map_err(A2aError::from)?;
     Ok(Json(list_page_to_json(&page)))
+}
+
+/// The requested `historyLength`, checked. A2A v1.0.1 §3.2.4 gives it
+/// three meanings — unset (no limit), `0` (no history), a positive count
+/// (that many recent messages) — and the specification's validation-error
+/// example rejects `historyLength=-5`; a negative value is an invalid
+/// request on every operation that takes it.
+fn checked_history_length(history_length: Option<i32>) -> Result<Option<i32>, A2aError> {
+    match history_length {
+        Some(n) if n < 0 => Err(A2aError::InvalidRequest {
+            message: format!("historyLength must be a non-negative integer, got {n}"),
+        }),
+        other => Ok(other),
+    }
 }
 
 fn list_page_to_json(page: &TaskListPage) -> serde_json::Value {
@@ -1480,6 +1504,7 @@ pub(crate) async fn core_get_task(
     task_id: &str,
     history_length: Option<i32>,
 ) -> Result<Json<serde_json::Value>, A2aError> {
+    let history_length = checked_history_length(history_length)?;
     let task = state
         .task_storage
         .get_task(tenant, task_id, owner, history_length)

@@ -85,6 +85,9 @@ struct EventSinkInner {
     event_broker: TaskEventBroker,
     handle: Arc<InFlightHandle>,
     is_closed: AtomicBool,
+    /// True while the latest status this sink committed is
+    /// INPUT_REQUIRED or AUTH_REQUIRED.
+    is_interrupted: AtomicBool,
     /// Serialises every `commit_*` path on this sink so concurrent
     /// calls from cloned handles cannot race. Without it,
     /// `commit_artifact`'s read-mutate-write full-replacement path
@@ -129,6 +132,7 @@ impl EventSink {
                 event_broker,
                 handle,
                 is_closed: AtomicBool::new(false),
+                is_interrupted: AtomicBool::new(false),
                 commit_lock: AsyncMutex::new(()),
                 push_dispatcher,
             })),
@@ -151,6 +155,16 @@ impl EventSink {
             Some(inner) => inner.is_closed.load(Ordering::Acquire),
             None => true,
         }
+    }
+
+    /// True while the latest status committed through this sink is an
+    /// interrupted state (INPUT_REQUIRED / AUTH_REQUIRED). The
+    /// post-execute rule reads it so an executor that raised the
+    /// interrupt through the sink and then returned keeps that state.
+    pub(crate) fn is_interrupted(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.is_interrupted.load(Ordering::Acquire))
     }
 
     /// Emit a status transition and persist a `StatusUpdate` event.
@@ -352,6 +366,7 @@ impl EventSinkInner {
                     );
                 }
 
+                self.is_interrupted.store(is_interrupted, Ordering::Release);
                 if is_terminal {
                     self.is_closed.store(true, Ordering::Release);
                 }

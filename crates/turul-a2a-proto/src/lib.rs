@@ -22,6 +22,9 @@ pub mod lf {
 // Convenience re-export
 pub use lf::a2a::v1::*;
 
+mod timestamp;
+pub use timestamp::Timestamp;
+
 // Re-export the well-known types crate so downstreams that don't
 // depend on pbjson-types directly (e.g. the gRPC adapter inside
 // `turul-a2a`) can name the generated types via a single namespace.

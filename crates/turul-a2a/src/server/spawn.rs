@@ -23,6 +23,10 @@
 //!
 //! - If the executor used `ctx.events` and committed a terminal, the
 //!   sink is closed — nothing more to do.
+//! - If the latest status the executor committed through `ctx.events`
+//!   is INPUT_REQUIRED / AUTH_REQUIRED and `&mut Task` carries no
+//!   terminal or interrupted state of its own, the turn ended on that
+//!   interrupt and it stands.
 //! - Otherwise, any artifacts the executor appended to `&mut Task`
 //!   during execution (direct-task-mutation path) are published via
 //!   the sink so they reach the durable event store.
@@ -85,6 +89,10 @@ pub struct SpawnDeps {
 /// `SendMessageRequest.metadata` and the negotiated extension URIs to
 /// the same-named `ExecutionContext` fields on the blocking, streaming
 /// and durable-queue paths alike.
+///
+/// `#[non_exhaustive]`: a durable-queue consumer outside this crate
+/// builds one with [`Self::from_queued_job`].
+#[non_exhaustive]
 pub struct SpawnScope {
     pub tenant: String,
     pub owner: String,
@@ -95,6 +103,28 @@ pub struct SpawnScope {
     pub accepted_output_modes: Vec<String>,
     pub request_metadata: Option<serde_json::Value>,
     pub activated_extensions: Vec<String>,
+}
+
+impl SpawnScope {
+    /// The scope a durable-queue consumer runs a dequeued job under: the
+    /// job's tenant, owner, task, context, message, claims and request
+    /// inputs, as the enqueuing request recorded them. Fails when the
+    /// job's message is not a valid [`Message`].
+    pub fn from_queued_job(
+        job: &crate::durable_executor::QueuedExecutorJob,
+    ) -> Result<Self, turul_a2a_types::A2aTypeError> {
+        Ok(Self {
+            tenant: job.tenant.clone(),
+            owner: job.owner.clone(),
+            task_id: job.task_id.clone(),
+            context_id: job.context_id.clone(),
+            message: Message::try_from(job.message.clone())?,
+            claims: job.claims.clone(),
+            accepted_output_modes: job.accepted_output_modes.clone(),
+            request_metadata: job.request_metadata.clone(),
+            activated_extensions: job.activated_extensions.clone(),
+        })
+    }
 }
 
 /// Result of a successful spawn. The caller awaits `yielded_rx`
@@ -409,6 +439,13 @@ pub(crate) async fn commit_post_execute(
                     let _ = sink
                         .commit_state_internal(state_opt.unwrap(), message_opt)
                         .await;
+                }
+                Some(TaskState::Submitted) | Some(TaskState::Working) | None
+                    if sink.is_interrupted() =>
+                {
+                    // The executor raised INPUT_REQUIRED / AUTH_REQUIRED
+                    // through the sink and returned: the turn ended on
+                    // that interrupt, which is already committed.
                 }
                 Some(TaskState::Submitted) | Some(TaskState::Working) | None => {
                     // Executor returned without reaching a terminal or

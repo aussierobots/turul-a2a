@@ -39,6 +39,11 @@ pub(crate) fn version_supported(requested: &str) -> bool {
 /// `compat-v03` feature.
 const LEGACY_VERSION: &str = "0.3";
 
+/// Whether `requested` names the legacy 0.3 protocol.
+pub(crate) fn is_legacy_version(requested: &str) -> bool {
+    same_major_minor(requested, LEGACY_VERSION)
+}
+
 /// Whether the HTTP transports serve the legacy 0.3 protocol.
 const HTTP_SERVES_V03: bool = cfg!(feature = "compat-v03");
 
@@ -53,7 +58,7 @@ const HTTP_SERVES_V03: bool = cfg!(feature = "compat-v03");
 pub(crate) fn check_version(requested: Option<&str>, serves_v03: bool) -> Result<(), A2aError> {
     match requested.map(str::trim).filter(|v| !v.is_empty()) {
         Some(v) if version_supported(v) => Ok(()),
-        Some(v) if serves_v03 && same_major_minor(v, LEGACY_VERSION) => Ok(()),
+        Some(v) if serves_v03 && is_legacy_version(v) => Ok(()),
         Some(v) => Err(A2aError::VersionNotSupported {
             version: v.to_string(),
         }),

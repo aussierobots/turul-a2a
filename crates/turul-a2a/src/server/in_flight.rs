@@ -495,20 +495,8 @@ pub async fn run_cross_instance_cancel_poller(
     }
 }
 
-/// Single poll pass. Public so integration tests can drive one tick
-/// deterministically without waiting on a wall-clock interval. Not part
-/// of the stable public surface — may change without a semver bump.
-///
-/// This re-export retains the doc for discoverability; the internal
-/// name stays `poll_once` for brevity.
-pub async fn poll_once_for_tests(
-    registry: &InFlightRegistry,
-    supervisor: &dyn crate::storage::A2aCancellationSupervisor,
-) {
-    poll_once(registry, supervisor).await
-}
-
-/// Internal single-poll pass (not exposed; tests use `poll_once_for_tests`).
+/// One poll pass: trip the cancellation token of every in-flight task
+/// whose cancel marker is set.
 async fn poll_once(
     registry: &InFlightRegistry,
     supervisor: &dyn crate::storage::A2aCancellationSupervisor,

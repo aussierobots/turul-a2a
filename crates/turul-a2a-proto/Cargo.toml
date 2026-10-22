@@ -23,6 +23,7 @@ prost = { workspace = true }
 pbjson = { workspace = true }
 pbjson-types = { workspace = true }
 serde = { workspace = true }
+chrono = { workspace = true }
 tonic = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
 

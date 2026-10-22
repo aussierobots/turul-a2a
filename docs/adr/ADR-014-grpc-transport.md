@@ -234,6 +234,17 @@ only.
 5. **`last_chunk`** keeps the two-layer contract of ADR-006: not task
    state, but persisted in `ArtifactUpdatePayload` so events read from
    the store preserve chunk boundaries on every transport.
+6. **Mid-stream errors.** A storage error after the stream opened ends
+   it with one final error item, never silently. The core stream emits
+   the `A2aError` and stops; each transport encodes it the way that
+   binding reports errors, then closes: HTTP+SSE sends a `data:` frame
+   with the AIP-193 error object of an HTTP error response
+   (`{"error": {code, status, message, details?}}`,
+   `A2aError::to_http_error_body`); JSON-RPC sends a JSON-RPC error
+   response carrying the request `id` (`A2aError::to_jsonrpc_error`);
+   gRPC ends the stream with the `Status` of §2.5. The specification
+   defines no mid-stream error frame; these reuse each binding's own
+   error shape so a client's existing error decoding applies.
 
 **Send-target resolution (normative, shared by blocking and streaming send).**
 
@@ -276,6 +287,9 @@ only.
   `a2a-last-event-id` still opens with the snapshot;
 - a follow-up while the previous turn's executor is still running is
   refused before any write;
+- a storage error after the snapshot ends the HTTP+SSE stream with the
+  AIP-193 error frame and the JSON-RPC stream with an error response
+  carrying the request id (`sse_tests.rs`, failing event store);
 - the old `sse_tests.rs` assertion that "first event should be
   statusUpdate" is deleted.
 
@@ -831,3 +845,4 @@ theirs. Opt-in is the correct posture for both.
 - 2026-10-22 — §2.11 test obligations: the one-server rule now names `A2aServer::into_routers()` (shared broker and in-flight registry, not only storage), and a stream and send-target parity list records what `stream_contract_tests.rs` asserts on all three transports — exact §5.4 error mapping, close policy, send-target rules on blocking and streaming send, follow-up refusal while an executor runs, terminal/unknown subscribe, and `append`/`lastChunk` as stored.
 - 2026-10-22 — §2.2: `A2aServer::into_routers()` added as a second public gRPC entry point (HTTP and gRPC routers over one shared server state, gRPC side auth-layered exactly as `into_tonic_router()`); the "only public entry point" sentence now names both.
 - 2026-10-22 — §2.5: ownership of the gRPC column moved to `A2aError::grpc_status` (`wire::errors::GRPC_*`), per ADR-004; this ADR's table is a restatement, not a second source of truth. The claim that A2A publishes no gRPC table is withdrawn — v1.0.1 §5.4 does. §2.4: the gRPC layer now validates `a2a-version` metadata on `A2AService` calls before auth; missing, empty, `0.3` or unsupported values are rejected with FAILED_PRECONDITION / VERSION_NOT_SUPPORTED regardless of `compat-v03`; health and reflection are exempt.
+- 2026-10-22 — §2.3 item 6: a storage error after a stream opened ends it with one error item encoded per binding — HTTP+SSE an AIP-193 `{"error": …}` frame, JSON-RPC an error response with the request id, gRPC a `Status` — instead of closing the SSE streams silently.

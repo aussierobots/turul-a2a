@@ -431,6 +431,13 @@ Contract details:
   framework-internal sinks holding `&Arc<…>` work without `'static`
   bounds. The previous explicit `'a` was incidental to the
   hand-rolled boxed-future shape and is no longer needed.
+- **Variant sets.** `ProgressState` (exactly the three non-terminal
+  states) and `SkillError` (exactly `InvalidRequest` / `Internal`) are
+  fixed: wildcard-free matches in the crate's own `sink` and `error`
+  module tests stop compiling if a variant is added. `SinkError` is
+  not fixed: `Closed` and `Backend` are its guaranteed minimum, and it
+  stays `#[non_exhaustive]` so a variant can be added without breaking
+  sinks or skills; no guard pins its set.
 - **Sink failure semantics — best-effort**. A progress write failing
   (transient store throttle, network blip, CAS loss) is *not* a
   correctness problem for the skill's actual work. Skill authors
@@ -1163,3 +1170,4 @@ Reports pass/fail. Does not modify source. Does not decide scope.
 
 - 2026-10-22 — §2.1 amended from "internal path-only, `publish = false`" to the shipped state (published since 0.1.26, versioned workspace dep, licence symlinks, publish order after `turul-a2a-types`); §3 non-goal struck; §4.1 records that the `turul-a2a` → patterns dependency and the `EventSink` bridge were not delivered. §2.2 item 3 contracts tightened to what the code now enforces: `SkillCard::parse` is the only constructor (the public `Deserialize` derive that bypassed the strict-keyword check is removed), uncompilable schemas are rejected at parse with `ManifestError::Schema`, and validation error locations are `#`-rooted instance pointers for every validate entry point. The §2.3 fixed variant sets (`ProgressState` non-terminal only, `SkillError`) are now compile-time enforced by wildcard-free matches inside the crate; `SinkError` stays open to additive variants beyond its `Closed` / `Backend` minimum.
 - 2026-10-22 — §2.2 item 5 clarified: the `SkillError` → `A2aError` mapping is adopter code, and inside an `AgentExecutor` it yields a `FAILED` task carrying the error text, not a wire error.
+- 2026-10-22 — §2.3 contract details gain a "Variant sets" bullet stating what the code enforces: `ProgressState` and `SkillError` are guarded fixed sets; `SinkError` has a `Closed` / `Backend` minimum with no fixed-set guard, as the first entry above records. The patterns test that claimed a `SinkError` guard now says the same.

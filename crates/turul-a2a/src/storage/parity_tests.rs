@@ -444,10 +444,14 @@ fn pages_of(ids: &[&str], page_size: usize) -> Vec<Vec<String>> {
 // P2-009: List pagination
 // =========================================================
 pub async fn test_list_pagination(storage: &dyn A2aTaskStorage) {
-    // Created in order, so pg-6 has the latest status timestamp.
+    // pg-6 has the latest status timestamp.
     for i in 0..7 {
         storage
-            .create_task("default", "owner", make_task(&format!("pg-{i}"), "ctx-pg"))
+            .create_task(
+                "default",
+                "owner",
+                make_task_at(&format!("pg-{i}"), "ctx-pg", i),
+            )
             .await
             .unwrap();
     }
@@ -477,7 +481,11 @@ pub async fn test_list_pagination(storage: &dyn A2aTaskStorage) {
 pub async fn test_list_pagination_exact_multiple(storage: &dyn A2aTaskStorage) {
     for i in 0..6 {
         storage
-            .create_task("default", "owner", make_task(&format!("em-{i}"), "ctx-em"))
+            .create_task(
+                "default",
+                "owner",
+                make_task_at(&format!("em-{i}"), "ctx-em", i),
+            )
             .await
             .unwrap();
     }
@@ -623,18 +631,19 @@ pub async fn test_list_filter_by_status(storage: &dyn A2aTaskStorage) {
 // P2-008: List filter by context_id
 // =========================================================
 pub async fn test_list_filter_by_context_id(storage: &dyn A2aTaskStorage) {
-    storage
-        .create_task("default", "owner", make_task("fc-1", "ctx-alpha"))
-        .await
-        .unwrap();
-    storage
-        .create_task("default", "owner", make_task("fc-2", "ctx-beta"))
-        .await
-        .unwrap();
-    storage
-        .create_task("default", "owner", make_task("fc-3", "ctx-alpha"))
-        .await
-        .unwrap();
+    for (offset, (id, ctx)) in [
+        ("fc-1", "ctx-alpha"),
+        ("fc-2", "ctx-beta"),
+        ("fc-3", "ctx-alpha"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        storage
+            .create_task("default", "owner", make_task_at(id, ctx, offset as i64))
+            .await
+            .unwrap();
+    }
 
     let page = storage
         .list_tasks(TaskFilter {
@@ -3843,7 +3852,15 @@ pub async fn test_push_failed_delivery_diagnostics_roundtrip(store: &dyn A2aPush
         .claim_delivery(&tenant, &task_id, seq, &config_id, "w", "owner-x", long)
         .await
         .expect("claim");
-    let before = SystemTime::now();
+    // Backends store attempt times at micro- or millisecond precision, so
+    // a stored time can fall below a nanosecond `before` taken in the same
+    // millisecond. Floor the window's start to the millisecond.
+    let before = {
+        let since_epoch = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        SystemTime::UNIX_EPOCH + Duration::from_millis(since_epoch.as_millis() as u64)
+    };
     store
         .record_attempt_started(&tenant, &task_id, seq, &config_id, "w", claim.generation)
         .await
@@ -4856,11 +4873,10 @@ fn status_time(task: &Task) -> chrono::DateTime<chrono::Utc> {
 /// relying on wall-clock gaps between writes (which can tie).
 fn make_task_at(task_id: &str, context_id: &str, offset_secs: i64) -> Task {
     let mut task = make_task(task_id, context_id);
-    task.as_proto_mut().status.as_mut().unwrap().timestamp =
-        Some(turul_a2a_proto::pbjson_types::Timestamp {
-            seconds: 1_600_000_000 + offset_secs,
-            nanos: 0,
-        });
+    task.as_proto_mut().status.as_mut().unwrap().timestamp = Some(turul_a2a_proto::Timestamp {
+        seconds: 1_600_000_000 + offset_secs,
+        nanos: 0,
+    });
     task
 }
 
@@ -4953,7 +4969,7 @@ pub async fn test_list_orders_by_status_timestamp(storage: &dyn A2aTaskStorage) 
     let page = storage.list_tasks(filter).await.unwrap();
     let ids: Vec<&str> = page.tasks.iter().map(|t| t.id()).collect();
     assert_eq!(ids, ["lo-z", "lo-a"]);
-    assert!(status_time(&page.tasks[0]) >= status_time(&page.tasks[1]));
+    assert!(status_time(&page.tasks[0]) > status_time(&page.tasks[1]));
 }
 
 /// `ListTasksRequest.status_timestamp_after`: only tasks whose status

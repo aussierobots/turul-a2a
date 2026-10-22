@@ -95,6 +95,7 @@ Shipped implementations: `SqsDurableExecutorQueue` with `max_payload_bytes() -> 
 
 ```rust
 #[derive(Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct QueuedExecutorJob {
     /// Envelope version for forward-compatible schema evolution.
     /// Current: 1. Unknown versions are rejected at dequeue time.
@@ -127,6 +128,8 @@ pub struct QueuedExecutorJob {
     pub enqueued_at_micros: i64,
 }
 ```
+
+The envelope is `#[non_exhaustive]`: code outside `turul-a2a` builds it with `QueuedExecutorJob::new(tenant, owner, task_id, context_id, message, enqueued_at_micros)` and sets the optional fields on the result, so a field added within version `1` (always `#[serde(default)]`) is not a breaking change. A consumer turns a dequeued job into the executor's scope with `SpawnScope::from_queued_job`, the one conversion the Lambda SQS handler and adopter-written consumers share; `SpawnScope` is `#[non_exhaustive]` too.
 
 ### HTTP invocation (enqueue side)
 
@@ -335,3 +338,4 @@ No migration for:
 - 2026-10-22 — Dequeue step 6 amended to what ships: an executor error commits FAILED and acknowledges the record (a retry would only find the task terminal). Enqueue-failure compensation shares one function with ADR-017's inline-push-config compensation. Test obligations: added task-not-found and executor-error cases and mapped every obligation to the test that pins it.
 - 2026-10-22 — `QueuedExecutorJob` gains `accepted_output_modes` and `request_metadata` so the durable path hands the executor the same `SendMessageRequest` inputs as the blocking and streaming paths (A2A v1.0.1 `SendMessageConfiguration.accepted_output_modes`, `SendMessageRequest.metadata`). Both fields are `#[serde(default)]`, so an envelope enqueued by an older producer still decodes; the envelope `version` stays `1`. Adopters who build `QueuedExecutorJob` with a struct literal must add the two fields.
 - 2026-10-22 — `QueuedExecutorJob` gains `activated_extensions` (`#[serde(default)]`, envelope `version` stays `1`) so the durable path reports the negotiated extension set to the executor exactly like the blocking and streaming paths (`ExecutionContext::activated_extensions`). Struct-literal builders of `QueuedExecutorJob` / `SpawnScope` must add the field.
+- 2026-10-22 — `QueuedExecutorJob` and `SpawnScope` are `#[non_exhaustive]`, built outside the crate through `QueuedExecutorJob::new` and `SpawnScope::from_queued_job`; the wire shape and serde defaults are unchanged. The implementation-plan note that `SpawnScope` is crate-private was inaccurate — it is public so the Lambda crate's SQS handler can build it — and the struct-literal migration advice in the previous entry is superseded by the constructors.

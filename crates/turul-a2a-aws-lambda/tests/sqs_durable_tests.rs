@@ -196,13 +196,12 @@ fn status_text(task: &Task) -> String {
 }
 
 fn job_for(tenant: &str, owner: &str, task_id: &str, context_id: &str) -> QueuedExecutorJob {
-    QueuedExecutorJob {
-        version: QueuedExecutorJob::VERSION,
-        tenant: tenant.into(),
-        owner: owner.into(),
-        task_id: task_id.into(),
-        context_id: context_id.into(),
-        message: turul_a2a_proto::Message {
+    QueuedExecutorJob::new(
+        tenant,
+        owner,
+        task_id,
+        context_id,
+        turul_a2a_proto::Message {
             message_id: uuid::Uuid::now_v7().to_string(),
             role: turul_a2a_proto::Role::User.into(),
             parts: vec![turul_a2a_proto::Part {
@@ -211,12 +210,8 @@ fn job_for(tenant: &str, owner: &str, task_id: &str, context_id: &str) -> Queued
             }],
             ..Default::default()
         },
-        claims: None,
-        accepted_output_modes: vec![],
-        request_metadata: None,
-        activated_extensions: vec![],
-        enqueued_at_micros: 0,
-    }
+        0,
+    )
 }
 
 // ---------------------------------------------------------------------------

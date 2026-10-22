@@ -29,8 +29,13 @@ use serde::{Deserialize, Serialize};
 /// Schema evolution: `version` defaults to the current shape's
 /// number. Consumers reject unknown versions at dequeue, which surfaces
 /// as a batch-item failure so the record can be retried or DLQ'd once
-/// the consumer's code catches up.
+/// the consumer's code catches up. Fields added within a version carry
+/// `#[serde(default)]` so an envelope enqueued before them still decodes.
+///
+/// `#[non_exhaustive]`: build one with [`Self::new`] and set the optional
+/// fields on the result, so adding a field is not a breaking change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct QueuedExecutorJob {
     /// Envelope version. Current: `1`. Increment on any schema change
     /// that cannot be handled by adding optional fields.
@@ -70,6 +75,32 @@ pub struct QueuedExecutorJob {
 impl QueuedExecutorJob {
     /// Current envelope version.
     pub const VERSION: u16 = 1;
+
+    /// A current-version envelope for `message` on task `task_id`, with no
+    /// claims, accepted output modes or request metadata; set those
+    /// fields on the result when the request carried them.
+    pub fn new(
+        tenant: impl Into<String>,
+        owner: impl Into<String>,
+        task_id: impl Into<String>,
+        context_id: impl Into<String>,
+        message: turul_a2a_proto::Message,
+        enqueued_at_micros: i64,
+    ) -> Self {
+        Self {
+            version: Self::VERSION,
+            tenant: tenant.into(),
+            owner: owner.into(),
+            task_id: task_id.into(),
+            context_id: context_id.into(),
+            message,
+            claims: None,
+            accepted_output_modes: Vec::new(),
+            request_metadata: None,
+            activated_extensions: Vec::new(),
+            enqueued_at_micros,
+        }
+    }
 }
 
 /// Errors returned by [`DurableExecutorQueue`] implementations.

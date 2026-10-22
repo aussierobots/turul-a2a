@@ -328,9 +328,13 @@ impl pb::grpc::A2aService for GrpcService {
 
     async fn get_extended_agent_card(
         &self,
-        _request: Request<pb::GetExtendedAgentCardRequest>,
+        request: Request<pb::GetExtendedAgentCardRequest>,
     ) -> Result<Response<pb::AgentCard>, Status> {
-        router::core_get_extended_agent_card(&self.state)
+        let claims = request
+            .extensions()
+            .get::<RequestContext>()
+            .and_then(|ctx| ctx.identity.claims());
+        router::core_get_extended_agent_card(&self.state, claims)
             .map(Response::new)
             .map_err(a2a_to_status)
     }
