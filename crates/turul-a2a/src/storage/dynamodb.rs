@@ -270,6 +270,40 @@ impl DynamoDbA2aStorage {
         format!("{tenant}#{task_id}")
     }
 
+    /// Whether any push config is registered for the task. Configs are
+    /// keyed per config (`{tenant}#{task_id}#{config_id}`), so this filters
+    /// a scan on `tenant`/`taskId` — the same lookup `list_configs` uses —
+    /// and stops at the first match. A scan `limit` applies before the
+    /// filter, so pages are followed until a match or the end.
+    async fn task_has_push_config(
+        &self,
+        tenant: &str,
+        task_id: &str,
+    ) -> Result<bool, A2aStorageError> {
+        let mut start_key = None;
+        loop {
+            let page = self
+                .client
+                .scan()
+                .table_name(&self.config.push_configs_table)
+                .filter_expression("tenant = :t AND taskId = :tid")
+                .expression_attribute_values(":t", AttributeValue::S(tenant.to_string()))
+                .expression_attribute_values(":tid", AttributeValue::S(task_id.to_string()))
+                .projection_expression("pk")
+                .set_exclusive_start_key(start_key)
+                .send()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            if page.count() > 0 {
+                return Ok(true);
+            }
+            match page.last_evaluated_key {
+                Some(k) => start_key = Some(k),
+                None => return Ok(false),
+            }
+        }
+    }
+
     /// Percent-escape the key delimiters (`%`, `|`, `#`) in a key
     /// component. `%` is escaped first so the encoding is injective.
     fn enc_key_component(s: &str) -> String {
@@ -2210,19 +2244,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         // avoids steady-state row accumulation on deployments that
         // never register webhooks.
         let has_push_configs = if self.push_dispatch_enabled {
-            let query = self
-                .client
-                .query()
-                .table_name(&self.config.push_configs_table)
-                .key_condition_expression("pk = :pk")
-                .expression_attribute_values(":pk", AttributeValue::S(pk.clone()))
-                .select(aws_sdk_dynamodb::types::Select::Count)
-                .limit(1);
-            let out = query
-                .send()
-                .await
-                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
-            out.count() > 0
+            self.task_has_push_config(tenant, task_id).await?
         } else {
             false
         };
@@ -3721,6 +3743,7 @@ mod tests {
     const TEST_PUSH_TABLE: &str = "test_a2a_push_configs";
     const TEST_EVENTS_TABLE: &str = "test_a2a_task_events";
     const TEST_PUSH_DELIVERIES_TABLE: &str = "test_a2a_push_deliveries";
+    const TEST_PENDING_DISPATCHES_TABLE: &str = "test_a2a_push_pending_dispatches";
 
     /// Create the push-deliveries table: `pk` HASH (String) + `sk`
     /// RANGE (String). Matches the shape used by the production
@@ -3882,6 +3905,8 @@ mod tests {
             create_test_table(&client, TEST_PUSH_TABLE).await;
             create_events_table(&client, TEST_EVENTS_TABLE).await;
             create_push_deliveries_table(&client, TEST_PUSH_DELIVERIES_TABLE).await;
+            // Pending-dispatch markers use the same pk/sk string key schema.
+            create_push_deliveries_table(&client, TEST_PENDING_DISPATCHES_TABLE).await;
         }
 
         let storage = DynamoDbA2aStorage::from_client(
@@ -3891,6 +3916,7 @@ mod tests {
                 push_configs_table: TEST_PUSH_TABLE.into(),
                 events_table: TEST_EVENTS_TABLE.into(),
                 push_deliveries_table: TEST_PUSH_DELIVERIES_TABLE.into(),
+                push_pending_dispatches_table: TEST_PENDING_DISPATCHES_TABLE.into(),
                 ..DynamoDbConfig::default()
             },
         );
@@ -4353,7 +4379,19 @@ mod tests {
             &self,
             limit: usize,
         ) -> Result<Vec<crate::push::claim::ReclaimableClaim>, A2aStorageError> {
-            self.inner.list_reclaimable_claims(limit).await
+            // The table is shared by every test in the run: read all rows,
+            // keep this test's tenants, and report them unscoped like every
+            // other wrapper method does.
+            let prefix = format!("{}_", self.tenant_prefix);
+            let rows = self.inner.list_reclaimable_claims(usize::MAX).await?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|mut row| {
+                    row.tenant = row.tenant.strip_prefix(&prefix)?.to_string();
+                    Some(row)
+                })
+                .take(limit)
+                .collect())
         }
 
         async fn record_pending_dispatch(
