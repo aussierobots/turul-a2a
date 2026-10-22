@@ -358,6 +358,66 @@ async fn jsonrpc_send_required_extension_missing_returns_extension_support_requi
     }
 }
 
+/// A2A v1.0.1 §3.3.4 applies the required-extension rule to every
+/// request, not only sends: GetTask, ListTasks and the extended card are
+/// refused too, while agent-card discovery stays reachable so a client can
+/// learn which extensions to activate.
+#[tokio::test]
+async fn required_extension_is_enforced_on_every_http_and_jsonrpc_operation() {
+    let get = |uri: &str| {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("a2a-version", "1.0")
+            .body(Body::empty())
+            .unwrap()
+    };
+    for uri in [
+        "/tasks/some-task",
+        "/tasks",
+        "/extendedAgentCard",
+        "/acme/tasks",
+    ] {
+        let (router, _) = router_with_card(base_card(vec![skill_invocation_extension(true)], true));
+        let resp = router.oneshot(get(uri)).await.unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            errors::HTTP_EXTENSION_SUPPORT_REQUIRED,
+            "{uri}"
+        );
+        let body = json_body(resp).await;
+        assert_eq!(
+            body.pointer("/error/details/0/reason")
+                .and_then(|v| v.as_str()),
+            Some(errors::REASON_EXTENSION_SUPPORT_REQUIRED),
+            "{uri}: {body}"
+        );
+    }
+
+    let (router, _) = router_with_card(base_card(vec![skill_invocation_extension(true)], true));
+    let resp = router
+        .oneshot(get("/.well-known/agent-card.json"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "discovery stays reachable");
+
+    let (router, _) = router_with_card(base_card(vec![skill_invocation_extension(true)], true));
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "GetTask", "params": {"id": "some-task"}
+    })
+    .to_string();
+    let resp = router
+        .oneshot(http_post("/jsonrpc", &body, &[]))
+        .await
+        .unwrap();
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["error"]["code"],
+        errors::JSONRPC_EXTENSION_SUPPORT_REQUIRED,
+        "{body}"
+    );
+}
+
 /// The negotiated set reaches the executor: the profile URI when the
 /// client activated it, nothing otherwise.
 #[tokio::test]
@@ -657,6 +717,31 @@ mod grpc {
             assert_eq!(info.reason, errors::REASON_EXTENSION_SUPPORT_REQUIRED);
         }
         assert!(seen.skill_ids().is_empty(), "executor must not run");
+    }
+
+    /// Every gRPC A2A call enforces the required extension, not only sends.
+    #[tokio::test]
+    async fn grpc_required_extension_is_enforced_on_every_operation() {
+        use tonic_types::StatusExt;
+        let mut client = client_requiring(true, Seen::default()).await;
+        let get = client
+            .get_task(tonic::Request::new(turul_a2a_proto::GetTaskRequest {
+                id: "some-task".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("required extension not activated");
+        let list = client
+            .list_tasks(tonic::Request::new(
+                turul_a2a_proto::ListTasksRequest::default(),
+            ))
+            .await
+            .expect_err("required extension not activated");
+        for status in [get, list] {
+            assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+            let info = status.get_details_error_info().expect("ErrorInfo");
+            assert_eq!(info.reason, errors::REASON_EXTENSION_SUPPORT_REQUIRED);
+        }
     }
 
     #[tokio::test]

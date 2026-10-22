@@ -312,8 +312,13 @@ it, the agent MUST return `ExtensionSupportRequiredError`"):
 `UnsupportedOperationError` (`-32004`, reason `UNSUPPORTED_OPERATION`).
 A2A v1.0.1 §3.3.4 names a dedicated error for exactly this case, so
 the framework returns it. Owner: `profile_dispatch::validate_activation`,
-called by every transport before dispatch (HTTP and gRPC on
-`SendMessage` / `SendStreamingMessage`; JSON-RPC on every method).
+applied to every A2A operation on every transport before dispatch — the
+rule names "the request", not only sends. HTTP+JSON enforces it in one
+route layer over every A2A route; JSON-RPC once per request; gRPC at the
+top of every `A2AService` method. Agent-card discovery
+(`/.well-known/agent-card.json`) is exempt so a client can learn which
+extensions to activate. The negotiated set is echoed on send responses
+(all methods on JSON-RPC).
 
 **When `required = false` and the client does not activate:**
 
@@ -646,3 +651,4 @@ a patterns-crate `SkillDispatchPayload` that was not built (§2.5).
 - 2026-10-22 — Code and ADR reconciled on where the profile's rules live. The framework now enforces the §2.3 request shape on every send transport (HTTP blocking + streaming, JSON-RPC, gRPC): once the profile is negotiated, a missing or non-string `Message.metadata["a2a.skillId"]` is rejected as InvalidParams (`-32602` / HTTP 400 / gRPC `INVALID_ARGUMENT`) before any task is created. §2.5 point 5 ("passes to the registered dispatcher") amended: the framework owns no skill registry, so routing and unknown-id handling stay in the `AgentExecutor`. The reserved metadata keys are exported from `turul_a2a::profiles`. The acceptance-gates entry no longer claims `profile_dispatch_tests` pins routing; §7.2 maps each sketch case to its test and records cases 6-8 (patterns-crate `SkillDispatchPayload`) as not built.
 - 2026-10-22 — §2.2 no-header default amended to what ships: the negotiated extension set is not visible to the executor, so the reference executor routes on `a2a.skillId` whether or not the activation header was sent. Gating executor routing on activation requires exposing the negotiated set on `ExecutionContext` — an open decision.
 - 2026-10-22 — §2.4: a required extension the client did not activate is `ExtensionSupportRequiredError` (JSON-RPC `-32008`, HTTP 400, gRPC `FAILED_PRECONDITION`, reason `EXTENSION_SUPPORT_REQUIRED`), as A2A v1.0.1 §3.3.4 requires, replacing `UnsupportedOperationError`. §2.2: the negotiated extension set is now exposed to the executor as `ExecutionContext::activated_extensions`; the reference executor dispatches only when the profile is activated (the no-header default holds), and the remote-delegate example forwards the caller's negotiated extensions upstream. The earlier §2.2 amendment ("not passed to the executor") is superseded. Tests: `profile_dispatch_tests` (`*_required_extension_missing_returns_extension_support_required` on HTTP/JSON-RPC/gRPC, `executor_sees_activated_extensions`), `execution_context_request_tests`.
+- 2026-10-22 — §2.4 scope: the required-extension check now runs on every A2A operation on all three transports (it ran only on sends over HTTP and gRPC, on every method over JSON-RPC); agent-card discovery is exempt. Tests: `required_extension_is_enforced_on_every_http_and_jsonrpc_operation`, `grpc_required_extension_is_enforced_on_every_operation`.

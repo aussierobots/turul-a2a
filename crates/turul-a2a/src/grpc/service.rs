@@ -168,6 +168,8 @@ impl pb::grpc::A2aService for GrpcService {
         &self,
         request: Request<pb::GetTaskRequest>,
     ) -> Result<Response<pb::Task>, Status> {
+        negotiate_profile_extensions_grpc(&self.state, request.metadata())
+            .map_err(a2a_to_status)?;
         let owner = owner_from(&request);
         let tenant = tenant_from(&request, &request.get_ref().tenant);
         let task_id = request.get_ref().id.clone();
@@ -194,6 +196,8 @@ impl pb::grpc::A2aService for GrpcService {
         &self,
         request: Request<pb::ListTasksRequest>,
     ) -> Result<Response<pb::ListTasksResponse>, Status> {
+        negotiate_profile_extensions_grpc(&self.state, request.metadata())
+            .map_err(a2a_to_status)?;
         let owner = owner_from(&request);
         let req = request.get_ref();
         let tenant = tenant_from(&request, &req.tenant);
@@ -216,6 +220,8 @@ impl pb::grpc::A2aService for GrpcService {
         &self,
         request: Request<pb::CancelTaskRequest>,
     ) -> Result<Response<pb::Task>, Status> {
+        negotiate_profile_extensions_grpc(&self.state, request.metadata())
+            .map_err(a2a_to_status)?;
         let owner = owner_from(&request);
         let tenant = tenant_from(&request, &request.get_ref().tenant);
         let task_id = request.get_ref().id.clone();
@@ -235,6 +241,8 @@ impl pb::grpc::A2aService for GrpcService {
         &self,
         request: Request<pb::TaskPushNotificationConfig>,
     ) -> Result<Response<pb::TaskPushNotificationConfig>, Status> {
+        negotiate_profile_extensions_grpc(&self.state, request.metadata())
+            .map_err(a2a_to_status)?;
         let owner = owner_from(&request);
         let tenant = tenant_from(&request, &request.get_ref().tenant);
         let task_id = request.get_ref().task_id.clone();
@@ -258,6 +266,8 @@ impl pb::grpc::A2aService for GrpcService {
         &self,
         request: Request<pb::GetTaskPushNotificationConfigRequest>,
     ) -> Result<Response<pb::TaskPushNotificationConfig>, Status> {
+        negotiate_profile_extensions_grpc(&self.state, request.metadata())
+            .map_err(a2a_to_status)?;
         let owner = owner_from(&request);
         let tenant = tenant_from(&request, &request.get_ref().tenant);
         let task_id = request.get_ref().task_id.clone();
@@ -278,6 +288,8 @@ impl pb::grpc::A2aService for GrpcService {
         &self,
         request: Request<pb::ListTaskPushNotificationConfigsRequest>,
     ) -> Result<Response<pb::ListTaskPushNotificationConfigsResponse>, Status> {
+        negotiate_profile_extensions_grpc(&self.state, request.metadata())
+            .map_err(a2a_to_status)?;
         let owner = owner_from(&request);
         let req = request.get_ref();
         let tenant = tenant_from(&request, &req.tenant);
@@ -306,6 +318,8 @@ impl pb::grpc::A2aService for GrpcService {
         &self,
         request: Request<pb::DeleteTaskPushNotificationConfigRequest>,
     ) -> Result<Response<pb::pbjson_types::Empty>, Status> {
+        negotiate_profile_extensions_grpc(&self.state, request.metadata())
+            .map_err(a2a_to_status)?;
         let owner = owner_from(&request);
         let tenant = tenant_from(&request, &request.get_ref().tenant);
         let task_id = request.get_ref().task_id.clone();
@@ -330,6 +344,8 @@ impl pb::grpc::A2aService for GrpcService {
         &self,
         request: Request<pb::GetExtendedAgentCardRequest>,
     ) -> Result<Response<pb::AgentCard>, Status> {
+        negotiate_profile_extensions_grpc(&self.state, request.metadata())
+            .map_err(a2a_to_status)?;
         let claims = request
             .extensions()
             .get::<RequestContext>()
@@ -374,6 +390,8 @@ impl pb::grpc::A2aService for GrpcService {
         &self,
         request: Request<pb::SubscribeToTaskRequest>,
     ) -> Result<Response<Self::SubscribeToTaskStream>, Status> {
+        negotiate_profile_extensions_grpc(&self.state, request.metadata())
+            .map_err(a2a_to_status)?;
         let owner = owner_from(&request);
         let tenant = tenant_from(&request, &request.get_ref().tenant);
         let task_id = request.get_ref().id.clone();

@@ -87,8 +87,6 @@ pub struct AppState {
 /// Build the axum router with all proto-defined routes.
 pub fn build_router(state: AppState) -> Router {
     let router = Router::new()
-        // Agent card discovery
-        .route("/.well-known/agent-card.json", get(agent_card_handler))
         .route("/extendedAgentCard", get(extended_agent_card_handler))
         // Message operations (proto lines 23, 35)
         .route("/message:send", post(send_message_handler))
@@ -118,9 +116,20 @@ pub fn build_router(state: AppState) -> Router {
             get(tenant_task_get_dispatch)
                 .post(tenant_task_post_dispatch)
                 .delete(tenant_task_delete_dispatch),
-        );
+        )
+        // A required extension the client did not activate is refused on
+        // every A2A operation (A2A v1.0.1 §3.3.4). Agent-card discovery,
+        // added below, stays reachable so clients can learn what to activate.
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_activated_extensions,
+        ));
 
-    // JSON-RPC dispatch: /jsonrpc is the canonical endpoint
+    // Agent card discovery
+    let router = router.route("/.well-known/agent-card.json", get(agent_card_handler));
+
+    // JSON-RPC dispatch: /jsonrpc is the canonical endpoint. It negotiates
+    // extensions itself so a refusal is a JSON-RPC error envelope.
     let router = router.route(
         crate::jsonrpc::JSONRPC_PATH,
         post(crate::jsonrpc::jsonrpc_dispatch_handler),
@@ -1877,6 +1886,19 @@ pub(crate) fn negotiate_profile_extensions(
         .map(|c| c.extensions.as_slice())
         .unwrap_or(&[]);
     crate::profile_dispatch::validate_activation(&activated, advertised)
+}
+
+/// Route layer: refuse any HTTP+JSON A2A operation when the agent card
+/// marks an extension `required` and the request does not activate it.
+async fn require_activated_extensions(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    match negotiate_profile_extensions(&state, req.headers()) {
+        Ok(_) => next.run(req).await,
+        Err(e) => e.into_response(),
+    }
 }
 
 /// Attach the `A2A-Extensions` echo header to a response when the
