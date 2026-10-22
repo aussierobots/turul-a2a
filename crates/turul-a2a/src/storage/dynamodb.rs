@@ -108,6 +108,107 @@ impl Default for DynamoDbConfig {
     }
 }
 
+/// Event sequences reserved for one transaction attempt, from
+/// [`DynamoDbA2aStorage::allocate_event_sequences`].
+struct EventSequenceAllocation {
+    /// Counter value the allocation was made from.
+    observed: u64,
+    /// `observed + 1 ..= observed + count`.
+    sequences: Vec<u64>,
+    /// Counter write for the transaction; `None` when no events commit.
+    counter_write: Option<aws_sdk_dynamodb::types::TransactWriteItem>,
+}
+
+impl EventSequenceAllocation {
+    fn sequences_after(observed: u64, count: usize) -> Vec<u64> {
+        (1..=count as u64).map(|i| observed + i).collect()
+    }
+
+    /// Highest sequence for the task once this attempt commits.
+    fn latest(&self) -> u64 {
+        self.sequences.last().copied().unwrap_or(self.observed)
+    }
+
+    /// Append the counter write to `items`, returning its index for
+    /// [`lost_sequence_race`].
+    fn attach_counter(
+        &mut self,
+        items: &mut Vec<aws_sdk_dynamodb::types::TransactWriteItem>,
+    ) -> Option<usize> {
+        self.counter_write.take().map(|write| {
+            items.push(write);
+            items.len() - 1
+        })
+    }
+}
+
+/// True when a sequence-allocating transaction was cancelled only because
+/// another writer advanced the task's sequence counter first (the counter
+/// condition failed) or a concurrent transaction held its items. No other
+/// item's condition may have failed: owner, terminal-state and event-key
+/// conditions are definitive answers, not races.
+fn lost_sequence_race(
+    reasons: &[aws_sdk_dynamodb::types::CancellationReason],
+    counter_index: Option<usize>,
+) -> bool {
+    let Some(counter_index) = counter_index else {
+        return false;
+    };
+    let code = |i: usize| reasons.get(i).and_then(|r| r.code());
+    let other_condition_failed =
+        (0..reasons.len()).any(|i| i != counter_index && code(i) == Some("ConditionalCheckFailed"));
+    let raced = code(counter_index) == Some("ConditionalCheckFailed")
+        || reasons
+            .iter()
+            .any(|r| r.code() == Some("TransactionConflict"));
+    raced && !other_condition_failed
+}
+
+/// Cancellation reasons of a `TransactWriteItems` failure; empty for any
+/// other error.
+fn cancellation_reasons(
+    err: &aws_sdk_dynamodb::error::SdkError<
+        aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError,
+    >,
+) -> &[aws_sdk_dynamodb::types::CancellationReason] {
+    match err.as_service_error() {
+        Some(
+            aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(e),
+        ) => e.cancellation_reasons(),
+        _ => &[],
+    }
+}
+
+/// Bounded, jittered backoff between attempts of a sequence-allocating
+/// transaction that lost the counter race. Each round of contention on one
+/// task commits at least one writer, so the bound covers dozens of
+/// simultaneous writers to a single task.
+#[derive(Default)]
+struct SequenceCommitRetry {
+    attempt: u32,
+}
+
+impl SequenceCommitRetry {
+    const MAX_ATTEMPTS: u32 = 32;
+
+    /// Sleep before the next attempt, or fail with
+    /// [`A2aStorageError::ConcurrentModification`] once the budget is spent.
+    async fn backoff(&mut self, pk: &str) -> Result<(), A2aStorageError> {
+        use rand::RngExt;
+        self.attempt += 1;
+        if self.attempt >= Self::MAX_ATTEMPTS {
+            return Err(A2aStorageError::ConcurrentModification(format!(
+                "event sequence allocation for {pk} lost {} consecutive races",
+                self.attempt
+            )));
+        }
+        let base_ms = 5u64 << self.attempt.min(5);
+        let jitter_ms = rand::rng().random_range(0..=base_ms);
+        tokio::time::sleep(std::time::Duration::from_millis(base_ms + jitter_ms)).await;
+        Ok(())
+    }
+}
+
 /// DynamoDB-backed A2A storage.
 #[derive(Clone)]
 pub struct DynamoDbA2aStorage {
@@ -495,6 +596,152 @@ impl DynamoDbA2aStorage {
             item.insert("ttl".into(), ttl_val);
         }
         item
+    }
+
+    /// Sort key of a task's event-sequence counter item, which shares the
+    /// task's event partition (`pk = {tenant}#{task_id}`). Event sequences
+    /// start at 1, so this key sorts below every event row and the
+    /// `sk > :after` range reads never return the counter.
+    fn sequence_counter_sk() -> String {
+        Self::event_sort_key(0)
+    }
+
+    /// The counter write that rides in every transaction committing
+    /// events: `ADD nextSequence :count`, conditioned on the counter still
+    /// holding the value the sequences were allocated from (absent for a
+    /// task with no events yet). A concurrent writer that committed first
+    /// fails this condition and the loser re-allocates; commit order
+    /// therefore always equals sequence order, so a reader that has seen
+    /// sequence `n` never later finds a committed event below `n`.
+    ///
+    /// `ttl` is refreshed on every write and is never earlier than the
+    /// event rows written in the same transaction, so the counter outlives
+    /// the events it numbers.
+    pub(crate) fn build_sequence_counter_update(
+        events_table: &str,
+        pk: &str,
+        observed: u64,
+        count: u64,
+        ttl: Option<AttributeValue>,
+    ) -> Result<aws_sdk_dynamodb::types::TransactWriteItem, A2aStorageError> {
+        let mut update = aws_sdk_dynamodb::types::Update::builder()
+            .table_name(events_table)
+            .key("pk", AttributeValue::S(pk.to_string()))
+            .key("sk", AttributeValue::S(Self::sequence_counter_sk()))
+            .expression_attribute_values(":count", AttributeValue::N(count.to_string()));
+        update = if observed == 0 {
+            update.condition_expression("attribute_not_exists(nextSequence)")
+        } else {
+            update
+                .condition_expression("nextSequence = :observed")
+                .expression_attribute_values(":observed", AttributeValue::N(observed.to_string()))
+        };
+        update = match ttl {
+            Some(ttl) => update
+                .update_expression("ADD nextSequence :count SET #ttl = :ttl")
+                .expression_attribute_names("#ttl", "ttl")
+                .expression_attribute_values(":ttl", ttl),
+            None => update.update_expression("ADD nextSequence :count"),
+        };
+        Ok(aws_sdk_dynamodb::types::TransactWriteItem::builder()
+            .update(
+                update
+                    .build()
+                    .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
+            )
+            .build())
+    }
+
+    /// Current value of a task's event-sequence counter: the highest
+    /// committed sequence, or 0 when the task has no events.
+    async fn read_sequence_counter(&self, pk: &str) -> Result<u64, A2aStorageError> {
+        // Strongly consistent: the allocation conditions on this value.
+        let result = self
+            .client
+            .get_item()
+            .consistent_read(true)
+            .table_name(&self.config.events_table)
+            .key("pk", AttributeValue::S(pk.to_string()))
+            .key("sk", AttributeValue::S(Self::sequence_counter_sk()))
+            .projection_expression("nextSequence")
+            .send()
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+        match result.item.as_ref().and_then(|i| i.get("nextSequence")) {
+            Some(AttributeValue::N(n)) => n
+                .parse::<u64>()
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string())),
+            _ => Ok(0),
+        }
+    }
+
+    /// The single per-task event-sequence allocator. Every path that
+    /// commits events reads the counter here, numbers its events from the
+    /// returned allocation, and attaches the allocation's counter write to
+    /// the same `TransactWriteItems`. When that transaction is cancelled by
+    /// [`lost_sequence_race`], the caller re-reads its inputs and
+    /// allocates again after [`SequenceCommitRetry::backoff`].
+    async fn allocate_event_sequences(
+        &self,
+        pk: &str,
+        count: usize,
+    ) -> Result<EventSequenceAllocation, A2aStorageError> {
+        let observed = self.read_sequence_counter(pk).await?;
+        let counter_write = if count == 0 {
+            None
+        } else {
+            let ttl = Self::ttl_epoch(
+                self.config
+                    .event_ttl_seconds
+                    .max(self.config.task_ttl_seconds),
+            );
+            Some(Self::build_sequence_counter_update(
+                &self.config.events_table,
+                pk,
+                observed,
+                count as u64,
+                ttl,
+            )?)
+        };
+        Ok(EventSequenceAllocation {
+            sequences: EventSequenceAllocation::sequences_after(observed, count),
+            observed,
+            counter_write,
+        })
+    }
+
+    /// Conditional event puts for `events` numbered by `sequences`. The
+    /// `attribute_not_exists` condition makes a sequence collision cancel
+    /// the transaction rather than overwrite a committed event.
+    fn event_transact_items(
+        &self,
+        pk: &str,
+        sequences: &[u64],
+        events: &[StreamEvent],
+    ) -> Result<Vec<aws_sdk_dynamodb::types::TransactWriteItem>, A2aStorageError> {
+        let ttl = Self::ttl_epoch(self.config.event_ttl_seconds);
+        sequences
+            .iter()
+            .zip(events)
+            .map(|(&seq, event)| {
+                let event_data = serde_json::to_string(event)
+                    .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
+                let put = aws_sdk_dynamodb::types::Put::builder()
+                    .table_name(&self.config.events_table)
+                    .set_item(Some(Self::build_event_item(
+                        pk,
+                        seq,
+                        &event_data,
+                        ttl.clone(),
+                    )))
+                    .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
+                    .build()
+                    .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+                Ok(aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(put)
+                    .build())
+            })
+            .collect()
     }
 
     /// Single source of truth for the task put-item shape.
@@ -1664,7 +1911,6 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
     }
 }
 
-/// Helper: query the current max event sequence for a task.
 /// Read the stored `latestEventSequence` attribute for a task row.
 /// Returns 0 for a missing task or missing attribute — the Put/Update
 /// caller then overwrites with `max(0, new_seqs)` which preserves the
@@ -1697,40 +1943,6 @@ async fn query_latest_event_sequence(
     Ok(0)
 }
 
-async fn query_max_sequence(
-    client: &Client,
-    table: &str,
-    pk: &str,
-) -> Result<u64, A2aStorageError> {
-    // Strongly-consistent query: picks the next event sequence number
-    // for the upcoming TransactWriteItems. A stale read would collide
-    // with a just-written event and fail the
-    // `attribute_not_exists(pk) AND attribute_not_exists(sk)`
-    // condition on the events-table Put.
-    let result = client
-        .query()
-        .consistent_read(true)
-        .table_name(table)
-        .key_condition_expression("pk = :pk")
-        .expression_attribute_values(":pk", AttributeValue::S(pk.to_string()))
-        .scan_index_forward(false)
-        .limit(1)
-        .projection_expression("eventSequence")
-        .send()
-        .await
-        .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
-
-    if let Some(items) = result.items
-        && let Some(item) = items.first()
-        && let Some(AttributeValue::N(n)) = item.get("eventSequence")
-    {
-        return n
-            .parse::<u64>()
-            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()));
-    }
-    Ok(0)
-}
-
 #[async_trait]
 impl A2aEventStore for DynamoDbA2aStorage {
     fn backend_name(&self) -> &'static str {
@@ -1744,33 +1956,26 @@ impl A2aEventStore for DynamoDbA2aStorage {
         event: StreamEvent,
     ) -> Result<u64, A2aStorageError> {
         let pk = Self::task_key(tenant, task_id);
-        let event_data = serde_json::to_string(&event)
-            .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
-
-        let max_seq = query_max_sequence(&self.client, &self.config.events_table, &pk).await?;
-        let new_seq = max_seq + 1;
-
-        // Uniqueness on the composite key `(pk, sk)` — both must be
-        // absent. Before the table grew an `sk` range key, the
-        // single-attribute check was a spurious success that
-        // overwrote the first row for the partition on any second
-        // put.
-        let item = Self::build_event_item(
-            &pk,
-            new_seq,
-            &event_data,
-            Self::ttl_epoch(self.config.event_ttl_seconds),
-        );
-        self.client
-            .put_item()
-            .table_name(&self.config.events_table)
-            .set_item(Some(item))
-            .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)")
-            .send()
-            .await
-            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
-
-        Ok(new_seq)
+        let events = [event];
+        let mut retry = SequenceCommitRetry::default();
+        loop {
+            let mut allocation = self.allocate_event_sequences(&pk, 1).await?;
+            let mut items = self.event_transact_items(&pk, &allocation.sequences, &events)?;
+            let counter_index = allocation.attach_counter(&mut items);
+            match self
+                .client
+                .transact_write_items()
+                .set_transact_items(Some(items))
+                .send()
+                .await
+            {
+                Ok(_) => return Ok(allocation.latest()),
+                Err(err) if lost_sequence_race(cancellation_reasons(&err), counter_index) => {
+                    retry.backoff(&pk).await?
+                }
+                Err(err) => return Err(A2aStorageError::DatabaseError(format!("{err:?}"))),
+            }
+        }
     }
 
     async fn get_events_after(
@@ -1838,8 +2043,8 @@ impl A2aEventStore for DynamoDbA2aStorage {
     }
 
     async fn latest_sequence(&self, tenant: &str, task_id: &str) -> Result<u64, A2aStorageError> {
-        let pk = Self::task_key(tenant, task_id);
-        query_max_sequence(&self.client, &self.config.events_table, &pk).await
+        self.read_sequence_counter(&Self::task_key(tenant, task_id))
+            .await
     }
 
     /// No-op on DynamoDB: expired tasks and events are reaped by the
@@ -1878,79 +2083,66 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let plan = super::artifacts::reconcile(&artifacts, &[])?;
         let manifest_json = super::artifacts::manifest_to_json(&plan.manifest)?;
 
-        // Sequence allocation: create_task_with_events always starts
-        // at seq=1 (no prior events for a fresh task), so the max
-        // sequence is simply events.len() when events are non-empty.
-        let sequences: Vec<u64> = (1..=events.len() as u64).collect();
-        let latest_event_sequence = sequences.last().copied().unwrap_or(0);
-
-        // Build TransactWriteItems: task put + artifact puts + event puts.
-        // The task put carries `latestEventSequence` directly so one Put
-        // covers the causal-floor maintenance, plus the artifact manifest.
-        let mut task_item = Self::build_task_item(
-            &pk,
-            tenant,
-            task.id(),
-            owner,
-            task.context_id(),
-            state_str,
-            &blob,
-            Some(latest_event_sequence),
-            Self::ttl_epoch(self.config.task_ttl_seconds),
-        );
-        task_item.insert("artifactManifest".into(), AttributeValue::S(manifest_json));
-        let task_put = aws_sdk_dynamodb::types::Put::builder()
-            .table_name(&self.config.tasks_table)
-            .set_item(Some(task_item));
-        let mut items = vec![
-            aws_sdk_dynamodb::types::TransactWriteItem::builder()
-                .put(
-                    task_put
-                        .build()
-                        .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
-                )
-                .build(),
-        ];
-
         let art_pk = Self::artifact_pk(tenant, task.id());
-        let artifact_items = self.artifact_transact_items(&art_pk, &plan)?;
-        Self::check_artifact_transaction_cap(artifact_items.len(), 1 + events.len())?;
-        items.extend(artifact_items);
+        let mut retry = SequenceCommitRetry::default();
+        loop {
+            let mut allocation = self.allocate_event_sequences(&pk, events.len()).await?;
 
-        for (i, event) in events.iter().enumerate() {
-            let seq = sequences[i];
-            let event_data = serde_json::to_string(event)
-                .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
-
-            let event_item = Self::build_event_item(
+            // Build TransactWriteItems: task put + artifact puts + event
+            // puts + counter write. The task put carries
+            // `latestEventSequence` directly so one Put covers the
+            // causal-floor maintenance, plus the artifact manifest.
+            let mut task_item = Self::build_task_item(
                 &pk,
-                seq,
-                &event_data,
-                Self::ttl_epoch(self.config.event_ttl_seconds),
+                tenant,
+                task.id(),
+                owner,
+                task.context_id(),
+                state_str,
+                &blob,
+                Some(allocation.latest()),
+                Self::ttl_epoch(self.config.task_ttl_seconds),
             );
-            let event_put = aws_sdk_dynamodb::types::Put::builder()
-                .table_name(&self.config.events_table)
-                .set_item(Some(event_item))
-                .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)");
-            items.push(
+            task_item.insert(
+                "artifactManifest".into(),
+                AttributeValue::S(manifest_json.clone()),
+            );
+            let task_put = aws_sdk_dynamodb::types::Put::builder()
+                .table_name(&self.config.tasks_table)
+                .set_item(Some(task_item));
+            let mut items = vec![
                 aws_sdk_dynamodb::types::TransactWriteItem::builder()
                     .put(
-                        event_put
+                        task_put
                             .build()
                             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
                     )
                     .build(),
-            );
+            ];
+
+            let artifact_items = self.artifact_transact_items(&art_pk, &plan)?;
+            Self::check_artifact_transaction_cap(
+                artifact_items.len(),
+                1 + events.len() + usize::from(allocation.counter_write.is_some()),
+            )?;
+            items.extend(artifact_items);
+            items.extend(self.event_transact_items(&pk, &allocation.sequences, &events)?);
+            let counter_index = allocation.attach_counter(&mut items);
+
+            match self
+                .client
+                .transact_write_items()
+                .set_transact_items(Some(items))
+                .send()
+                .await
+            {
+                Ok(_) => return Ok((task, allocation.sequences)),
+                Err(err) if lost_sequence_race(cancellation_reasons(&err), counter_index) => {
+                    retry.backoff(&pk).await?
+                }
+                Err(err) => return Err(A2aStorageError::DatabaseError(format!("{err:?}"))),
+            }
         }
-
-        self.client
-            .transact_write_items()
-            .set_transact_items(Some(items))
-            .send()
-            .await
-            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
-
-        Ok((task, sequences))
     }
 
     async fn update_task_status_with_events(
@@ -1962,142 +2154,11 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         mut events: Vec<StreamEvent>,
     ) -> Result<(Task, Vec<u64>), A2aStorageError> {
         let pk = Self::task_key(tenant, task_id);
-
-        // Read the raw item (consistent) for validation. The blob is used
-        // raw: status transitions never rewrite artifact records, so the
-        // separated layout's stripped blob stays stripped and the manifest
-        // is carried forward unchanged.
-        let read = self
-            .client
-            .get_item()
-            .consistent_read(true)
-            .table_name(&self.config.tasks_table)
-            .key("pk", AttributeValue::S(pk.clone()))
-            .send()
-            .await
-            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
-        let item = read
-            .item
-            .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?;
-        let stored_owner = item
-            .get("owner")
-            .and_then(|v| v.as_s().ok())
-            .cloned()
-            .unwrap_or_default();
-        if stored_owner != owner {
-            return Err(A2aStorageError::TaskNotFound(task_id.to_string()));
-        }
-        let blob = item
-            .get("taskJson")
-            .and_then(|v| v.as_s().ok())
-            .ok_or_else(|| A2aStorageError::DatabaseError("Missing task_json".into()))?;
-        let manifest_json = item
-            .get("artifactManifest")
-            .and_then(|v| v.as_s().ok())
-            .cloned();
-        let task = Self::task_from_json(blob)?;
-
-        let current_state = task
-            .status()
-            .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?
-            .state()
-            .map_err(A2aStorageError::TypeError)?;
         let new_state = new_status.state().map_err(A2aStorageError::TypeError)?;
+        // Carries the commit timestamp from the first attempt into any
+        // retry, so the task status and its events keep one timestamp.
+        let mut status_proto = new_status.into_proto();
 
-        turul_a2a_types::state_machine::validate_transition(current_state, new_state).map_err(
-            |e| match e {
-                turul_a2a_types::A2aTypeError::InvalidTransition { current, requested } => {
-                    A2aStorageError::InvalidTransition {
-                        task_id: task_id.to_string(),
-                        current,
-                        requested,
-                    }
-                }
-                turul_a2a_types::A2aTypeError::TerminalState(s) => {
-                    A2aStorageError::TerminalStateAlreadySet {
-                        task_id: task_id.to_string(),
-                        current_state: s.wire_name().to_string(),
-                    }
-                }
-                other => A2aStorageError::TypeError(other),
-            },
-        )?;
-
-        // Build updated task from the raw (artifact-free for separated)
-        // blob, changing only status.
-        let mut proto = task.as_proto().clone();
-        proto.status = Some(new_status.into_proto());
-        let mut updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
-        super::status_time::stamp_status(&mut updated_task, &mut events);
-
-        let task_json = Self::task_to_json(&updated_task)?;
-        let state_str = Self::status_state_str(&updated_task);
-
-        // Get current max sequence for event numbering AND the
-        // prior latest_event_sequence so the Put preserves it when
-        // events is empty.
-        let max_seq = query_max_sequence(&self.client, &self.config.events_table, &pk).await?;
-        let prior_latest =
-            query_latest_event_sequence(&self.client, &self.config.tasks_table, &pk).await?;
-        let new_latest_event_sequence = prior_latest.max(max_seq + events.len() as u64);
-
-        // Build TransactWriteItems: task update + event puts.
-        //
-        // Terminal-write CAS: the task Put's
-        // ConditionExpression now ALSO asserts that the existing
-        // statusState is NOT any of the four terminal values. Between the
-        // get_task read above and this transact_write_items call, another
-        // instance may have committed a terminal for this pk — the
-        // condition-expression rejects our write atomically at the
-        // backend, preserving the single-terminal-writer invariant.
-        let mut task_item = Self::build_task_item(
-            &pk,
-            tenant,
-            task_id,
-            owner,
-            updated_task.context_id(),
-            state_str,
-            &task_json,
-            Some(new_latest_event_sequence),
-            Self::ttl_epoch(self.config.task_ttl_seconds),
-        );
-        // Preserve the artifact manifest across the status write so the
-        // separated layout's bodies remain reachable. Absent for legacy
-        // items (their artifacts stay inline in the blob).
-        if let Some(ref manifest) = manifest_json {
-            task_item.insert(
-                "artifactManifest".into(),
-                AttributeValue::S(manifest.clone()),
-            );
-        }
-        let mut items = vec![
-            aws_sdk_dynamodb::types::TransactWriteItem::builder()
-                .put(
-                    aws_sdk_dynamodb::types::Put::builder()
-                        .table_name(&self.config.tasks_table)
-                        .set_item(Some(task_item))
-                        .condition_expression(format!(
-                            "#owner = :owner AND (attribute_not_exists(statusState) \
-                             OR {})",
-                            *TERMINAL_STATE_CONDITION
-                        ))
-                        .expression_attribute_names("#owner", "owner")
-                        .set_expression_attribute_values(Some(terminal_condition_values([(
-                            ":owner",
-                            AttributeValue::S(owner.to_string()),
-                        )])))
-                        .build()
-                        .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
-                )
-                .build(),
-        ];
-
-        // Append events and, when the push_dispatch opt-in is on,
-        // add a Put for the pending-dispatch marker inside the same
-        // TransactWriteItems. Terminal `StatusUpdate`
-        // events only — non-terminal / artifact events do not produce
-        // markers.
-        //
         // Pending-dispatch optimization: if push_dispatch is on,
         // pre-flight a single Query on the push_configs table scoped
         // to this task. When zero configs exist, skip marker writes
@@ -2124,123 +2185,241 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         } else {
             false
         };
-        let now_micros = ddb_systime_to_micros(std::time::SystemTime::now());
-        let marker_ttl = Self::ttl_epoch(self.config.push_delivery_ttl_seconds);
-        let mut sequences = Vec::with_capacity(events.len());
-        for (i, event) in events.iter().enumerate() {
-            let seq = max_seq + (i as u64) + 1;
-            sequences.push(seq);
-            let event_data = serde_json::to_string(event)
-                .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
 
-            let event_item = Self::build_event_item(
+        // Each attempt re-reads the task, so a retry after losing the
+        // sequence race validates and writes against the winner's state.
+        let mut retry = SequenceCommitRetry::default();
+        loop {
+            // Read the raw item (consistent) for validation. The blob is used
+            // raw: status transitions never rewrite artifact records, so the
+            // separated layout's stripped blob stays stripped and the manifest
+            // is carried forward unchanged.
+            let read = self
+                .client
+                .get_item()
+                .consistent_read(true)
+                .table_name(&self.config.tasks_table)
+                .key("pk", AttributeValue::S(pk.clone()))
+                .send()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            let item = read
+                .item
+                .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?;
+            let stored_owner = item
+                .get("owner")
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+                .unwrap_or_default();
+            if stored_owner != owner {
+                return Err(A2aStorageError::TaskNotFound(task_id.to_string()));
+            }
+            let blob = item
+                .get("taskJson")
+                .and_then(|v| v.as_s().ok())
+                .ok_or_else(|| A2aStorageError::DatabaseError("Missing task_json".into()))?;
+            let manifest_json = item
+                .get("artifactManifest")
+                .and_then(|v| v.as_s().ok())
+                .cloned();
+            // The task's causal floor; the Put below must not regress it.
+            let prior_latest = match item.get("latestEventSequence") {
+                Some(AttributeValue::N(n)) => n
+                    .parse::<u64>()
+                    .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?,
+                _ => 0,
+            };
+            let task = Self::task_from_json(blob)?;
+
+            let current_state = task
+                .status()
+                .ok_or_else(|| A2aStorageError::TaskNotFound(task_id.to_string()))?
+                .state()
+                .map_err(A2aStorageError::TypeError)?;
+
+            turul_a2a_types::state_machine::validate_transition(current_state, new_state).map_err(
+                |e| match e {
+                    turul_a2a_types::A2aTypeError::InvalidTransition { current, requested } => {
+                        A2aStorageError::InvalidTransition {
+                            task_id: task_id.to_string(),
+                            current,
+                            requested,
+                        }
+                    }
+                    turul_a2a_types::A2aTypeError::TerminalState(s) => {
+                        A2aStorageError::TerminalStateAlreadySet {
+                            task_id: task_id.to_string(),
+                            current_state: s.wire_name().to_string(),
+                        }
+                    }
+                    other => A2aStorageError::TypeError(other),
+                },
+            )?;
+
+            // Build updated task from the raw (artifact-free for separated)
+            // blob, changing only status.
+            let mut proto = task.as_proto().clone();
+            proto.status = Some(status_proto.clone());
+            let mut updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+            super::status_time::stamp_status(&mut updated_task, &mut events);
+            if let Some(stamped) = updated_task.as_proto().status.clone() {
+                status_proto = stamped;
+            }
+
+            let task_json = Self::task_to_json(&updated_task)?;
+            let state_str = Self::status_state_str(&updated_task);
+
+            let mut allocation = self.allocate_event_sequences(&pk, events.len()).await?;
+
+            // Build TransactWriteItems: task update + event puts + markers
+            // + counter write.
+            //
+            // Terminal-write CAS: the task Put's ConditionExpression also
+            // asserts that the existing statusState is NOT any of the four
+            // terminal values. Between the read above and this
+            // transact_write_items call, another instance may have
+            // committed a terminal for this pk — the condition-expression
+            // rejects our write atomically at the backend, preserving the
+            // single-terminal-writer invariant.
+            let mut task_item = Self::build_task_item(
                 &pk,
-                seq,
-                &event_data,
-                Self::ttl_epoch(self.config.event_ttl_seconds),
+                tenant,
+                task_id,
+                owner,
+                updated_task.context_id(),
+                state_str,
+                &task_json,
+                Some(prior_latest.max(allocation.latest())),
+                Self::ttl_epoch(self.config.task_ttl_seconds),
             );
-            items.push(
+            // Preserve the artifact manifest across the status write so the
+            // separated layout's bodies remain reachable. Absent for legacy
+            // items (their artifacts stay inline in the blob).
+            if let Some(ref manifest) = manifest_json {
+                task_item.insert(
+                    "artifactManifest".into(),
+                    AttributeValue::S(manifest.clone()),
+                );
+            }
+            let mut items = vec![
                 aws_sdk_dynamodb::types::TransactWriteItem::builder()
                     .put(
                         aws_sdk_dynamodb::types::Put::builder()
-                            .table_name(&self.config.events_table)
-                            .set_item(Some(event_item))
-                            .condition_expression(
-                                "attribute_not_exists(pk) AND attribute_not_exists(sk)",
-                            )
+                            .table_name(&self.config.tasks_table)
+                            .set_item(Some(task_item))
+                            .condition_expression(format!(
+                                "#owner = :owner AND (attribute_not_exists(statusState) \
+                                 OR {})",
+                                *TERMINAL_STATE_CONDITION
+                            ))
+                            .expression_attribute_names("#owner", "owner")
+                            .set_expression_attribute_values(Some(terminal_condition_values([(
+                                ":owner",
+                                AttributeValue::S(owner.to_string()),
+                            )])))
                             .build()
                             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
                     )
                     .build(),
-            );
+            ];
+            items.extend(self.event_transact_items(&pk, &allocation.sequences, &events)?);
 
-            if self.push_dispatch_enabled
-                && has_push_configs
-                && event.is_terminal()
-                && matches!(event, StreamEvent::StatusUpdate { .. })
-            {
-                let marker_sk = seq.to_string();
-                let mut marker_put = aws_sdk_dynamodb::types::Put::builder()
-                    .table_name(&self.config.push_pending_dispatches_table)
-                    .item("pk", AttributeValue::S(pk.clone()))
-                    .item("sk", AttributeValue::S(marker_sk))
-                    .item("tenant", AttributeValue::S(tenant.to_string()))
-                    .item("taskId", AttributeValue::S(task_id.to_string()))
-                    .item("eventSequence", AttributeValue::N(seq.to_string()))
-                    .item("owner", AttributeValue::S(owner.to_string()))
-                    .item(
-                        "recordedAtMicros",
-                        AttributeValue::N(now_micros.to_string()),
-                    );
-                if let Some(ttl) = marker_ttl.clone() {
-                    marker_put = marker_put.item("ttl", ttl);
-                }
-                items.push(
-                    aws_sdk_dynamodb::types::TransactWriteItem::builder()
-                        .put(
-                            marker_put
-                                .build()
-                                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
-                        )
-                        .build(),
-                );
-            }
-        }
-
-        let send_result = self
-            .client
-            .transact_write_items()
-            .set_transact_items(Some(items))
-            .send()
-            .await;
-
-        match send_result {
-            Ok(_) => {
-                // The write kept the blob artifact-free for separated rows;
-                // rehydrate the returned task so callers (push dispatch,
-                // yielded-result handlers) observe its artifacts.
-                let rehydrated = self
-                    .rehydrate_task(tenant, task_id, &task_json, manifest_json.as_deref())
-                    .await?;
-                Ok((rehydrated, sequences))
-            }
-            Err(err) => {
-                // Detect the task-item condition failure — either the owner
-                // check or the non-terminal CAS failed. Re-fetch the task to
-                // figure out which: if the current state is terminal, this is
-                // a CAS loser; otherwise fall back to the generic DB error.
-                //
-                // Detection is via the service error string; the Rust SDK
-                // surfaces `TransactionCanceledException` here.
-                let err_dbg = format!("{err:?}");
-                if err_dbg.contains("TransactionCanceledException")
-                    || err_dbg.contains("ConditionalCheckFailed")
+            // When the push_dispatch opt-in is on, add a Put for the
+            // pending-dispatch marker inside the same TransactWriteItems.
+            // Terminal `StatusUpdate` events only — non-terminal / artifact
+            // events do not produce markers.
+            let now_micros = ddb_systime_to_micros(std::time::SystemTime::now());
+            let marker_ttl = Self::ttl_epoch(self.config.push_delivery_ttl_seconds);
+            for (&seq, event) in allocation.sequences.iter().zip(&events) {
+                if self.push_dispatch_enabled
+                    && has_push_configs
+                    && event.is_terminal()
+                    && matches!(event, StreamEvent::StatusUpdate { .. })
                 {
-                    // Probe current state to classify.
-                    match self.get_task(tenant, task_id, owner, Some(0)).await {
-                        Ok(Some(current_task)) => {
-                            let probe_state = current_task.status().and_then(|s| s.state().ok());
-                            if let Some(s) = probe_state
-                                && turul_a2a_types::state_machine::is_terminal(s)
-                            {
-                                return Err(A2aStorageError::TerminalStateAlreadySet {
-                                    task_id: task_id.to_string(),
-                                    current_state: s.wire_name().to_string(),
-                                });
-                            }
-                        }
-                        Ok(None) => {
-                            // Task disappeared between reads — unusual but surface
-                            // as TaskNotFound.
-                            return Err(A2aStorageError::TaskNotFound(task_id.to_string()));
-                        }
-                        Err(_) => {
-                            // Fall through to generic error.
+                    let marker_sk = seq.to_string();
+                    let mut marker_put = aws_sdk_dynamodb::types::Put::builder()
+                        .table_name(&self.config.push_pending_dispatches_table)
+                        .item("pk", AttributeValue::S(pk.clone()))
+                        .item("sk", AttributeValue::S(marker_sk))
+                        .item("tenant", AttributeValue::S(tenant.to_string()))
+                        .item("taskId", AttributeValue::S(task_id.to_string()))
+                        .item("eventSequence", AttributeValue::N(seq.to_string()))
+                        .item("owner", AttributeValue::S(owner.to_string()))
+                        .item(
+                            "recordedAtMicros",
+                            AttributeValue::N(now_micros.to_string()),
+                        );
+                    if let Some(ttl) = marker_ttl.clone() {
+                        marker_put = marker_put.item("ttl", ttl);
+                    }
+                    items.push(
+                        aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                            .put(
+                                marker_put.build().map_err(|e| {
+                                    A2aStorageError::DatabaseError(format!("{e:?}"))
+                                })?,
+                            )
+                            .build(),
+                    );
+                }
+            }
+            let counter_index = allocation.attach_counter(&mut items);
+
+            let err = match self
+                .client
+                .transact_write_items()
+                .set_transact_items(Some(items))
+                .send()
+                .await
+            {
+                Ok(_) => {
+                    // The write kept the blob artifact-free for separated
+                    // rows; rehydrate the returned task so callers (push
+                    // dispatch, yielded-result handlers) observe its
+                    // artifacts.
+                    let rehydrated = self
+                        .rehydrate_task(tenant, task_id, &task_json, manifest_json.as_deref())
+                        .await?;
+                    return Ok((rehydrated, allocation.sequences));
+                }
+                Err(err) if lost_sequence_race(cancellation_reasons(&err), counter_index) => {
+                    retry.backoff(&pk).await?;
+                    continue;
+                }
+                Err(err) => err,
+            };
+
+            // Detect the task-item condition failure — either the owner
+            // check or the non-terminal CAS failed. Re-fetch the task to
+            // figure out which: if the current state is terminal, this is
+            // a CAS loser; otherwise fall back to the generic DB error.
+            let err_dbg = format!("{err:?}");
+            if err_dbg.contains("TransactionCanceledException")
+                || err_dbg.contains("ConditionalCheckFailed")
+            {
+                match self.get_task(tenant, task_id, owner, Some(0)).await {
+                    Ok(Some(current_task)) => {
+                        let probe_state = current_task.status().and_then(|s| s.state().ok());
+                        if let Some(s) = probe_state
+                            && turul_a2a_types::state_machine::is_terminal(s)
+                        {
+                            return Err(A2aStorageError::TerminalStateAlreadySet {
+                                task_id: task_id.to_string(),
+                                current_state: s.wire_name().to_string(),
+                            });
                         }
                     }
+                    Ok(None) => {
+                        // Task disappeared between reads — unusual but
+                        // surface as TaskNotFound.
+                        return Err(A2aStorageError::TaskNotFound(task_id.to_string()));
+                    }
+                    Err(_) => {
+                        // Fall through to generic error.
+                    }
                 }
-                Err(A2aStorageError::DatabaseError(err_dbg))
             }
+            return Err(A2aStorageError::DatabaseError(err_dbg));
         }
     }
 
@@ -2255,133 +2434,118 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let pk = Self::task_key(tenant, task.id());
         let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
-
-        let stored = self.fetch_stored_manifest(tenant, task.id()).await?;
-        let plan = super::artifacts::reconcile(&artifacts, &stored)?;
-        let manifest_json = super::artifacts::manifest_to_json(&plan.manifest)?;
-
-        // Get current max sequence AND prior latest_event_sequence:
-        // a full-replacement Put must not regress the causal floor
-        // when events is empty.
-        let max_seq = query_max_sequence(&self.client, &self.config.events_table, &pk).await?;
-        let prior_latest =
-            query_latest_event_sequence(&self.client, &self.config.tasks_table, &pk).await?;
-        let new_latest_event_sequence = prior_latest.max(max_seq + events.len() as u64);
-
-        // Build TransactWriteItems: task put (with owner check +
-        // terminal CAS) + artifact puts/deletes + event puts. The
-        // ConditionExpression rejects writes against a task whose
-        // persisted statusState is already terminal, protecting against
-        // full-task replacement clobbering a concurrent terminal commit.
-        let mut task_item = Self::build_task_item(
-            &pk,
-            tenant,
-            task.id(),
-            owner,
-            task.context_id(),
-            state_str,
-            &blob,
-            Some(new_latest_event_sequence),
-            Self::ttl_epoch(self.config.task_ttl_seconds),
-        );
-        task_item.insert("artifactManifest".into(), AttributeValue::S(manifest_json));
-        let task_put = aws_sdk_dynamodb::types::Put::builder()
-            .table_name(&self.config.tasks_table)
-            .set_item(Some(task_item))
-            .condition_expression(format!(
-                "#owner = :owner AND (attribute_not_exists(statusState) \
-                 OR {})",
-                *TERMINAL_STATE_CONDITION
-            ))
-            .expression_attribute_names("#owner", "owner")
-            .set_expression_attribute_values(Some(terminal_condition_values([(
-                ":owner",
-                AttributeValue::S(owner.to_string()),
-            )])));
-        let mut items = vec![
-            aws_sdk_dynamodb::types::TransactWriteItem::builder()
-                .put(
-                    task_put
-                        .build()
-                        .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
-                )
-                .build(),
-        ];
-
         let art_pk = Self::artifact_pk(tenant, task.id());
-        let artifact_items = self.artifact_transact_items(&art_pk, &plan)?;
-        Self::check_artifact_transaction_cap(artifact_items.len(), 1 + events.len())?;
-        items.extend(artifact_items);
+        let task_id = task.id().to_string();
 
-        let mut sequences = Vec::with_capacity(events.len());
-        for (i, event) in events.iter().enumerate() {
-            let seq = max_seq + (i as u64) + 1;
-            sequences.push(seq);
-            let event_data = serde_json::to_string(event)
-                .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
+        // Each attempt re-reads the stored manifest and causal floor, so a
+        // retry after losing the sequence race reconciles artifacts against
+        // the winner's records instead of orphaning them.
+        let mut retry = SequenceCommitRetry::default();
+        loop {
+            let stored = self.fetch_stored_manifest(tenant, &task_id).await?;
+            let plan = super::artifacts::reconcile(&artifacts, &stored)?;
+            let manifest_json = super::artifacts::manifest_to_json(&plan.manifest)?;
 
-            let event_item = Self::build_event_item(
+            // Prior latest_event_sequence: a full-replacement Put must not
+            // regress the causal floor when events is empty.
+            let prior_latest =
+                query_latest_event_sequence(&self.client, &self.config.tasks_table, &pk).await?;
+            let mut allocation = self.allocate_event_sequences(&pk, events.len()).await?;
+
+            // Build TransactWriteItems: task put (with owner check +
+            // terminal CAS) + artifact puts/deletes + event puts + counter
+            // write. The ConditionExpression rejects writes against a task
+            // whose persisted statusState is already terminal, protecting
+            // against full-task replacement clobbering a concurrent
+            // terminal commit.
+            let mut task_item = Self::build_task_item(
                 &pk,
-                seq,
-                &event_data,
-                Self::ttl_epoch(self.config.event_ttl_seconds),
+                tenant,
+                &task_id,
+                owner,
+                task.context_id(),
+                state_str,
+                &blob,
+                Some(prior_latest.max(allocation.latest())),
+                Self::ttl_epoch(self.config.task_ttl_seconds),
             );
-            let event_put = aws_sdk_dynamodb::types::Put::builder()
-                .table_name(&self.config.events_table)
-                .set_item(Some(event_item))
-                .condition_expression("attribute_not_exists(pk) AND attribute_not_exists(sk)");
-            items.push(
+            task_item.insert("artifactManifest".into(), AttributeValue::S(manifest_json));
+            let task_put = aws_sdk_dynamodb::types::Put::builder()
+                .table_name(&self.config.tasks_table)
+                .set_item(Some(task_item))
+                .condition_expression(format!(
+                    "#owner = :owner AND (attribute_not_exists(statusState) \
+                     OR {})",
+                    *TERMINAL_STATE_CONDITION
+                ))
+                .expression_attribute_names("#owner", "owner")
+                .set_expression_attribute_values(Some(terminal_condition_values([(
+                    ":owner",
+                    AttributeValue::S(owner.to_string()),
+                )])));
+            let mut items = vec![
                 aws_sdk_dynamodb::types::TransactWriteItem::builder()
                     .put(
-                        event_put
+                        task_put
                             .build()
                             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
                     )
                     .build(),
-            );
-        }
+            ];
 
-        let task_id = task.id().to_string();
-        let tx_result = self
-            .client
-            .transact_write_items()
-            .set_transact_items(Some(items))
-            .send()
-            .await;
+            let artifact_items = self.artifact_transact_items(&art_pk, &plan)?;
+            Self::check_artifact_transaction_cap(
+                artifact_items.len(),
+                1 + events.len() + usize::from(allocation.counter_write.is_some()),
+            )?;
+            items.extend(artifact_items);
+            items.extend(self.event_transact_items(&pk, &allocation.sequences, &events)?);
+            let counter_index = allocation.attach_counter(&mut items);
 
-        match tx_result {
-            Ok(_) => Ok(sequences),
-            Err(err) => {
-                // Classify via the service error string: if the tx was
-                // cancelled because the task-item's condition failed AND
-                // the persisted state is terminal, return
-                // TerminalStateAlreadySet. Owner-mismatch falls through to
-                // a generic DB error since the existing contract path
-                // never mapped update_task_with_events to OwnerMismatch.
-                let err_dbg = format!("{err:?}");
-                if err_dbg.contains("TransactionCanceledException")
-                    || err_dbg.contains("ConditionalCheckFailed")
-                {
-                    match self.get_task(tenant, &task_id, owner, Some(0)).await {
-                        Ok(Some(current_task)) => {
-                            let probe_state = current_task.status().and_then(|s| s.state().ok());
-                            if let Some(s) = probe_state
-                                && turul_a2a_types::state_machine::is_terminal(s)
-                            {
-                                return Err(A2aStorageError::TerminalStateAlreadySet {
-                                    task_id,
-                                    current_state: s.wire_name().to_string(),
-                                });
-                            }
-                        }
-                        Ok(None) => {
-                            return Err(A2aStorageError::TaskNotFound(task_id));
-                        }
-                        Err(_) => {}
-                    }
+            let err = match self
+                .client
+                .transact_write_items()
+                .set_transact_items(Some(items))
+                .send()
+                .await
+            {
+                Ok(_) => return Ok(allocation.sequences),
+                Err(err) if lost_sequence_race(cancellation_reasons(&err), counter_index) => {
+                    retry.backoff(&pk).await?;
+                    continue;
                 }
-                Err(A2aStorageError::DatabaseError(err_dbg))
+                Err(err) => err,
+            };
+
+            // Classify via the service error string: if the tx was
+            // cancelled because the task-item's condition failed AND
+            // the persisted state is terminal, return
+            // TerminalStateAlreadySet. Owner-mismatch falls through to
+            // a generic DB error since the existing contract path
+            // never mapped update_task_with_events to OwnerMismatch.
+            let err_dbg = format!("{err:?}");
+            if err_dbg.contains("TransactionCanceledException")
+                || err_dbg.contains("ConditionalCheckFailed")
+            {
+                match self.get_task(tenant, &task_id, owner, Some(0)).await {
+                    Ok(Some(current_task)) => {
+                        let probe_state = current_task.status().and_then(|s| s.state().ok());
+                        if let Some(s) = probe_state
+                            && turul_a2a_types::state_machine::is_terminal(s)
+                        {
+                            return Err(A2aStorageError::TerminalStateAlreadySet {
+                                task_id,
+                                current_state: s.wire_name().to_string(),
+                            });
+                        }
+                    }
+                    Ok(None) => {
+                        return Err(A2aStorageError::TaskNotFound(task_id));
+                    }
+                    Err(_) => {}
+                }
             }
+            return Err(A2aStorageError::DatabaseError(err_dbg));
         }
     }
 }
@@ -5018,7 +5182,7 @@ mod tests {
 
     #[test]
     fn build_event_item_has_required_attributes_for_append_event_path() {
-        // `append_event` writes one event row with seq = max + 1,
+        // `append_event` writes one event row at the next counter value,
         // no TTL when unconfigured.
         let item = DynamoDbA2aStorage::build_event_item(
             "tenant-a#task-1",
@@ -5052,8 +5216,8 @@ mod tests {
 
     #[test]
     fn build_event_item_has_required_attributes_for_update_status_path() {
-        // `update_task_status_with_events` writes events at seq =
-        // max_seq + 1; the terminal-preservation CAS still includes
+        // `update_task_status_with_events` writes events at the next
+        // counter values; the terminal-preservation CAS still includes
         // these rows. Numeric values near u32::MAX confirm the
         // encoding stays stable at high sequences.
         let big_seq = 4_000_000_000u64;
@@ -5196,6 +5360,165 @@ mod tests {
     #[test]
     fn default_task_ttl_is_one_day() {
         assert_eq!(DynamoDbConfig::default().task_ttl_seconds, 24 * 3600);
+    }
+
+    // Per-task event-sequence counter item.
+
+    #[test]
+    fn sequence_counter_sorts_below_every_event_row() {
+        let counter = DynamoDbA2aStorage::sequence_counter_sk();
+        assert!(counter < DynamoDbA2aStorage::event_sort_key(1));
+        // `get_events_after(0)` reads `sk > event_sort_key(0)`, which must
+        // exclude the counter item.
+        assert!(counter <= DynamoDbA2aStorage::event_sort_key(0));
+    }
+
+    fn counter_update(
+        observed: u64,
+        count: u64,
+        ttl: Option<AttributeValue>,
+    ) -> aws_sdk_dynamodb::types::Update {
+        DynamoDbA2aStorage::build_sequence_counter_update("events", "t#task", observed, count, ttl)
+            .unwrap()
+            .update()
+            .cloned()
+            .expect("counter write is an Update")
+    }
+
+    #[test]
+    fn counter_update_adds_count_on_the_counter_key() {
+        let update = counter_update(4, 3, None);
+        assert_eq!(update.table_name(), "events");
+        assert_eq!(
+            update.key().get("pk"),
+            Some(&AttributeValue::S("t#task".into()))
+        );
+        assert_eq!(
+            update.key().get("sk"),
+            Some(&AttributeValue::S(DynamoDbA2aStorage::sequence_counter_sk()))
+        );
+        assert_eq!(update.update_expression(), "ADD nextSequence :count");
+        let values = update.expression_attribute_values().unwrap();
+        assert_eq!(values.get(":count"), Some(&AttributeValue::N("3".into())));
+    }
+
+    #[test]
+    fn counter_update_for_first_events_requires_absent_counter() {
+        let update = counter_update(0, 1, None);
+        assert_eq!(
+            update.condition_expression(),
+            Some("attribute_not_exists(nextSequence)")
+        );
+        assert!(
+            !update
+                .expression_attribute_values()
+                .unwrap()
+                .contains_key(":observed")
+        );
+    }
+
+    #[test]
+    fn counter_update_requires_the_observed_value() {
+        let update = counter_update(7, 2, None);
+        assert_eq!(
+            update.condition_expression(),
+            Some("nextSequence = :observed")
+        );
+        assert_eq!(
+            update
+                .expression_attribute_values()
+                .unwrap()
+                .get(":observed"),
+            Some(&AttributeValue::N("7".into()))
+        );
+    }
+
+    #[test]
+    fn counter_update_refreshes_ttl_when_configured() {
+        let update = counter_update(1, 1, Some(AttributeValue::N("123".into())));
+        assert_eq!(
+            update.update_expression(),
+            "ADD nextSequence :count SET #ttl = :ttl"
+        );
+        assert_eq!(
+            update.expression_attribute_names().unwrap().get("#ttl"),
+            Some(&"ttl".to_string())
+        );
+        assert_eq!(
+            update.expression_attribute_values().unwrap().get(":ttl"),
+            Some(&AttributeValue::N("123".into()))
+        );
+    }
+
+    #[test]
+    fn allocation_numbers_events_after_the_observed_counter() {
+        assert_eq!(EventSequenceAllocation::sequences_after(0, 2), vec![1, 2]);
+        assert_eq!(
+            EventSequenceAllocation::sequences_after(5, 3),
+            vec![6, 7, 8]
+        );
+        assert!(EventSequenceAllocation::sequences_after(9, 0).is_empty());
+
+        let with_events = EventSequenceAllocation {
+            observed: 5,
+            sequences: vec![6, 7],
+            counter_write: None,
+        };
+        assert_eq!(with_events.latest(), 7);
+        let without_events = EventSequenceAllocation {
+            observed: 5,
+            sequences: vec![],
+            counter_write: None,
+        };
+        assert_eq!(without_events.latest(), 5);
+    }
+
+    fn reasons(codes: &[&str]) -> Vec<aws_sdk_dynamodb::types::CancellationReason> {
+        codes
+            .iter()
+            .map(|c| {
+                aws_sdk_dynamodb::types::CancellationReason::builder()
+                    .code(*c)
+                    .build()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn counter_condition_failure_alone_is_a_lost_race() {
+        let r = reasons(&["None", "None", "ConditionalCheckFailed"]);
+        assert!(lost_sequence_race(&r, Some(2)));
+    }
+
+    #[test]
+    fn transaction_conflict_is_a_lost_race() {
+        let r = reasons(&["TransactionConflict", "None", "None"]);
+        assert!(lost_sequence_race(&r, Some(2)));
+        let r = reasons(&["None", "None", "TransactionConflict"]);
+        assert!(lost_sequence_race(&r, Some(2)));
+    }
+
+    #[test]
+    fn task_condition_failure_is_not_a_lost_race() {
+        // Owner or terminal-state condition on the task item failed: a
+        // definitive rejection even if the counter also moved.
+        let r = reasons(&["ConditionalCheckFailed", "None", "ConditionalCheckFailed"]);
+        assert!(!lost_sequence_race(&r, Some(2)));
+        let r = reasons(&["ConditionalCheckFailed", "None", "None"]);
+        assert!(!lost_sequence_race(&r, Some(2)));
+    }
+
+    #[test]
+    fn event_key_collision_is_not_a_lost_race() {
+        let r = reasons(&["None", "ConditionalCheckFailed", "None"]);
+        assert!(!lost_sequence_race(&r, Some(2)));
+    }
+
+    #[test]
+    fn transaction_without_counter_never_retries() {
+        let r = reasons(&["TransactionConflict"]);
+        assert!(!lost_sequence_race(&r, None));
+        assert!(!lost_sequence_race(&[], Some(0)));
     }
 
     // =========================================================
