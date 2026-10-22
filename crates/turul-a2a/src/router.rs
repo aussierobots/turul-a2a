@@ -443,10 +443,12 @@ pub(crate) async fn open_send_stream(
             message: format!("Invalid request body: {e}"),
         })?;
     let (accepted_output_modes, request_metadata) = executor_request_inputs(&request);
-    let history_length = request
-        .configuration
-        .as_ref()
-        .and_then(|c| c.history_length);
+    let history_length = checked_history_length(
+        request
+            .configuration
+            .as_ref()
+            .and_then(|c| c.history_length),
+    )?;
     let proto_message = request.message.ok_or(A2aError::InvalidRequest {
         message: "message field is required".into(),
     })?;
@@ -1041,10 +1043,12 @@ pub async fn core_send_message(
     // Some(n>0)=last n (a2a.proto:150-154). Do NOT collapse Some(0) to
     // None; the storage layer's `trim_task` already differentiates
     // (e.g., storage/postgres.rs:212-222).
-    let history_length: Option<i32> = request
-        .configuration
-        .as_ref()
-        .and_then(|c| c.history_length);
+    let history_length = checked_history_length(
+        request
+            .configuration
+            .as_ref()
+            .and_then(|c| c.history_length),
+    )?;
 
     let inline_push_config = inline_push_config(request.configuration.as_ref())?;
 
@@ -1357,6 +1361,7 @@ pub(crate) async fn core_list_tasks(
     owner: &str,
     query: &ListTasksQuery,
 ) -> Result<Json<serde_json::Value>, A2aError> {
+    let history_length = checked_history_length(query.history_length)?;
     let status = match &query.status {
         Some(s) => Some(
             TaskState::from_wire_name(s).ok_or_else(|| A2aError::InvalidRequest {
@@ -1384,7 +1389,7 @@ pub(crate) async fn core_list_tasks(
         page_size: query.page_size,
         // proto3 leaves an unset string empty: "" asks for the first page.
         page_token: query.page_token.clone().filter(|t| !t.is_empty()),
-        history_length: query.history_length,
+        history_length,
         status_timestamp_after,
         include_artifacts: query.include_artifacts,
     };
@@ -1395,6 +1400,20 @@ pub(crate) async fn core_list_tasks(
         .await
         .map_err(A2aError::from)?;
     Ok(Json(list_page_to_json(&page)))
+}
+
+/// The requested `historyLength`, checked. A2A v1.0.1 §3.2.4 gives it
+/// three meanings — unset (no limit), `0` (no history), a positive count
+/// (that many recent messages) — and the specification's validation-error
+/// example rejects `historyLength=-5`; a negative value is an invalid
+/// request on every operation that takes it.
+fn checked_history_length(history_length: Option<i32>) -> Result<Option<i32>, A2aError> {
+    match history_length {
+        Some(n) if n < 0 => Err(A2aError::InvalidRequest {
+            message: format!("historyLength must be a non-negative integer, got {n}"),
+        }),
+        other => Ok(other),
+    }
 }
 
 fn list_page_to_json(page: &TaskListPage) -> serde_json::Value {
@@ -1418,6 +1437,7 @@ pub(crate) async fn core_get_task(
     task_id: &str,
     history_length: Option<i32>,
 ) -> Result<Json<serde_json::Value>, A2aError> {
+    let history_length = checked_history_length(history_length)?;
     let task = state
         .task_storage
         .get_task(tenant, task_id, owner, history_length)
