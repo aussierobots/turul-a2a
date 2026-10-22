@@ -1189,6 +1189,71 @@ async fn send_streaming_message_returns_text_event_stream() {
     );
 }
 
+/// `TaskStatus.timestamp` is a `google.protobuf.Timestamp`; the proto3
+/// JSON mapping writes it as RFC 3339 with a "Z" offset
+/// (https://protobuf.dev/programming-guides/json/). Every response that
+/// carries a status timestamp uses that form: send, GetTask on both
+/// bindings, and the stream's snapshot and status updates.
+#[tokio::test]
+async fn status_timestamps_are_rfc3339_with_z() {
+    fn assert_z(ts: &serde_json::Value, what: &str) {
+        let s = ts
+            .as_str()
+            .unwrap_or_else(|| panic!("{what}: status.timestamp missing"));
+        assert!(
+            s.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(s).is_ok(),
+            "{what}: {s} is not Z-normalised RFC 3339"
+        );
+    }
+
+    let router = compliance_router();
+    let (status, _, sent) = http_call(
+        router.clone(),
+        Method::POST,
+        "/message:send",
+        Some(http_send_body("m-ts", "x")),
+    )
+    .await;
+    assert_eq!(status, 200, "{sent}");
+    assert_z(&sent["task"]["status"]["timestamp"], "SendMessage");
+    let task_id = sent["task"]["id"].as_str().unwrap();
+
+    let (_, _, got) = http_call(
+        router.clone(),
+        Method::GET,
+        &format!("/tasks/{task_id}"),
+        None,
+    )
+    .await;
+    assert_z(&got["status"]["timestamp"], "HTTP GetTask");
+    let rpc = jsonrpc_call(
+        router.clone(),
+        "GetTask",
+        serde_json::json!({"id": task_id}),
+        5,
+    )
+    .await;
+    assert_z(&rpc["result"]["status"]["timestamp"], "JSON-RPC GetTask");
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/message:stream")
+        .header("A2A-Version", "1.0")
+        .header("content-type", "application/json")
+        .body(Body::from(http_send_body("m-ts-stream", "x")))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let events = common::read_sse(resp.into_body(), std::time::Duration::from_secs(5))
+        .await
+        .closed();
+    assert_z(&events[0]["task"]["status"]["timestamp"], "stream snapshot");
+    for event in &events[1..] {
+        if let Some(status) = event.get("statusUpdate") {
+            assert_z(&status["status"]["timestamp"], "stream status update");
+        }
+    }
+}
+
 // =========================================================
 // gRPC transport parity
 // =========================================================

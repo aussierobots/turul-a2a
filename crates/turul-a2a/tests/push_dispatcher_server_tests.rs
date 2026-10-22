@@ -91,7 +91,8 @@ fn header<'a>(req: &'a wiremock::Request, name: &str) -> Option<&'a str> {
 }
 
 /// Assert the webhook body is a `StreamResponse` carrying only `task`
-/// (A2A v1.0.1 §4.3.3) with the A2A media type, and return that task.
+/// (A2A v1.0.1 §4.3.3) with the A2A media type, its status timestamp in
+/// the proto3 JSON form (RFC 3339 with "Z"), and return that task.
 fn posted_task(req: &wiremock::Request) -> serde_json::Value {
     assert_eq!(
         header(req, "content-type"),
@@ -104,6 +105,13 @@ fn posted_task(req: &wiremock::Request) -> serde_json::Value {
         members,
         vec!["task"],
         "push body must be a StreamResponse with exactly one member, `task`"
+    );
+    let ts = body["task"]["status"]["timestamp"]
+        .as_str()
+        .expect("the pushed task carries its status timestamp");
+    assert!(
+        ts.ends_with('Z'),
+        "status timestamp must be Z-normalised: {ts}"
     );
     body["task"].clone()
 }

@@ -10,7 +10,7 @@
 //! move a task in the listing.
 
 use chrono::{DateTime, NaiveDateTime, SubsecRound, Utc};
-use turul_a2a_proto::pbjson_types::Timestamp;
+use turul_a2a_proto::Timestamp;
 use turul_a2a_types::Task;
 
 use super::error::A2aStorageError;
@@ -28,10 +28,7 @@ pub(crate) fn stamp_status(task: &mut Task, events: &mut [StreamEvent]) {
     let Some(status) = task.as_proto_mut().status.as_mut() else {
         return;
     };
-    let ts = *status.timestamp.get_or_insert_with(|| Timestamp {
-        seconds: now.timestamp(),
-        nanos: now.timestamp_subsec_nanos() as i32,
-    });
+    let ts = *status.timestamp.get_or_insert_with(|| Timestamp::from(now));
     let ts_json = serde_json::to_value(ts).unwrap_or_default();
     for event in events {
         if let StreamEvent::StatusUpdate { status_update } = event
@@ -54,7 +51,7 @@ pub(crate) fn sort_key(task: &Task) -> String {
         .status
         .as_ref()
         .and_then(|s| s.timestamp.as_ref())
-        .and_then(|ts| DateTime::from_timestamp(ts.seconds, ts.nanos.max(0) as u32))
+        .and_then(|ts| DateTime::<Utc>::try_from(*ts).ok())
         .map(|at| key_of(&at))
         .unwrap_or_default()
 }

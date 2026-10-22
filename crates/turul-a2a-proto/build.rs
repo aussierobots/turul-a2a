@@ -14,6 +14,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let descriptor_path = PathBuf::from(env::var("OUT_DIR")?).join("a2a_descriptor.bin");
 
     // Step 1: generate prost message types (+ tonic service stubs when grpc).
+    // Well-known types come from `pbjson_types`, except Timestamp: its
+    // serde impl there writes a "+00:00" offset, and the proto3 JSON
+    // mapping requires "Z", so `crate::Timestamp` (src/timestamp.rs)
+    // stands in. The more specific extern path wins.
     compile_protos(proto_file, proto_includes, &descriptor_path)?;
 
     // Step 2: pbjson serde impls (camelCase JSON matching proto JSON mapping).
@@ -44,6 +48,7 @@ fn compile_protos(
         .build_client(true)
         .compile_well_known_types(true)
         .extern_path(".google.protobuf", "::pbjson_types")
+        .extern_path(".google.protobuf.Timestamp", "crate::Timestamp")
         .file_descriptor_set_path(descriptor_path)
         .compile_protos(&[proto_file], proto_includes)?;
     Ok(())
@@ -58,6 +63,7 @@ fn compile_protos(
     prost_build::Config::new()
         .compile_well_known_types()
         .extern_path(".google.protobuf", "::pbjson_types")
+        .extern_path(".google.protobuf.Timestamp", "crate::Timestamp")
         .file_descriptor_set_path(descriptor_path)
         .compile_protos(&[proto_file], proto_includes)?;
     Ok(())

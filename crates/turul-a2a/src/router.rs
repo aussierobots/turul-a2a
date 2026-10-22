@@ -679,12 +679,9 @@ impl ListTasksQuery {
             .status_timestamp_after
             .as_ref()
             .map(|ts| {
-                u32::try_from(ts.nanos)
-                    .ok()
-                    .filter(|nanos| *nanos < 1_000_000_000)
-                    .and_then(|nanos| chrono::DateTime::from_timestamp(ts.seconds, nanos))
+                chrono::DateTime::<chrono::Utc>::try_from(*ts)
                     .map(|at| at.to_rfc3339())
-                    .ok_or_else(|| A2aError::InvalidRequest {
+                    .map_err(|_| A2aError::InvalidRequest {
                         message: "statusTimestampAfter is out of range".into(),
                     })
             })

@@ -4648,6 +4648,7 @@ dependencies = [
 name = "turul-a2a-proto"
 version = "0.1.35"
 dependencies = [
+ "chrono",
  "pbjson",
  "pbjson-build",
  "pbjson-types",

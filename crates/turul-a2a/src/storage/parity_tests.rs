@@ -4856,11 +4856,10 @@ fn status_time(task: &Task) -> chrono::DateTime<chrono::Utc> {
 /// relying on wall-clock gaps between writes (which can tie).
 fn make_task_at(task_id: &str, context_id: &str, offset_secs: i64) -> Task {
     let mut task = make_task(task_id, context_id);
-    task.as_proto_mut().status.as_mut().unwrap().timestamp =
-        Some(turul_a2a_proto::pbjson_types::Timestamp {
-            seconds: 1_600_000_000 + offset_secs,
-            nanos: 0,
-        });
+    task.as_proto_mut().status.as_mut().unwrap().timestamp = Some(turul_a2a_proto::Timestamp {
+        seconds: 1_600_000_000 + offset_secs,
+        nanos: 0,
+    });
     task
 }
 

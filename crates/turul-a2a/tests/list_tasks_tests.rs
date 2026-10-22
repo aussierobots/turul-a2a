@@ -219,8 +219,7 @@ async fn status_timestamp_after_http_and_jsonrpc() {
     let (status, page) = http_call(
         router.clone(),
         Method::GET,
-        // A query string carries `+` as a space, so the offset is percent-encoded.
-        &format!("/tasks?statusTimestampAfter={}", bound.replace('+', "%2B")),
+        &format!("/tasks?statusTimestampAfter={bound}"),
         None,
     )
     .await;
@@ -377,10 +376,7 @@ mod grpc {
         for nanos in [-1, 1_000_000_000] {
             let err = client
                 .list_tasks(tonic::Request::new(turul_a2a_proto::ListTasksRequest {
-                    status_timestamp_after: Some(turul_a2a_proto::pbjson_types::Timestamp {
-                        seconds: 0,
-                        nanos,
-                    }),
+                    status_timestamp_after: Some(turul_a2a_proto::Timestamp { seconds: 0, nanos }),
                     ..request()
                 }))
                 .await
@@ -391,7 +387,7 @@ mod grpc {
         let bound = chrono::DateTime::parse_from_rfc3339(&status_timestamp(&second)).unwrap();
         let page = client
             .list_tasks(tonic::Request::new(turul_a2a_proto::ListTasksRequest {
-                status_timestamp_after: Some(turul_a2a_proto::pbjson_types::Timestamp {
+                status_timestamp_after: Some(turul_a2a_proto::Timestamp {
                     seconds: bound.timestamp(),
                     nanos: bound.timestamp_subsec_nanos() as i32,
                 }),

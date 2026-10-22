@@ -19,7 +19,7 @@ Three approaches were evaluated:
 
 Generate from proto with `prost` + `pbjson`, then wrap in ergonomic Rust types. The project uses a two-crate architecture:
 
-1. **`turul-a2a-proto`** -- generates Rust types via `prost-build` + `pbjson-build`. The proto file is vendored at `proto/a2a.proto`. Google well-known types are mapped to `pbjson_types` via `compile_well_known_types()` + `extern_path`. `pbjson` provides `serde::Serialize` / `serde::Deserialize` implementations with camelCase JSON field names, matching the proto JSON mapping specification.
+1. **`turul-a2a-proto`** -- generates Rust types via `prost-build` + `pbjson-build`. The proto file is vendored at `proto/a2a.proto`. Google well-known types are mapped to `pbjson_types` via `compile_well_known_types()` + `extern_path`, except `google.protobuf.Timestamp`, which maps to `turul_a2a_proto::Timestamp`: `pbjson_types::Timestamp` serialises with a `+00:00` offset, while the proto3 JSON mapping requires Z-normalised RFC 3339 with 0, 3, 6 or 9 fractional digits. `pbjson` provides `serde::Serialize` / `serde::Deserialize` implementations with camelCase JSON field names, matching the proto JSON mapping specification.
 
 2. **`turul-a2a-types`** -- wraps generated proto types with ergonomic Rust types that provide:
    - `From` / `TryFrom` conversions between proto and wrapper layers.
@@ -36,3 +36,7 @@ gRPC support via `tonic` is feature-gated behind `grpc` on `turul-a2a-proto`, `t
 - **`pbjson` handles JSON serialization.** camelCase field names, `oneof` representations, and well-known type mappings all follow the proto JSON mapping spec without manual `#[serde(rename)]` annotations.
 - **`#[non_exhaustive]` on all public wrapper types.** New fields can be added to wrapper types in minor versions without breaking downstream consumers.
 - **gRPC is opt-in, not default.** The `tonic` code-gen path is gated behind the `grpc` feature per ADR-014; HTTP/JSON-only deployments pay zero tonic weight in their dependency tree.
+
+## Revision log
+
+- 2026-10-22 — `google.protobuf.Timestamp` now maps to `turul_a2a_proto::Timestamp`, whose serde impl writes the proto3 JSON form (RFC 3339, "Z"); every Timestamp field of the generated types, and so every JSON transport and the push body, emits that one form. Input accepts any RFC 3339 offset.
