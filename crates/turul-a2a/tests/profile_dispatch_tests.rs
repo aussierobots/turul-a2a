@@ -378,16 +378,35 @@ async fn http_streaming_send_missing_skill_id_returns_invalid_params() {
     assert!(seen.skill_ids().is_empty(), "executor must not run");
 }
 
+#[tokio::test]
+async fn tenant_scoped_send_missing_skill_id_returns_invalid_params() {
+    let (router, seen) = http_router(false);
+    let resp = router
+        .oneshot(http_post(
+            "/acme/message:send",
+            &send_body(None),
+            &[("A2A-Extensions", SKILL_INVOCATION_PROFILE_V1)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    assert!(seen.skill_ids().is_empty(), "executor must not run");
+}
+
 // ---------------------------------------------------------------------------
 // JSON-RPC
 // ---------------------------------------------------------------------------
 
 fn jsonrpc_send(skill_id: Option<serde_json::Value>) -> String {
+    jsonrpc_call("SendMessage", skill_id)
+}
+
+fn jsonrpc_call(method: &str, skill_id: Option<serde_json::Value>) -> String {
     let params: serde_json::Value = serde_json::from_str(&send_body(skill_id)).unwrap();
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": 7,
-        "method": "SendMessage",
+        "method": method,
         "params": params,
     })
     .to_string()
@@ -424,6 +443,23 @@ async fn jsonrpc_send_missing_skill_id_returns_invalid_params() {
         .oneshot(http_post(
             "/jsonrpc",
             &jsonrpc_send(None),
+            &[("A2A-Extensions", SKILL_INVOCATION_PROFILE_V1)],
+        ))
+        .await
+        .unwrap();
+    let body = json_body(resp).await;
+    assert_eq!(body["id"], 7, "got {body}");
+    assert_eq!(body["error"]["code"], -32602, "got {body}");
+    assert!(seen.skill_ids().is_empty(), "executor must not run");
+}
+
+#[tokio::test]
+async fn jsonrpc_streaming_send_missing_skill_id_returns_invalid_params() {
+    let (router, seen) = streaming_http_router();
+    let resp = router
+        .oneshot(http_post(
+            "/jsonrpc",
+            &jsonrpc_call("SendStreamingMessage", None),
             &[("A2A-Extensions", SKILL_INVOCATION_PROFILE_V1)],
         ))
         .await
@@ -517,6 +553,18 @@ mod grpc {
         let mut client = client(seen.clone()).await;
         let status = client
             .send_message(activated_request(None))
+            .await
+            .expect_err("missing skill id must be rejected");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(seen.skill_ids().is_empty(), "executor must not run");
+    }
+
+    #[tokio::test]
+    async fn grpc_streaming_send_missing_skill_id_is_invalid_argument() {
+        let seen = Seen::default();
+        let mut client = client(seen.clone()).await;
+        let status = client
+            .send_streaming_message(activated_request(None))
             .await
             .expect_err("missing skill id must be rejected");
         assert_eq!(status.code(), Code::InvalidArgument);

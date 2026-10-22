@@ -6,9 +6,13 @@
 //! No network egress — the agent has no external deps.
 
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+
+/// The card name the spawned binary advertises.
+const AGENT_NAME: &str = "Planner-Router Agent";
 
 struct AgentGuard {
     child: Child,
@@ -22,13 +26,46 @@ impl Drop for AgentGuard {
     }
 }
 
-/// A port the OS reports free right now. The listener is dropped before
-/// the agent binds it.
+/// A port the OS reports free right now, never handed out twice in this
+/// test binary (its tests run in parallel). The listener is dropped
+/// before the agent binds the port.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("0.0.0.0:0")
-        .and_then(|l| l.local_addr())
-        .expect("reserve free port")
-        .port()
+    static ISSUED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    let mut issued = ISSUED.lock().expect("port registry");
+    loop {
+        let port = std::net::TcpListener::bind("0.0.0.0:0")
+            .and_then(|l| l.local_addr())
+            .expect("reserve free port")
+            .port();
+        if !issued.contains(&port) {
+            issued.push(port);
+            return port;
+        }
+    }
+}
+
+/// Poll the agent card until this test's own child serves it. Fails fast
+/// if the child exits (for example because its port was taken in the
+/// meantime) and refuses a card served by a different listener.
+async fn wait_until_ready(guard: &mut AgentGuard) {
+    let url = format!("{}/.well-known/agent-card.json", guard.base);
+    for _ in 0..150 {
+        if let Some(status) = guard.child.try_wait().expect("poll agent process") {
+            panic!("agent exited before it was ready ({status})");
+        }
+        if let Ok(r) = reqwest::get(&url).await
+            && r.status().is_success()
+        {
+            let card: Value = r.json().await.expect("agent card JSON");
+            assert_eq!(
+                card["name"], AGENT_NAME,
+                "{url} is served by another process"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("agent did not become ready at {url} within 15s");
 }
 
 async fn spawn_agent() -> AgentGuard {
@@ -39,20 +76,12 @@ async fn spawn_agent() -> AgentGuard {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn agent");
-    let guard = AgentGuard {
+    let mut guard = AgentGuard {
         child,
         base: format!("http://127.0.0.1:{port}"),
     };
-    let url = format!("{}/.well-known/agent-card.json", guard.base);
-    for _ in 0..150 {
-        if let Ok(r) = reqwest::get(&url).await
-            && r.status().is_success()
-        {
-            return guard;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("agent did not become ready at {url} within 15s");
+    wait_until_ready(&mut guard).await;
+    guard
 }
 
 /// Send `text` and return `(skill name on the artifact, artifact JSON)`

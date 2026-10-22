@@ -175,6 +175,45 @@ async fn streaming_send_delivers_accepted_output_modes_and_request_metadata() {
     assert_eq!(*observed.lock().unwrap(), vec![expected_inputs()]);
 }
 
+#[cfg(feature = "grpc")]
+mod grpc {
+    use super::*;
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use turul_a2a_proto::grpc::A2aServiceClient;
+
+    #[tokio::test]
+    async fn grpc_send_delivers_accepted_output_modes_and_request_metadata() {
+        let observed = Observed::default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = A2aServer::builder()
+            .executor(ObservingExecutor {
+                observed: observed.clone(),
+            })
+            .storage(InMemoryA2aStorage::new())
+            .bind(([127, 0, 0, 1], 0))
+            .build()
+            .unwrap()
+            .into_tonic_router();
+        tokio::spawn(async move {
+            let _ = router
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect_lazy();
+        let request: turul_a2a_proto::SendMessageRequest =
+            serde_json::from_value(send_request(true, false)).unwrap();
+        A2aServiceClient::new(channel)
+            .send_message(request)
+            .await
+            .expect("grpc send");
+        assert_eq!(*observed.lock().unwrap(), vec![expected_inputs()]);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Durable-queue envelope
 // ---------------------------------------------------------------------------

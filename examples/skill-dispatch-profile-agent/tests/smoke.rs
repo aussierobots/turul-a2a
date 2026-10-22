@@ -11,11 +11,15 @@
 //! No network egress.
 
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
 const PROFILE_URI: &str = "https://turul.dev/a2a/extensions/skill-invocation/v1";
+
+/// The card name the spawned binary advertises.
+const AGENT_NAME: &str = "Skill Dispatch Profile Agent";
 
 struct AgentGuard {
     child: Child,
@@ -29,13 +33,46 @@ impl Drop for AgentGuard {
     }
 }
 
-/// A port the OS reports free right now. The listener is dropped before
-/// the agent binds it.
+/// A port the OS reports free right now, never handed out twice in this
+/// test binary (its tests run in parallel). The listener is dropped
+/// before the agent binds the port.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("0.0.0.0:0")
-        .and_then(|l| l.local_addr())
-        .expect("reserve free port")
-        .port()
+    static ISSUED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    let mut issued = ISSUED.lock().expect("port registry");
+    loop {
+        let port = std::net::TcpListener::bind("0.0.0.0:0")
+            .and_then(|l| l.local_addr())
+            .expect("reserve free port")
+            .port();
+        if !issued.contains(&port) {
+            issued.push(port);
+            return port;
+        }
+    }
+}
+
+/// Poll the agent card until this test's own child serves it. Fails fast
+/// if the child exits (for example because its port was taken in the
+/// meantime) and refuses a card served by a different listener.
+async fn wait_until_ready(guard: &mut AgentGuard) {
+    let url = format!("{}/.well-known/agent-card.json", guard.base);
+    for _ in 0..150 {
+        if let Some(status) = guard.child.try_wait().expect("poll agent process") {
+            panic!("agent exited before it was ready ({status})");
+        }
+        if let Ok(r) = reqwest::get(&url).await
+            && r.status().is_success()
+        {
+            let card: Value = r.json().await.expect("agent card JSON");
+            assert_eq!(
+                card["name"], AGENT_NAME,
+                "{url} is served by another process"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("agent did not become ready at {url} within 15s");
 }
 
 async fn spawn_agent() -> AgentGuard {
@@ -46,26 +83,12 @@ async fn spawn_agent() -> AgentGuard {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn agent");
-    let guard = AgentGuard {
+    let mut guard = AgentGuard {
         child,
         base: format!("http://127.0.0.1:{port}"),
     };
-    wait_for_card(&guard.base).await;
+    wait_until_ready(&mut guard).await;
     guard
-}
-
-async fn wait_for_card(base: &str) {
-    let client = reqwest::Client::new();
-    let url = format!("{base}/.well-known/agent-card.json");
-    for _ in 0..150 {
-        if let Ok(r) = client.get(&url).send().await
-            && r.status().is_success()
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("agent did not become ready at {url} within 15s");
 }
 
 async fn send_message(base: &str, body: Value, activate_profile: bool) -> reqwest::Response {
@@ -259,4 +282,26 @@ async fn not_activated_fails_task_with_guidance() {
         status_text(&payload).contains("a2a.skillId"),
         "failure message should cite the missing metadata key: {payload:#}"
     );
+}
+
+/// `a2a.skillId` without the activation header: the executor cannot see
+/// the negotiated extension set, so it routes on metadata alone. The
+/// framework did not apply the profile, so nothing is echoed.
+#[tokio::test]
+async fn skill_id_without_activation_header_still_dispatches() {
+    let agent = spawn_agent().await;
+    let resp = send_message(
+        &agent.base,
+        dispatch_body("reverse", json!({ "text": "abc" })),
+        false,
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert!(resp.headers().get("a2a-extensions").is_none());
+
+    let payload: Value = resp.json().await.expect("send json");
+    assert_eq!(task_state(&payload), "TASK_STATE_COMPLETED", "{payload:#}");
+    let artifact: Value =
+        serde_json::from_str(first_artifact_text(&payload)).expect("artifact is JSON");
+    assert_eq!(artifact, json!({ "reversed": "cba" }));
 }
