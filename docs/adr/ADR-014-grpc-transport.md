@@ -129,8 +129,12 @@ this ADR):
 - `turul-a2a` feature `grpc` (MUST enable `turul-a2a-proto/grpc`
   transitively): exposes `A2aServer::into_tonic_router()` plus a
   `grpc` module with the service impl. `into_tonic_router()` always
-  applies the Tower auth stack per §2.4 — this is the only public
-  entry point into the gRPC surface in 0.1.7. A raw service
+  applies the Tower auth stack per §2.4. `A2aServer::into_routers()`
+  is the second public entry point: it returns the HTTP router and
+  the gRPC router built over one shared server state (storage, event
+  broker, in-flight executor registry), and its gRPC router carries
+  the same Tower auth stack as `into_tonic_router()`. These two are
+  the only public entry points into the gRPC surface. A raw service
   accessor (e.g. `grpc_service()` returning the un-layered
   `A2aServiceServer`) is deliberately omitted: exposing the
   unauthenticated inner service as a public API would permit
@@ -808,3 +812,4 @@ theirs. Opt-in is the correct posture for both.
 - 2026-10-22 — §2.3 rewritten and accepted: one core stream for all three transports. Both streaming RPCs open with a `Task` snapshot, with no history replayed after it. Streams close on terminal states and INPUT_REQUIRED and stay open on AUTH_REQUIRED. Send-target resolution is shared by blocking and streaming send, which fixes streaming send ignoring `message.taskId`. Withdraws the earlier rule, in §2.3 and §2.11, that streaming send does not open with a `Task`. Follow-ups are refused while the previous turn's executor is still running; `Last-Event-ID: {task_id}:0` is now a resume; an already-caught-up resumed stream on a closing state ends at once.
 - 2026-10-22 — §2.3 item 3: `Last-Event-ID` / `a2a-last-event-id` resume removed and SSE `id:` fields dropped. Resuming without a snapshot broke A2A §3.1.6 L311 (every SubscribeToTask stream MUST open with the Task); reconnecting is a new subscribe (§3.5.2).
 - 2026-10-22 — §2.11 test obligations: the one-server rule now names `A2aServer::into_routers()` (shared broker and in-flight registry, not only storage), and a stream and send-target parity list records what `stream_contract_tests.rs` asserts on all three transports — exact §5.4 error mapping, close policy, send-target rules on blocking and streaming send, follow-up refusal while an executor runs, terminal/unknown subscribe, and `append`/`lastChunk` as stored.
+- 2026-10-22 — §2.2: `A2aServer::into_routers()` added as a second public gRPC entry point (HTTP and gRPC routers over one shared server state, gRPC side auth-layered exactly as `into_tonic_router()`); the "only public entry point" sentence now names both.

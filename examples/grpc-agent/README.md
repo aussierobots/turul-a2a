@@ -10,9 +10,10 @@ in a single crate:
 
 The example demonstrates:
 
-- `A2aServer::into_tonic_router()` — the single public gRPC entry
-  point, which always layers the Tower auth stack (ADR-014 §2.2 /
-  §2.4).
+- `A2aServer::into_tonic_router()` — a public gRPC entry point that
+  always layers the Tower auth stack (ADR-014 §2.2 / §2.4). The other
+  one, `A2aServer::into_routers()`, returns the HTTP and gRPC routers
+  over one shared server state, with the same auth stack.
 - Server-streaming via `SendStreamingMessage` using the durable
   event store + broker (ADR-009 shared with SSE, no parallel event
   pipeline).

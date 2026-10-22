@@ -5,9 +5,9 @@ Worked example of an A2A executor that emits chunked artifacts over SSE using
 (transport-level `last_chunk`) and ADR-010 (executor `EventSink`).
 
 The executor tokenises a canned response and emits each word as a chunk of a
-single artifact: the first chunk starts it, every later chunk is appended. Watching `curl --no-buffer` against
-`/message:stream` gives you the "tokens arriving in real time" experience
-that A2A streaming was designed for.
+single artifact: the first chunk starts it, every later chunk is appended.
+Watching `curl --no-buffer` against `/message:stream` gives you the "tokens
+arriving in real time" experience that A2A streaming was designed for.
 
 ## Run
 
