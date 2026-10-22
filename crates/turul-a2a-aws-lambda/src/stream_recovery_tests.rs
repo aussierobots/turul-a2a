@@ -2,12 +2,16 @@
 //!
 //! Release-gate contract:
 //!
-//! - Valid marker + successful redispatch → no BatchItemFailure; POST fires.
-//! - `get_task → Ok(None)` (task deleted) → no BatchItemFailure, marker deleted.
+//! - Valid marker + successful redispatch → no BatchItemFailure; one
+//!   POST; marker deleted.
+//! - `get_task → Ok(None)` (task deleted) → no BatchItemFailure, no
+//!   POST, marker deleted.
 //! - Transient storage error on `get_task` → BatchItemFailure with the record's SequenceNumber.
 //! - Unparseable NEW_IMAGE → BatchItemFailure.
 //! - Duplicate records (same `(tenant, task_id, event_sequence)`) → exactly one POST.
-//! - Non-INSERT records (MODIFY / REMOVE) → skipped silently.
+//! - Stream and scheduled worker racing on one marker → exactly one POST.
+//! - Non-INSERT records (MODIFY / REMOVE) → skipped silently: no POST,
+//!   marker kept.
 //!
 //! The tests run the full request-Lambda storage stack (in-memory,
 //! opt-in enabled) plus a wiremock for push URLs, so the assertion
@@ -191,6 +195,31 @@ fn event_with_records(records: Vec<EventRecord>) -> DynamoDbEvent {
     e
 }
 
+/// Whether the pending-dispatch marker for `(task_id, seq)` is still stored.
+async fn marker_present(delivery: &Arc<dyn A2aPushDeliveryStore>, task_id: &str, seq: u64) -> bool {
+    delivery
+        .list_stale_pending_dispatches(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+            64,
+        )
+        .await
+        .expect("list markers")
+        .iter()
+        .any(|p| p.task_id == task_id && p.event_sequence == seq)
+}
+
+/// A receiver that must see exactly `posts` POSTs (checked on drop).
+async fn receiver(posts: u64) -> MockServer {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(posts)
+        .mount(&mock)
+        .await;
+    mock
+}
+
 // ---------- Release-gate tests ----------
 
 #[tokio::test]
@@ -206,7 +235,7 @@ async fn stream_success_path_fires_one_post_and_no_batch_failures() {
         .mount(&mock)
         .await;
 
-    let (storage, dispatcher, _delivery) = build_stack().await;
+    let (storage, dispatcher, delivery) = build_stack().await;
     let (tenant, task_id, owner, seq) =
         seed_task_with_marker(&storage, &format!("{}/webhook", mock.uri()), "t-success").await;
 
@@ -221,15 +250,21 @@ async fn stream_success_path_fires_one_post_and_no_batch_failures() {
         "success path must not surface BatchItemFailure: {:?}",
         response.batch_item_failures
     );
+    assert!(
+        !marker_present(&delivery, &task_id, seq).await,
+        "a delivered marker is deleted"
+    );
+    assert_eq!(mock.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
 async fn stream_deleted_task_returns_success_and_deletes_marker() {
     // Task deleted between marker write and stream delivery → delete
     // marker, return success (NO BatchItemFailure).
+    let mock = receiver(0).await;
     let (storage, dispatcher, delivery) = build_stack().await;
     let (tenant, task_id, owner, seq) =
-        seed_task_with_marker(&storage, "http://unused.invalid/webhook", "t-deleted").await;
+        seed_task_with_marker(&storage, &format!("{}/webhook", mock.uri()), "t-deleted").await;
 
     // Delete the task so get_task returns Ok(None).
     A2aTaskStorage::delete_task(storage.as_ref(), &tenant, &task_id, &owner)
@@ -259,6 +294,11 @@ async fn stream_deleted_task_returns_success_and_deletes_marker() {
     assert!(
         pending.iter().all(|p| p.task_id != task_id),
         "marker for deleted task must be removed; got {pending:?}"
+    );
+    assert_eq!(
+        mock.received_requests().await.unwrap().len(),
+        0,
+        "nothing is delivered for a deleted task"
     );
 }
 
@@ -417,9 +457,10 @@ async fn stream_unparseable_new_image_surfaces_batch_item_failure() {
 #[tokio::test]
 async fn stream_non_insert_records_are_skipped() {
     // MODIFY / REMOVE records are skipped silently.
-    let (storage, dispatcher, _delivery) = build_stack().await;
+    let mock = receiver(0).await;
+    let (storage, dispatcher, delivery) = build_stack().await;
     let (tenant, task_id, owner, seq) =
-        seed_task_with_marker(&storage, "http://unused.invalid/webhook", "t-mod").await;
+        seed_task_with_marker(&storage, &format!("{}/webhook", mock.uri()), "t-mod").await;
 
     let handler = LambdaStreamRecoveryHandler::new(dispatcher);
 
@@ -435,6 +476,11 @@ async fn stream_non_insert_records_are_skipped() {
         response.batch_item_failures.is_empty(),
         "non-INSERT records must be skipped silently"
     );
+    assert!(
+        marker_present(&delivery, &task_id, seq).await,
+        "a skipped record leaves its marker for the scheduled worker"
+    );
+    assert_eq!(mock.received_requests().await.unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -449,7 +495,7 @@ async fn stream_duplicate_inserts_produce_exactly_one_post() {
         .mount(&mock)
         .await;
 
-    let (storage, dispatcher, _delivery) = build_stack().await;
+    let (storage, dispatcher, delivery) = build_stack().await;
     let (tenant, task_id, owner, seq) =
         seed_task_with_marker(&storage, &format!("{}/webhook", mock.uri()), "t-dupe").await;
 
@@ -465,6 +511,44 @@ async fn stream_duplicate_inserts_produce_exactly_one_post() {
         "duplicate records must not surface BatchItemFailure: {:?}",
         response.batch_item_failures
     );
+    assert!(!marker_present(&delivery, &task_id, seq).await);
+    assert_eq!(mock.received_requests().await.unwrap().len(), 1);
     // wiremock's `expect(1)` assertion fires on Drop.
+    drop(mock);
+}
+
+#[tokio::test]
+async fn stream_and_scheduler_racing_on_one_marker_post_once() {
+    // The stream worker and the scheduled sweep pick up the same
+    // marker at the same moment. Claim fencing lets exactly one of them
+    // deliver; neither reports a failure and the marker ends deleted.
+    use crate::scheduled_recovery::{
+        LambdaScheduledRecoveryConfig, LambdaScheduledRecoveryHandler,
+    };
+
+    let mock = receiver(1).await;
+    let (storage, dispatcher, delivery) = build_stack().await;
+    let (tenant, task_id, owner, seq) =
+        seed_task_with_marker(&storage, &format!("{}/webhook", mock.uri()), "t-race").await;
+
+    let stream = LambdaStreamRecoveryHandler::new(dispatcher.clone());
+    let scheduled = LambdaScheduledRecoveryHandler::new(dispatcher, delivery.clone()).with_config(
+        LambdaScheduledRecoveryConfig {
+            stale_cutoff: std::time::Duration::ZERO,
+            stale_markers_limit: 16,
+            reclaimable_claims_limit: 16,
+        },
+    );
+    let event = event_with_records(vec![make_insert_record(
+        &tenant, &task_id, &owner, seq, "seq-race",
+    )]);
+    let (stream_resp, sweep) =
+        tokio::join!(stream.handle_stream_event(event), scheduled.run_sweep());
+
+    assert!(stream_resp.batch_item_failures.is_empty());
+    assert_eq!(sweep.stale_markers_transient_errors, 0, "{sweep:?}");
+    assert!(sweep.errors.is_empty(), "{sweep:?}");
+    assert!(!marker_present(&delivery, &task_id, seq).await);
+    assert_eq!(mock.received_requests().await.unwrap().len(), 1);
     drop(mock);
 }

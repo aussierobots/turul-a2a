@@ -84,7 +84,13 @@ Release-gate invariants (pinned by tests in `src/stream_recovery_tests.rs` and `
 - Transient storage error → `BatchItemFailure` with the record's `SequenceNumber`.
 - Unparseable NEW_IMAGE → `BatchItemFailure` (logged).
 - Duplicate stream records → exactly one POST (claim fencing).
-- Scheduled sweep: stale markers recovered, transient errors counted and markers retained, reclaimable claims redispatched, batch limits honoured.
+- Stream worker and scheduled sweep racing on one marker → exactly one POST.
+- Scheduled sweep: stale markers recovered, transient errors counted and markers retained, reclaimable claims redispatched, batch limits honoured with the remainder left for the next tick.
+
+The request Lambda must opt in on both sides, or `build()` refuses
+the configuration: the storage writes the marker only when built with
+`.with_push_dispatch_enabled(true)`, and the builder consumes it only
+when `.push_delivery_store(storage.clone())` is wired.
 
 Operator responsibilities (not framework-managed):
 

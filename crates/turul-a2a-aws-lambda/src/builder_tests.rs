@@ -625,3 +625,173 @@ fn strip_path_prefix_treats_slash_as_noop() {
         "single-slash prefix must build — treated as no-op"
     );
 }
+
+// --------------------------------------------------------------------------
+// return_immediately capability. The Lambda environment can freeze once
+// the response is flushed, so `build()` turns the capability off unless
+// a durable executor queue is wired; wiring one turns it back on.
+// --------------------------------------------------------------------------
+
+/// Captures enqueued jobs; never fails.
+struct CapturingQueue {
+    jobs: std::sync::Mutex<Vec<turul_a2a::durable_executor::QueuedExecutorJob>>,
+}
+
+#[async_trait]
+impl turul_a2a::durable_executor::DurableExecutorQueue for CapturingQueue {
+    fn max_payload_bytes(&self) -> usize {
+        256 * 1024
+    }
+    async fn enqueue(
+        &self,
+        job: turul_a2a::durable_executor::QueuedExecutorJob,
+    ) -> Result<(), turul_a2a::durable_executor::QueueError> {
+        self.jobs.lock().unwrap().push(job);
+        Ok(())
+    }
+    fn kind(&self) -> &'static str {
+        "capturing"
+    }
+}
+
+fn return_immediately_send(path: &str, jsonrpc: bool) -> lambda_http::Request {
+    let params = serde_json::json!({
+        "message": {
+            "messageId": uuid::Uuid::now_v7().to_string(),
+            "role": "ROLE_USER",
+            "parts": [{"text": "hello"}],
+        },
+        "configuration": {"returnImmediately": true},
+    });
+    let body = if jsonrpc {
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": params})
+    } else {
+        params
+    };
+    http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
+        .body(lambda_http::Body::Text(body.to_string()))
+        .unwrap()
+}
+
+async fn response_json(
+    handler: &LambdaA2aHandler,
+    req: lambda_http::Request,
+) -> (http::StatusCode, serde_json::Value) {
+    let resp = handler.handle(req).await.expect("handle() must not error");
+    let status = resp.status();
+    let body = match resp.body() {
+        lambda_http::Body::Text(s) => serde_json::from_str(s).unwrap_or_default(),
+        _ => serde_json::Value::Null,
+    };
+    (status, body)
+}
+
+#[tokio::test]
+async fn build_disables_return_immediately_without_durable_executor() {
+    use turul_a2a::server::RuntimeConfig;
+
+    // Even a runtime config asking for the capability is overridden.
+    let mut cfg = RuntimeConfig::default();
+    cfg.supports_return_immediately = true;
+    let handler = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .storage(InMemoryA2aStorage::new())
+        .runtime_config(cfg)
+        .build()
+        .expect("build");
+    assert!(!handler.state.runtime_config.supports_return_immediately);
+
+    // HTTP: 400 with ErrorInfo reason UNSUPPORTED_OPERATION.
+    let (status, body) =
+        response_json(&handler, return_immediately_send("/message:send", false)).await;
+    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body.pointer("/error/details/0/reason")
+            .and_then(|v| v.as_str()),
+        Some("UNSUPPORTED_OPERATION"),
+        "{body}"
+    );
+
+    // JSON-RPC: -32004.
+    let (status, body) = response_json(&handler, return_immediately_send("/jsonrpc", true)).await;
+    assert_eq!(status, http::StatusCode::OK);
+    assert_eq!(
+        body.pointer("/error/code").and_then(|v| v.as_i64()),
+        Some(-32004),
+        "{body}"
+    );
+
+    // Refused before any write.
+    let page = handler
+        .state
+        .task_storage
+        .list_tasks(turul_a2a::storage::TaskFilter {
+            tenant: Some(String::new()),
+            owner: Some("anonymous".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(page.tasks.is_empty());
+}
+
+#[tokio::test]
+async fn build_enables_return_immediately_with_durable_executor() {
+    let queue = std::sync::Arc::new(CapturingQueue {
+        jobs: std::sync::Mutex::new(Vec::new()),
+    });
+    let handler = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .storage(InMemoryA2aStorage::new())
+        .with_durable_executor(queue.clone())
+        .build()
+        .expect("build");
+    assert!(handler.state.runtime_config.supports_return_immediately);
+
+    let (status, body) =
+        response_json(&handler, return_immediately_send("/message:send", false)).await;
+    assert_eq!(status, http::StatusCode::OK, "{body}");
+    assert_eq!(
+        body.pointer("/task/status/state").and_then(|v| v.as_str()),
+        Some("TASK_STATE_WORKING")
+    );
+    let jobs = queue.jobs.lock().unwrap();
+    assert_eq!(jobs.len(), 1, "the turn is enqueued, not run in-process");
+    assert_eq!(
+        Some(jobs[0].task_id.as_str()),
+        body.pointer("/task/id").and_then(|v| v.as_str())
+    );
+}
+
+#[cfg(feature = "sqs")]
+#[test]
+fn with_sqs_return_immediately_enables_the_capability() {
+    // Building an SQS client makes no network call.
+    let config = aws_sdk_sqs::Config::builder()
+        .region(aws_sdk_sqs::config::Region::new("us-east-1"))
+        .behavior_version(aws_sdk_sqs::config::BehaviorVersion::latest())
+        .build();
+    let client = std::sync::Arc::new(aws_sdk_sqs::Client::from_conf(config));
+    let handler = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .storage(InMemoryA2aStorage::new())
+        .with_sqs_return_immediately(
+            "https://sqs.us-east-1.amazonaws.com/000000000000/fake-queue",
+            client,
+        )
+        .build()
+        .expect("build");
+    assert!(handler.state.runtime_config.supports_return_immediately);
+    assert_eq!(
+        handler
+            .state
+            .durable_executor_queue
+            .as_ref()
+            .map(|q| q.kind()),
+        Some("sqs")
+    );
+}

@@ -67,6 +67,8 @@ API Gateway authorizers produce a context (e.g., `{ "userId": "user-123", "tenan
 
 **Trust boundary rule:** The adapter MUST strip any client-supplied `x-authorizer-*` headers from the incoming request before injecting authorizer context. Only data from Lambda's `requestContext.authorizer` is trusted to populate these headers. This prevents spoofing where an external caller sends fake headers to bypass authentication.
 
+What is mapped today (added 2026-10-22): API Gateway v1 — each string field of `requestContext.authorizer`; API Gateway v2 — the JWT authorizer's `jwt.claims`. A v2 Lambda-authorizer context and ALB events inject nothing. Pinned by `adapter::tests::{apigw_v2_jwt_claims_survive_and_forged_headers_are_stripped, apigw_v1_authorizer_context_survives_and_forged_headers_are_stripped, strips_client_supplied_authorizer_headers}`: a legitimate authorizer value reaches the router under its `x-authorizer-*` name even when the client forged the same header, and every other client-sent `x-authorizer-*` header is dropped.
+
 `LambdaAuthorizerMiddleware` (implements `A2aMiddleware`) reads these adapter-injected headers and constructs `AuthIdentity::Authenticated`. This does NOT bypass the auth stack — it IS a registered middleware, same as `BearerMiddleware` or `ApiKeyMiddleware`.
 
 ### Storage: DynamoDB (D1)
@@ -112,3 +114,4 @@ D3 gets its own ADR when prioritized.
 ## Revision log
 
 - 2026-10-22 — `Last-Event-ID` replay removed (ADR-014 §2.3 item 3).
+- 2026-10-22 — Trust boundary: recorded which authorizer sources are mapped and the tests that pin the strip-then-inject order.

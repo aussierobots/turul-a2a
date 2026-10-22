@@ -1,6 +1,6 @@
 # ADR-018: Lambda durable executor continuation via SQS
 
-- **Status:** Accepted
+- **Status:** Accepted, amended 2026-10-22 (see the revision log)
 - **Date:** 2026-04-24
 
 ## Context
@@ -125,7 +125,7 @@ pub struct QueuedExecutorJob {
 4. Call `queue.check_payload_size(&job)`. On `QueueError::PayloadTooLarge` → return `A2aError::InvalidRequest` (HTTP 400 / JSON-RPC -32602 / gRPC `INVALID_ARGUMENT`) with a descriptive error message. **No task is created on this path** — the preflight runs before any storage write.
 5. `create_task_with_events` (Submitted → Working).
 6. Inline push config registration (ADR-017 Bug 2).
-7. `queue.enqueue(job)`. On enqueue failure (storage / transport): FAILED compensation (same shape as ADR-017 Bug 2 inline-push-config storage-failure compensation). Task moves to FAILED with an agent `Message` carrying `"durable executor enqueue failed: <error>"`. No executor is ever spawned. Caller receives the error.
+7. `queue.enqueue(job)`. On enqueue failure (storage / transport): FAILED compensation — the same function as ADR-017 Bug 2's (`fail_unstarted_task`). Task moves to FAILED with an agent `Message` reading exactly `"durable executor enqueue failed: <error>"`. No executor is ever spawned. Caller receives `A2aError::Internal` with that same text.
 8. Return the Working task to the caller.
 
 The HTTP invocation **never** also tokio-spawns the executor locally — double-execute would break idempotency. Enqueue is the sole dispatch path in Pattern B.
@@ -144,7 +144,7 @@ A new `LambdaA2aService::handle_sqs(event: SqsEvent) -> SqsBatchResponse`. For e
    - On `TerminalStateAlreadySet` → success (a racing writer — typically a concurrent cancel-commit from another invocation or an executor that finished on a second delivery — won; the task is terminal, which is what the caller asked for).
    - On other storage error → batch-item failure (retry per the adopter's `MaximumRetryAttempts`).
 5. `run_executor_for_existing_task(deps, scope)` — only reached if the task is non-terminal AND no cancel marker was observed. Synchronously awaits executor completion and post-execute detection. The Lambda invocation *is* the executor; no `tokio::spawn` needed.
-6. On executor error: batch-item failure (SQS retries; DLQ on exhaustion).
+6. On executor error: the post-execute rule commits the task FAILED with `executor error: <error>` and the record is acknowledged. *(Amended 2026-10-22 to what ships. The original text said batch-item failure; but the FAILED commit makes the task terminal, so a redelivery would only reach step 3 and no-op — a retry cannot re-run the executor.)*
 
 Return `SqsBatchResponse { batch_item_failures }` so per-record retry is honoured (matches `lambda-stream-worker` pattern).
 
@@ -251,6 +251,8 @@ lambda_runtime::run(lambda_runtime::service_fn(|event: serde_json::Value| async 
 
 All in `crates/turul-a2a-aws-lambda/tests/` unless noted.
 
+> **Amended 2026-10-22.** Each obligation below is pinned by: envelope round-trip — `crates/turul-a2a/tests/adr018_tests.rs::queued_executor_job_envelope_roundtrip_preserves_claims`, unknown version — `sqs_durable_tests::sqs_unknown_envelope_version_reports_batch_item_failure` (a valid envelope with only `version` changed fails; the unchanged envelope then runs); claims — `adr018_tests::blocking_send_delivers_claims_to_executor` and `sqs_durable_tests::sqs_path_delivers_envelope_claims_to_executor`; oversize — `adr018_tests::oversize_payload_rejected_before_task_creation`; enqueue failure — `adr018_tests::enqueue_failure_compensates_to_failed_with_reason` (exact error body, exact status text, in-flight registry empty); idempotency — `sqs_durable_tests::sqs_same_record_twice_runs_the_executor_once` and `sqs_terminal_task_is_idempotent_noop`; cancelled queued task — `sqs_cancel_marker_commits_canceled_without_executor`; `TerminalStateAlreadySet` race — `sqs_cancel_losing_to_a_concurrent_terminal_is_success`; concurrent duplicate — `sqs_concurrent_duplicate_commits_one_terminal_and_both_succeed`; partial batch — `sqs_mixed_batch_reports_only_the_poison_record`; task not found — `sqs_task_not_found_is_a_batch_item_failure`; executor error — `sqs_executor_error_fails_the_task_and_acknowledges_the_record`; classifier — `classify_event_*`; builder wiring — `crates/turul-a2a-aws-lambda/src/builder_tests.rs::{build_disables_return_immediately_without_durable_executor, build_enables_return_immediately_with_durable_executor, with_sqs_return_immediately_enables_the_capability}`.
+
 - **Envelope round-trip** — `QueuedExecutorJob` serializes and deserializes through `serde_json` with all fields preserved, **including `claims`**; unknown envelope `version` rejects at dequeue.
 - **Claims reach executor on both paths (Phase 1)** — a spy executor records `ctx.claims` on each call. Assert the blocking-send path observes `Some(original_claims)` (fixing the pre-existing `None` bug) AND the SQS-dequeue path observes `Some(original_claims)` after the envelope round-trip. Same assertion, two invocation paths.
 - **Oversize payload does not create task** — construct a `QueuedExecutorJob` whose encoded length exceeds `max_payload_bytes()`; drive the HTTP path; assert (a) response is `A2aError::InvalidRequest` (HTTP 400), (b) `list_tasks` shows zero rows, (c) the fake queue's `enqueue` was never called.
@@ -260,6 +262,8 @@ All in `crates/turul-a2a-aws-lambda/tests/` unless noted.
 - **Cancelled queued task, `TerminalStateAlreadySet` races as success** — set the cancel marker, drive the SQS handler concurrently with a competing terminal commit; assert one writer wins (either CANCELED from the SQS handler or the competing terminal); the SQS handler returns success regardless; no retry, no DLQ.
 - **Concurrent duplicate** — two concurrent SQS invocations of the same record both reach the executor (neither observed the cancel marker); only one terminal commit succeeds; the loser sees `TerminalStateAlreadySet` and returns success.
 - **SQS event handler — partial batch response** — mixed batch with one poison record returns `batch_item_failures` naming only that record.
+- **Task not found** — a record whose task does not exist is a batch-item failure naming that record.
+- **Executor error** — the task ends FAILED with the executor's error text and the record is acknowledged (no batch-item failure).
 - **`LambdaEvent::classify`** — HTTP-shaped event, SQS-shaped event, unknown shape each classify correctly.
 - **Builder wiring** — `with_sqs_return_immediately(...)` sets `runtime_config.supports_return_immediately = true`; `with_durable_executor(fake)` does the same with a mock trait impl; absent call leaves the flag `false`.
 
@@ -312,3 +316,7 @@ No migration for:
   Still additive semver because (a) `core_send_message` is `#[doc(hidden)]`, (b) `ExecutionContext` is `#[non_exhaustive]`, (c) `SpawnScope` is crate-private. The behaviour delta (claims reaching executors where previously they saw `None`) is documented in the 0.1.14 CHANGELOG so adopter executors that branched on `ctx.claims.is_none()` get a warning before upgrade.
 - **Phase 2 — this ADR (minor after Phase 1).** Trait, SQS impl, builder methods, SQS handler, `LambdaEvent` classifier, tests.
 - **Phase 3 — example + docs (follow-on).** `examples/lambda-durable-agent/` demonstrating end-to-end wiring against LocalStack; README updates to the three Lambda example READMEs; CHANGELOG migration note.
+
+## Revision log
+
+- 2026-10-22 — Dequeue step 6 amended to what ships: an executor error commits FAILED and acknowledges the record (a retry would only find the task terminal). Enqueue-failure compensation shares one function with ADR-017's inline-push-config compensation. Test obligations: added task-not-found and executor-error cases and mapped every obligation to the test that pins it.

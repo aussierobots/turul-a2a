@@ -20,13 +20,11 @@
 /// `lambda_runtime::run<serde_json::Value>` service function and
 /// dispatch each arm. The framework's own [`LambdaA2aHandler::run`],
 /// [`LambdaA2aHandler::run_http_only`],
-/// [`LambdaA2aHandler::run_http_and_sqs`], and
-/// [`LambdaA2aHandler::run_sqs_only`] use this internally.
+/// `LambdaA2aHandler::run_http_and_sqs`, and
+/// `LambdaA2aHandler::run_sqs_only` use this internally.
 ///
 /// [`LambdaA2aHandler::run`]: crate::LambdaA2aHandler::run
 /// [`LambdaA2aHandler::run_http_only`]: crate::LambdaA2aHandler::run_http_only
-/// [`LambdaA2aHandler::run_http_and_sqs`]: crate::LambdaA2aHandler::run_http_and_sqs
-/// [`LambdaA2aHandler::run_sqs_only`]: crate::LambdaA2aHandler::run_sqs_only
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LambdaEvent {
     /// HTTP event (API Gateway REST, HTTP API, Function URL, ALB).

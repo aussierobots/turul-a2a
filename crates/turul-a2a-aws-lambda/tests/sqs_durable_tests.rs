@@ -3,12 +3,19 @@
 //! Covers:
 //! - `classify_event` routes HTTP / SQS / unknown shapes correctly.
 //! - `handle_sqs` / `drive_sqs_batch` contract:
-//!     - terminal task → idempotent no-op success.
+//!     - terminal task → idempotent no-op success; the same record
+//!       delivered twice runs the executor once.
 //!     - cancel marker set → CANCELED committed directly, executor
-//!       never invoked, `TerminalStateAlreadySet` also returns success.
-//!     - non-terminal + no cancel → executor runs to Completed.
-//!     - poison record (malformed body / unknown version) → reported
-//!       as a batch-item failure.
+//!       never invoked; losing the CANCELED commit to a concurrent
+//!       terminal (`TerminalStateAlreadySet`) is still success.
+//!     - non-terminal + no cancel → executor runs to Completed, seeing
+//!       the envelope's claims.
+//!     - two concurrent deliveries of one record: both run, one
+//!       terminal commit wins, both succeed.
+//!     - executor error → task FAILED with the error text; the record
+//!       is acknowledged (a retry would find the task terminal).
+//!     - task not found, malformed body, unknown envelope version →
+//!       batch-item failure naming only that record.
 //! - `SqsDurableExecutorQueue::max_payload_bytes == 256 * 1024`.
 
 #![cfg(feature = "sqs")]
@@ -133,14 +140,59 @@ async fn seed_task(
     context_id
 }
 
-fn sqs_event_with_body(body: String) -> SqsEvent {
+fn sqs_record(message_id: &str, body: String) -> SqsMessage {
     let mut msg = SqsMessage::default();
-    msg.message_id = Some(uuid::Uuid::now_v7().to_string());
+    msg.message_id = Some(message_id.into());
     msg.body = Some(body);
     msg.event_source = Some("aws:sqs".into());
+    msg
+}
+
+fn sqs_event(records: Vec<SqsMessage>) -> SqsEvent {
     let mut event = SqsEvent::default();
-    event.records = vec![msg];
+    event.records = records;
     event
+}
+
+fn sqs_event_with_body(body: String) -> SqsEvent {
+    sqs_event(vec![sqs_record(&uuid::Uuid::now_v7().to_string(), body)])
+}
+
+fn failed_ids(resp: &aws_lambda_events::event::sqs::SqsBatchResponse) -> Vec<String> {
+    resp.batch_item_failures
+        .iter()
+        .map(|f| f.item_identifier.clone())
+        .collect()
+}
+
+async fn task_state(storage: &InMemoryA2aStorage, owner: &str, task_id: &str) -> TaskState {
+    storage
+        .get_task("", task_id, owner, None)
+        .await
+        .unwrap()
+        .expect("task")
+        .status()
+        .unwrap()
+        .state()
+        .unwrap()
+}
+
+fn status_text(task: &Task) -> String {
+    task.status()
+        .unwrap()
+        .as_proto()
+        .message
+        .as_ref()
+        .map(|m| {
+            m.parts
+                .iter()
+                .filter_map(|p| match &p.content {
+                    Some(turul_a2a_proto::part::Content::Text(t)) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        })
+        .unwrap_or_default()
 }
 
 fn job_for(tenant: &str, owner: &str, task_id: &str, context_id: &str) -> QueuedExecutorJob {
@@ -342,28 +394,340 @@ async fn sqs_non_terminal_no_cancel_runs_executor_to_completion() {
 #[tokio::test]
 async fn sqs_unknown_envelope_version_reports_batch_item_failure() {
     let (executor, invocations) = SpyExecutor::new();
-    let (state, _storage) = state_with_executor(executor);
+    let (state, storage) = state_with_executor(executor);
+    let owner = "alice";
+    let task_id = "task-version";
+    let context_id = seed_task(&storage, "", owner, task_id).await;
 
-    // Envelope with version=999 (future / unknown).
-    let body = serde_json::json!({
-        "version": 999,
-        "tenant": "",
-        "owner": "alice",
-        "taskId": "t",
-        "contextId": "c",
-        "message": {},
-        "claims": null,
-        "enqueuedAtMicros": 0,
-    });
-    // Note: the envelope uses serde default field names — need camelCase
-    // keys matching QueuedExecutorJob's default Serialize layout.
-    let body_str = serde_json::to_string(&body).unwrap();
+    // A valid envelope for a runnable task, with only the version
+    // changed.
+    let job = job_for("", owner, task_id, &context_id);
+    let mut tampered = serde_json::to_value(&job).unwrap();
+    tampered["version"] = serde_json::Value::from(QueuedExecutorJob::VERSION + 1);
 
-    let resp = drive_sqs_batch(&state, sqs_event_with_body(body_str)).await;
-    // Either: deserialise fails (wrong shape) OR deserialise succeeds
-    // and version check fails. Both produce a batch-item failure.
-    assert_eq!(resp.batch_item_failures.len(), 1);
+    let resp = drive_sqs_batch(
+        &state,
+        sqs_event(vec![sqs_record("rec-future", tampered.to_string())]),
+    )
+    .await;
+    assert_eq!(failed_ids(&resp), vec!["rec-future".to_string()]);
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        task_state(&storage, owner, task_id).await,
+        TaskState::Working
+    );
+
+    // The untouched envelope is accepted — the version was the only
+    // difference.
+    let resp = drive_sqs_batch(
+        &state,
+        sqs_event(vec![sqs_record(
+            "rec-current",
+            serde_json::to_string(&job).unwrap(),
+        )]),
+    )
+    .await;
+    assert!(failed_ids(&resp).is_empty());
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn sqs_same_record_twice_runs_the_executor_once() {
+    let (executor, invocations) = SpyExecutor::new();
+    let (state, storage) = state_with_executor(executor);
+    let owner = "alice";
+    let task_id = "task-redelivered";
+    let context_id = seed_task(&storage, "", owner, task_id).await;
+    let body = serde_json::to_string(&job_for("", owner, task_id, &context_id)).unwrap();
+
+    for _ in 0..2 {
+        let resp =
+            drive_sqs_batch(&state, sqs_event(vec![sqs_record("rec-1", body.clone())])).await;
+        assert!(failed_ids(&resp).is_empty());
+    }
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        task_state(&storage, owner, task_id).await,
+        TaskState::Completed
+    );
+}
+
+/// Records the claims the executor observes, then completes.
+struct ClaimsSpyExecutor {
+    seen: std::sync::Mutex<Option<serde_json::Value>>,
+}
+
+#[async_trait]
+impl AgentExecutor for ClaimsSpyExecutor {
+    async fn execute(
+        &self,
+        task: &mut Task,
+        _msg: &Message,
+        ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        *self.seen.lock().unwrap() = ctx.claims.clone();
+        let mut proto = task.as_proto().clone();
+        proto.status = Some(turul_a2a_proto::TaskStatus {
+            state: turul_a2a_proto::TaskState::Completed.into(),
+            message: None,
+            timestamp: None,
+        });
+        *task = Task::try_from(proto).unwrap();
+        Ok(())
+    }
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        turul_a2a_proto::AgentCard::default()
+    }
+}
+
+#[tokio::test]
+async fn sqs_path_delivers_envelope_claims_to_executor() {
+    let executor = Arc::new(ClaimsSpyExecutor {
+        seen: std::sync::Mutex::new(None),
+    });
+    let (state, storage) = state_with_executor(executor.clone());
+    let owner = "alice";
+    let task_id = "task-claims";
+    let context_id = seed_task(&storage, "", owner, task_id).await;
+    let claims = serde_json::json!({"sub": "alice", "scope": "a2a:write"});
+    let mut job = job_for("", owner, task_id, &context_id);
+    job.claims = Some(claims.clone());
+
+    let resp = drive_sqs_batch(
+        &state,
+        sqs_event_with_body(serde_json::to_string(&job).unwrap()),
+    )
+    .await;
+    assert!(failed_ids(&resp).is_empty());
+    assert_eq!(*executor.seen.lock().unwrap(), Some(claims));
+}
+
+#[tokio::test]
+async fn sqs_task_not_found_is_a_batch_item_failure() {
+    let (executor, invocations) = SpyExecutor::new();
+    let (state, _storage) = state_with_executor(executor);
+    let body = serde_json::to_string(&job_for("", "alice", "task-missing", "ctx")).unwrap();
+    let resp = drive_sqs_batch(&state, sqs_event(vec![sqs_record("rec-missing", body)])).await;
+    assert_eq!(failed_ids(&resp), vec!["rec-missing".to_string()]);
+    assert_eq!(invocations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn sqs_mixed_batch_reports_only_the_poison_record() {
+    let (executor, invocations) = SpyExecutor::new();
+    let (state, storage) = state_with_executor(executor);
+    let owner = "alice";
+    let task_id = "task-good";
+    let context_id = seed_task(&storage, "", owner, task_id).await;
+    let good = serde_json::to_string(&job_for("", owner, task_id, &context_id)).unwrap();
+
+    let resp = drive_sqs_batch(
+        &state,
+        sqs_event(vec![
+            sqs_record("rec-good", good),
+            sqs_record("rec-poison", "{not json".into()),
+        ]),
+    )
+    .await;
+    assert_eq!(failed_ids(&resp), vec!["rec-poison".to_string()]);
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        task_state(&storage, owner, task_id).await,
+        TaskState::Completed
+    );
+}
+
+struct FailingExecutor;
+
+#[async_trait]
+impl AgentExecutor for FailingExecutor {
+    async fn execute(
+        &self,
+        _task: &mut Task,
+        _msg: &Message,
+        _ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        Err(A2aError::Internal("model backend unavailable".into()))
+    }
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        turul_a2a_proto::AgentCard::default()
+    }
+}
+
+/// An executor error is committed as the task's FAILED terminal and
+/// the record is acknowledged: a redelivery would only find the task
+/// terminal and do nothing.
+#[tokio::test]
+async fn sqs_executor_error_fails_the_task_and_acknowledges_the_record() {
+    let (state, storage) = state_with_executor(Arc::new(FailingExecutor));
+    let owner = "alice";
+    let task_id = "task-exec-error";
+    let context_id = seed_task(&storage, "", owner, task_id).await;
+    let body = serde_json::to_string(&job_for("", owner, task_id, &context_id)).unwrap();
+
+    let resp = drive_sqs_batch(&state, sqs_event(vec![sqs_record("rec-err", body)])).await;
+    assert!(failed_ids(&resp).is_empty());
+    let task = storage
+        .get_task("", task_id, owner, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Failed);
+    assert_eq!(
+        status_text(&task),
+        "executor error: Internal error: model backend unavailable"
+    );
+}
+
+/// Atomic store whose CANCELED commit loses a race: a competing writer
+/// commits COMPLETED first, so the CANCELED write meets a terminal task.
+struct CompletedWinsRaceStore {
+    inner: Arc<InMemoryA2aStorage>,
+}
+
+#[async_trait]
+impl turul_a2a::storage::A2aAtomicStore for CompletedWinsRaceStore {
+    fn backend_name(&self) -> &'static str {
+        turul_a2a::storage::A2aAtomicStore::backend_name(self.inner.as_ref())
+    }
+    async fn create_task_with_events(
+        &self,
+        tenant: &str,
+        owner: &str,
+        task: Task,
+        events: Vec<turul_a2a::streaming::StreamEvent>,
+    ) -> Result<(Task, Vec<u64>), turul_a2a::storage::A2aStorageError> {
+        self.inner
+            .create_task_with_events(tenant, owner, task, events)
+            .await
+    }
+    async fn update_task_status_with_events(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        owner: &str,
+        new_status: TaskStatus,
+        events: Vec<turul_a2a::streaming::StreamEvent>,
+    ) -> Result<(Task, Vec<u64>), turul_a2a::storage::A2aStorageError> {
+        if new_status.state().ok() == Some(TaskState::Canceled) {
+            let completed = TaskStatus::new(TaskState::Completed);
+            let event = turul_a2a::streaming::StreamEvent::StatusUpdate {
+                status_update: turul_a2a::streaming::StatusUpdatePayload {
+                    task_id: task_id.into(),
+                    context_id: String::new(),
+                    status: serde_json::to_value(&completed).unwrap(),
+                },
+            };
+            self.inner
+                .update_task_status_with_events(tenant, task_id, owner, completed, vec![event])
+                .await?;
+        }
+        self.inner
+            .update_task_status_with_events(tenant, task_id, owner, new_status, events)
+            .await
+    }
+    async fn update_task_with_events(
+        &self,
+        tenant: &str,
+        owner: &str,
+        task: Task,
+        events: Vec<turul_a2a::streaming::StreamEvent>,
+    ) -> Result<Vec<u64>, turul_a2a::storage::A2aStorageError> {
+        self.inner
+            .update_task_with_events(tenant, owner, task, events)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn sqs_cancel_losing_to_a_concurrent_terminal_is_success() {
+    let (executor, invocations) = SpyExecutor::new();
+    let (mut state, storage) = state_with_executor(executor);
+    state.atomic_store = Arc::new(CompletedWinsRaceStore {
+        inner: storage.clone(),
+    });
+    let owner = "alice";
+    let task_id = "task-cancel-race";
+    let context_id = seed_task(&storage, "", owner, task_id).await;
+    storage
+        .set_cancel_requested("", task_id, owner)
+        .await
+        .unwrap();
+
+    let body = serde_json::to_string(&job_for("", owner, task_id, &context_id)).unwrap();
+    let resp = drive_sqs_batch(&state, sqs_event(vec![sqs_record("rec-race", body)])).await;
+    assert!(failed_ids(&resp).is_empty(), "no retry, no DLQ");
+    assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        task_state(&storage, owner, task_id).await,
+        TaskState::Completed,
+        "the competing terminal stands"
+    );
+}
+
+/// Waits until both concurrent deliveries are inside `execute`, then
+/// completes; so both invocations load the task while it is WORKING.
+struct RendezvousExecutor {
+    barrier: tokio::sync::Barrier,
+    invocations: AtomicUsize,
+}
+
+#[async_trait]
+impl AgentExecutor for RendezvousExecutor {
+    async fn execute(
+        &self,
+        task: &mut Task,
+        _msg: &Message,
+        _ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        self.invocations.fetch_add(1, Ordering::SeqCst);
+        self.barrier.wait().await;
+        let mut proto = task.as_proto().clone();
+        proto.status = Some(turul_a2a_proto::TaskStatus {
+            state: turul_a2a_proto::TaskState::Completed.into(),
+            message: None,
+            timestamp: None,
+        });
+        *task = Task::try_from(proto).unwrap();
+        Ok(())
+    }
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        turul_a2a_proto::AgentCard::default()
+    }
+}
+
+#[tokio::test]
+async fn sqs_concurrent_duplicate_commits_one_terminal_and_both_succeed() {
+    let executor = Arc::new(RendezvousExecutor {
+        barrier: tokio::sync::Barrier::new(2),
+        invocations: AtomicUsize::new(0),
+    });
+    let (state, storage) = state_with_executor(executor.clone());
+    let owner = "alice";
+    let task_id = "task-dup";
+    let context_id = seed_task(&storage, "", owner, task_id).await;
+    let body = serde_json::to_string(&job_for("", owner, task_id, &context_id)).unwrap();
+
+    let (a, b) = tokio::join!(
+        drive_sqs_batch(&state, sqs_event(vec![sqs_record("rec-a", body.clone())])),
+        drive_sqs_batch(&state, sqs_event(vec![sqs_record("rec-b", body.clone())])),
+    );
+    assert!(failed_ids(&a).is_empty() && failed_ids(&b).is_empty());
+    assert_eq!(executor.invocations.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        task_state(&storage, owner, task_id).await,
+        TaskState::Completed
+    );
+
+    use turul_a2a::storage::A2aEventStore;
+    let terminal_events = storage
+        .get_events_after("", task_id, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|(_, e)| e.is_terminal())
+        .count();
+    assert_eq!(terminal_events, 1, "exactly one terminal commit wins");
 }
 
 // ---------------------------------------------------------------------------

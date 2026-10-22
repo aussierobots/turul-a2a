@@ -6,13 +6,14 @@
 //! - Claims thread through to the executor on BOTH the blocking-send
 //!   path and the durable-queue path.
 //! - Oversize payload does not create a task (preflight).
-//! - Enqueue-failure compensates to FAILED with reason message.
-//! - Cancelled queued task: `supervisor_get_cancel_requested == true`
-//!   → CANCELED committed directly, executor never invoked.
-//! - Concurrent cancel + terminal race: `TerminalStateAlreadySet`
-//!   returned as success (the record is deleted, no retry).
+//! - Enqueue-failure compensates to FAILED with reason message and
+//!   returns the enqueue error; no executor is registered.
 //! - Pending-dispatch marker write is skipped when zero push configs
 //!   are registered for the task.
+//! - Message text, task id and context id survive enqueue → dequeue.
+//!
+//! The SQS dequeue contract (cancel marker, races, duplicates, batch
+//! failures) is tested in the Lambda crate, `tests/sqs_durable_tests.rs`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -350,6 +351,7 @@ async fn enqueue_failure_compensates_to_failed_with_reason() {
     let (executor, invocations, _claims) = ClaimsObservingExecutor::new();
     let state = state_with_queue(executor, queue);
     let task_storage = state.task_storage.clone();
+    let in_flight = state.in_flight.clone();
     let router = build_router(state);
 
     let req = Request::post("/message:send")
@@ -357,8 +359,14 @@ async fn enqueue_failure_compensates_to_failed_with_reason() {
         .header("a2a-version", "1.0")
         .body(Body::from(send_body(true)))
         .unwrap();
-    let (status, _) = json_response(router, req).await;
-    assert!(status >= 400, "enqueue failure must surface as error");
+    let (status, body) = json_response(router, req).await;
+    let reason = format!(
+        "durable executor enqueue failed: {}",
+        QueueError::Transport("simulated transport failure".into())
+    );
+    let expected = A2aError::Internal(reason.clone());
+    assert_eq!(status, expected.http_status(), "{body}");
+    assert_eq!(body, expected.to_http_error_body());
 
     let page = task_storage
         .list_tasks(turul_a2a::storage::TaskFilter {
@@ -388,23 +396,21 @@ async fn enqueue_failure_compensates_to_failed_with_reason() {
             _ => None,
         })
         .collect::<String>();
-    assert!(
-        text.contains("durable executor enqueue failed"),
-        "reason message must name the failure; got {text:?}"
-    );
+    assert_eq!(text, reason, "the FAILED status message carries the reason");
 
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    assert_eq!(in_flight.len(), 0, "no executor was registered");
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1 claims plumbing — executor sees Some(claims) on blocking send
+// Claims plumbing — executor sees Some(claims) on blocking send
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn blocking_send_delivers_claims_to_executor() {
     // Use `core_send_message` directly so we can pass claims explicitly
     // (the HTTP path would require a live auth middleware + JWT, which
-    // is overkill for this Phase 1 assertion).
+    // is overkill for this assertion).
     let (executor, invocations, last_claims) = ClaimsObservingExecutor::new();
     let state = base_state(executor);
     let claims_in = Some(serde_json::json!({"sub": "alice", "scope": "read"}));
@@ -429,7 +435,7 @@ async fn blocking_send_delivers_claims_to_executor() {
 }
 
 // ---------------------------------------------------------------------------
-// Pending-dispatch optimization (task 45)
+// Pending-dispatch marker skipped without push configs
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

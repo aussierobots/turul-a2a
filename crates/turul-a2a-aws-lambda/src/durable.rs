@@ -217,7 +217,7 @@ async fn drive_sqs_record(state: &AppState, record: SqsMessage) -> Result<(), St
                     item = %identifier,
                     tenant = %job.tenant,
                     task_id = %job.task_id,
-                    "ADR-018: canceled before dispatch — CANCELED committed, executor never invoked"
+                    "canceled before dispatch — CANCELED committed, executor never invoked"
                 );
                 state.event_broker.notify(&job.task_id).await;
                 return Ok(());
@@ -233,7 +233,7 @@ async fn drive_sqs_record(state: &AppState, record: SqsMessage) -> Result<(), St
                 tracing::error!(
                     item = %identifier,
                     error = %e,
-                    "ADR-018 canceled compensation failed; batch-item retry"
+                    "CANCELED commit before dispatch failed; batch-item retry"
                 );
                 return Err(identifier);
             }
