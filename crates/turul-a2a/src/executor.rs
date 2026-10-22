@@ -40,6 +40,17 @@ pub struct ExecutionContext {
     /// up a server can use it as-is; they simply cannot drive durable
     /// lifecycle events without real storage.
     pub events: EventSink,
+    /// `SendMessageConfiguration.accepted_output_modes` from the request
+    /// that started this execution: the media types the client is
+    /// prepared to accept for response parts (a2a.proto
+    /// `SendMessageConfiguration`, "Agents SHOULD use this to tailor
+    /// their output"). Empty when the client sent none.
+    pub accepted_output_modes: Vec<String>,
+    /// `SendMessageRequest.metadata` from the request that started this
+    /// execution, as a JSON object. Distinct from `Message.metadata`,
+    /// which the executor reads from the message itself. `None` when the
+    /// client sent none.
+    pub request_metadata: Option<serde_json::Value>,
 }
 
 impl ExecutionContext {
@@ -61,6 +72,8 @@ impl ExecutionContext {
             claims: None,
             cancellation: CancellationToken::new(),
             events: EventSink::detached(),
+            accepted_output_modes: Vec::new(),
+            request_metadata: None,
         }
     }
 }

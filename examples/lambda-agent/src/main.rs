@@ -72,6 +72,10 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     // Set it to the Function URL / API Gateway endpoint for this Lambda.
     let public_url = public_url_or_warn();
 
+    lambda_builder(public_url).run().await
+}
+
+fn lambda_builder(public_url: String) -> LambdaA2aServerBuilder {
     LambdaA2aServerBuilder::new()
         .executor(LambdaEchoExecutor { public_url })
         // Demo: in-memory storage, no push-notification delivery. If
@@ -81,8 +85,6 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         // `with_push_dispatch_enabled(true)` flag on the storage. The
         // builder rejects mismatched combinations.
         .storage(InMemoryA2aStorage::new())
-        .run()
-        .await
 }
 
 fn public_url_or_warn() -> String {
@@ -95,5 +97,57 @@ fn public_url_or_warn() -> String {
             );
             "https://lambda.invalid".to_string()
         }
+    }
+}
+
+/// The handler `main` runs, built and driven in process with Lambda
+/// HTTP requests (no Lambda runtime, no network).
+#[cfg(test)]
+mod tests {
+    use lambda_http::Body;
+
+    fn request(method: &str, uri: &str, body: &str) -> lambda_http::Request {
+        lambda_http::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("a2a-version", "1.0")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn json(resp: &lambda_http::Response<Body>) -> serde_json::Value {
+        serde_json::from_slice(resp.body().as_ref()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn handler_serves_card_with_public_url_and_completes_send() {
+        let handler = super::lambda_builder("https://agent.example".into())
+            .build()
+            .expect("handler builds");
+
+        let resp = handler
+            .handle(request("GET", "/.well-known/agent-card.json", ""))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let card = json(&resp);
+        assert_eq!(
+            card["supportedInterfaces"][0]["url"],
+            "https://agent.example"
+        );
+
+        let send = r#"{"message":{"messageId":"m-1","role":"ROLE_USER","parts":[{"text":"hi"}]}}"#;
+        let resp = handler
+            .handle(request("POST", "/message:send", send))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = json(&resp);
+        assert_eq!(body["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+        assert_eq!(
+            body["task"]["artifacts"][0]["parts"][0]["text"],
+            "Hello from Lambda!"
+        );
     }
 }

@@ -25,20 +25,17 @@ use turul_a2a::card_builder::AgentCardBuilder;
 use turul_a2a::error::A2aError;
 use turul_a2a::event_sink::EventSink;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
-use turul_a2a::profiles::SKILL_INVOCATION_PROFILE_V1;
+use turul_a2a::profiles::{
+    SKILL_ID_METADATA_KEY, SKILL_INVOCATION_PROFILE_V1, SKILL_PARAMS_METADATA_KEY,
+};
 use turul_a2a_patterns::{
     InMemorySkillRegistry, ProgressState, SinkError, SkillCard, SkillError, SkillHandler,
     SkillProgressSink, SkillRegistry,
 };
-use turul_a2a_types::pbjson::{struct_to_json_object, value_to_json};
+use turul_a2a_types::pbjson::value_to_json;
 use turul_a2a_types::{Artifact, Message, Part, Task};
 
 const DEFAULT_BIND_PORT: u16 = 3015;
-
-/// Reserved metadata key holding the target `AgentSkill.id`.
-const META_SKILL_ID: &str = "a2a.skillId";
-/// Reserved metadata key holding the structured parameter object.
-const META_SKILL_PARAMS: &str = "a2a.skillParams";
 
 // Manifests embedded so the binary is self-contained; the source files
 // under `skills/<id>/SKILL.md` are the canonical reference for adopters.
@@ -248,8 +245,8 @@ impl DispatcherExecutor {
 
 /// Inspect `Message.metadata` for the two reserved profile keys and
 /// return `(skill_id, params)`. Returns `None` for `skill_id` if the key
-/// is absent (the caller treats this as "profile not activated /
-/// missing dispatch intent" and fails the task explanatorily).
+/// is absent (the caller treats this as "profile not activated" and
+/// fails the task explanatorily).
 ///
 /// `a2a.skillParams` is optional; absence is mapped to an empty object so
 /// downstream schema validation still has a well-formed input to check.
@@ -260,13 +257,13 @@ fn extract_dispatch_payload(message: &Message) -> (Option<String>, Value) {
 
     let skill_id = metadata
         .fields
-        .get(META_SKILL_ID)
+        .get(SKILL_ID_METADATA_KEY)
         .map(|v| value_to_json(v.clone()))
         .and_then(|v| v.as_str().map(str::to_string));
 
     let params = metadata
         .fields
-        .get(META_SKILL_PARAMS)
+        .get(SKILL_PARAMS_METADATA_KEY)
         .map(|v| value_to_json(v.clone()))
         .unwrap_or_else(|| json!({}));
 
@@ -284,15 +281,17 @@ impl AgentExecutor for DispatcherExecutor {
         let (skill_id, params) = extract_dispatch_payload(message);
 
         let Some(skill_id) = skill_id else {
-            // Profile not activated, or activated but missing the required
-            // key. We surface this as a Failed task with an explanatory
-            // message — adopters can swap this for InvalidParamsError if
-            // they prefer a hard-reject contract.
+            // No `a2a.skillId`: the un-targeted path. The executor cannot
+            // see whether the client sent the activation header, so it
+            // routes on metadata alone. A client that did activate the
+            // profile without `a2a.skillId` never reaches here — the
+            // framework rejects that request as InvalidParams first.
+            // Fail the task with guidance.
             let metadata_keys = message.metadata_keys();
             task.fail(format!(
-                "Skill dispatch requires Message.metadata[\"{META_SKILL_ID}\"] (string). \
+                "Skill dispatch requires Message.metadata[\"{SKILL_ID_METADATA_KEY}\"] (string). \
                  Send the request with header `A2A-Extensions: {SKILL_INVOCATION_PROFILE_V1}` \
-                 and set the skill id in `metadata` (and inputs in `{META_SKILL_PARAMS}`). \
+                 and set the skill id in `metadata` (and inputs in `{SKILL_PARAMS_METADATA_KEY}`). \
                  Observed metadata keys: {metadata_keys:?}."
             ));
             return Ok(());
@@ -371,15 +370,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Silence dead_code on `struct_to_json_object` import if the future
-// reads-by-key path is removed. Imported for adopter discoverability
-// from `turul_a2a_types::pbjson`.
-#[allow(dead_code)]
-fn _force_pbjson_import_visibility() -> usize {
-    let _ = struct_to_json_object;
-    0
-}
-
 // ---------------------------------------------------------------------------
 // Unit tests for the dispatch metadata extractor.
 // ---------------------------------------------------------------------------
@@ -421,8 +411,11 @@ mod unit {
     #[test]
     fn extract_reads_skill_id_and_params() {
         let mut meta = HashMap::new();
-        meta.insert(META_SKILL_ID.to_string(), json!("echo_loud"));
-        meta.insert(META_SKILL_PARAMS.to_string(), json!({ "text": "hi" }));
+        meta.insert(SKILL_ID_METADATA_KEY.to_string(), json!("echo_loud"));
+        meta.insert(
+            SKILL_PARAMS_METADATA_KEY.to_string(),
+            json!({ "text": "hi" }),
+        );
         let msg = message_with_metadata(meta);
         let (id, params) = extract_dispatch_payload(&msg);
         assert_eq!(id.as_deref(), Some("echo_loud"));
@@ -432,7 +425,7 @@ mod unit {
     #[test]
     fn extract_params_default_empty_object_when_absent() {
         let mut meta = HashMap::new();
-        meta.insert(META_SKILL_ID.to_string(), json!("reverse"));
+        meta.insert(SKILL_ID_METADATA_KEY.to_string(), json!("reverse"));
         let msg = message_with_metadata(meta);
         let (id, params) = extract_dispatch_payload(&msg);
         assert_eq!(id.as_deref(), Some("reverse"));

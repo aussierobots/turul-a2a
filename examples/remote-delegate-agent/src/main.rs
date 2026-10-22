@@ -34,6 +34,7 @@ use turul_a2a::A2aServer;
 use turul_a2a::card_builder::AgentCardBuilder;
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
+use turul_a2a::profiles::{SKILL_ID_METADATA_KEY, SKILL_INVOCATION_PROFILE_V1};
 use turul_a2a_client::response::SendResponse;
 use turul_a2a_client::{A2aClient, A2aClientError, ClientAuth};
 use turul_a2a_proto as pb;
@@ -53,6 +54,33 @@ struct RemoteDelegateExecutor {
     local_card: pb::AgentCard,
     upstream_card: pb::AgentCard,
     timeout: Duration,
+}
+
+/// Extension URIs to activate on the upstream call for this message.
+///
+/// Activation is the `A2A-Extensions` request header, not
+/// `Message.extensions` (that field only attributes extensions present
+/// in the message). The delegate is the upstream's client, so it
+/// activates the skill-invocation profile itself whenever the message
+/// it forwards carries `a2a.skillId` routing metadata and the upstream
+/// advertises the profile. The header is what makes the upstream
+/// framework apply the profile (echo, request-shape check, and any
+/// required-extension rejection); whether the upstream executor also
+/// routes without it is that agent's choice.
+fn upstream_activations(message: &Message, upstream_card: &pb::AgentCard) -> Vec<String> {
+    let targets_skill = message
+        .metadata()
+        .is_some_and(|m| m.fields.contains_key(SKILL_ID_METADATA_KEY));
+    let upstream_advertises = upstream_card.capabilities.as_ref().is_some_and(|c| {
+        c.extensions
+            .iter()
+            .any(|e| e.uri == SKILL_INVOCATION_PROFILE_V1)
+    });
+    if targets_skill && upstream_advertises {
+        vec![SKILL_INVOCATION_PROFILE_V1.to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 impl RemoteDelegateExecutor {
@@ -124,12 +152,20 @@ impl AgentExecutor for RemoteDelegateExecutor {
         ctx: &ExecutionContext,
     ) -> Result<(), A2aError> {
         let outbound = build_outbound_request(message);
+        let activations = upstream_activations(message, &self.upstream_card);
+        // `A2aClient` is cheap to clone (the HTTP pool is shared); the
+        // per-call clone carries this message's extension activations.
+        let client = if activations.is_empty() {
+            self.client.as_ref().clone()
+        } else {
+            self.client.as_ref().clone().with_extensions(activations)
+        };
 
         // The A2aClient already carries an internal HTTP timeout, but we
         // wrap with tokio::time::timeout so the deadline applies even if
         // the underlying client's timeout configuration changes shape.
         let send_result =
-            tokio::time::timeout(self.timeout, self.client.send_message_proto(outbound)).await;
+            tokio::time::timeout(self.timeout, client.send_message_proto(outbound)).await;
 
         let proto_resp = match send_result {
             Ok(Ok(resp)) => resp,
@@ -210,9 +246,10 @@ impl AgentExecutor for RemoteDelegateExecutor {
 //   - context_id and task_id are NOT forwarded; the upstream call is a
 //     fresh conversation from the upstream's perspective. Trade-off: the
 //     upstream cannot correlate the delegate's tasks across calls.
-//   - metadata and extensions are forwarded intact so the skill-dispatch
-//     profile (and any other A2A extension) keeps working through the
-//     delegate.
+//   - metadata is forwarded intact, so skill-dispatch routing keys
+//     (`a2a.skillId` / `a2a.skillParams`) reach the upstream.
+//   - extensions (attribution only) are forwarded intact. Activation is
+//     the A2A-Extensions header, set per call by `upstream_activations`.
 //   - role and parts are copied verbatim.
 // ---------------------------------------------------------------------------
 
@@ -393,70 +430,78 @@ mod unit {
         assert_eq!(outbound.task_id, "");
     }
 
-    #[test]
-    fn outbound_preserves_metadata_for_profile_dispatch() {
-        // Build an inbound message carrying the skill-dispatch profile
-        // metadata so the delegate can forward routing intent.
-        let metadata_struct = {
-            use std::collections::HashMap;
-            let mut fields = HashMap::new();
-            fields.insert("a2a.skillId".to_string(), pbjson_types_value("echo_loud"));
-            fields.insert(
-                "a2a.skillParams".to_string(),
-                pbjson_types_value_json(json!({"text": "hi"})),
-            );
-            pb::pbjson_types::Struct { fields }
-        };
-        let mut inbound_proto = pb::Message {
+    /// An inbound message with skill-dispatch routing metadata and an
+    /// attribution entry in `Message.extensions`.
+    fn skill_targeted_message() -> Message {
+        let metadata = turul_a2a_types::pbjson::json_object_to_struct(
+            [
+                (SKILL_ID_METADATA_KEY.to_string(), json!("echo_loud")),
+                ("a2a.skillParams".to_string(), json!({"text": "hi"})),
+            ]
+            .into(),
+        );
+        Message::try_from(pb::Message {
             message_id: "in-1".into(),
-            context_id: String::new(),
-            task_id: String::new(),
             role: pb::Role::User as i32,
-            parts: vec![],
-            metadata: Some(metadata_struct.clone()),
-            extensions: vec!["https://turul.dev/a2a/extensions/skill-invocation/v1".into()],
-            reference_task_ids: vec![],
-        };
-        // Round-trip through the wrapper so the test exercises the same
-        // path the executor uses.
-        let inbound = Message::try_from(std::mem::take(&mut inbound_proto)).unwrap();
+            metadata: Some(metadata),
+            extensions: vec![SKILL_INVOCATION_PROFILE_V1.into()],
+            ..Default::default()
+        })
+        .unwrap()
+    }
 
-        let req = build_outbound_request(&inbound);
-        let outbound = req.message.expect("outbound message present");
+    fn upstream_card(advertised: &[&str]) -> pb::AgentCard {
+        pb::AgentCard {
+            capabilities: Some(pb::AgentCapabilities {
+                extensions: advertised
+                    .iter()
+                    .map(|uri| pb::AgentExtension {
+                        uri: (*uri).to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
 
-        assert_eq!(outbound.metadata.as_ref(), Some(&metadata_struct));
+    /// The routing metadata and the attribution list are copied to the
+    /// outbound message unchanged. Neither activates anything upstream.
+    #[test]
+    fn outbound_preserves_metadata_and_attribution_extensions() {
+        let inbound = skill_targeted_message();
+        let outbound = build_outbound_request(&inbound)
+            .message
+            .expect("outbound message present");
+
+        assert_eq!(outbound.metadata.as_ref(), inbound.metadata());
         assert_eq!(
             outbound.extensions,
-            vec!["https://turul.dev/a2a/extensions/skill-invocation/v1".to_string()]
+            vec![SKILL_INVOCATION_PROFILE_V1.to_string()]
         );
     }
 
-    fn pbjson_types_value(s: &str) -> pb::pbjson_types::Value {
-        pb::pbjson_types::Value {
-            kind: Some(pb::pbjson_types::value::Kind::StringValue(s.to_string())),
-        }
+    /// A skill-targeted message to an upstream advertising the profile
+    /// activates it via the A2A-Extensions header.
+    #[test]
+    fn skill_targeted_message_activates_profile_upstream() {
+        assert_eq!(
+            upstream_activations(
+                &skill_targeted_message(),
+                &upstream_card(&[SKILL_INVOCATION_PROFILE_V1])
+            ),
+            vec![SKILL_INVOCATION_PROFILE_V1.to_string()]
+        );
     }
 
-    fn pbjson_types_value_json(v: serde_json::Value) -> pb::pbjson_types::Value {
-        // Cheap conversion: walk Value, build pbjson_types::Value. Only
-        // covers the shape this test needs (object of strings).
-        match v {
-            serde_json::Value::Object(map) => {
-                let mut fields = std::collections::HashMap::new();
-                for (k, val) in map {
-                    fields.insert(k, pbjson_types_value_json(val));
-                }
-                pb::pbjson_types::Value {
-                    kind: Some(pb::pbjson_types::value::Kind::StructValue(
-                        pb::pbjson_types::Struct { fields },
-                    )),
-                }
-            }
-            serde_json::Value::String(s) => pbjson_types_value(&s),
-            _ => pb::pbjson_types::Value {
-                kind: Some(pb::pbjson_types::value::Kind::NullValue(0)),
-            },
-        }
+    #[test]
+    fn no_activation_without_routing_metadata_or_upstream_support() {
+        let plain = Message::new("in-2", turul_a2a_types::Role::User, vec![Part::text("hi")]);
+        assert!(
+            upstream_activations(&plain, &upstream_card(&[SKILL_INVOCATION_PROFILE_V1])).is_empty()
+        );
+        assert!(upstream_activations(&skill_targeted_message(), &upstream_card(&[])).is_empty());
     }
 
     #[test]

@@ -69,6 +69,11 @@ struct Registration {
 }
 
 /// Default in-memory `SkillRegistry`.
+///
+/// An empty skill id is rejected with `SkillError::InvalidRequest`.
+/// Registering an id that is already present replaces the previous
+/// descriptor and handler. `list` returns descriptors in ascending id
+/// order.
 #[derive(Default)]
 pub struct InMemorySkillRegistry {
     inner: Mutex<BTreeMap<String, Registration>>,

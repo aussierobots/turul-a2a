@@ -110,6 +110,14 @@ pub struct QueuedExecutorJob {
     /// `ExecutionContext.claims`. The SQS invocation does NOT
     /// re-validate the JWT; claims ride with the envelope.
     pub claims: Option<serde_json::Value>,
+    /// `SendMessageConfiguration.accepted_output_modes` — matches
+    /// `ExecutionContext.accepted_output_modes`; empty when absent.
+    #[serde(default)]
+    pub accepted_output_modes: Vec<String>,
+    /// `SendMessageRequest.metadata` — matches
+    /// `ExecutionContext.request_metadata`; `None` when absent.
+    #[serde(default)]
+    pub request_metadata: Option<serde_json::Value>,
     /// Enqueue timestamp for lag / DLQ diagnostics (epoch micros).
     pub enqueued_at_micros: i64,
 }
@@ -121,7 +129,7 @@ pub struct QueuedExecutorJob {
 
 1. URL + capability checks (unchanged).
 2. Pre-compute `task_id` and `context_id`. The existing flow at `router.rs:836` already generates `task_id` via `uuid::Uuid::now_v7()` before task creation, so this is the same code path.
-3. Build the `QueuedExecutorJob` envelope — includes `task_id`, `context_id`, `tenant`, `owner`, `claims` (see §"Claims plumbing" in the extraction section), `message`, and `enqueued_at_micros`.
+3. Build the `QueuedExecutorJob` envelope — includes `task_id`, `context_id`, `tenant`, `owner`, `claims` (see §"Claims plumbing" in the extraction section), `message`, `accepted_output_modes` and `request_metadata` (from the request's `configuration` and `metadata`), and `enqueued_at_micros`.
 4. Call `queue.check_payload_size(&job)`. On `QueueError::PayloadTooLarge` → return `A2aError::InvalidRequest` (HTTP 400 / JSON-RPC -32602 / gRPC `INVALID_ARGUMENT`) with a descriptive error message. **No task is created on this path** — the preflight runs before any storage write.
 5. `create_task_with_events` (Submitted → Working).
 6. Inline push config registration (ADR-017 Bug 2).
@@ -320,3 +328,4 @@ No migration for:
 ## Revision log
 
 - 2026-10-22 — Dequeue step 6 amended to what ships: an executor error commits FAILED and acknowledges the record (a retry would only find the task terminal). Enqueue-failure compensation shares one function with ADR-017's inline-push-config compensation. Test obligations: added task-not-found and executor-error cases and mapped every obligation to the test that pins it.
+- 2026-10-22 — `QueuedExecutorJob` gains `accepted_output_modes` and `request_metadata` so the durable path hands the executor the same `SendMessageRequest` inputs as the blocking and streaming paths (A2A v1.0.1 `SendMessageConfiguration.accepted_output_modes`, `SendMessageRequest.metadata`). Both fields are `#[serde(default)]`, so an envelope enqueued by an older producer still decodes; the envelope `version` stays `1`. Adopters who build `QueuedExecutorJob` with a struct literal must add the two fields.

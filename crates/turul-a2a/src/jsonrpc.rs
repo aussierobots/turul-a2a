@@ -58,7 +58,8 @@ pub async fn jsonrpc_dispatch_handler(
             );
         }
     };
-    let response = jsonrpc_dispatch_inner(State(state), axum::Extension(ctx), headers, body).await;
+    let response =
+        jsonrpc_dispatch_inner(State(state), axum::Extension(ctx), headers, body, &echoed).await;
     crate::router::attach_extension_echo(response, &echoed)
 }
 
@@ -68,6 +69,7 @@ async fn jsonrpc_dispatch_inner(
     #[cfg_attr(not(feature = "compat-v03"), allow(unused_variables))]
     headers: axum::http::HeaderMap,
     body: String,
+    negotiated_extensions: &std::collections::HashSet<String>,
 ) -> axum::response::Response {
     let owner = ctx.identity.owner().to_string();
     let claims = ctx.identity.claims().cloned();
@@ -177,6 +179,17 @@ async fn jsonrpc_dispatch_inner(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    // Send methods carry the negotiated profile's request-shape check.
+    if (method == methods::SEND_MESSAGE || method == methods::SEND_STREAMING_MESSAGE)
+        && let Err(e) =
+            crate::profile_dispatch::check_skill_invocation_request(negotiated_extensions, &params)
+    {
+        if is_notification {
+            return axum::http::StatusCode::NO_CONTENT.into_response();
+        }
+        return Json(e.to_jsonrpc_error(Some(&id))).into_response();
+    }
 
     // 6. Streaming methods return SSE directly (bypass normal dispatch)
     if method == methods::SEND_STREAMING_MESSAGE || method == methods::SUBSCRIBE_TO_TASK {

@@ -12,10 +12,16 @@
 //! - [`response_header_value`] formats a non-empty intersection back
 //!   into a header value for echo on the response.
 //!
-//! Payload routing — reading `Message.metadata["a2a.skillId"]` /
-//! `["a2a.skillParams"]` and dispatching to a specific skill — is
-//! adopter code inside the `AgentExecutor`. The framework only
-//! standardises the activation contract on the wire.
+//! - [`check_skill_invocation_request`] enforces the profile's request
+//!   shape on a send: once the skill-invocation profile is negotiated,
+//!   `Message.metadata["a2a.skillId"]` must be a string, otherwise the
+//!   request fails with InvalidParams (-32602 / HTTP 400) before any
+//!   task is created.
+//!
+//! Routing — looking up the skill named by `a2a.skillId`, deciding what
+//! an unknown id means, and passing `a2a.skillParams` to it — is
+//! adopter code inside the `AgentExecutor`. The framework owns no skill
+//! registry.
 //!
 //! The transport layer (HTTP + JSON-RPC + gRPC) invokes this module
 //! before the executor runs and echoes activated URIs on the response.
@@ -32,6 +38,71 @@ use crate::error::A2aError;
 /// `A2A-Extensions` request header.
 pub const SKILL_INVOCATION_PROFILE_V1: &str =
     "https://turul.dev/a2a/extensions/skill-invocation/v1";
+
+/// Reserved `Message.metadata` key naming the target `AgentSkill.id`
+/// under the skill-invocation profile. Required (string) whenever the
+/// profile is activated.
+pub const SKILL_ID_METADATA_KEY: &str = "a2a.skillId";
+
+/// Reserved `Message.metadata` key carrying the optional structured
+/// parameters for the skill named by [`SKILL_ID_METADATA_KEY`].
+pub const SKILL_PARAMS_METADATA_KEY: &str = "a2a.skillParams";
+
+/// Enforce the skill-invocation request shape on a send.
+///
+/// `negotiated` is the set returned by [`validate_activation`] (URIs the
+/// client activated *and* the agent advertises); `request` is the
+/// `SendMessageRequest` in proto-JSON form. When the skill-invocation
+/// profile is negotiated, `message.metadata["a2a.skillId"]` must be
+/// present and a string; otherwise the request is rejected with
+/// `InvalidRequest` (InvalidParams: JSON-RPC -32602, HTTP 400, gRPC
+/// INVALID_ARGUMENT). A request without a `message` passes here — the
+/// send path rejects it with its own error.
+pub fn check_skill_invocation_request(
+    negotiated: &HashSet<String>,
+    request: &serde_json::Value,
+) -> Result<(), A2aError> {
+    if !negotiated.contains(SKILL_INVOCATION_PROFILE_V1) {
+        return Ok(());
+    }
+    let Some(message) = request.get("message") else {
+        return Ok(());
+    };
+    match message
+        .get("metadata")
+        .and_then(|m| m.get(SKILL_ID_METADATA_KEY))
+    {
+        Some(serde_json::Value::String(_)) => Ok(()),
+        Some(_) => Err(A2aError::InvalidRequest {
+            message: format!(
+                "Message.metadata[\"{SKILL_ID_METADATA_KEY}\"] must be a string when \
+                 extension '{SKILL_INVOCATION_PROFILE_V1}' is activated"
+            ),
+        }),
+        None => Err(A2aError::InvalidRequest {
+            message: format!(
+                "Message.metadata[\"{SKILL_ID_METADATA_KEY}\"] is required when \
+                 extension '{SKILL_INVOCATION_PROFILE_V1}' is activated"
+            ),
+        }),
+    }
+}
+
+/// [`check_skill_invocation_request`] over a raw request body. The body
+/// is parsed only when the profile is negotiated; a body that is not
+/// JSON passes here and is rejected by the send path.
+pub fn check_skill_invocation_body(
+    negotiated: &HashSet<String>,
+    body: &str,
+) -> Result<(), A2aError> {
+    if !negotiated.contains(SKILL_INVOCATION_PROFILE_V1) {
+        return Ok(());
+    }
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(request) => check_skill_invocation_request(negotiated, &request),
+        Err(_) => Ok(()),
+    }
+}
 
 /// Parse the value of an inbound `A2A-Extensions` request header into
 /// a set of activated URIs.

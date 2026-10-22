@@ -26,6 +26,7 @@ use http::{Method, Request};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+use turul_a2a::card_builder::AgentSkillBuilder;
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
 use turul_a2a::middleware::{A2aMiddleware, MiddlewareError, RequestContext, SecurityContribution};
@@ -37,24 +38,27 @@ use turul_a2a_types::{Message, Task};
 // Fixtures
 // ---------------------------------------------------------------------------
 
-/// A skill whose proto is fully adopter-controlled so we can populate
-/// `security_requirements` without depending on a builder setter that
-/// does not yet exist on `main`.
+/// A skill carrying one requirement on `scheme_name` (no scopes), built
+/// through the adopter-facing `AgentSkillBuilder`.
 fn skill_with_requirement(id: &str, scheme_name: &str) -> turul_a2a_proto::AgentSkill {
-    let mut schemes = HashMap::new();
-    schemes.insert(
+    let schemes = HashMap::from([(
         scheme_name.to_string(),
         turul_a2a_proto::StringList { list: vec![] },
-    );
-    turul_a2a_proto::AgentSkill {
-        id: id.into(),
-        name: id.into(),
-        description: "skill used by ADR-015 tests".into(),
-        tags: vec!["adr015".into()],
-        examples: vec![],
-        input_modes: vec!["text/plain".into()],
-        output_modes: vec!["text/plain".into()],
-        security_requirements: vec![turul_a2a_proto::SecurityRequirement { schemes }],
+    )]);
+    AgentSkillBuilder::new(id, id, "skill used by skill-security tests")
+        .tags(vec!["skill-security"])
+        .input_modes(vec!["text/plain"])
+        .output_modes(vec!["text/plain"])
+        .security_requirements(vec![turul_a2a_proto::SecurityRequirement { schemes }])
+        .build()
+}
+
+/// The `InvalidRequest` message of a rejected server build.
+fn build_error_message(result: Result<A2aServer, A2aError>) -> String {
+    match result {
+        Ok(_) => panic!("server build MUST be rejected"),
+        Err(A2aError::InvalidRequest { message }) => message,
+        Err(other) => panic!("server build must fail with InvalidRequest; got {other:?}"),
     }
 }
 
@@ -66,20 +70,6 @@ fn bearer_scheme() -> turul_a2a_proto::SecurityScheme {
                     description: String::new(),
                     scheme: "Bearer".into(),
                     bearer_format: "JWT".into(),
-                },
-            ),
-        ),
-    }
-}
-
-fn api_key_scheme() -> turul_a2a_proto::SecurityScheme {
-    turul_a2a_proto::SecurityScheme {
-        scheme: Some(
-            turul_a2a_proto::security_scheme::Scheme::ApiKeySecurityScheme(
-                turul_a2a_proto::ApiKeySecurityScheme {
-                    description: String::new(),
-                    location: "header".into(),
-                    name: "X-API-Key".into(),
                 },
             ),
         ),
@@ -176,118 +166,101 @@ impl A2aMiddleware for BearerContributingMiddleware {
 
 /// Agent-level `SecurityRequirement` naming a scheme that is not in
 /// the merged `security_schemes` map causes server build to fail with
-/// `InvalidRequest` citing the offending
-/// scheme and "agent-level".
+/// `InvalidRequest` naming the failing surface (`agent_card`), the
+/// agent-level requirement, and the offending scheme.
 #[test]
 fn server_build_rejects_agent_requirement_with_undeclared_scheme() {
     let mut public = base_card(vec![]);
-    let mut agent_req = HashMap::new();
-    agent_req.insert(
-        "bearer".to_string(),
-        turul_a2a_proto::StringList { list: vec![] },
-    );
     public
         .security_requirements
-        .push(turul_a2a_proto::SecurityRequirement { schemes: agent_req });
+        .push(turul_a2a_proto::SecurityRequirement {
+            schemes: HashMap::from([(
+                "bearer".to_string(),
+                turul_a2a_proto::StringList { list: vec![] },
+            )]),
+        });
 
-    let result = A2aServer::builder()
-        .executor(CardExecutor {
-            public,
-            extended: None,
-        })
-        .storage(InMemoryA2aStorage::new())
-        .build();
-
-    let err = match result {
-        Ok(_) => panic!("server build MUST reject agent-level undeclared scheme"),
-        Err(e) => e,
-    };
-    let msg = format!("{err:?}");
-    assert!(
-        matches!(err, A2aError::InvalidRequest { .. }),
-        "must be InvalidRequest; got {msg}"
+    let msg = build_error_message(
+        A2aServer::builder()
+            .executor(CardExecutor {
+                public,
+                extended: None,
+            })
+            .storage(InMemoryA2aStorage::new())
+            .build(),
     );
     assert!(
-        msg.contains("bearer"),
-        "error MUST name the offending scheme; got {msg}"
+        msg.starts_with("agent_card: "),
+        "error MUST name the public card surface; got {msg}"
     );
+    assert!(msg.contains("agent-level"), "got {msg}");
     assert!(
-        msg.to_lowercase().contains("agent")
-            || msg.contains("agent-level")
-            || msg.to_lowercase().contains("agent_card"),
-        "error MUST identify which surface failed (agent-level / agent_card); got {msg}"
+        msg.contains("'bearer'"),
+        "error MUST name the scheme; got {msg}"
     );
 }
 
 /// Public-card skill-level `SecurityRequirement` naming a scheme that
 /// is not in the merged `security_schemes` map causes server build to
-/// fail with `InvalidRequest` citing the offending scheme AND the
-/// skill id.
+/// fail with `InvalidRequest` naming the surface, the skill id and the
+/// scheme.
 #[test]
 fn server_build_rejects_skill_requirement_with_undeclared_scheme() {
     let public = base_card(vec![skill_with_requirement("search", "bearer")]);
 
-    let result = A2aServer::builder()
-        .executor(CardExecutor {
-            public,
-            extended: None,
-        })
-        .storage(InMemoryA2aStorage::new())
-        .build();
-
-    let err = match result {
-        Ok(_) => panic!("server build MUST reject skill-level undeclared scheme"),
-        Err(e) => e,
-    };
-    let msg = format!("{err:?}");
-    assert!(
-        matches!(err, A2aError::InvalidRequest { .. }),
-        "must be InvalidRequest; got {msg}"
+    let msg = build_error_message(
+        A2aServer::builder()
+            .executor(CardExecutor {
+                public,
+                extended: None,
+            })
+            .storage(InMemoryA2aStorage::new())
+            .build(),
     );
     assert!(
-        msg.contains("bearer"),
-        "error MUST name the offending scheme; got {msg}"
+        msg.starts_with("agent_card: "),
+        "error MUST name the public card surface; got {msg}"
     );
     assert!(
-        msg.contains("search"),
-        "error MUST name the offending skill id; got {msg}"
+        msg.contains("skill 'search'"),
+        "error MUST name the skill id; got {msg}"
+    );
+    assert!(
+        msg.contains("'bearer'"),
+        "error MUST name the scheme; got {msg}"
     );
 }
 
 /// An extended-card skill-level requirement naming an undeclared
-/// scheme MUST also fail build. Without this surface covered, the
-/// extended card could ship a reference that the public card would
-/// have caught.
+/// scheme MUST also fail build, and the error must say it was the
+/// extended card — the public card here is valid. Without this surface
+/// covered, the extended card could ship a reference the public card
+/// would have caught.
 #[test]
 fn server_build_rejects_extended_card_skill_requirement_with_undeclared_scheme() {
     let public = base_card(vec![]);
     let extended = base_card(vec![skill_with_requirement("ext-only", "bearer")]);
 
-    let result = A2aServer::builder()
-        .executor(CardExecutor {
-            public,
-            extended: Some(extended),
-        })
-        .storage(InMemoryA2aStorage::new())
-        .build();
-
-    let err = match result {
-        Ok(_) => panic!("server build MUST reject extended-card undeclared scheme"),
-        Err(e) => e,
-    };
-    let msg = format!("{err:?}");
-    assert!(
-        matches!(err, A2aError::InvalidRequest { .. }),
-        "must be InvalidRequest; got {msg}"
+    let msg = build_error_message(
+        A2aServer::builder()
+            .executor(CardExecutor {
+                public,
+                extended: Some(extended),
+            })
+            .storage(InMemoryA2aStorage::new())
+            .build(),
     );
-    assert!(msg.contains("bearer"), "error MUST name scheme; got {msg}");
     assert!(
-        msg.contains("ext-only"),
+        msg.starts_with("extended_agent_card: "),
+        "error MUST name the extended card surface; got {msg}"
+    );
+    assert!(
+        msg.contains("skill 'ext-only'"),
         "error MUST name the skill id; got {msg}"
     );
     assert!(
-        msg.contains("extended") || msg.contains("extended_agent_card"),
-        "error MUST identify the failing surface as the extended card; got {msg}"
+        msg.contains("'bearer'"),
+        "error MUST name the scheme; got {msg}"
     );
 }
 
@@ -389,13 +362,13 @@ async fn server_build_accepts_skill_requirement_declared_by_adopter() {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let card: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
-    // skills[0].securityRequirements[0].schemes.bearer must be present.
-    let bearer = card
-        .pointer("/skills/0/securityRequirements/0/schemes/bearer")
-        .expect("camelCase skill requirement for bearer must be preserved");
-    assert!(
-        bearer.is_object() || bearer.is_null() || bearer.get("list").is_some(),
-        "StringList envelope for scopes expected; got {bearer}"
+    // The skill requirement round-trips exactly: one requirement naming
+    // `bearer` with an empty scope list (proto JSON omits the empty
+    // `list`, leaving an empty StringList object).
+    assert_eq!(
+        card.pointer("/skills/0/securityRequirements"),
+        Some(&serde_json::json!([{ "schemes": { "bearer": {} } }])),
+        "got {card}"
     );
 }
 
@@ -475,10 +448,10 @@ async fn middleware_contributions_and_skill_requirements_both_survive() {
 // ---------------------------------------------------------------------------
 
 /// Advertising a skill-level `SecurityRequirement` MUST NOT, on its
-/// own, install any runtime gatekeeper. With no middleware in the stack the request succeeds
-/// regardless of whether the wire names any skill or carries any
-/// Authorization header — the message body carries no
-/// skill-targeting metadata by design.
+/// own, install any runtime gatekeeper. With no middleware in the stack
+/// a request without any Authorization header succeeds and the executor
+/// runs. The message carries no skill-targeting metadata: the A2A proto
+/// has no normative way for a message to target a skill.
 ///
 /// The invariant under test is precisely that advertising
 /// skill-level requirements is declaration-only; authorization is
@@ -492,12 +465,6 @@ async fn advertised_skill_requirements_do_not_install_middleware() {
     public
         .security_schemes
         .insert("bearer".into(), bearer_scheme());
-    // Extend the declared schemes with one more so the test is robust
-    // to the validator computing a merged map that happens to include
-    // additional middleware-contributed names.
-    public
-        .security_schemes
-        .insert("apiKey".into(), api_key_scheme());
 
     let server = A2aServer::builder()
         .executor(CardExecutor {
@@ -531,5 +498,57 @@ async fn advertised_skill_requirements_do_not_install_middleware() {
         resp.status().as_u16(),
         200,
         "declaration-only: no middleware installed, request must pass"
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body.pointer("/task/status/state").and_then(|v| v.as_str()),
+        Some("TASK_STATE_COMPLETED"),
+        "the executor ran ungated; got {body}"
+    );
+}
+
+/// An extended-card skill requirement naming a scheme only a middleware
+/// contributes: build accepts it (the extended card is validated after
+/// the same merge as the public card), and the served extended card
+/// carries both the merged scheme and the skill requirement.
+#[tokio::test]
+async fn server_build_accepts_extended_card_skill_requirement_satisfied_by_middleware() {
+    let mut public = base_card(vec![]);
+    if let Some(caps) = public.capabilities.as_mut() {
+        caps.extended_agent_card = Some(true);
+    }
+    let extended = base_card(vec![skill_with_requirement("ext-only", "bearer")]);
+
+    let server = A2aServer::builder()
+        .executor(CardExecutor {
+            public,
+            extended: Some(extended),
+        })
+        .storage(InMemoryA2aStorage::new())
+        .middleware(Arc::new(BearerContributingMiddleware))
+        .build()
+        .expect("build must succeed when middleware supplies the extended card's scheme");
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/extendedAgentCard")
+        .header("A2A-Version", "1.0")
+        .body(Body::empty())
+        .unwrap();
+    let resp = server.into_router().oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let card: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    let schemes = card
+        .get("securitySchemes")
+        .and_then(|v| v.as_object())
+        .expect("securitySchemes object");
+    assert_eq!(schemes.keys().collect::<Vec<_>>(), ["bearer"], "got {card}");
+    assert_eq!(
+        card.pointer("/skills/0/securityRequirements"),
+        Some(&serde_json::json!([{ "schemes": { "bearer": {} } }])),
+        "got {card}"
     );
 }

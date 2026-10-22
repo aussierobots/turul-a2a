@@ -68,30 +68,7 @@ async fn main() -> Result<(), Error> {
         .without_time()
         .init();
 
-    let storage = build_storage();
-    let delivery: Arc<dyn A2aPushDeliveryStore> = storage.clone();
-    let push_storage: Arc<dyn A2aPushNotificationStorage> = storage.clone();
-    let task_storage: Arc<dyn A2aTaskStorage> = storage.clone();
-
-    let delivery_cfg = PushDeliveryConfig::default();
-    let worker = Arc::new(
-        PushDeliveryWorker::new(
-            delivery.clone(),
-            delivery_cfg,
-            None,
-            format!("scheduled-worker-{}", instance_tag()),
-        )
-        .map_err(|e| Error::from(format!("worker build failed: {e}")))?,
-    );
-    let dispatcher = Arc::new(PushDispatcher::new(worker, push_storage, task_storage));
-
-    let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery).with_config(
-        LambdaScheduledRecoveryConfig {
-            stale_cutoff: std::time::Duration::from_secs(10 * 60),
-            stale_markers_limit: 128,
-            reclaimable_claims_limit: 128,
-        },
-    );
+    let handler = build_handler()?;
 
     lambda_runtime::run(service_fn(move |event: LambdaEvent<EventBridgeEvent>| {
         let handler = handler.clone();
@@ -114,10 +91,62 @@ async fn main() -> Result<(), Error> {
     .await
 }
 
+/// One-time cold-start setup: the recovery handler over the shared
+/// backend.
+fn build_handler() -> Result<LambdaScheduledRecoveryHandler, Error> {
+    let storage = build_storage();
+    let delivery: Arc<dyn A2aPushDeliveryStore> = storage.clone();
+    let push_storage: Arc<dyn A2aPushNotificationStorage> = storage.clone();
+    let task_storage: Arc<dyn A2aTaskStorage> = storage.clone();
+
+    let delivery_cfg = PushDeliveryConfig::default();
+    let worker = Arc::new(
+        PushDeliveryWorker::new(
+            delivery.clone(),
+            delivery_cfg,
+            None,
+            format!("scheduled-worker-{}", instance_tag()),
+        )
+        .map_err(|e| Error::from(format!("worker build failed: {e}")))?,
+    );
+    let dispatcher = Arc::new(PushDispatcher::new(worker, push_storage, task_storage));
+
+    Ok(
+        LambdaScheduledRecoveryHandler::new(dispatcher, delivery).with_config(
+            LambdaScheduledRecoveryConfig {
+                stale_cutoff: std::time::Duration::from_secs(10 * 60),
+                stale_markers_limit: 128,
+                reclaimable_claims_limit: 128,
+            },
+        ),
+    )
+}
+
 fn instance_tag() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{now:x}-{}", std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use aws_lambda_events::event::eventbridge::EventBridgeEvent;
+
+    /// The handler `main` runs builds without AWS access, and a tick over
+    /// an empty backend finds and reports nothing.
+    #[tokio::test]
+    async fn handler_builds_and_an_empty_tick_is_a_no_op() {
+        let handler = super::build_handler().expect("handler builds");
+        let response = handler
+            .handle_scheduled_event(EventBridgeEvent::default())
+            .await;
+        assert_eq!(response.stale_markers_found, 0);
+        assert_eq!(response.stale_markers_recovered, 0);
+        assert_eq!(response.stale_markers_transient_errors, 0);
+        assert_eq!(response.reclaimable_claims_found, 0);
+        assert_eq!(response.reclaimable_claims_processed, 0);
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+    }
 }

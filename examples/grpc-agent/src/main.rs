@@ -80,21 +80,23 @@ impl AgentExecutor for GrpcEchoExecutor {
     }
 }
 
+fn server() -> Result<A2aServer, A2aError> {
+    A2aServer::builder()
+        .executor(GrpcEchoExecutor)
+        .storage(InMemoryA2aStorage::new())
+        // `bind` is unused when we construct the tonic router ourselves,
+        // but the builder requires a value to satisfy validation.
+        .bind(([127, 0, 0, 1], GRPC_PORT))
+        .build()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let addr = format!("127.0.0.1:{GRPC_PORT}").parse()?;
 
-    let server = A2aServer::builder()
-        .executor(GrpcEchoExecutor)
-        .storage(InMemoryA2aStorage::new())
-        // `bind` is unused when we construct the tonic router ourselves,
-        // but the builder requires a value to satisfy validation.
-        .bind(([127, 0, 0, 1], GRPC_PORT))
-        .build()?;
-
-    let router = server.into_tonic_router();
+    let router = server()?.into_tonic_router();
 
     println!("gRPC A2A agent listening on {addr}");
     println!();
@@ -116,4 +118,109 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     router.serve(addr).await?;
     Ok(())
+}
+
+/// In-process tests: the same tonic router `main` serves, on an
+/// OS-assigned loopback port, driven by the framework's gRPC client.
+#[cfg(test)]
+mod tests {
+    use futures::StreamExt;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use turul_a2a_client::grpc::A2aGrpcClient;
+    use turul_a2a_proto as pb;
+
+    async fn client() -> A2aGrpcClient {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = super::server().unwrap().into_tonic_router();
+        tokio::spawn(async move {
+            let _ = router
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+        A2aGrpcClient::connect(format!("http://{addr}"))
+            .await
+            .expect("connect")
+    }
+
+    fn message(text: &str) -> pb::Message {
+        pb::Message {
+            message_id: uuid::Uuid::now_v7().to_string(),
+            role: pb::Role::User.into(),
+            parts: vec![pb::Part {
+                content: Some(pb::part::Content::Text(text.into())),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn text_of(artifact: &pb::Artifact) -> String {
+        artifact
+            .parts
+            .iter()
+            .filter_map(|p| match &p.content {
+                Some(pb::part::Content::Text(t)) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn send_completes_with_the_echo_in_one_artifact() {
+        let mut client = client().await;
+        let resp = client.send_message(message("hello world")).await.unwrap();
+        let Some(pb::send_message_response::Payload::Task(task)) = resp.payload else {
+            panic!("expected a Task payload: {resp:?}");
+        };
+        assert_eq!(task.status.unwrap().state, pb::TaskState::Completed as i32);
+        assert_eq!(task.artifacts.len(), 1);
+        assert_eq!(text_of(&task.artifacts[0]), "echo: hello world");
+    }
+
+    /// The stream opens with the Task, then the two chunks of one
+    /// artifact (the second appends and is the last chunk), then the
+    /// terminal status.
+    #[tokio::test]
+    async fn stream_opens_with_task_then_two_chunks_then_completed() {
+        let mut client = client().await;
+        let mut stream = client
+            .send_streaming_message(message("hello world"))
+            .await
+            .unwrap();
+        let mut payloads = Vec::new();
+        while let Some(item) = stream.next().await {
+            payloads.push(item.unwrap().payload.expect("payload"));
+        }
+
+        assert!(
+            matches!(
+                payloads.first(),
+                Some(pb::stream_response::Payload::Task(_))
+            ),
+            "{payloads:?}"
+        );
+        let chunks: Vec<&pb::TaskArtifactUpdateEvent> = payloads
+            .iter()
+            .filter_map(|p| match p {
+                pb::stream_response::Payload::ArtifactUpdate(a) => Some(a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chunks.len(), 2, "{payloads:?}");
+        assert!(!chunks[0].append && !chunks[0].last_chunk);
+        assert!(chunks[1].append && chunks[1].last_chunk);
+        let joined: String = chunks
+            .iter()
+            .map(|c| text_of(c.artifact.as_ref().unwrap()))
+            .collect();
+        assert_eq!(joined, "echo: hello world");
+        match payloads.last() {
+            Some(pb::stream_response::Payload::StatusUpdate(s)) => assert_eq!(
+                s.status.as_ref().unwrap().state,
+                pb::TaskState::Completed as i32
+            ),
+            other => panic!("expected terminal status last, got {other:?}"),
+        }
+    }
 }

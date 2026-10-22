@@ -50,3 +50,34 @@ const _: fn() = || {
     fn assert<T: ?Sized + SkillProgressSink>() {}
     assert::<dyn SkillProgressSink>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::ProgressState;
+
+    /// `ProgressState` carries exactly the non-terminal states. Inside the
+    /// defining crate `#[non_exhaustive]` does not force a wildcard arm,
+    /// so this match has none: adding any variant — in particular a
+    /// terminal state (Completed / Failed / Canceled / Rejected) — fails
+    /// to compile here until the binding contract is deliberately
+    /// amended.
+    #[test]
+    fn progress_state_variant_set_is_fixed_and_non_terminal() {
+        fn label(state: ProgressState) -> &'static str {
+            match state {
+                ProgressState::Working => "working",
+                ProgressState::InputRequired => "input-required",
+                ProgressState::AuthRequired => "auth-required",
+            }
+        }
+        assert_eq!(
+            [
+                ProgressState::Working,
+                ProgressState::InputRequired,
+                ProgressState::AuthRequired,
+            ]
+            .map(label),
+            ["working", "input-required", "auth-required"]
+        );
+    }
+}

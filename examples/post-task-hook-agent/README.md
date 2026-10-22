@@ -280,8 +280,8 @@ auth dependency. The smoke test is hermetic.
 
 - `curl: (7) Failed to connect` — the agent has not started yet, or
   `A2A_PORT` is set to a different value than the one you're hitting.
-- `agent did not become ready` in the smoke test — increase the wait
-  budget or check that nothing else is bound to port 38014.
+- `agent did not become ready` in the smoke test — the built binary did
+  not start listening within 15s; run it by hand to see its startup error.
 - `metrics` keeps returning zeros — confirm you sent a `count <n>` call
   first; the counter only moves when the hook observes an outcome.
 
@@ -291,7 +291,7 @@ auth dependency. The smoke test is hermetic.
 cargo test -p post-task-hook-agent --tests
 ```
 
-The smoke test spawns the binary on isolated ports (38014-38016) and walks
+The smoke test runs the built binary on a free port per test and walks
 the success, failure, and repeated-call paths end-to-end. Hermetic — no
 network access.
 

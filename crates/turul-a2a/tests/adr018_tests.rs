@@ -249,6 +249,8 @@ fn queued_executor_job_envelope_roundtrip_preserves_claims() {
             ..Default::default()
         },
         claims: Some(claims.clone()),
+        accepted_output_modes: vec![],
+        request_metadata: None,
         enqueued_at_micros: 123_456_789,
     };
     let encoded = serde_json::to_string(&job).unwrap();
@@ -635,6 +637,8 @@ async fn durable_path_preserves_text_task_id_and_context_id_across_enqueue_deque
         context_id: job.context_id.clone(),
         message: Message::try_from(job.message.clone()).expect("message round-trips"),
         claims: job.claims.clone(),
+        accepted_output_modes: job.accepted_output_modes.clone(),
+        request_metadata: job.request_metadata.clone(),
     };
     run_queued_executor_job(deps, scope).await;
 

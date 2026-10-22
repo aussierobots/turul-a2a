@@ -101,5 +101,76 @@ async fn handler_lookup_dispatches_through_dyn() {
         .handler("ping")
         .await
         .expect("ping should be registered");
-    let _ = h.run(json!({}), &StubSink).await;
+    assert_eq!(h.run(json!({}), &StubSink).await.unwrap(), json!({}));
+}
+
+/// Returns a fixed tag so a test can tell which handler is registered.
+struct Tagged(&'static str);
+
+#[async_trait]
+impl SkillHandler for Tagged {
+    async fn run(
+        &self,
+        _params: Value,
+        _sink: &dyn SkillProgressSink,
+    ) -> Result<Value, SkillError> {
+        Ok(json!(self.0))
+    }
+}
+
+/// An empty skill id is rejected as `InvalidRequest` and nothing is
+/// registered.
+#[tokio::test]
+async fn empty_skill_id_is_rejected() {
+    let reg = InMemorySkillRegistry::new();
+    let err = reg
+        .register_programmatic(make_agent_skill(""), None, Arc::new(Noop))
+        .await
+        .expect_err("empty id must be rejected");
+    assert!(matches!(err, SkillError::InvalidRequest(_)), "got {err:?}");
+    assert!(reg.list().await.is_empty());
+}
+
+/// Registering an id that is already present replaces both the
+/// descriptor and the handler (last registration wins).
+#[tokio::test]
+async fn duplicate_skill_id_overwrites_previous_registration() {
+    let reg = InMemorySkillRegistry::new();
+    reg.register_programmatic(
+        make_agent_skill("dup"),
+        Some(json!({"type": "string"})),
+        Arc::new(Tagged("first")),
+    )
+    .await
+    .unwrap();
+    reg.register_programmatic(
+        make_agent_skill("dup"),
+        Some(json!({"type": "object"})),
+        Arc::new(Tagged("second")),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(reg.list().await.len(), 1);
+    let descriptor = reg.describe("dup").await.unwrap();
+    assert_eq!(descriptor.params_schema, Some(json!({"type": "object"})));
+    let handler = reg.handler("dup").await.unwrap();
+    assert_eq!(
+        handler.run(json!({}), &StubSink).await.unwrap(),
+        json!("second")
+    );
+}
+
+/// `list` returns every registered descriptor, ordered by id.
+#[tokio::test]
+async fn list_returns_all_descriptors_ordered_by_id() {
+    let reg = InMemorySkillRegistry::new();
+    assert!(reg.list().await.is_empty());
+    for id in ["beta", "alpha", "gamma"] {
+        reg.register_programmatic(make_agent_skill(id), None, Arc::new(Noop))
+            .await
+            .unwrap();
+    }
+    let ids: Vec<String> = reg.list().await.into_iter().map(|d| d.id).collect();
+    assert_eq!(ids, ["alpha", "beta", "gamma"]);
 }

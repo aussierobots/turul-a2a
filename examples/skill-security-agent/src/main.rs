@@ -103,14 +103,18 @@ impl AgentExecutor for SkillSecurityExecutor {
     }
 }
 
+fn server() -> Result<A2aServer, A2aError> {
+    A2aServer::builder()
+        .executor(SkillSecurityExecutor)
+        .bind(([0, 0, 0, 0], 3006))
+        .build()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let server = A2aServer::builder()
-        .executor(SkillSecurityExecutor)
-        .bind(([0, 0, 0, 0], 3006))
-        .build()?;
+    let server = server()?;
 
     println!("Skill-Security Agent listening on http://0.0.0.0:3006");
     println!("Agent card: http://localhost:3006/.well-known/agent-card.json");
@@ -130,4 +134,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     server.run().await?;
     Ok(())
+}
+
+/// In-process tests: the same server `main` runs, driven through its
+/// router without binding a socket.
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    async fn call(req: Request<Body>) -> (u16, Value) {
+        let resp = super::server()
+            .unwrap()
+            .into_router()
+            .oneshot(req)
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Only `secure-summary` advertises a skill-level requirement, and it
+    /// names the agent-level `bearer` scheme.
+    #[tokio::test]
+    async fn card_advertises_bearer_requirement_on_secure_summary_only() {
+        let (status, card) = call(
+            Request::get("/.well-known/agent-card.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(card["securitySchemes"]["bearer"].is_object(), "{card:#}");
+
+        let skills = card["skills"].as_array().expect("skills array");
+        let by_id = |id: &str| {
+            skills
+                .iter()
+                .find(|s| s["id"] == id)
+                .unwrap_or_else(|| panic!("skill {id} missing: {card:#}"))
+        };
+        assert!(by_id("public-echo").get("securityRequirements").is_none());
+        assert_eq!(
+            by_id("secure-summary")["securityRequirements"],
+            json!([{ "schemes": { "bearer": {} } }])
+        );
+    }
+
+    /// Declaration-only: with no auth middleware, a request carrying no
+    /// credentials still runs.
+    #[tokio::test]
+    async fn requests_succeed_without_credentials() {
+        let body = json!({
+            "message": {"messageId": "m-1", "role": "ROLE_USER", "parts": [{"text": "hello"}]}
+        });
+        let (status, resp) = call(
+            Request::post("/message:send")
+                .header("content-type", "application/json")
+                .header("a2a-version", "1.0")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(resp["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+        assert_eq!(
+            resp["task"]["artifacts"][0]["parts"][0]["text"],
+            "received: hello"
+        );
+    }
 }

@@ -61,37 +61,25 @@ async fn ok_sink_dispatches_through_dyn_reference() {
     assert!(!dyn_ref.is_closed());
 }
 
-/// Negative: terminal states are not constructible.
-/// The four terminal task states (Completed/Failed/Canceled/Rejected)
-/// must not exist on `ProgressState`. We assert by pattern-matching
-/// only the three legal variants and confirming the catch-all is
-/// unreachable for the values we construct.
+// `ProgressState` and `SinkError` are `#[non_exhaustive]`, so matches in
+// this consumer crate need a wildcard arm and cannot detect an added
+// variant. The guarantee that `ProgressState` holds only the three
+// non-terminal states (and that `SinkError` holds only `Closed` and
+// `Backend`) is enforced by the wildcard-free matches in the crate's own
+// `sink` and `error` module tests, which stop compiling if a variant is
+// added.
+
+/// Consumer view: the three non-terminal states are constructible and
+/// distinct.
 #[test]
-fn progress_state_excludes_terminal_states() {
-    let states = [
-        ProgressState::Working,
-        ProgressState::InputRequired,
-        ProgressState::AuthRequired,
-    ];
-    for s in states {
-        let label = match s {
-            ProgressState::Working => "working",
-            ProgressState::InputRequired => "input",
-            ProgressState::AuthRequired => "auth",
-            _ => "unexpected",
-        };
-        assert_ne!(label, "unexpected");
-    }
-    // Compile-fail-by-name (documented; cannot be enforced as a runtime test):
-    //
-    //     let _ = ProgressState::Completed;   // would fail to compile
-    //     let _ = ProgressState::Failed;      // would fail to compile
-    //
-    // Adding any of these variants would break the contract that
-    // terminal task states remain framework-owned and are not
-    // constructible through the sink surface.
+fn progress_state_non_terminal_variants_are_distinct() {
+    assert_ne!(ProgressState::Working, ProgressState::InputRequired);
+    assert_ne!(ProgressState::Working, ProgressState::AuthRequired);
+    assert_ne!(ProgressState::InputRequired, ProgressState::AuthRequired);
 }
 
+/// Consumer view: both sink error variants are constructible and
+/// distinguishable.
 #[test]
 fn sink_error_has_closed_and_backend_variants() {
     let e1 = SinkError::Closed;

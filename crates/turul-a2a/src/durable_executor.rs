@@ -47,6 +47,16 @@ pub struct QueuedExecutorJob {
     /// envelope — the consumer does NOT re-validate the JWT. Mirrors
     /// `ExecutionContext.claims`.
     pub claims: Option<serde_json::Value>,
+    /// `SendMessageConfiguration.accepted_output_modes` from the HTTP
+    /// invocation. Mirrors `ExecutionContext.accepted_output_modes`;
+    /// empty when the client sent none.
+    #[serde(default)]
+    pub accepted_output_modes: Vec<String>,
+    /// `SendMessageRequest.metadata` from the HTTP invocation. Mirrors
+    /// `ExecutionContext.request_metadata`; `None` when the client sent
+    /// none.
+    #[serde(default)]
+    pub request_metadata: Option<serde_json::Value>,
     /// Epoch microseconds at which the HTTP invocation enqueued the
     /// job. Used by consumers for lag / DLQ diagnostics.
     pub enqueued_at_micros: i64,
