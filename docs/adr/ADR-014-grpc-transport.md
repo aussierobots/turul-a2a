@@ -554,6 +554,29 @@ Note on `SendStreamingMessage`: like `SubscribeToTask`, it opens
 with the `Task` snapshot on every transport (§2.3), so parity tests
 assert a first-Task check on both streaming RPCs.
 
+**Mandatory — stream and send-target parity.** The streaming RPCs'
+three-transport assertions live in
+`crates/turul-a2a/tests/stream_contract_tests.rs` (the spec-compliance
+suite points there). Each runs on HTTP+JSON, JSON-RPC and gRPC and
+asserts, with exact per-transport error mapping (A2A §5.4; validation
+errors as HTTP 400 / JSON-RPC -32602 / gRPC INVALID_ARGUMENT with no
+`ErrorInfo`):
+  * the snapshot first, its state, and the exact status sequence after
+    it (nothing the snapshot reflects is replayed, including on a
+    continuation);
+  * the close policy: streams end after terminal states and
+    INPUT_REQUIRED and stay open across AUTH_REQUIRED;
+  * send-target rules on both blocking and streaming send: unknown
+    `taskId` → `TaskNotFound`; terminal task → `UnsupportedOperation`;
+    mismatched `contextId` → rejected; absent `contextId` → inferred;
+    SUBMITTED / WORKING task → `InvalidRequest`;
+  * a follow-up sent while the previous turn's executor is still running
+    → `UnsupportedOperation` on every transport, with nothing written;
+  * terminal-subscribe → `UnsupportedOperation`, unknown task →
+    `TaskNotFound`;
+  * artifact chunks: `append` / `lastChunk` on the wire equal what the
+    event store holds.
+
 **Mandatory — core-handler sharing is enforced by parity.** ADR-005's
 "no behavior fork between transports" invariant (extended by this
 ADR to three transports) is a structural test obligation: a bug
@@ -594,8 +617,11 @@ include three cases:
 **Mandatory — same storage backend across all three transports per
 parity run.** Each parity run constructs one `A2aServer` with one
 storage backend and exercises all three transports against that
-single server instance. gRPC tests do not bring their own storage
-stack; they share the in-memory default used by the rest of
+single server instance, obtained with `A2aServer::into_routers()` so
+the HTTP and gRPC routers also share the event broker and the
+in-flight executor registry (two separately built servers would not
+see each other's running turns). gRPC tests do not bring their own
+storage stack; they share the in-memory default used by the rest of
 `spec_compliance.rs`. Per-backend parity (SQLite, PostgreSQL,
 DynamoDB) remains the responsibility of ADR-003 / ADR-009 storage
 parity tests and is not re-done at the transport layer — but when
@@ -781,3 +807,4 @@ theirs. Opt-in is the correct posture for both.
 - 2026-10-22 — Error-mapping table aligned to A2A v1.0.1 §5.4: `PushNotificationNotSupported` and `ExtendedAgentCardNotConfigured` UNIMPLEMENTED→FAILED_PRECONDITION; HTTP column TaskNotCancelable 409→400, ContentTypeNotSupported 415→400, InvalidAgentResponse 502→500, ExtendedAgentCardNotConfigured 404→400 (the 404 row never matched `wire.rs`). The "capability absence → UNIMPLEMENTED" rationale is withdrawn because the spec no longer makes that split.
 - 2026-10-22 — §2.3 rewritten and accepted: one core stream for all three transports. Both streaming RPCs open with a `Task` snapshot, with no history replayed after it. Streams close on terminal states and INPUT_REQUIRED and stay open on AUTH_REQUIRED. Send-target resolution is shared by blocking and streaming send, which fixes streaming send ignoring `message.taskId`. Withdraws the earlier rule, in §2.3 and §2.11, that streaming send does not open with a `Task`. Follow-ups are refused while the previous turn's executor is still running; `Last-Event-ID: {task_id}:0` is now a resume; an already-caught-up resumed stream on a closing state ends at once.
 - 2026-10-22 — §2.3 item 3: `Last-Event-ID` / `a2a-last-event-id` resume removed and SSE `id:` fields dropped. Resuming without a snapshot broke A2A §3.1.6 L311 (every SubscribeToTask stream MUST open with the Task); reconnecting is a new subscribe (§3.5.2).
+- 2026-10-22 — §2.11 test obligations: the one-server rule now names `A2aServer::into_routers()` (shared broker and in-flight registry, not only storage), and a stream and send-target parity list records what `stream_contract_tests.rs` asserts on all three transports — exact §5.4 error mapping, close policy, send-target rules on blocking and streaming send, follow-up refusal while an executor runs, terminal/unknown subscribe, and `append`/`lastChunk` as stored.
