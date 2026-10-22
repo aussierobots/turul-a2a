@@ -23,6 +23,7 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -30,6 +31,7 @@ use axum::body::Body;
 use http::{Method, Request};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use tokio::sync::Semaphore;
 use tower::ServiceExt;
 
 use turul_a2a::error::A2aError;
@@ -46,15 +48,31 @@ const STREAM_WAIT: Duration = Duration::from_secs(10);
 /// - `input` → INPUT_REQUIRED; a follow-up `more` completes the task;
 /// - `auth` → AUTH_REQUIRED, then (credential arriving out of band)
 ///   WORKING, then COMPLETED, all on the same stream;
-/// - `auth-hold` → like `auth`, but holds AUTH_REQUIRED long enough
-///   that a test can act while the executor is still running;
-/// - `hold` → stays WORKING long enough for a test to act, then
-///   completes;
+/// - `auth-hold` → like `auth`, but holds AUTH_REQUIRED until the test
+///   releases it (`Harness::release`);
+/// - `auth-pause` → like `auth`, but holds AUTH_REQUIRED for `PAUSE`,
+///   for a test that must subscribe while the executor runs: when a
+///   subscriber has attached is not observable from outside, so the
+///   release cannot be tied to it;
+/// - `hold` → stays WORKING until the test releases it, then completes;
 /// - `chunks` → one artifact in three chunks, then COMPLETED;
 /// - anything else → COMPLETED.
-struct ScriptAgent;
+struct ScriptAgent {
+    /// One permit releases one held executor.
+    gate: Arc<Semaphore>,
+}
 
-const HOLD: Duration = Duration::from_millis(1500);
+const PAUSE: Duration = Duration::from_millis(1500);
+
+impl ScriptAgent {
+    async fn wait_for_release(&self) {
+        self.gate
+            .acquire()
+            .await
+            .expect("gate is never closed")
+            .forget();
+    }
+}
 
 #[async_trait]
 impl AgentExecutor for ScriptAgent {
@@ -68,19 +86,18 @@ impl AgentExecutor for ScriptAgent {
             "input" => {
                 task.set_status(TaskStatus::new(TaskState::InputRequired));
             }
-            "auth" | "auth-hold" => {
+            text @ ("auth" | "auth-hold" | "auth-pause") => {
                 ctx.events.require_auth(None).await?;
-                let hold = if msg.joined_text() == "auth" {
-                    Duration::from_millis(100)
-                } else {
-                    HOLD
-                };
-                tokio::time::sleep(hold).await;
+                match text {
+                    "auth" => tokio::time::sleep(Duration::from_millis(100)).await,
+                    "auth-pause" => tokio::time::sleep(PAUSE).await,
+                    _ => self.wait_for_release().await,
+                }
                 ctx.events.set_status(TaskState::Working, None).await?;
                 ctx.events.complete(None).await?;
             }
             "hold" => {
-                tokio::time::sleep(HOLD).await;
+                self.wait_for_release().await;
                 ctx.events.complete(None).await?;
             }
             "chunks" => {
@@ -220,6 +237,7 @@ fn assert_error_info(details: &Value, reason: Option<&str>, ctx: &str) {
 struct Harness {
     router: axum::Router,
     storage: InMemoryA2aStorage,
+    gate: Arc<Semaphore>,
     #[cfg(feature = "grpc")]
     grpc_addr: std::net::SocketAddr,
     #[cfg(feature = "grpc")]
@@ -233,11 +251,19 @@ impl Drop for Harness {
     }
 }
 
+impl Harness {
+    /// Let one `hold` / `auth-hold` executor finish.
+    fn release(&self) {
+        self.gate.add_permits(1);
+    }
+}
+
 /// One server, every transport.
 async fn harness() -> Harness {
     let storage = InMemoryA2aStorage::new();
+    let gate = Arc::new(Semaphore::new(0));
     let server = A2aServer::builder()
-        .executor(ScriptAgent)
+        .executor(ScriptAgent { gate: gate.clone() })
         .storage(storage.clone())
         .bind(([127, 0, 0, 1], 0))
         .build()
@@ -256,6 +282,7 @@ async fn harness() -> Harness {
         Harness {
             router,
             storage,
+            gate,
             grpc_addr,
             grpc,
         }
@@ -265,6 +292,7 @@ async fn harness() -> Harness {
         Harness {
             router: server.into_router(),
             storage,
+            gate,
         }
     }
 }
@@ -517,20 +545,6 @@ async fn get_task(h: &Harness, task_id: &str) -> Value {
     json_body(call(&h.router, req).await).await
 }
 
-fn state_of(item: &Value) -> Option<&str> {
-    item["task"]["status"]["state"]
-        .as_str()
-        .or_else(|| item["statusUpdate"]["status"]["state"].as_str())
-}
-
-fn status_states(items: &[Value]) -> Vec<&str> {
-    items
-        .iter()
-        .filter(|i| i.get("statusUpdate").is_some())
-        .filter_map(state_of)
-        .collect()
-}
-
 /// The snapshot that must open every stream.
 fn snapshot(t: Transport, items: &[Value]) -> &Value {
     let first = items
@@ -618,7 +632,7 @@ async fn streaming_send_opens_with_working_task_and_closes_on_completed() {
             "{t:?}"
         );
         assert_eq!(
-            status_states(&items),
+            common::status_states(&items),
             ["TASK_STATE_COMPLETED"],
             "{t:?}: SUBMITTED and WORKING are in the snapshot and must not be replayed"
         );
@@ -633,7 +647,7 @@ async fn stream_closes_on_input_required_and_continuation_resumes_same_task() {
             .await
             .unwrap();
         assert_eq!(
-            status_states(&first),
+            common::status_states(&first),
             ["TASK_STATE_INPUT_REQUIRED"],
             "{t:?}: stream closes after INPUT_REQUIRED"
         );
@@ -654,7 +668,7 @@ async fn stream_closes_on_input_required_and_continuation_resumes_same_task() {
         );
         assert_eq!(resumed["status"]["state"], "TASK_STATE_WORKING", "{t:?}");
         assert_eq!(
-            status_states(&second),
+            common::status_states(&second),
             ["TASK_STATE_COMPLETED"],
             "{t:?}: neither the first turn nor this turn's WORKING is replayed"
         );
@@ -669,7 +683,7 @@ async fn stream_stays_open_across_auth_required() {
             .await
             .unwrap();
         assert_eq!(
-            status_states(&items),
+            common::status_states(&items),
             [
                 "TASK_STATE_AUTH_REQUIRED",
                 "TASK_STATE_WORKING",
@@ -793,8 +807,9 @@ async fn send_to_a_submitted_or_working_task_is_invalid_request() {
             let streaming = stream_send(&h, t, msg).await.unwrap_err();
             assert_failure(t, &streaming, Expected::InvalidRequest, "streaming send");
         }
+        h.release();
         assert_eq!(
-            status_states(&run.await.unwrap()),
+            common::status_states(&run.await.unwrap()),
             ["TASK_STATE_COMPLETED"],
             "{t:?}: the running turn is undisturbed"
         );
@@ -851,7 +866,7 @@ async fn subscribe_to_a_terminal_or_unknown_task_is_refused() {
 async fn subscribe_to_a_live_task_delivers_only_later_events() {
     let h = harness().await;
     for t in transports() {
-        let (task_id, sender) = start_background(&h, "auth-hold").await;
+        let (task_id, sender) = start_background(&h, "auth-pause").await;
         wait_for_state(&h, &task_id, "TASK_STATE_AUTH_REQUIRED").await;
 
         let items = subscribe(&h, t, &task_id, None).await.unwrap();
@@ -861,7 +876,7 @@ async fn subscribe_to_a_live_task_delivers_only_later_events() {
             "{t:?}"
         );
         assert_eq!(
-            status_states(&items),
+            common::status_states(&items),
             ["TASK_STATE_WORKING", "TASK_STATE_COMPLETED"],
             "{t:?}: only events after the snapshot"
         );
@@ -897,10 +912,11 @@ async fn follow_up_while_the_executor_is_still_running_is_refused_without_side_e
             "streaming send",
         );
 
+        h.release();
         // The refusals wrote nothing: the original turn runs to the end
         // undisturbed and neither message is in the history.
         assert_eq!(
-            status_states(&sender.await.unwrap()),
+            common::status_states(&sender.await.unwrap()),
             [
                 "TASK_STATE_AUTH_REQUIRED",
                 "TASK_STATE_WORKING",
@@ -988,8 +1004,8 @@ async fn artifact_chunks_keep_append_and_last_chunk_on_every_transport() {
             "{t:?}: the wire shows what is stored"
         );
         assert_eq!(
-            status_states(&items).last().copied(),
-            Some("TASK_STATE_COMPLETED"),
+            common::status_states(&items),
+            ["TASK_STATE_COMPLETED"],
             "{t:?}"
         );
     }

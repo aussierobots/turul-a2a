@@ -1,7 +1,8 @@
 //! Helpers shared by the streaming integration tests: reading an SSE
 //! body while telling "the server closed the stream" apart from "the
-//! wait elapsed with the stream still open", and waiting for a spawned
-//! server to answer before the first request.
+//! wait elapsed with the stream still open", listing the states of a
+//! stream's status updates, and waiting for a spawned server to answer
+//! before the first request.
 
 // Each test binary uses a different subset of these helpers.
 #![allow(dead_code)]
@@ -97,6 +98,14 @@ pub fn parse_sse(text: &str) -> Vec<Value> {
                     .unwrap_or_else(|e| panic!("SSE data is not JSON ({e}): {data}")),
             )
         })
+        .collect()
+}
+
+/// The state of every `statusUpdate` event, in order.
+pub fn status_states(events: &[Value]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| e["statusUpdate"]["status"]["state"].as_str())
         .collect()
 }
 

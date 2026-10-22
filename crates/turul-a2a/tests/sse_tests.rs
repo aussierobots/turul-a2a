@@ -132,13 +132,6 @@ async fn closed_stream(router: &axum::Router, body: &str) -> Vec<serde_json::Val
         .closed()
 }
 
-fn status_states(events: &[serde_json::Value]) -> Vec<&str> {
-    events
-        .iter()
-        .filter_map(|e| e["statusUpdate"]["status"]["state"].as_str())
-        .collect()
-}
-
 // =========================================================
 // POST /message:stream — content type and event shape
 // =========================================================
@@ -211,7 +204,7 @@ async fn message_stream_closes_after_the_terminal_event() {
     // SUBMITTED and WORKING are reflected in the snapshot and not
     // replayed; COMPLETED is the only status update, it is the last
     // event, and the stream has closed after it.
-    assert_eq!(status_states(&events), ["TASK_STATE_COMPLETED"]);
+    assert_eq!(common::status_states(&events), ["TASK_STATE_COMPLETED"]);
     assert!(
         events.last().unwrap().get("statusUpdate").is_some(),
         "the terminal status update is the last event, got {events:?}"

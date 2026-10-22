@@ -199,13 +199,6 @@ async fn jrpc_call(router: axum::Router, body: &str) -> (u16, serde_json::Value)
     post_json(router, "/jsonrpc", body).await
 }
 
-fn status_states(events: &[serde_json::Value]) -> Vec<&str> {
-    events
-        .iter()
-        .filter_map(|e| e["statusUpdate"]["status"]["state"].as_str())
-        .collect()
-}
-
 // =========================================================
 // E2E-01: Full SendMessage lifecycle
 // =========================================================
@@ -342,7 +335,7 @@ async fn e2e_streaming_event_sequence() {
         events[0]["task"]["status"]["state"], "TASK_STATE_WORKING",
         "first event is the Task snapshot, got {events:?}"
     );
-    assert_eq!(status_states(&events), ["TASK_STATE_COMPLETED"]);
+    assert_eq!(common::status_states(&events), ["TASK_STATE_COMPLETED"]);
 }
 
 // =========================================================
@@ -443,7 +436,7 @@ async fn e2e_subscribe_live_task() {
     // follows, and the stream closes after it.
     assert_eq!(events.len(), 2, "snapshot + live event, got: {events:?}");
     assert_eq!(events[0]["task"]["status"]["state"], "TASK_STATE_WORKING");
-    assert_eq!(status_states(&events), ["TASK_STATE_COMPLETED"]);
+    assert_eq!(common::status_states(&events), ["TASK_STATE_COMPLETED"]);
 }
 
 // =========================================================
