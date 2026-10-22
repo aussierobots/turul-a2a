@@ -696,3 +696,13 @@ async fn jsonrpc_subscribe_terminal_task_returns_error() {
     assert_eq!(body["error"]["data"][0]["reason"], "UNSUPPORTED_OPERATION");
     assert_eq!(body["error"]["data"][0]["domain"], "a2a-protocol.org");
 }
+
+/// GetTask params are decoded with the proto3 JSON mapping: a historyLength
+/// that does not fit int32 is an invalid request, not silently wrapped.
+#[tokio::test]
+async fn get_task_history_length_out_of_int32_range_is_invalid_params() {
+    let router = build_router(test_state());
+    let params = serde_json::json!({"id": "any", "historyLength": -4294967296_i64});
+    let (_, body) = jsonrpc_call(router, &jsonrpc_request("GetTask", params, 9)).await;
+    assert_eq!(body["error"]["code"], -32602, "{body}");
+}

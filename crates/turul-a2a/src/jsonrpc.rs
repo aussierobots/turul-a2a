@@ -558,21 +558,22 @@ async fn dispatch_get_task(
     owner: &str,
     params: Value,
 ) -> Result<Value, A2aError> {
-    let id = params
-        .get("id")
-        .and_then(|v| v.as_str())
-        .ok_or(A2aError::InvalidRequest {
+    // Decode with the proto3 JSON mapping so a mistyped or out-of-range
+    // field (e.g. a historyLength that does not fit int32) is an invalid
+    // request rather than silently truncated.
+    let request: turul_a2a_proto::GetTaskRequest =
+        serde_json::from_value(params).map_err(|e| A2aError::InvalidRequest {
+            message: format!("Invalid params: {e}"),
+        })?;
+    if request.id.is_empty() {
+        return Err(A2aError::InvalidRequest {
             message: "Missing required field: id".into(),
-        })?
-        .to_string();
-
-    let history_length = params
-        .get("historyLength")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32);
+        });
+    }
 
     let Json(response) =
-        crate::router::core_get_task(state, tenant, owner, &id, history_length).await?;
+        crate::router::core_get_task(state, tenant, owner, &request.id, request.history_length)
+            .await?;
     Ok(response)
 }
 
