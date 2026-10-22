@@ -429,7 +429,7 @@ async fn e2e_subscribe_live_task() {
         .await
         .unwrap();
 
-    // Subscribe to the non-terminal task — should replay stored events
+    // Subscribe to the non-terminal task
     let router = build_router(st.clone());
     let req = Request::get("/tasks/sub-e2e-1:subscribe")
         .header("a2a-version", "1.0")
@@ -445,15 +445,11 @@ async fn e2e_subscribe_live_task() {
         .unwrap_or("");
     assert!(ct.contains("text/event-stream"));
 
-    // Collect replayed events (Task snapshot + stored events)
     let events = collect_sse(resp.into_body(), Duration::from_secs(3)).await;
 
-    // Should have received Task snapshot + 2 stored events
-    assert!(
-        events.len() >= 3,
-        "Subscribe should emit Task + 2 stored events, got: {}",
-        events.len()
-    );
+    // The snapshot already reflects SUBMITTED and WORKING, so neither is
+    // replayed after it; the task is idle, so nothing else arrives.
+    assert_eq!(events.len(), 1, "snapshot only, got: {events:?}");
 
     // First event should be Task object (spec §3.1.6)
     assert!(

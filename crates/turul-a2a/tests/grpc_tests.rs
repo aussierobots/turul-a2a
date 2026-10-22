@@ -11,9 +11,10 @@
 //!   * Error mapping: canonical gRPC codes + `ErrorInfo` with reason
 //!     strings from `turul_a2a_types::wire::errors::REASON_*` and
 //!     domain `"a2a-protocol.org"`.
-//!   * Streaming first-event-Task semantics (SubscribeToTask only).
+//!   * Both streaming RPCs open with the `Task` snapshot.
 //!   * Terminal-subscribe rejection as `FAILED_PRECONDITION`.
-//!   * `a2a-last-event-id` replay.
+//!   * `a2a-last-event-id` resume is covered with the other transports
+//!     in `stream_contract_tests.rs`.
 //!   * Tenant precedence (proto wins over metadata). Helper-level unit
 //!     tests already cover the rule; this suite adds one end-to-end
 //!     check that scoping lands in the right tenant.
@@ -501,27 +502,13 @@ async fn grpc_send_streaming_message_to_terminal() {
 
     assert!(!events.is_empty(), "stream produced no events");
 
-    // no synthetic `Task` snapshot precedes persisted
-    // events on SendStreamingMessage — the stream starts at the first
-    // stored event, which is SUBMITTED per the shared core's setup
-    // (`router::setup_streaming_send`). Pinning this explicitly so a
-    // regression that accidentally emits a `Task` first (as
-    // SubscribeToTask does) is caught here.
+    // A2A §3.1.2: the stream MUST begin with the Task object.
     match &events[0].payload {
-        Some(turul_a2a_proto::stream_response::Payload::StatusUpdate(upd)) => {
-            let state = upd.status.as_ref().map(|s| s.state());
-            assert_eq!(
-                state,
-                Some(turul_a2a_proto::TaskState::Submitted),
-                "first event must be StatusUpdate(SUBMITTED) / §2.11"
-            );
+        Some(turul_a2a_proto::stream_response::Payload::Task(task)) => {
+            let state = task.status.as_ref().map(|s| s.state());
+            assert_eq!(state, Some(turul_a2a_proto::TaskState::Working));
         }
-        other => panic!(
-            "first event must be StatusUpdate(SUBMITTED); got {other:?}. A synthetic \
-             Task first event would indicate regression of the gRPC streaming \
-             contract (first event MUST be the SUBMITTED status, not a Task \
-             snapshot)."
-        ),
+        other => panic!("first event must be the Task snapshot; got {other:?}"),
     }
 
     // Last event must be terminal Completed.

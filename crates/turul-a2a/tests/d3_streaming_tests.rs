@@ -282,18 +282,48 @@ async fn d3_terminal_task_returns_error() {
     );
 }
 
+/// After `delay`, commit INPUT_REQUIRED for `task_id` straight to the
+/// store without notifying any broker, so only the store poll can
+/// deliver it. INPUT_REQUIRED also closes the stream, which ends the
+/// collection.
+fn commit_input_required_later(state: &AppState, task_id: &str, delay: Duration) {
+    let store = state.atomic_store.clone();
+    let task_id = task_id.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let event = StreamEvent::StatusUpdate {
+            status_update: streaming::StatusUpdatePayload {
+                task_id: task_id.clone(),
+                context_id: format!("ctx-{task_id}"),
+                status: serde_json::json!({"state": "TASK_STATE_INPUT_REQUIRED"}),
+            },
+        };
+        store
+            .update_task_status_with_events(
+                "",
+                &task_id,
+                "anonymous",
+                TaskStatus::new(TaskState::InputRequired),
+                vec![event],
+            )
+            .await
+            .unwrap();
+    });
+}
+
 // =========================================================
-// D3-03: Non-terminal subscribe replays stored events
+// D3-03: Last-Event-ID replays stored events from the store
 // =========================================================
 
 #[tokio::test]
-async fn d3_subscribe_replays_stored_events() {
+async fn d3_last_event_id_zero_replays_all_stored_events() {
     let state = single_instance_state();
     let num_events = create_non_terminal_task(&state, "d3-replay-1").await;
 
     let router = build_router(state);
     let req = Request::get("/tasks/d3-replay-1:subscribe")
         .header("a2a-version", "1.0")
+        .header("Last-Event-ID", "d3-replay-1:0")
         .body(Body::empty())
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
@@ -301,17 +331,14 @@ async fn d3_subscribe_replays_stored_events() {
 
     let events = collect_sse(resp.into_body(), Duration::from_secs(3)).await;
 
-    // Task snapshot + stored events
-    assert!(
-        events.len() > num_events,
-        "Should get Task snapshot + {} stored events, got {}",
-        num_events,
-        events.len()
-    );
-
-    // All events should have durable IDs
-    for (i, (id, _)) in events.iter().enumerate() {
-        assert!(id.is_some(), "Event {i} should have a durable ID");
+    // Resume from 0: every stored event, no snapshot.
+    assert_eq!(events.len(), num_events, "got {events:?}");
+    for (i, (id, data)) in events.iter().enumerate() {
+        assert_eq!(
+            id.as_deref(),
+            Some(format!("d3-replay-1:{}", i + 1).as_str())
+        );
+        assert!(data.get("statusUpdate").is_some(), "event {i}: {data}");
     }
 }
 
@@ -322,9 +349,10 @@ async fn d3_subscribe_replays_stored_events() {
 #[tokio::test]
 async fn d3_reconnect_with_last_event_id() {
     let state = single_instance_state();
-    create_non_terminal_task(&state, "d3-reconn-1").await;
+    let num_events = create_non_terminal_task(&state, "d3-reconn-1").await;
 
-    // Initial subscribe to get event IDs
+    // A fresh subscribe is only the snapshot; its id carries the
+    // sequence it reflects.
     let router = build_router(state.clone());
     let req = Request::get("/tasks/d3-reconn-1:subscribe")
         .header("a2a-version", "1.0")
@@ -332,46 +360,30 @@ async fn d3_reconnect_with_last_event_id() {
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
     let initial = collect_sse(resp.into_body(), Duration::from_secs(3)).await;
-    assert!(
-        initial.len() >= 2,
-        "Need at least 2 events for reconnect test"
+    assert_eq!(initial.len(), 1, "snapshot only, got {initial:?}");
+    assert!(initial[0].1.get("task").is_some());
+    assert_eq!(
+        initial[0].0.as_deref(),
+        Some(format!("d3-reconn-1:{num_events}").as_str())
     );
 
-    // Find the ID of event at sequence 1 (first stored event after Task snapshot)
-    let first_stored_id = initial
-        .iter()
-        .find(|(id, data)| id.is_some() && data.get("statusUpdate").is_some())
-        .and_then(|(id, _)| id.clone())
-        .expect("Should have a stored event with ID");
-
-    // Reconnect with Last-Event-ID
+    // Reconnect after the first stored event: only later events, no snapshot.
     let router = build_router(state);
     let req = Request::get("/tasks/d3-reconn-1:subscribe")
         .header("a2a-version", "1.0")
-        .header("Last-Event-ID", &first_stored_id)
+        .header("Last-Event-ID", "d3-reconn-1:1")
         .body(Body::empty())
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
 
     let reconnected = collect_sse(resp.into_body(), Duration::from_secs(3)).await;
-
-    // Should get fewer events (skipped up to Last-Event-ID)
-    // No Task snapshot on reconnect (Last-Event-ID > 0)
+    assert_eq!(reconnected.len(), num_events - 1, "got {reconnected:?}");
     assert!(
-        reconnected.len() < initial.len(),
-        "Reconnect should return fewer events: reconnected={}, initial={}",
-        reconnected.len(),
-        initial.len()
+        reconnected.iter().all(|(_, d)| d.get("task").is_none()),
+        "Reconnect should NOT re-emit Task snapshot"
     );
-
-    // First reconnected event should NOT be a Task snapshot
-    if !reconnected.is_empty() {
-        assert!(
-            reconnected[0].1.get("task").is_none(),
-            "Reconnect should NOT re-emit Task snapshot"
-        );
-    }
+    assert_eq!(reconnected[0].0.as_deref(), Some("d3-reconn-1:2"));
 }
 
 // =========================================================
@@ -381,35 +393,29 @@ async fn d3_reconnect_with_last_event_id() {
 #[tokio::test]
 async fn d3_cross_instance_subscriber_producer() {
     let (state_a, state_b) = two_instances();
-
-    // Write events on instance A (non-terminal task)
     create_non_terminal_task(&state_a, "d3-cross-1").await;
 
-    // Subscribe on instance B — different broker, shared store
-    // The store poll (2s) will pick up the events.
-    let router_b = build_router(state_b);
+    // Subscribe on instance B; instance A commits the next event. B's
+    // broker never hears about it, so only the shared-store poll can
+    // deliver it.
+    // Keep B's state (and its broker) alive for the stream's lifetime,
+    // as a running server would.
+    let router_b = build_router(state_b.clone());
     let req = Request::get("/tasks/d3-cross-1:subscribe")
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let resp = router_b.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
+    commit_input_required_later(&state_a, "d3-cross-1", Duration::from_millis(300));
 
-    let events = collect_sse(resp.into_body(), Duration::from_secs(4)).await;
-
-    // Instance B should see Task snapshot + stored events via shared store
-    assert!(
-        events.len() >= 3,
-        "Cross-instance subscriber should see Task + 2 events, got {}",
-        events.len()
-    );
-
-    // First event should be Task object
-    assert!(
-        events[0].1.get("task").is_some(),
-        "First event should be Task"
-    );
+    let events = collect_sse(resp.into_body(), Duration::from_secs(5)).await;
+    assert_eq!(events.len(), 2, "snapshot + A's event, got {events:?}");
     assert_eq!(events[0].1["task"]["id"], "d3-cross-1");
+    assert_eq!(
+        events[1].1["statusUpdate"]["status"]["state"],
+        "TASK_STATE_INPUT_REQUIRED"
+    );
 }
 
 // =========================================================
@@ -418,53 +424,29 @@ async fn d3_cross_instance_subscriber_producer() {
 
 #[tokio::test]
 async fn d3_no_broker_correctness_dependency() {
-    // Write events directly to store WITHOUT any broker notification.
-    // Subscriber should still see events via store polling.
-    let s = InMemoryA2aStorage::new();
-    let state = AppState {
-        executor: Arc::new(CompletingExecutor),
-        task_storage: Arc::new(s.clone()),
-        push_storage: Arc::new(s.clone()),
-        event_store: Arc::new(s.clone()),
-        atomic_store: Arc::new(s),
-        event_broker: TaskEventBroker::new(),
-        middleware_stack: Arc::new(MiddlewareStack::new(vec![])),
-        runtime_config: turul_a2a::server::RuntimeConfig::default(),
-        in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
-        cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
-        push_delivery_store: None,
-        push_dispatcher: None,
-        durable_executor_queue: None,
-    };
-
-    // Create non-terminal task with events — NO broker.notify()
+    let state = single_instance_state();
     create_non_terminal_task(&state, "d3-nobroker-1").await;
 
-    // Subscribe — broker was NOT notified. Poll fallback should pick up events.
-    let router = build_router(state);
+    let router = build_router(state.clone());
     let req = Request::get("/tasks/d3-nobroker-1:subscribe")
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
+    // Committed with no broker notification: the poll fallback must
+    // deliver it.
+    commit_input_required_later(&state, "d3-nobroker-1", Duration::from_millis(300));
 
-    let events = collect_sse(resp.into_body(), Duration::from_secs(4)).await;
-
-    // Should see Task snapshot + events from store (no broker involved)
-    assert!(
-        events.len() >= 3,
-        "Subscriber should see events without broker: got {}",
-        events.len()
-    );
-
-    // All should have durable IDs
+    let events = collect_sse(resp.into_body(), Duration::from_secs(5)).await;
+    assert_eq!(events.len(), 2, "snapshot + polled event, got {events:?}");
     for (i, (id, _)) in events.iter().enumerate() {
-        assert!(
-            id.is_some(),
-            "Event {i} should have durable ID even without broker"
-        );
+        assert!(id.is_some(), "Event {i} should have a durable ID");
     }
+    assert_eq!(
+        events[1].1["statusUpdate"]["status"]["state"],
+        "TASK_STATE_INPUT_REQUIRED"
+    );
 }
 
 // =========================================================

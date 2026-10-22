@@ -11,8 +11,8 @@ A2A defines streaming via `POST /message:stream` (send + stream) and `GET /tasks
 
 In-process `TaskEventBroker` using `tokio::sync::broadcast` for multi-subscriber fan-out per task.
 
-- `POST /message:stream` subscribes before task creation, spawns executor in background, returns SSE stream.
-- `GET /tasks/{id}:subscribe` verifies task exists and is non-terminal, subscribes, publishes current status as first event.
+- `POST /message:stream` commits the start of the turn, snapshots the task, subscribes, spawns the executor in the background, and returns the SSE stream.
+- `GET /tasks/{id}:subscribe` verifies task exists and is non-terminal, subscribes, and opens with a `Task` snapshot. The stream contract shared by both streaming RPCs and all transports (first item, close policy, send-target resolution) is owned by ADR-014 §2.3.
 - `last_chunk` is transport-level metadata only in v0.1 -- forwarded to streaming subscribers but not persisted in storage.
 - The `append` flag IS implemented in storage: `append=true` with matching `artifact_id` appends parts to existing artifact.
 
@@ -24,3 +24,8 @@ In-process `TaskEventBroker` using `tokio::sync::broadcast` for multi-subscriber
 - **`last_chunk` can be upgraded to persisted state** in a future version without breaking the storage trait (the parameter already exists).
 - **Broker cleanup on terminal state prevents memory leaks.** Subscriptions are dropped when a task reaches a terminal status.
 - **Multi-subscriber fan-out is proven by parity tests.** Both HTTP SSE and JSON-RPC streaming exercise the same broker path.
+
+## Revision log
+
+- 2026-04-10 — Initial acceptance.
+- 2026-10-22 — Subscribe opens with a `Task` snapshot, not a status event. The cross-transport stream contract now lives in ADR-014 §2.3.

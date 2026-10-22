@@ -169,64 +169,117 @@ pre-raise MSRV for a feature that is off by default.
 
 ### 2.3 Streaming — single source of truth
 
-`SendStreamingMessage` and `SubscribeToTask` server-streams MUST consume
-the same durable event path as SSE (ADR-009 §§3-4, §7). The gRPC adapter
-SHALL NOT open a parallel event pipeline, SHALL NOT subscribe to the
-broker for data, and SHALL NOT assign its own event sequences.
+> **Amendment 2026-10-22 — Accepted.** This section replaces the
+> 2026-04-21 text. The earlier text ratified two defects: streaming send
+> did not open with a `Task` (violating A2A §3.1.2), and it claimed a
+> shared replay helper that the code never had (HTTP, JSON-RPC and gRPC
+> each carried their own copy of the stream loop). The per-transport
+> copies were deleted in the same change that implemented this section.
 
-Concretely:
+`SendStreamingMessage` and `SubscribeToTask` on every transport are
+produced by **one core stream** in `crates/turul-a2a/src/streaming/`.
+Transports encode its items (SSE `data:` frames, JSON-RPC result
+envelopes, `pb::StreamResponse`) and do nothing else: no storage reads,
+no state checks, no poll interval, no close decision. The durable event
+store is the only event source (ADR-009); the broker is a wake-up signal
+only.
 
-- The gRPC stream handler calls the same replay-then-live helper that
-  feeds the SSE encoder (`crates/turul-a2a/src/streaming/*`), receives
-  `StreamEvent` values tagged with `(task_id, event_sequence)`, and
-  serializes each into a `pb::StreamResponse` proto message.
-- `last_chunk` (ADR-006) has a two-layer persistence contract that
-  gRPC inherits unchanged from SSE:
-    1. It is **not** persisted as task artifact state —
-       `A2aTaskStorage::append_artifact` explicitly drops it (see the
-       `_last_chunk` parameter in all four backend impls and the
-       contract note at `crates/turul-a2a/src/storage/traits.rs:104-109`).
-    2. It **is** persisted as stream-event metadata inside the
-       `ArtifactUpdatePayload` field of `StreamEvent::ArtifactUpdate`
-       in the durable event store
-       (`crates/turul-a2a/src/streaming/mod.rs:65-80`), so replay
-       and reconnection preserve chunk boundaries for every
-       transport.
+**Owners.**
 
-  The gRPC adapter conveys `last_chunk` through the corresponding
-  `pb::StreamResponse` field exactly as the SSE encoder emits it —
-  the value is read from the persisted `ArtifactUpdatePayload`, not
-  invented by the adapter.
-- Terminal `SubscribeToTask` semantics are unchanged across transports:
-  the shared core raises `A2aError::UnsupportedOperation`
-  (CLAUDE.md §"Spec-aligned behaviors"; ADR-009 §12 supersession;
-  ADR-010 §4.3). The gRPC adapter MUST NOT perform its own
-  terminal-state check and MUST NOT invent a transport-specific
-  error. The canonical mapping in §2.5 maps this variant to
-  `FAILED_PRECONDITION`, per the A2A v1.0.1 error-mapping table.
-- `Last-Event-ID`-equivalent resume for gRPC: the client sends
-  `a2a-last-event-id` ASCII metadata (value = UTF-8
-  `"{task_id}:{sequence}"` matching the SSE convention in ADR-009
-  §2); the adapter parses it and calls the same replay entry point
-  as the HTTP handler. Missing or unparseable metadata means "start
-  from 0" — same behaviour as SSE without the header. The `-bin`
-  suffix MUST NOT be used; the value is printable ASCII by
-  construction.
-- **Spec §3.1.6 first-event-Task semantics are SubscribeToTask-only.**
-  `SubscribeToTask` MUST emit the `Task` snapshot as the first stream
-  item on a fresh attach (`after_sequence == 0`), then replay stored
-  events. On resume (`a2a-last-event-id` present) the snapshot is
-  skipped — the caller already has it. `SendStreamingMessage`, by
-  contrast, does NOT emit a synthetic `Task` first event: the shared
-  core has already written `SUBMITTED` + `WORKING` to the durable
-  event store before the stream opens, so the first item delivered
-  is the first persisted `StreamEvent` — matching the HTTP SSE path
-  (`router.rs` `core_send_streaming_message` comment:
-  "No initial Task snapshot: SUBMITTED + WORKING are already in the
-  event store and will replay on subscription"). This is the
-  established behaviour across both transports; the gRPC adapter
-  inherits it verbatim via `initial_task: None` to
-  `make_store_grpc_stream`.
+| Concern | Single owner |
+|---|---|
+| Stream items, ordering, close decision, poll interval | `streaming::task_stream::task_event_stream` (one `STORE_POLL_INTERVAL`) |
+| Which task a send targets (new vs. continuation) and its validation | `router::resolve_send_target` + `router::start_task_turn`, called by blocking **and** streaming send |
+| Opening each streaming RPC | `router::open_send_stream`, `router::open_subscribe_stream`; transports encode only |
+| Terminal classification | `turul_a2a_types::state_machine::is_terminal`; stream events decode their status through `TaskStatus` rather than matching wire-name strings |
+
+**Stream contract (normative, A2A v1.0.1).**
+
+1. **First item is a `Task` snapshot** on both RPCs: §3.1.2 ("the
+   stream MUST begin with the Task object") and §3.1.6. turul executors
+   always produce a Task, so the Message-only stream form of §3.1.2 is
+   never emitted.
+2. **No duplicate history after the snapshot.** The core reads the
+   task's latest event sequence `L`, then the snapshot, then emits
+   only events with sequence `> L`. On streaming send, `L` and the
+   snapshot are read after `start_task_turn` commits WORKING and
+   before the executor is spawned, so `L` is that WORKING event's
+   sequence and no overlap is possible. On subscribe, reading `L`
+   before the snapshot means an event
+   committed in between may appear both in the snapshot and as an
+   update. That at-least-once overlap is accepted; the alternative
+   (dropping it) loses events. Closing the overlap would need an atomic
+   task-plus-sequence read on the storage traits, which is out of scope.
+3. **Resume.** With `Last-Event-ID` / `a2a-last-event-id` present for
+   this task, the snapshot is skipped and events after the given
+   sequence are replayed. `{task_id}:0` is a resume from the start
+   (full replay, no snapshot); previously it was treated as a fresh
+   attach. A resumed stream that is already caught up on a task in a
+   closing state (item 4) ends at once rather than idling.
+4. **Close policy.** The stream closes after emitting a terminal status
+   (COMPLETED, FAILED, CANCELED, REJECTED; §3.1.2, §3.1.6 MUST) and
+   after emitting INPUT_REQUIRED (§11.7). It stays **open** on
+   AUTH_REQUIRED, because §7.6.1 says the agent SHOULD keep active
+   response streams open so an out-of-band credential can resume work.
+   Where §11.7 ("closes at terminal or interrupted state") conflicts
+   with §7.6.1, the more specific SHOULD wins. The same rule applies to
+   the snapshot: subscribing to an INPUT_REQUIRED task yields the
+   snapshot and then closes.
+5. **`last_chunk`** keeps the two-layer contract of ADR-006: not task
+   state, but persisted in `ArtifactUpdatePayload` so replay preserves
+   chunk boundaries on every transport.
+
+**Send-target resolution (normative, shared by blocking and streaming send).**
+
+- `message.taskId` empty → new task. Its `contextId` is the message's, or
+  freshly generated.
+- `message.taskId` set:
+  - unknown, or owned by someone else → `TaskNotFound` (§3.1.2);
+  - the task is in a terminal state → `UnsupportedOperation` (§3.1.2
+    errors list). This replaces today's `InvalidRequest` (-32602, no
+    ErrorInfo) on the blocking path;
+  - message `contextId` set and different from the task's → rejected
+    with `InvalidRequest` (§3.4.3 MUST reject; the spec names no error
+    type);
+  - message `contextId` empty → inferred from the task (§3.4.3 MUST);
+  - the previous turn's executor is still registered on this instance
+    (for example parked on AUTH_REQUIRED) → `UnsupportedOperation`,
+    checked before any write. Without this, the follow-up committed
+    WORKING and then failed to spawn, leaving the task stuck;
+  - the task is INPUT_REQUIRED or AUTH_REQUIRED → the message is
+    appended and the task moves to WORKING;
+  - the task is SUBMITTED or WORKING → `InvalidRequest`, unchanged.
+    The spec leaves this case undefined, and turul executors only
+    accept follow-ups in an interrupted state.
+- Terminal `SubscribeToTask` → `UnsupportedOperation` from the core
+  (§3.1.6). Transports MUST NOT add their own terminal check; §2.5 maps
+  the error to gRPC `FAILED_PRECONDITION`.
+- gRPC resume uses `a2a-last-event-id` ASCII metadata
+  (`"{task_id}:{sequence}"`, no `-bin` suffix), parsed by the same
+  helper as the SSE `Last-Event-ID` header.
+
+**Test obligations.** These are cross-transport tests in
+`stream_contract_tests.rs`, each run on HTTP, JSON-RPC and gRPC:
+
+- streaming send: first item is a `Task`;
+- a continuation stream on an INPUT_REQUIRED task opens with a `Task`
+  and carries no replayed history;
+- unknown `taskId` → TaskNotFound; terminal task → UnsupportedOperation;
+  contextId mismatch → rejected;
+- the stream closes after INPUT_REQUIRED and after terminal states, and
+  stays open across AUTH_REQUIRED → WORKING;
+- subscribe to a live task emits no event at or below the snapshot
+  sequence; `Last-Event-ID` / `a2a-last-event-id` resume replays only
+  later events and closes when caught up on a closing state;
+- a follow-up while the previous turn's executor is still running is
+  refused before any write;
+- the old `sse_tests.rs` assertion that "first event should be
+  statusUpdate" is deleted.
+
+The routing test scans the crate's `src/`: only the core stream
+defines `STORE_POLL_INTERVAL`, nothing outside it and the storage
+backends reads the event store directly, and `jsonrpc.rs` and
+`grpc/streaming.rs` open both RPCs through the shared core.
 
 Under ADR-006's single-instance local-broker model, multi-instance gRPC
 streaming inherits ADR-009's correctness guarantees (durable store is
@@ -498,12 +551,9 @@ terminal-subscribe rejection, pagination cursor stability,
 all three transports. No transport MAY diverge from another on any
 of these.
 
-Note on `SendStreamingMessage`: neither the HTTP SSE path nor the
-gRPC stream emits a synthetic `Task` snapshot before persisted
-events, because `SUBMITTED` + `WORKING` are already in the store
-when the stream opens (§2.3). Parity tests therefore assert the
-same event-order shape on both transports — starting from the
-first persisted event — not a first-Task check.
+Note on `SendStreamingMessage`: like `SubscribeToTask`, it opens
+with the `Task` snapshot on every transport (§2.3), so parity tests
+assert a first-Task check on both streaming RPCs.
 
 **Mandatory — core-handler sharing is enforced by parity.** ADR-005's
 "no behavior fork between transports" invariant (extended by this
@@ -522,17 +572,16 @@ include three cases:
   * `empty_when_neither_set`: proto `tenant = ""` + no metadata
     → request scopes to the default tenant (empty string).
 
-- `SendStreamingMessage` (gRPC): full event stream starting from
-  the first persisted event (`SUBMITTED`) through to terminal
-  event; ordering preserved; every event carries the same
-  `(task_id, event_sequence)` it would carry over SSE. No
-  synthetic `Task` snapshot precedes the first stored event (see
-  §2.3). The durable event store is the source of truth (ADR-009
+- `SendStreamingMessage` (gRPC): the `Task` snapshot first, then
+  every event after the snapshot's sequence through to the state
+  that closes the stream (§2.3); ordering preserved; every event
+  carries the same `(task_id, event_sequence)` it would carry over
+  SSE. The durable event store is the source of truth (ADR-009
   §§3-4, §7); the gRPC stream MUST NOT invent its own sequence
   numbers.
 - `SubscribeToTask` (gRPC):
-  - Attach-to-non-terminal + replay-from-0: identical event set
-    to the SSE equivalent.
+  - Attach-to-non-terminal: the `Task` snapshot, then only events
+    above its sequence — identical to the SSE equivalent.
   - `Last-Event-ID` reconnection: client sends
     `a2a-last-event-id: {task_id}:{sequence}` ASCII metadata;
     adapter delivers only events with `event_sequence >` the
@@ -733,3 +782,4 @@ theirs. Opt-in is the correct posture for both.
 
 - 2026-04-21 — Initial acceptance against A2A v1.0.0.
 - 2026-10-22 — Error-mapping table aligned to A2A v1.0.1 §5.4: `PushNotificationNotSupported` and `ExtendedAgentCardNotConfigured` UNIMPLEMENTED→FAILED_PRECONDITION; HTTP column TaskNotCancelable 409→400, ContentTypeNotSupported 415→400, InvalidAgentResponse 502→500, ExtendedAgentCardNotConfigured 404→400 (the 404 row never matched `wire.rs`). The "capability absence → UNIMPLEMENTED" rationale is withdrawn because the spec no longer makes that split.
+- 2026-10-22 — §2.3 rewritten and accepted: one core stream for all three transports. Both streaming RPCs open with a `Task` snapshot, with no history replayed after it. Streams close on terminal states and INPUT_REQUIRED and stay open on AUTH_REQUIRED. Send-target resolution is shared by blocking and streaming send, which fixes streaming send ignoring `message.taskId`. Withdraws the earlier rule, in §2.3 and §2.11, that streaming send does not open with a `Task`. Follow-ups are refused while the previous turn's executor is still running; `Last-Event-ID: {task_id}:0` is now a resume; an already-caught-up resumed stream on a closing state ends at once.

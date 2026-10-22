@@ -128,7 +128,7 @@ fn parse_sse_event(text: &str) -> Option<SseEvent> {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum StreamEvent {
-    /// Full task snapshot (first event in subscribe streams).
+    /// Full task snapshot (first event in both send and subscribe streams).
     Task(Task),
     /// Direct message from the agent.
     Message(Message),

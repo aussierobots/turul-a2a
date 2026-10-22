@@ -8,11 +8,13 @@
 //! Used by `POST /message:stream` and `GET /tasks/{id}:subscribe`.
 
 pub mod replay;
+pub(crate) mod task_stream;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, broadcast};
+use turul_a2a_types::{TaskState, TaskStatus};
 
 /// A single streaming event (persisted in the durable event store).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -31,24 +33,24 @@ pub enum StreamEvent {
 }
 
 impl StreamEvent {
+    /// The task state a status update carries; `None` for artifact
+    /// updates or a status that does not decode.
+    pub fn task_state(&self) -> Option<TaskState> {
+        match self {
+            StreamEvent::StatusUpdate { status_update } => {
+                serde_json::from_value::<TaskStatus>(status_update.status.clone())
+                    .ok()?
+                    .state()
+                    .ok()
+            }
+            StreamEvent::ArtifactUpdate { .. } => None,
+        }
+    }
+
     /// Check if this event represents a terminal task state.
     pub fn is_terminal(&self) -> bool {
-        match self {
-            StreamEvent::StatusUpdate { status_update } => status_update
-                .status
-                .get("state")
-                .and_then(|s| s.as_str())
-                .is_some_and(|s| {
-                    matches!(
-                        s,
-                        "TASK_STATE_COMPLETED"
-                            | "TASK_STATE_FAILED"
-                            | "TASK_STATE_CANCELED"
-                            | "TASK_STATE_REJECTED"
-                    )
-                }),
-            StreamEvent::ArtifactUpdate { .. } => false,
-        }
+        self.task_state()
+            .is_some_and(turul_a2a_types::state_machine::is_terminal)
     }
 }
 

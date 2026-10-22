@@ -283,7 +283,9 @@ impl A2aClient {
     /// Send a streaming message. Returns a typed event stream.
     ///
     /// Events are `StreamEvent` variants: `Task`, `Message`, `StatusUpdate`, `ArtifactUpdate`.
-    /// The stream closes when the task reaches a terminal state.
+    /// A turul-a2a server opens the stream with a `Task` snapshot (spec §3.1.2) and
+    /// closes it on a terminal state or INPUT_REQUIRED; continue an INPUT_REQUIRED
+    /// task by streaming a new message that carries its `task_id`.
     pub async fn send_streaming_message(
         &self,
         request: impl Into<pb::SendMessageRequest>,

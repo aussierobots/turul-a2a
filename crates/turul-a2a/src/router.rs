@@ -4,22 +4,20 @@
 //! uses `{id=*}:action` patterns that don't map directly to axum's `:param` syntax.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use tokio::sync::broadcast;
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::A2aError;
 use crate::executor::AgentExecutor;
 use crate::storage::{
-    A2aAtomicStore, A2aEventStore, A2aPushNotificationStorage, A2aStorageError, A2aTaskStorage,
-    TaskFilter, TaskListPage,
+    A2aAtomicStore, A2aPushNotificationStorage, A2aStorageError, A2aTaskStorage, TaskFilter,
+    TaskListPage,
 };
+use crate::streaming::task_stream::{StreamItem, StreamStart, TaskEventStream, task_event_stream};
 use crate::streaming::{StreamEvent, replay};
 use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
 
@@ -446,90 +444,54 @@ async fn tenant_send_streaming_message_handler(
     Ok(attach_extension_echo(response, &echoed))
 }
 
-/// Task-side setup for streaming send: parse request, create task,
-/// emit SUBMITTED + WORKING through the atomic store, spawn the
-/// executor. Returns the `task_id` and a broker wake-up receiver.
+/// Open the stream for `SendStreamingMessage`: resolve the target task,
+/// commit the start of the turn, snapshot the task, then spawn the
+/// executor. The snapshot and its event sequence are read before the
+/// executor runs, so nothing it emits can fall between them.
 ///
-/// Shared by the HTTP SSE path (`core_send_streaming_message`) and the
-/// gRPC streaming adapter. Both transports dispatch into this single
-/// entry point so SSE and gRPC streaming cannot diverge.
-pub(crate) async fn setup_streaming_send(
+/// Shared by every transport.
+pub(crate) async fn open_send_stream(
     state: AppState,
     tenant: &str,
     owner: &str,
     claims: Option<serde_json::Value>,
     body: String,
-) -> Result<(String, broadcast::Receiver<()>), A2aError> {
+) -> Result<TaskEventStream, A2aError> {
     let request: turul_a2a_proto::SendMessageRequest =
         serde_json::from_str(&body).map_err(|e| A2aError::InvalidRequest {
             message: format!("Invalid request body: {e}"),
         })?;
-
+    let history_length = request
+        .configuration
+        .as_ref()
+        .and_then(|c| c.history_length);
     let proto_message = request.message.ok_or(A2aError::InvalidRequest {
         message: "message field is required".into(),
     })?;
-
     let message = Message::try_from(proto_message).map_err(|e| A2aError::InvalidRequest {
         message: format!("Invalid message: {e}"),
     })?;
 
-    let task_id = uuid::Uuid::now_v7().to_string();
-    let context_id = if message.as_proto().context_id.is_empty() {
-        uuid::Uuid::now_v7().to_string()
-    } else {
-        message.as_proto().context_id.clone()
-    };
+    let target = resolve_send_target(&state, tenant, owner, &message).await?;
+    start_task_turn(&state, tenant, owner, &target, &message).await?;
 
-    // Subscribe to wake-ups BEFORE creating the task so we don't miss notifications.
-    let wake_rx = state.event_broker.subscribe(&task_id).await;
-
-    // Atomic: create task (SUBMITTED) + SUBMITTED event.
-    let mut task =
-        Task::new(&task_id, TaskStatus::new(TaskState::Submitted)).with_context_id(&context_id);
-    task.append_message(message.clone());
-
-    let submitted_event = StreamEvent::StatusUpdate {
-        status_update: crate::streaming::StatusUpdatePayload {
-            task_id: task_id.clone(),
-            context_id: context_id.clone(),
-            status: serde_json::to_value(TaskStatus::new(TaskState::Submitted)).unwrap_or_default(),
-        },
-    };
-
-    state
-        .atomic_store
-        .create_task_with_events(tenant, owner, task, vec![submitted_event])
+    let sequence = state
+        .event_store
+        .latest_sequence(tenant, &target.task_id)
         .await
         .map_err(A2aError::from)?;
-
-    state.event_broker.notify(&task_id).await;
-
-    // Advance SUBMITTED → WORKING via the CAS-guarded atomic store so
-    // streaming subscribers see the WORKING event before the executor
-    // emits its own events.
-    let working_event = StreamEvent::StatusUpdate {
-        status_update: crate::streaming::StatusUpdatePayload {
-            task_id: task_id.clone(),
-            context_id: context_id.clone(),
-            status: serde_json::to_value(TaskStatus::new(TaskState::Working)).unwrap_or_default(),
-        },
-    };
-    state
-        .atomic_store
-        .update_task_status_with_events(
-            tenant,
-            &task_id,
-            owner,
-            TaskStatus::new(TaskState::Working),
-            vec![working_event],
-        )
+    let task = state
+        .task_storage
+        .get_task(tenant, &target.task_id, owner, history_length)
         .await
-        .map_err(A2aError::from)?;
-    state.event_broker.notify(&task_id).await;
+        .map_err(A2aError::from)?
+        .ok_or_else(|| A2aError::TaskNotFound {
+            task_id: target.task_id.clone(),
+        })?;
+    let wake_rx = state.event_broker.subscribe(&target.task_id).await;
 
-    // Spawn the executor on a tracked handle. We drop the yielded
-    // receiver — streaming transport does not block on it; subscribers
-    // observe terminal events through the durable store instead.
+    // Streaming does not block on the executor's yielded receiver;
+    // subscribers observe its events through the durable store.
     let spawn_deps = crate::server::spawn::SpawnDeps {
         executor: state.executor.clone(),
         task_storage: state.task_storage.clone(),
@@ -541,46 +503,45 @@ pub(crate) async fn setup_streaming_send(
     let scope = crate::server::spawn::SpawnScope {
         tenant: tenant.to_string(),
         owner: owner.to_string(),
-        task_id: task_id.clone(),
-        context_id: context_id.clone(),
-        message: message.clone(),
-        claims: claims.clone(),
+        task_id: target.task_id.clone(),
+        context_id: target.context_id.clone(),
+        message,
+        claims,
     };
     let _spawn = crate::server::spawn::spawn_tracked_executor(spawn_deps, scope)?;
 
-    Ok((task_id, wake_rx))
-}
-
-pub(crate) async fn core_send_streaming_message(
-    state: AppState,
-    tenant: &str,
-    owner: &str,
-    claims: Option<serde_json::Value>,
-    body: String,
-) -> Result<axum::response::Response, A2aError> {
-    let (task_id, wake_rx) =
-        setup_streaming_send(state.clone(), tenant, owner, claims, body).await?;
-    // SSE stream reads from the durable store. No initial Task
-    // snapshot: SUBMITTED + WORKING are already in the event store and
-    // will replay on subscription.
-    Ok(make_store_sse_response(
+    Ok(task_event_stream(
         state.event_store,
         tenant.to_string(),
-        task_id,
-        0,
+        target.task_id,
+        StreamStart::Snapshot {
+            task: Box::new(task),
+            sequence,
+        },
         wake_rx,
-        None,
     ))
 }
 
-pub(crate) async fn core_subscribe_to_task(
+/// Open the stream for `SubscribeToTask`. Unknown or foreign tasks are
+/// `TaskNotFound`; terminal tasks are `UnsupportedOperation` (A2A
+/// §3.1.6). A `Last-Event-ID` for this task resumes after that event
+/// without a snapshot; otherwise the stream opens with one.
+///
+/// Shared by every transport.
+pub(crate) async fn open_subscribe_stream(
     state: AppState,
     tenant: &str,
     owner: &str,
     task_id: &str,
-    last_event_id_header: Option<&str>,
-) -> Result<axum::response::Response, A2aError> {
-    // Verify task exists and caller owns it
+    last_event_id: Option<&str>,
+) -> Result<TaskEventStream, A2aError> {
+    // Read the sequence before the snapshot: an event committed in
+    // between may appear in both, but none can be missed.
+    let sequence = state
+        .event_store
+        .latest_sequence(tenant, task_id)
+        .await
+        .map_err(A2aError::from)?;
     let task = state
         .task_storage
         .get_task(tenant, task_id, owner, None)
@@ -590,7 +551,6 @@ pub(crate) async fn core_subscribe_to_task(
             task_id: task_id.to_string(),
         })?;
 
-    // Spec §3.1.6: terminal tasks return UnsupportedOperationError
     if let Some(status) = task.status()
         && let Ok(s) = status.state()
         && s.is_terminal()
@@ -600,120 +560,83 @@ pub(crate) async fn core_subscribe_to_task(
         });
     }
 
-    // Parse Last-Event-ID for replay
-    let after_sequence = last_event_id_header
+    let start = match last_event_id
         .and_then(replay::parse_last_event_id)
         .filter(|parsed| parsed.task_id == task_id)
-        .map(|parsed| parsed.sequence)
-        .unwrap_or(0);
-
-    // Spec §3.1.6: MUST return a Task object as the first event.
-    // On reconnection (Last-Event-ID present), skip the snapshot — client has context.
-    let initial_task = if after_sequence == 0 {
-        Some(task)
-    } else {
-        None
+    {
+        Some(parsed) => StreamStart::Resume {
+            after_sequence: parsed.sequence,
+            current_state: task.status().and_then(|s| s.state().ok()),
+            current_sequence: sequence,
+        },
+        None => StreamStart::Snapshot {
+            task: Box::new(task),
+            sequence,
+        },
     };
-
-    // Subscribe to wake-up notifications
     let wake_rx = state.event_broker.subscribe(task_id).await;
 
-    Ok(make_store_sse_response(
+    Ok(task_event_stream(
         state.event_store,
         tenant.to_string(),
         task_id.to_string(),
-        after_sequence,
+        start,
         wake_rx,
-        initial_task,
     ))
 }
 
-/// Polling interval for cross-instance subscribers that don't receive
-/// same-instance broker notifications.
-const STORE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) async fn core_send_streaming_message(
+    state: AppState,
+    tenant: &str,
+    owner: &str,
+    claims: Option<serde_json::Value>,
+    body: String,
+) -> Result<axum::response::Response, A2aError> {
+    let stream = open_send_stream(state, tenant, owner, claims, body).await?;
+    Ok(sse_response(stream, |item| item))
+}
 
-/// Build an SSE response that reads events from the durable store.
-///
-/// 1. Initial Task snapshot (spec §3.1.6): emit Task object as first event (if provided)
-/// 2. Replay: emit all events after `after_sequence` from the store
-/// 3. Live loop: wait for broker wake-up or poll timeout, re-query store
-/// 4. Close: when a terminal event is emitted
-///
-/// Each SSE event has `id: {task_id}:{sequence}` for reconnection support.
-/// The initial Task snapshot uses `id: {task_id}:0` (before any event sequence).
-fn make_store_sse_response(
-    event_store: Arc<dyn A2aEventStore>,
-    tenant: String,
-    task_id: String,
-    after_sequence: u64,
-    wake_rx: broadcast::Receiver<()>,
-    initial_task: Option<Task>,
+pub(crate) async fn core_subscribe_to_task(
+    state: AppState,
+    tenant: &str,
+    owner: &str,
+    task_id: &str,
+    last_event_id_header: Option<&str>,
+) -> Result<axum::response::Response, A2aError> {
+    let stream = open_subscribe_stream(state, tenant, owner, task_id, last_event_id_header).await?;
+    Ok(sse_response(stream, |item| item))
+}
+
+/// Encode a task stream as SSE. Each item becomes one event whose
+/// `data:` is `wrap` applied to the `StreamResponse` JSON
+/// (`{"task": …}` / `{"statusUpdate": …}` / `{"artifactUpdate": …}`)
+/// and whose `id:` is `{task_id}:{sequence}` for `Last-Event-ID`
+/// resume. A storage error ends the stream.
+pub(crate) fn sse_response(
+    stream: TaskEventStream,
+    wrap: impl Fn(serde_json::Value) -> serde_json::Value + Send + 'static,
 ) -> axum::response::Response {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
+    use tokio_stream::StreamExt;
 
-    tokio::spawn(async move {
-        // Spec §3.1.6: emit Task object as first event in the stream
-        if let Some(task) = initial_task {
-            let task_json =
-                serde_json::json!({"task": serde_json::to_value(&task).unwrap_or_default()});
-            let json = serde_json::to_string(&task_json).unwrap_or_default();
-            let sse_event = Event::default()
-                .id(replay::format_event_id(&task_id, 0))
-                .data(json);
-            if tx.send(Ok(sse_event)).await.is_err() {
-                return;
+    let task_id = stream.task_id;
+    let events = stream.items.map_while(move |item| {
+        let (sequence, body) = match item.ok()? {
+            StreamItem::Task { task, sequence } => (
+                sequence,
+                serde_json::json!({"task": serde_json::to_value(&task).unwrap_or_default()}),
+            ),
+            StreamItem::Event { sequence, event } => {
+                (sequence, serde_json::to_value(&event).unwrap_or_default())
             }
-        }
-
-        let mut last_seq = after_sequence;
-        let mut wake_rx = wake_rx;
-
-        loop {
-            // Query store for events after last_seq
-            let events = match event_store
-                .get_events_after(&tenant, &task_id, last_seq)
-                .await
-            {
-                Ok(e) => e,
-                Err(_) => break,
-            };
-
-            let mut saw_terminal = false;
-            for (seq, event) in events {
-                last_seq = seq;
-                let event_id = replay::format_event_id(&task_id, seq);
-                let json = serde_json::to_string(&event).unwrap_or_default();
-                let sse_event = Event::default().id(event_id).data(json);
-                if tx.send(Ok(sse_event)).await.is_err() {
-                    return; // subscriber disconnected
-                }
-                if event.is_terminal() {
-                    saw_terminal = true;
-                }
-            }
-
-            if saw_terminal {
-                break; // close stream after terminal event
-            }
-
-            // Wait for broker wake-up or periodic poll (cross-instance fallback)
-            tokio::select! {
-                result = wake_rx.recv() => {
-                    match result {
-                        Ok(()) => {} // re-query store
-                        Err(broadcast::error::RecvError::Closed) => break,
-                        Err(broadcast::error::RecvError::Lagged(_)) => {} // re-query
-                    }
-                }
-                _ = tokio::time::sleep(STORE_POLL_INTERVAL) => {
-                    // Periodic poll for cross-instance correctness
-                }
-            }
-        }
+        };
+        let data = serde_json::to_string(&wrap(body)).unwrap_or_default();
+        Some(Ok::<_, std::convert::Infallible>(
+            Event::default()
+                .id(replay::format_event_id(&task_id, sequence))
+                .data(data),
+        ))
     });
-
-    let stream = ReceiverStream::new(rx);
-    Sse::new(stream)
+    Sse::new(events)
         .keep_alive(KeepAlive::default())
         .into_response()
 }
@@ -793,6 +716,165 @@ fn parse_task_state(s: &str) -> Option<TaskState> {
 }
 
 #[doc(hidden)]
+/// The task a `SendMessage` / `SendStreamingMessage` targets.
+pub(crate) struct SendTarget {
+    pub(crate) task_id: String,
+    pub(crate) context_id: String,
+    pub(crate) is_continuation: bool,
+}
+
+/// Resolve which task an incoming message targets. Shared by blocking
+/// and streaming send so both apply the same rules (A2A §3.1.2, §3.4.3):
+///
+/// - no `taskId` → a new task in the message's `contextId`, or a new one;
+/// - unknown or foreign `taskId` → `TaskNotFound`;
+/// - terminal task → `UnsupportedOperation`;
+/// - `contextId` differing from the task's → rejected; absent → inferred;
+/// - only INPUT_REQUIRED / AUTH_REQUIRED tasks accept follow-ups, and
+///   only once the previous turn's executor has returned on this
+///   instance. Checked before any write, so a refused follow-up leaves
+///   the task untouched.
+pub(crate) async fn resolve_send_target(
+    state: &AppState,
+    tenant: &str,
+    owner: &str,
+    message: &Message,
+) -> Result<SendTarget, A2aError> {
+    let msg_task_id = message.as_proto().task_id.clone();
+    if msg_task_id.is_empty() {
+        let context_id = if message.as_proto().context_id.is_empty() {
+            uuid::Uuid::now_v7().to_string()
+        } else {
+            message.as_proto().context_id.clone()
+        };
+        return Ok(SendTarget {
+            task_id: uuid::Uuid::now_v7().to_string(),
+            context_id,
+            is_continuation: false,
+        });
+    }
+
+    let existing = state
+        .task_storage
+        .get_task(tenant, &msg_task_id, owner, None)
+        .await
+        .map_err(A2aError::from)?
+        .ok_or_else(|| A2aError::TaskNotFound {
+            task_id: msg_task_id.clone(),
+        })?;
+
+    let msg_context_id = &message.as_proto().context_id;
+    if !msg_context_id.is_empty() && msg_context_id != existing.context_id() {
+        return Err(A2aError::InvalidRequest {
+            message: format!(
+                "contextId mismatch: message has '{}' but task {} has '{}'",
+                msg_context_id,
+                msg_task_id,
+                existing.context_id()
+            ),
+        });
+    }
+
+    if let Some(status) = existing.status()
+        && let Ok(s) = status.state()
+    {
+        match s {
+            TaskState::InputRequired | TaskState::AuthRequired => {}
+            s if s.is_terminal() => {
+                return Err(A2aError::UnsupportedOperation {
+                    message: format!(
+                        "Task {msg_task_id} is in terminal state {s:?} and cannot accept further messages"
+                    ),
+                });
+            }
+            _ => {
+                return Err(A2aError::InvalidRequest {
+                    message: format!(
+                        "Task {msg_task_id} is in state {s:?}, only INPUT_REQUIRED or AUTH_REQUIRED tasks accept follow-up messages"
+                    ),
+                });
+            }
+        }
+    }
+
+    if state
+        .in_flight
+        .get(&(tenant.to_string(), msg_task_id.clone()))
+        .is_some()
+    {
+        return Err(A2aError::UnsupportedOperation {
+            message: format!(
+                "Task {msg_task_id} is still being processed by its executor; \
+                 send the follow-up once the current turn has finished"
+            ),
+        });
+    }
+
+    Ok(SendTarget {
+        task_id: msg_task_id,
+        context_id: existing.context_id().to_string(),
+        is_continuation: true,
+    })
+}
+
+/// Commit the start of a turn so subscribers and push delivery observe
+/// the lifecycle: a new task is created in SUBMITTED and advanced to
+/// WORKING; a continuation appends the message and moves
+/// INPUT_REQUIRED / AUTH_REQUIRED → WORKING. Every status change goes
+/// through the CAS-guarded atomic store.
+pub(crate) async fn start_task_turn(
+    state: &AppState,
+    tenant: &str,
+    owner: &str,
+    target: &SendTarget,
+    message: &Message,
+) -> Result<(), A2aError> {
+    let status_event = |state: TaskState| StreamEvent::StatusUpdate {
+        status_update: crate::streaming::StatusUpdatePayload {
+            task_id: target.task_id.clone(),
+            context_id: target.context_id.clone(),
+            status: serde_json::to_value(TaskStatus::new(state)).unwrap_or_default(),
+        },
+    };
+
+    if target.is_continuation {
+        state
+            .task_storage
+            .append_message(tenant, &target.task_id, owner, message.clone())
+            .await
+            .map_err(A2aError::from)?;
+    } else {
+        let mut task = Task::new(&target.task_id, TaskStatus::new(TaskState::Submitted))
+            .with_context_id(&target.context_id);
+        task.append_message(message.clone());
+        state
+            .atomic_store
+            .create_task_with_events(
+                tenant,
+                owner,
+                task,
+                vec![status_event(TaskState::Submitted)],
+            )
+            .await
+            .map_err(A2aError::from)?;
+        state.event_broker.notify(&target.task_id).await;
+    }
+
+    state
+        .atomic_store
+        .update_task_status_with_events(
+            tenant,
+            &target.task_id,
+            owner,
+            TaskStatus::new(TaskState::Working),
+            vec![status_event(TaskState::Working)],
+        )
+        .await
+        .map_err(A2aError::from)?;
+    state.event_broker.notify(&target.task_id).await;
+    Ok(())
+}
+
 pub async fn core_send_message(
     state: AppState,
     tenant: &str,
@@ -871,57 +953,9 @@ pub async fn core_send_message(
         }
     }
 
-    let msg_task_id = message.as_proto().task_id.clone();
-
-    // If message has a task_id, continue the existing task; otherwise create new.
-    let (task_id, context_id, is_continuation) = if !msg_task_id.is_empty() {
-        let existing = state
-            .task_storage
-            .get_task(tenant, &msg_task_id, owner, None)
-            .await
-            .map_err(A2aError::from)?
-            .ok_or_else(|| A2aError::TaskNotFound {
-                task_id: msg_task_id.clone(),
-            })?;
-
-        // Reject contextId/taskId mismatch (spec §3.4.3 MUST).
-        let msg_context_id = &message.as_proto().context_id;
-        if !msg_context_id.is_empty() && msg_context_id != existing.context_id() {
-            return Err(A2aError::InvalidRequest {
-                message: format!(
-                    "contextId mismatch: message has '{}' but task {} has '{}'",
-                    msg_context_id,
-                    msg_task_id,
-                    existing.context_id()
-                ),
-            });
-        }
-
-        // Continuation is only valid from interrupted states.
-        if let Some(status) = existing.status()
-            && let Ok(s) = status.state()
-        {
-            match s {
-                TaskState::InputRequired | TaskState::AuthRequired => {}
-                _ => {
-                    return Err(A2aError::InvalidRequest {
-                        message: format!(
-                            "Task {msg_task_id} is in state {s:?}, only INPUT_REQUIRED or AUTH_REQUIRED tasks accept follow-up messages"
-                        ),
-                    });
-                }
-            }
-        }
-
-        (msg_task_id, existing.context_id().to_string(), true)
-    } else {
-        let context_id = if message.as_proto().context_id.is_empty() {
-            uuid::Uuid::now_v7().to_string()
-        } else {
-            message.as_proto().context_id.clone()
-        };
-        (uuid::Uuid::now_v7().to_string(), context_id, false)
-    };
+    let target = resolve_send_target(&state, tenant, owner, &message).await?;
+    let task_id = target.task_id.clone();
+    let context_id = target.context_id.clone();
 
     // §HTTP invocation step 3-4: if a durable executor queue
     // is wired AND `return_immediately` is requested, build the
@@ -958,79 +992,7 @@ pub async fn core_send_message(
             None
         };
 
-    // Set up task storage in WORKING atomically, emitting SUBMITTED
-    // + WORKING events through the CAS-guarded atomic store so that
-    // subscribers / push delivery observe the lifecycle even on the
-    // blocking-send path. For continuations, append the incoming
-    // message and transition INPUT_REQUIRED/AUTH_REQUIRED → WORKING.
-    if is_continuation {
-        state
-            .task_storage
-            .append_message(tenant, &task_id, owner, message.clone())
-            .await
-            .map_err(A2aError::from)?;
-
-        let working_event = StreamEvent::StatusUpdate {
-            status_update: crate::streaming::StatusUpdatePayload {
-                task_id: task_id.clone(),
-                context_id: context_id.clone(),
-                status: serde_json::to_value(TaskStatus::new(TaskState::Working))
-                    .unwrap_or_default(),
-            },
-        };
-        state
-            .atomic_store
-            .update_task_status_with_events(
-                tenant,
-                &task_id,
-                owner,
-                TaskStatus::new(TaskState::Working),
-                vec![working_event],
-            )
-            .await
-            .map_err(A2aError::from)?;
-        state.event_broker.notify(&task_id).await;
-    } else {
-        let mut task =
-            Task::new(&task_id, TaskStatus::new(TaskState::Submitted)).with_context_id(&context_id);
-        task.append_message(message.clone());
-
-        let submitted_event = StreamEvent::StatusUpdate {
-            status_update: crate::streaming::StatusUpdatePayload {
-                task_id: task_id.clone(),
-                context_id: context_id.clone(),
-                status: serde_json::to_value(TaskStatus::new(TaskState::Submitted))
-                    .unwrap_or_default(),
-            },
-        };
-        state
-            .atomic_store
-            .create_task_with_events(tenant, owner, task, vec![submitted_event])
-            .await
-            .map_err(A2aError::from)?;
-        state.event_broker.notify(&task_id).await;
-
-        let working_event = StreamEvent::StatusUpdate {
-            status_update: crate::streaming::StatusUpdatePayload {
-                task_id: task_id.clone(),
-                context_id: context_id.clone(),
-                status: serde_json::to_value(TaskStatus::new(TaskState::Working))
-                    .unwrap_or_default(),
-            },
-        };
-        state
-            .atomic_store
-            .update_task_status_with_events(
-                tenant,
-                &task_id,
-                owner,
-                TaskStatus::new(TaskState::Working),
-                vec![working_event],
-            )
-            .await
-            .map_err(A2aError::from)?;
-        state.event_broker.notify(&task_id).await;
-    }
+    start_task_turn(&state, tenant, owner, &target, &message).await?;
 
     // Bug 2 steps 4-5: register any inline push config BEFORE
     // spawning the executor so a pre-terminal failure cannot leave a

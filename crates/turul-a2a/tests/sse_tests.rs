@@ -199,7 +199,7 @@ async fn message_stream_returns_text_event_stream() {
 }
 
 #[tokio::test]
-async fn message_stream_first_event_is_status_snapshot() {
+async fn message_stream_first_event_is_task_snapshot() {
     let state = test_state();
     let router = build_router(state);
     let req = Request::post("/message:stream")
@@ -213,16 +213,16 @@ async fn message_stream_first_event_is_status_snapshot() {
 
     assert!(!events.is_empty(), "Should receive at least one event");
 
-    // First event should be a statusUpdate
+    // A2A §3.1.2: the stream MUST begin with the Task object.
     let first = &events[0];
     assert!(
-        first.get("statusUpdate").is_some(),
-        "First event should be statusUpdate, got: {first}"
+        first.get("task").is_some(),
+        "First event should be the Task snapshot, got: {first}"
     );
-    let su = &first["statusUpdate"];
-    assert!(su.get("taskId").is_some());
-    assert!(su.get("contextId").is_some());
-    assert!(su.get("status").is_some());
+    let task = &first["task"];
+    assert!(task.get("id").is_some());
+    assert!(task.get("contextId").is_some());
+    assert!(task.get("status").is_some());
 }
 
 #[tokio::test]
@@ -238,8 +238,10 @@ async fn message_stream_events_are_proto_correct_stream_response() {
     let resp = router.oneshot(req).await.unwrap();
     let events = collect_sse_events(resp.into_body(), Duration::from_secs(2)).await;
 
-    // Every event must be a valid StreamResponse variant (statusUpdate or artifactUpdate)
-    for event in &events {
+    // Every event must be a valid StreamResponse variant: the Task
+    // snapshot first, then status or artifact updates.
+    assert!(events[0].get("task").is_some(), "first: {}", events[0]);
+    for event in &events[1..] {
         let is_status = event.get("statusUpdate").is_some();
         let is_artifact = event.get("artifactUpdate").is_some();
         assert!(
@@ -501,7 +503,7 @@ async fn subscribe_tenant_scoped_missing_returns_404() {
 // =========================================================
 
 #[tokio::test]
-async fn subscribe_non_terminal_task_returns_sse_with_stored_events() {
+async fn subscribe_non_terminal_task_returns_sse_opening_with_task_snapshot() {
     let state = test_state();
 
     // Create task with events via atomic store (D3 model)
@@ -570,13 +572,10 @@ async fn subscribe_non_terminal_task_returns_sse_with_stored_events() {
         "Subscribe should return text/event-stream, got: {content_type}"
     );
 
-    // Should emit Task snapshot (spec §3.1.6) + replay stored events (SUBMITTED + WORKING)
+    // Task snapshot only (spec §3.1.6): it already reflects the stored
+    // SUBMITTED and WORKING events, so neither is replayed.
     let events = collect_sse_events(resp.into_body(), Duration::from_secs(3)).await;
-    assert!(
-        events.len() >= 3,
-        "Subscribe should emit Task snapshot + 2 stored events, got: {}",
-        events.len()
-    );
+    assert_eq!(events.len(), 1, "snapshot only, got: {events:?}");
 
     // First event MUST be a Task object (spec §3.1.6)
     let first = &events[0];
@@ -588,12 +587,5 @@ async fn subscribe_non_terminal_task_returns_sse_with_stored_events() {
         first["task"]["id"].as_str().unwrap_or(""),
         "sub-happy-1",
         "Task snapshot should contain the task ID"
-    );
-
-    // Subsequent events are stored StreamEvents
-    let second = &events[1];
-    assert!(
-        second.get("statusUpdate").is_some(),
-        "Second event should be statusUpdate from store, got: {second}"
     );
 }

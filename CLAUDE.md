@@ -149,7 +149,7 @@ The builder rejects inconsistent configurations (ADR-013 §4.3). Non-push adopte
 
 ### Multi-Instance Streaming
 
-- Cross-instance streaming subscription works via the shared event store: the `:subscribe` handler reads events from the durable store, polling at `STORE_POLL_INTERVAL` (`crates/turul-a2a/src/router.rs:622`) when no same-instance broker wake-up arrives. Verified by `tests/distributed_tests.rs` and `tests/d3_streaming_tests.rs`.
+- Cross-instance streaming subscription works via the shared event store: the `:subscribe` handler reads events from the durable store, polling at `STORE_POLL_INTERVAL` (`crates/turul-a2a/src/streaming/task_stream.rs`) when no same-instance broker wake-up arrives. That module is the one stream loop behind `SendStreamingMessage` and `SubscribeToTask` on all three transports (ADR-014 §2.3). Verified by `tests/distributed_tests.rs` and `tests/d3_streaming_tests.rs`.
 - The in-process `TaskEventBroker` is a same-instance fanout optimization, not the source of truth — it short-circuits the poll loop when the subscriber happens to land on the instance that committed the event.
 - Lambda exception: the adapter does not run the persistent cross-instance cancel-marker poller, so cross-instance cancellation propagation to a live executor on a different warm Lambda invocation is not currently supported (see `crates/turul-a2a-aws-lambda/src/lib.rs` module docs). Streaming subscription itself works.
 - See ADR-008 for the durable event coordination contract.
@@ -250,7 +250,7 @@ Our vendored `proto/a2a.proto` is byte-identical to upstream `a2aproject/A2A:mai
 - Query params: camelCase (historyLength, pageSize, pageToken, contextId)
 - contextId/taskId mismatch rejection on continuation (spec §3.4.3)
 
-**Release scope.** turul-a2a is tested against the current upstream A2A v1.0 proto (`proto/a2a.proto`) and implements the core HTTP+JSON and JSON-RPC server surfaces covered by that vendored contract. Known open gaps against A2A v1.0.1: streaming send ignores `message.taskId` and does not open with a `Task`; the push webhook body is a bare `Task` rather than a `StreamResponse`; `AgentCard.capabilities` flags are not enforced; `ListTasks.statusTimestampAfter` is ignored. Otherwise: ListTasks sorts by `updated_at DESC` across all four backends; pagination cursor encodes `updated_at|task_id` for stable iteration; the spec-compliance suite (`crates/turul-a2a/tests/spec_compliance.rs`) walks every core RPC on both transports.
+**Release scope.** turul-a2a is tested against the current upstream A2A v1.0 proto (`proto/a2a.proto`) and implements the core HTTP+JSON and JSON-RPC server surfaces covered by that vendored contract. Known open gaps against A2A v1.0.1: the push webhook body is a bare `Task` rather than a `StreamResponse`; `AgentCard.capabilities` flags are not enforced; `ListTasks.statusTimestampAfter` is ignored. Otherwise: ListTasks sorts by `updated_at DESC` across all four backends; pagination cursor encodes `updated_at|task_id` for stable iteration; the spec-compliance suite (`crates/turul-a2a/tests/spec_compliance.rs`) walks every core RPC on both transports.
 
 **Out of scope for the framework release:**
 - gRPC transport on AWS Lambda (ADR-014 §2.6: Lambda lacks persistent HTTP/2). The feature itself is fully wired for self-hosted targets (ECS / Fargate / AppRunner / Kubernetes / bare VMs) — see [ADR-014](docs/adr/ADR-014-grpc-transport.md) and `examples/grpc-agent`.

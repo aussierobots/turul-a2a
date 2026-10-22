@@ -4,6 +4,34 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.35] — 2026-10-22
+
+Streaming now follows the A2A v1.0.1 stream rules on all three transports (HTTP+SSE, JSON-RPC+SSE, gRPC), served from one shared stream implementation. See ADR-014.
+
+### Fixed
+
+- `SendStreamingMessage` now opens with the `Task` object, as A2A §3.1.2 requires. Previously the first item was a `SUBMITTED` status update. The snapshot is taken once the task is WORKING, so a new stream never shows `SUBMITTED`. `configuration.historyLength` is applied to the snapshot.
+- `SendStreamingMessage` now honours `message.taskId`. Previously it always created a new task. Multi-turn conversations now work over streaming: an unknown `taskId` returns `TaskNotFoundError`, a task in a terminal state returns `UnsupportedOperationError`, a `contextId` that does not match the task is rejected, and a missing `contextId` is taken from the task.
+- `SubscribeToTask` no longer replays the task's whole event history after the snapshot. Only events newer than the snapshot follow it.
+- A follow-up message to a task whose previous turn's executor is still running (for example, one parked on AUTH_REQUIRED) is now refused with `UnsupportedOperationError` before anything is written. Previously it marked the task WORKING, then failed with an internal error, leaving the task stuck in WORKING.
+- Blocking `SendMessage` to a task in a terminal state now returns `UnsupportedOperationError` (HTTP 400 / JSON-RPC -32004 / gRPC `FAILED_PRECONDITION`, with ErrorInfo), as the spec lists. Previously it returned a generic invalid-params error (-32602) with no ErrorInfo.
+
+### Changed
+
+- Streams close after a terminal state **or INPUT_REQUIRED**. To continue, send a new message with the same `taskId`; it opens a fresh stream for the next turn. Streams stay open across AUTH_REQUIRED, so work resumed by an out-of-band credential arrives on the same stream.
+- `Last-Event-ID: {taskId}:0` (and gRPC `a2a-last-event-id`) now means "resume from the start": the full stored history is replayed, without a snapshot. Previously `:0` was treated as a fresh attach. Omit the header for a fresh attach. A resumed stream that is already caught up on a task that is INPUT_REQUIRED or terminal now closes at once instead of idling.
+- The SSE `id:` of the `Task` snapshot is now `{taskId}:{sequence}`, where `sequence` is the latest event the snapshot reflects (previously `{taskId}:0`). Reconnecting with that `Last-Event-ID` resumes after the snapshot without replaying earlier events.
+
+### Compatibility
+
+- Clients that expected a `statusUpdate` as the first stream item, or that rebuilt task state by replaying the history `SubscribeToTask` used to send after the snapshot, must read the initial state from the `Task` snapshot instead. `turul-a2a-client` already exposes it as `StreamEvent::Task`.
+- Clients that keep a stream open waiting past INPUT_REQUIRED will now see it close.
+- A rare overlap is possible on `SubscribeToTask`: an event committed while the snapshot is being taken can appear both inside the snapshot and as the next update. No event is ever lost.
+
+### Verification
+
+New cross-transport stream-contract tests (HTTP, JSON-RPC, gRPC), the SSE, JSON-RPC, gRPC, cross-instance and broker-independence streaming suites, workspace tests, and SQLite storage parity tests passed.
+
 ## [0.1.34] — 2026-10-22
 
 Aligns the error model with A2A v1.0.1 (§5.4 error-mapping table). See ADR-004 and ADR-014.

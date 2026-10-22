@@ -625,11 +625,9 @@ async fn jsonrpc_subscribe_to_task_returns_task_snapshot_first() {
     assert_eq!(resp.status(), 200);
 
     let events = collect_jsonrpc_sse(resp.into_body(), std::time::Duration::from_secs(3)).await;
-    assert!(
-        events.len() >= 3,
-        "Should get Task snapshot + 2 events, got {}",
-        events.len()
-    );
+    // The snapshot already reflects the stored SUBMITTED and WORKING
+    // events, so neither is replayed after it.
+    assert_eq!(events.len(), 1, "snapshot only, got {events:?}");
 
     // First event should be Task snapshot in JSON-RPC envelope
     let first = &events[0];
