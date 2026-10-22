@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 use turul_a2a_proto::AgentSkill;
 
 use crate::error::{ManifestError, RenderError, ValidationError};
-use crate::schema::strict_keyword_check;
+use crate::schema::{compile_schema, validate_json};
 use crate::template::render_template;
 
 /// Parsed SKILL.md manifest.
@@ -19,41 +19,63 @@ use crate::template::render_template;
 /// skills supply execution metadata + provider_config; non-LLM skills omit
 /// them. The Markdown body is the prompt template (used only by LLM-backed
 /// skills); template grammar is `{{ name }}` with dotted paths.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+///
+/// [`SkillCard::parse`] is the only constructor: the struct is
+/// `#[non_exhaustive]` and deliberately implements neither `Deserialize`
+/// nor `Default`, so every card has passed the frontmatter,
+/// strict-keyword and schema-compilation checks.
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct SkillCard {
     // AgentSkill discovery fields (all eight).
     pub id: String,
     pub name: String,
     pub description: String,
-    #[serde(default)]
     pub tags: Vec<String>,
-    #[serde(default)]
     pub examples: Vec<String>,
-    #[serde(default)]
     pub input_modes: Vec<String>,
-    #[serde(default)]
     pub output_modes: Vec<String>,
-    #[serde(default)]
     pub security_requirements: Vec<String>,
 
     // Provider-neutral execution metadata (optional).
-    #[serde(default)]
     pub input_schema: Option<Value>,
-    #[serde(default)]
     pub output_schema: Option<Value>,
-    #[serde(default)]
     pub execution_hints: Option<ExecutionHints>,
 
     // Opaque to this crate — the patterns layer does not interpret
     // provider-specific configuration; that is the adopter's concern.
-    #[serde(default)]
     pub provider_config: Option<Value>,
 
     /// Markdown body (prompt template for LLM-backed skills).
-    #[serde(skip)]
     pub body: String,
+}
+
+/// Serde shape of the SKILL.md frontmatter. Private so that
+/// [`SkillCard::parse`] stays the only way to obtain a `SkillCard`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Frontmatter {
+    id: String,
+    name: String,
+    description: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    examples: Vec<String>,
+    #[serde(default)]
+    input_modes: Vec<String>,
+    #[serde(default)]
+    output_modes: Vec<String>,
+    #[serde(default)]
+    security_requirements: Vec<String>,
+    #[serde(default)]
+    input_schema: Option<Value>,
+    #[serde(default)]
+    output_schema: Option<Value>,
+    #[serde(default)]
+    execution_hints: Option<ExecutionHints>,
+    #[serde(default)]
+    provider_config: Option<Value>,
 }
 
 /// Provider-neutral execution hints.
@@ -122,6 +144,11 @@ impl SkillCard {
     /// Format: `---\n<frontmatter>\n---\n<body>`. Frontmatter is YAML
     /// with camelCase keys (strict — no snake_case aliases); body is an
     /// opaque template string consumed by `render_prompt`.
+    ///
+    /// Declared `inputSchema` / `outputSchema` must be usable: unknown
+    /// JSON Schema keywords and schemas the 2020-12 validator cannot
+    /// compile are rejected here as [`ManifestError::Schema`], never
+    /// deferred to the first validate call.
     pub fn parse(text: &str) -> Result<Self, ManifestError> {
         let (frontmatter, body) = split_frontmatter(text).ok_or(ManifestError::Parse {
             location: "document".to_string(),
@@ -135,38 +162,38 @@ impl SkillCard {
             })?;
         let json = yaml_to_json(yaml)?;
 
-        let mut card: SkillCard =
-            serde_json::from_value(json).map_err(|e| ManifestError::Parse {
-                location: "frontmatter".to_string(),
-                reason: e.to_string(),
-            })?;
-        card.body = body.to_string();
+        let fm: Frontmatter = serde_json::from_value(json).map_err(|e| ManifestError::Parse {
+            location: "frontmatter".to_string(),
+            reason: e.to_string(),
+        })?;
 
-        // Strict keyword check on declared input/output schemas: unknown
-        // JSON Schema keywords are rejected at parse time.
-        if let Some(schema) = &card.input_schema {
-            strict_keyword_check(schema, "/inputSchema").map_err(|e| match e {
-                ValidationError::UnsupportedKeyword { keyword } => ManifestError::Schema {
-                    location: "/inputSchema".to_string(),
-                    reason: format!("unsupported JSON Schema keyword `{keyword}`"),
-                },
-                ValidationError::Invalid { location, reason } => {
-                    ManifestError::Schema { location, reason }
-                }
-            })?;
+        for (schema, location) in [
+            (&fm.input_schema, "/inputSchema"),
+            (&fm.output_schema, "/outputSchema"),
+        ] {
+            if let Some(schema) = schema {
+                compile_schema(schema).map_err(|e| ManifestError::Schema {
+                    location: location.to_string(),
+                    reason: e.to_string(),
+                })?;
+            }
         }
-        if let Some(schema) = &card.output_schema {
-            strict_keyword_check(schema, "/outputSchema").map_err(|e| match e {
-                ValidationError::UnsupportedKeyword { keyword } => ManifestError::Schema {
-                    location: "/outputSchema".to_string(),
-                    reason: format!("unsupported JSON Schema keyword `{keyword}`"),
-                },
-                ValidationError::Invalid { location, reason } => {
-                    ManifestError::Schema { location, reason }
-                }
-            })?;
-        }
-        Ok(card)
+
+        Ok(SkillCard {
+            id: fm.id,
+            name: fm.name,
+            description: fm.description,
+            tags: fm.tags,
+            examples: fm.examples,
+            input_modes: fm.input_modes,
+            output_modes: fm.output_modes,
+            security_requirements: fm.security_requirements,
+            input_schema: fm.input_schema,
+            output_schema: fm.output_schema,
+            execution_hints: fm.execution_hints,
+            provider_config: fm.provider_config,
+            body: body.to_string(),
+        })
     }
 
     /// Project the eight A2A discovery fields onto an `AgentSkill`.
@@ -210,37 +237,27 @@ impl SkillCard {
         render_template(&self.body, params)
     }
 
-    /// Validate input against the manifest's input schema.
+    /// Validate input against the manifest's input schema. A card
+    /// without an input schema accepts any input. Error locations are
+    /// JSON pointers into the instance rooted at `#`, as in
+    /// [`validate_json`](crate::validate_json).
     pub fn validate_input(&self, input: &Value) -> Result<(), ValidationError> {
-        validate_against(&self.input_schema, input, "/inputSchema")
+        match &self.input_schema {
+            Some(schema) => validate_json(schema, input),
+            None => Ok(()),
+        }
     }
 
-    /// Validate output against the manifest's output schema.
+    /// Validate output against the manifest's output schema. A card
+    /// without an output schema accepts any output. Error locations are
+    /// JSON pointers into the instance rooted at `#`, as in
+    /// [`validate_json`](crate::validate_json).
     pub fn validate_output(&self, output: &Value) -> Result<(), ValidationError> {
-        validate_against(&self.output_schema, output, "/outputSchema")
+        match &self.output_schema {
+            Some(schema) => validate_json(schema, output),
+            None => Ok(()),
+        }
     }
-}
-
-fn validate_against(
-    schema: &Option<Value>,
-    instance: &Value,
-    location_root: &str,
-) -> Result<(), ValidationError> {
-    let Some(schema) = schema else {
-        return Ok(());
-    };
-    strict_keyword_check(schema, location_root)?;
-    let validator = jsonschema::draft202012::new(schema).map_err(|e| ValidationError::Invalid {
-        location: location_root.to_string(),
-        reason: format!("invalid schema: {e}"),
-    })?;
-    if let Some(err) = validator.iter_errors(instance).next() {
-        return Err(ValidationError::Invalid {
-            location: err.instance_path().to_string(),
-            reason: err.to_string(),
-        });
-    }
-    Ok(())
 }
 
 fn split_frontmatter(text: &str) -> Option<(&str, &str)> {

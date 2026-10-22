@@ -4,10 +4,11 @@ Reusable abstractions for **A2A skill authoring** — handler trait,
 registry, SKILL.md manifest parser, progress sink, terminal hook,
 JSON Schema validation helper.
 
-> **Status:** path-only, `publish = false`. This crate ships when
-> [ADR-021](../../docs/adr/ADR-021-turul-a2a-patterns-extraction.md)
-> §4 gates clear (two real adopters + dispatcher decision + downstream
-> impact survey). Consume via workspace path until then.
+> **Status:** published on crates.io alongside the other `turul-a2a-*`
+> crates (see
+> [ADR-021](../../docs/adr/ADR-021-turul-a2a-patterns-extraction.md)).
+> It depends on `turul-a2a-proto` and `turul-a2a-types` only — never on
+> the `turul-a2a` server runtime.
 
 ## What it is
 
@@ -32,7 +33,7 @@ ADR-021 §1.2).
 | `SkillHandler` | Async trait. Adopter impls write `async fn run(&self, params, sink) -> Result<Value, SkillError>`. `#[async_trait]`. |
 | `SkillProgressSink` + `ProgressState` + `SinkError` | Trait the handler emits status updates and artifacts through during execution. `ProgressState` is `#[non_exhaustive]` and contains only **non-terminal** states (`Working`, `InputRequired`, `AuthRequired`) — terminal commits are framework-owned. `SinkError::{Closed, Backend(String)}` for best-effort failure semantics. `#[async_trait]`. |
 | `SkillRegistry` + `InMemorySkillRegistry` | Maps `AgentSkill.id` → `SkillHandler`. In-memory impl is the default; alternative impls (e.g. dynamic discovery) are adopter-owned. |
-| `SkillCard` + `ExecutionHints` | SKILL.md manifest type: three-section frontmatter (AgentSkill discovery fields / provider-neutral execution metadata / opaque `providerConfig`) plus markdown body. `SkillCard::parse(text)` is the only constructor. `validate_input` / `validate_output` use [`validate_json`]. `to_agent_skill()` projects to the proto `AgentSkill`. |
+| `SkillCard` + `ExecutionHints` | SKILL.md manifest type: three-section frontmatter (AgentSkill discovery fields / provider-neutral execution metadata / opaque `providerConfig`) plus markdown body. `SkillCard::parse(text)` is the only constructor (no `Deserialize`); it rejects unsupported keywords and uncompilable schemas. `validate_input` / `validate_output` use [`validate_json`]. `to_agent_skill()` projects to the proto `AgentSkill`. |
 | `SkillDescriptor` | Introspection struct (`id`, `card`, `params_schema`). **Single source of truth** for the schema: for manifest-backed skills, derived from the manifest; for programmatic skills, supplied once at registration. Never adopter-fillable independently. |
 | `SkillError` | Two variants only: `InvalidRequest(String)` (maps to A2A `InvalidRequest`) and `Internal(String)` (maps to A2A `Internal`). |
 | `TerminalHook` + `SkillOutcome` | Post-execution observer fired by adopter dispatch code when `SkillHandler::run` returns. Best-effort (return type `()`). `SkillOutcome::{Success(&Value), Failure(&SkillError)}` (`#[non_exhaustive]`). Minimal generic variant only — richer extractor-registry / isolation semantics remain deferred (ADR-021 §9 Q5). `#[async_trait]`. |

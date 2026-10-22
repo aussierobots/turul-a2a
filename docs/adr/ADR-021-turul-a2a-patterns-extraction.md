@@ -98,24 +98,27 @@ acceptance.
 
 ## 2. Decision
 
-### 2.1 Create `turul-a2a-patterns` as an internal path-only workspace crate
+### 2.1 Create `turul-a2a-patterns` as a published workspace crate
 
-Create `crates/turul-a2a-patterns/` with these `Cargo.toml`
-properties:
+*Amended 2026-10-22 to the shipped state.* The crate was created
+path-only (`publish = false`) and flipped to publishable in 0.1.26
+(see the §4 status update). Its `Cargo.toml` properties today:
 
-- `publish = false` in the crate's own `Cargo.toml`.
+- No `publish = false`; the crate publishes to crates.io.
 - Crate inherits `version.workspace = true` (no workspace version
   drift).
-- Listed in root `[workspace.dependencies]` as a path-only entry:
-  `turul-a2a-patterns = { path = "crates/turul-a2a-patterns" }`
-  (no `version = "X.Y.Z"` field — required only for publishable
-  crates).
-- Not in the publish dependency order (CLAUDE.md §"Release & Publish").
-- MUST NOT become a `[dependencies]` entry of any *publishable*
-  workspace crate while it is path-only. (Allowed as
-  `[dev-dependencies]`.) Adding it to a publishable crate's
-  `[dependencies]` triggers a publish-blocker for that crate and
-  forces §4 gates to clear first.
+- Listed in root `[workspace.dependencies]` with both fields:
+  `turul-a2a-patterns = { version = "X.Y.Z", path = "crates/turul-a2a-patterns" }`.
+- Runtime dependencies are `turul-a2a-proto` and `turul-a2a-types`
+  only among workspace crates (never `turul-a2a`, even transitively —
+  §2.3), so it publishes after `turul-a2a-types` in the
+  CLAUDE.md §"Release & Publish" dependency order.
+- Ships `LICENSE-APACHE` / `LICENSE-MIT` symlinks to the workspace
+  licence files, like every other publish crate.
+- No publishable workspace crate has it as a `[dependencies]` entry
+  today. The §4.1 bridge (`turul-a2a` depending on it to provide
+  `impl SkillProgressSink for EventSink`) was **not** delivered with
+  the flip; adopters still bridge with a local newtype (§2.3).
 
 The "patterns" name is deliberate. The crate hosts **skill-authoring
 abstractions**, not the A2A proto's `AgentSkill` (8-field discovery
@@ -259,9 +262,19 @@ Ordered by certainty:
      loosen what the patterns crate has already validated.
    - **Unsupported JSON Schema keywords**: strict reject at parse
      time, never silently ignored. Adopters get an explicit error.
+     A declared schema the 2020-12 validator cannot compile is
+     likewise rejected at parse time (`ManifestError::Schema` with
+     location `/inputSchema` or `/outputSchema`).
+   - **Single constructor**: `SkillCard::parse` is the only way to
+     obtain a `SkillCard` — the struct is `#[non_exhaustive]` and
+     implements neither `Deserialize` nor `Default`, so no card
+     bypasses the checks above.
    - **Error reporting**: structured (location + reason) for both
      schema validation and template rendering. Tests assert against
-     the structured form, not against message strings.
+     the structured form, not against message strings. Validation
+     error locations are JSON pointers into the instance rooted at
+     `#` (`#`, `#/user/name`) for `validate_input`,
+     `validate_output` and `validate_json` alike.
 
    The model call itself is the adopter's responsibility. For
    LLM-backed skills the patterns crate provides everything around
@@ -613,8 +626,9 @@ The activation dispatch hook (parse, echo, reject) lives in
 - Modifying any existing `turul-a2a` / `turul-a2a-types` /
   `turul-a2a-proto` types. The new workspace member is purely
   additive.
-- Publishing the new crate. Path-only workspace dep until §4 gates
-  clear.
+- ~~Publishing the new crate. Path-only workspace dep until §4 gates
+  clear.~~ Superseded by the §4 status update: published since
+  0.1.26 (§2.1).
 
 ## 4. Pre-publish gates
 
@@ -685,6 +699,13 @@ question is informational; tracked as §8 trigger context, not a
 publish prerequisite.
 
 ### 4.1 Post-gate publish action (not a gate)
+
+> **As shipped (recorded 2026-10-22):** the 0.1.26 override delivered
+> only the first two bullets below (crate publishable; workspace dep
+> carries `version`). `turul-a2a` does not depend on
+> `turul-a2a-patterns` and has no `impl SkillProgressSink for
+> EventSink`; the example newtype bridges remain load-bearing. Adding
+> that dependency to a publishable crate is a separate decision.
 
 When all four gates above are independently observed as cleared, a
 **single release event** delivers all of the following together —
@@ -1129,3 +1150,7 @@ Reports pass/fail. Does not modify source. Does not decide scope.
   - Object-safety verified by a compile-time `const _` assertion in
     the crate. The dispatcher-owned variant with framework isolation
     is a future amendment, gated on the successor dispatcher ADR.
+
+## Revision log
+
+- 2026-10-22 — §2.1 amended from "internal path-only, `publish = false`" to the shipped state (published since 0.1.26, versioned workspace dep, licence symlinks, publish order after `turul-a2a-types`); §3 non-goal struck; §4.1 records that the `turul-a2a` → patterns dependency and the `EventSink` bridge were not delivered. §2.2 item 3 contracts tightened to what the code now enforces: `SkillCard::parse` is the only constructor (the public `Deserialize` derive that bypassed the strict-keyword check is removed), uncompilable schemas are rejected at parse with `ManifestError::Schema`, and validation error locations are `#`-rooted instance pointers for every validate entry point. The §2.3 fixed variant sets (`ProgressState` non-terminal only, `SkillError`, `SinkError`) are now compile-time enforced by wildcard-free matches inside the crate.

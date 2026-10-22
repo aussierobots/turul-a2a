@@ -1,10 +1,10 @@
 //! Public `validate_json` free function.
 //!
-//! `SkillCard` is `#[non_exhaustive]` with no public constructor, so
-//! adopters cannot validate arbitrary `(schema, instance)` pairs
-//! without round-tripping through `SkillCard::parse`. The free
-//! function exposes the same JSON Schema 2020-12 validator with the
-//! same strict-keyword check used by manifest parsing.
+//! `SkillCard::parse` is the only way to obtain a `SkillCard`, so
+//! validating an arbitrary `(schema, instance)` pair through the card
+//! would need a SKILL.md document. The free function exposes the same
+//! JSON Schema 2020-12 validator, with the same strict-keyword check,
+//! that `SkillCard::validate_input` / `validate_output` use.
 
 use serde_json::json;
 
@@ -35,12 +35,26 @@ fn missing_required_field_returns_invalid_with_rooted_location() {
     let instance = json!({});
     let err = validate_json(&schema, &instance).expect_err("must reject");
     match err {
-        ValidationError::Invalid { location, .. } => {
-            assert!(
-                location.starts_with('#'),
-                "expected location rooted at `#`, got: {location}"
-            );
+        ValidationError::Invalid { location, .. } => assert_eq!(location, "#"),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+}
+
+#[test]
+fn nested_violation_location_is_instance_pointer_rooted_at_hash() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "user": {
+                "type": "object",
+                "properties": { "name": { "type": "string" } }
+            }
         }
+    });
+    let instance = json!({ "user": { "name": 7 } });
+    let err = validate_json(&schema, &instance).expect_err("must reject");
+    match err {
+        ValidationError::Invalid { location, .. } => assert_eq!(location, "#/user/name"),
         other => panic!("expected Invalid, got {other:?}"),
     }
 }

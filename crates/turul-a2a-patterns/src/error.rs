@@ -62,3 +62,41 @@ pub enum ValidationError {
     #[error("unsupported JSON Schema keyword `{keyword}`")]
     UnsupportedKeyword { keyword: String },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{SinkError, SkillError};
+
+    /// `SkillError` has exactly two variants. Inside the defining crate
+    /// `#[non_exhaustive]` does not force a wildcard arm, so this match
+    /// has none: adding a variant fails to compile here until the
+    /// binding contract is deliberately amended.
+    #[test]
+    fn skill_error_variant_set_is_fixed() {
+        fn label(e: &SkillError) -> &'static str {
+            match e {
+                SkillError::InvalidRequest(_) => "invalid-request",
+                SkillError::Internal(_) => "internal",
+            }
+        }
+        assert_eq!(
+            label(&SkillError::InvalidRequest("x".into())),
+            "invalid-request"
+        );
+        assert_eq!(label(&SkillError::Internal("x".into())), "internal");
+    }
+
+    /// `SinkError` has exactly `Closed` and `Backend(String)`; same
+    /// compile-time guard as above.
+    #[test]
+    fn sink_error_variant_set_is_fixed() {
+        fn label(e: &SinkError) -> &'static str {
+            match e {
+                SinkError::Closed => "closed",
+                SinkError::Backend(_) => "backend",
+            }
+        }
+        assert_eq!(label(&SinkError::Closed), "closed");
+        assert_eq!(label(&SinkError::Backend("x".into())), "backend");
+    }
+}

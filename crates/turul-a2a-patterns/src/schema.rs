@@ -122,23 +122,30 @@ pub(crate) fn strict_keyword_check(schema: &Value, pointer: &str) -> Result<(), 
     }
 }
 
+/// Strict-keyword check plus 2020-12 compilation of `schema`. The single
+/// gate shared by SKILL.md parsing and [`validate_json`].
+pub(crate) fn compile_schema(schema: &Value) -> Result<jsonschema::Validator, ValidationError> {
+    strict_keyword_check(schema, "#")?;
+    jsonschema::draft202012::new(schema).map_err(|e| ValidationError::Invalid {
+        location: "#".to_string(),
+        reason: format!("invalid schema: {e}"),
+    })
+}
+
 /// Validate `instance` against `schema` (JSON Schema 2020-12).
 ///
 /// Returns the same `ValidationError` shape used elsewhere in this
-/// crate, with `location` rooted at `#` of the instance.
+/// crate, with `location` a JSON pointer into the instance rooted at
+/// `#` (`#` itself for the document root, `#/user/name` below it).
 ///
 /// Schema keywords outside the 2020-12 dialect are rejected at this
-/// call site via the same `strict_keyword_check` used by SKILL.md
-/// manifest validation.
+/// call site via the same strict-keyword check used by SKILL.md
+/// manifest parsing.
 pub fn validate_json(
     schema: &serde_json::Value,
     instance: &serde_json::Value,
 ) -> Result<(), ValidationError> {
-    strict_keyword_check(schema, "#")?;
-    let validator = jsonschema::draft202012::new(schema).map_err(|e| ValidationError::Invalid {
-        location: "#".to_string(),
-        reason: format!("invalid schema: {e}"),
-    })?;
+    let validator = compile_schema(schema)?;
     if let Some(err) = validator.iter_errors(instance).next() {
         let path = err.instance_path().to_string();
         let location = if path.is_empty() {
