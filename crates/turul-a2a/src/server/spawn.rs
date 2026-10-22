@@ -23,6 +23,10 @@
 //!
 //! - If the executor used `ctx.events` and committed a terminal, the
 //!   sink is closed — nothing more to do.
+//! - If the latest status the executor committed through `ctx.events`
+//!   is INPUT_REQUIRED / AUTH_REQUIRED and `&mut Task` carries no
+//!   terminal or interrupted state of its own, the turn ended on that
+//!   interrupt and it stands.
 //! - Otherwise, any artifacts the executor appended to `&mut Task`
 //!   during execution (direct-task-mutation path) are published via
 //!   the sink so they reach the durable event store.
@@ -404,6 +408,13 @@ pub(crate) async fn commit_post_execute(
                     let _ = sink
                         .commit_state_internal(state_opt.unwrap(), message_opt)
                         .await;
+                }
+                Some(TaskState::Submitted) | Some(TaskState::Working) | None
+                    if sink.is_interrupted() =>
+                {
+                    // The executor raised INPUT_REQUIRED / AUTH_REQUIRED
+                    // through the sink and returned: the turn ended on
+                    // that interrupt, which is already committed.
                 }
                 Some(TaskState::Submitted) | Some(TaskState::Working) | None => {
                     // Executor returned without reaching a terminal or

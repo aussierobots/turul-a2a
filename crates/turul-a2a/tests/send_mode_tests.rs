@@ -22,11 +22,15 @@
 //!   `TerminalStateAlreadySet`.
 //! - Blocking send returns as soon as the task reaches an interrupted
 //!   state (INPUT_REQUIRED / AUTH_REQUIRED), on HTTP and JSON-RPC.
+//! - An interrupted state raised through the sink stays the task's state
+//!   when the executor then returns `Ok`, on blocking and streaming send.
 //! - `returnImmediately = true` returns the task before the executor
 //!   reaches terminal.
 //!
 //! Timing assertions run on tokio's paused clock, so each bound names
 //! the code path taken rather than racing the wall clock.
+
+mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -866,6 +870,162 @@ async fn blocking_send_returns_on_interrupted_state_over_http_and_jsonrpc() {
             assert!(
                 elapsed < timeout,
                 "{binding}: returned on the interrupt, not the blocking timeout ({elapsed:?})"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// An interrupted state raised through the sink outlives the executor's
+// return. The executor commits INPUT_REQUIRED / AUTH_REQUIRED through
+// `ctx.events` and returns `Ok` without touching `&mut Task`; the turn
+// ended on the interrupt, so the task stays interrupted instead of being
+// forced to FAILED. Checked on blocking and streaming send, HTTP and
+// JSON-RPC.
+// ---------------------------------------------------------------------------
+
+/// Raises an interrupted state through the sink, then returns.
+struct InterruptsAndReturns {
+    state: TaskState,
+}
+
+#[async_trait]
+impl AgentExecutor for InterruptsAndReturns {
+    async fn execute(
+        &self,
+        _task: &mut Task,
+        _msg: &Message,
+        ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        match self.state {
+            TaskState::InputRequired => {
+                ctx.events
+                    .require_input(Some(agent_text("which file?")))
+                    .await?;
+            }
+            TaskState::AuthRequired => {
+                ctx.events
+                    .require_auth(Some(agent_text("sign in to continue")))
+                    .await?;
+            }
+            other => panic!("not an interrupted state: {other:?}"),
+        }
+        Ok(())
+    }
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        turul_a2a_proto::AgentCard {
+            capabilities: Some(turul_a2a_proto::AgentCapabilities {
+                streaming: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+}
+
+fn interrupted_wire_name(state: TaskState) -> &'static str {
+    match state {
+        TaskState::InputRequired => "TASK_STATE_INPUT_REQUIRED",
+        TaskState::AuthRequired => "TASK_STATE_AUTH_REQUIRED",
+        other => panic!("not an interrupted state: {other:?}"),
+    }
+}
+
+/// Let every spawned executor return and its post-execute commit run. On
+/// the paused clock the sleep only ends once every other task is idle.
+async fn settle(state: &AppState) {
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(state.in_flight.is_empty(), "the executor has returned");
+}
+
+async fn persisted_state(state: &AppState, task_id: &str) -> TaskState {
+    state
+        .task_storage
+        .get_task("", task_id, "anonymous", None)
+        .await
+        .unwrap()
+        .expect("task persisted")
+        .status()
+        .unwrap()
+        .state()
+        .unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn interrupt_raised_through_sink_survives_executor_return_on_blocking_send() {
+    for interrupted in [TaskState::InputRequired, TaskState::AuthRequired] {
+        for jsonrpc in [false, true] {
+            let state = make_state(Arc::new(InterruptsAndReturns { state: interrupted }));
+            let task = blocking_send_over(state.clone(), jsonrpc).await;
+            let binding = if jsonrpc { "JSON-RPC" } else { "HTTP" };
+            assert_eq!(
+                task["status"]["state"],
+                interrupted_wire_name(interrupted),
+                "{binding}: {task}"
+            );
+
+            settle(&state).await;
+            assert_eq!(
+                persisted_state(&state, task["id"].as_str().unwrap()).await,
+                interrupted,
+                "{binding}: returning Ok after the interrupt must not force FAILED"
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn interrupt_raised_through_sink_survives_executor_return_on_streaming_send() {
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    for interrupted in [TaskState::InputRequired, TaskState::AuthRequired] {
+        for jsonrpc in [false, true] {
+            let state = make_state(Arc::new(InterruptsAndReturns { state: interrupted }));
+            let send: serde_json::Value = serde_json::from_str(&send_request_body("help")).unwrap();
+            let (path, body) = if jsonrpc {
+                let rpc = serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "SendStreamingMessage", "params": send,
+                });
+                ("/jsonrpc", rpc)
+            } else {
+                ("/message:stream", send)
+            };
+            let req = http::Request::post(path)
+                .header("content-type", "application/json")
+                .header("a2a-version", "1.0")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let resp = turul_a2a::router::build_router(state.clone())
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let read = common::read_sse(resp.into_body(), Duration::from_secs(5)).await;
+            let binding = if jsonrpc { "JSON-RPC" } else { "HTTP" };
+            // INPUT_REQUIRED closes the stream; AUTH_REQUIRED keeps it open
+            // for an out-of-band credential.
+            let frames = if interrupted == TaskState::InputRequired {
+                read.closed()
+            } else {
+                read.still_open()
+            };
+            let items: Vec<serde_json::Value> = frames
+                .into_iter()
+                .map(|f| if jsonrpc { f["result"].clone() } else { f })
+                .collect();
+            assert_eq!(
+                common::status_states(&items),
+                [interrupted_wire_name(interrupted)],
+                "{binding}: the interrupt is the last status on the stream: {items:?}"
+            );
+
+            let task_id = items[0]["task"]["id"].as_str().unwrap().to_string();
+            settle(&state).await;
+            assert_eq!(
+                persisted_state(&state, &task_id).await,
+                interrupted,
+                "{binding}: returning Ok after the interrupt must not force FAILED"
             );
         }
     }

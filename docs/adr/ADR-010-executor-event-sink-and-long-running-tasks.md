@@ -331,7 +331,9 @@ async fn execute(
 **Detection rule** (for the framework): after `execute()` returns `Ok(())`:
 - If `ctx.events.is_closed()` is true (a terminal was emitted), treat that terminal as the outcome.
 - If `task.state()` is terminal and `ctx.events` was never used, emit the corresponding event via the sink internally (preserving legacy behavior exactly).
-- If `task.state()` is non-terminal and `ctx.events` was never used AND the task is not in a legitimate interrupted state, the framework emits `FAILED` with reason "executor returned without reaching terminal state and without emitting events." This protects against silent hangs.
+- If `task.state()` is INPUT_REQUIRED / AUTH_REQUIRED, commit that interrupted state through the sink.
+- If `task.state()` is SUBMITTED / WORKING and the latest status committed through `ctx.events` is INPUT_REQUIRED / AUTH_REQUIRED, the turn ended on that interrupt: it stands and nothing more is committed.
+- Otherwise (`task.state()` non-terminal, no interrupt committed through `ctx.events`) the framework emits `FAILED` with reason "executor returned without reaching terminal state and without emitting events." This protects against silent hangs.
 
 ### 8. Scope Limits
 
@@ -473,3 +475,4 @@ These tests gate ADR-010 acceptance and phase-2 completion. All must be green on
 - 2026-10-22 — HTTP status for `TaskNotCancelable` updated 409 → 400 to follow the A2A v1.0.1 error-mapping table (see ADR-004). No behavioural change to the cancellation contract.
 - 2026-10-22 — `Last-Event-ID` replay references removed; resume no longer exists (ADR-014 §2.3 item 3).
 - 2026-10-22 — Cancel/timeout tests restated as implemented: #5 and #6 point at the deterministic ADR-012 cases (the back-to-back race is replaced by forced outcomes); #11 bounds run on a paused clock; #11(c) corrected — a sink-emitted terminal never reaches the hard-deadline CAS, so the CAS-loss case uses a concurrent `CancelTask` writer. Code brought in line with §4.1 step 4a: the hard deadline now aborts the executor whichever terminal wins the CAS (it previously aborted only when the framework's FAILED won).
+- 2026-10-22 — §7.2 detection rule completed: an executor that raises INPUT_REQUIRED / AUTH_REQUIRED through `ctx.events` and then returns `Ok` keeps the interrupted state. The code had forced FAILED in that case, because only a terminal closes the sink; the rule now names the three non-terminal outcomes explicitly.
