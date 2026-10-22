@@ -265,12 +265,7 @@ async fn auth_middleware_rejects_unauthenticated_http() {
         .unwrap();
     let (status, _headers, body) = response_with_headers(router, req).await;
     assert_eq!(status, 401, "Unauthenticated should return 401");
-    // body is `{"error": "<kind_string>"}`
-    assert_eq!(
-        body["error"].as_str(),
-        Some("invalid_token"),
-        "Body should be kind-string form: {body}"
-    );
+    assert_auth_body(&body, "invalid_token");
 }
 
 #[tokio::test]
@@ -283,17 +278,7 @@ async fn auth_middleware_rejects_unauthenticated_jsonrpc() {
         .unwrap();
     let (status, _, body) = response_with_headers(router, req).await;
     assert_eq!(status, 401, "JSON-RPC without auth should get HTTP 401");
-    // Must NOT be a JSON-RPC error object
-    assert!(
-        body.get("jsonrpc").is_none(),
-        "Auth failure on /jsonrpc must be HTTP 401, not JSON-RPC error: {body}"
-    );
-    // body is `{"error": "<kind_string>"}`
-    assert_eq!(
-        body["error"].as_str(),
-        Some("invalid_token"),
-        "Body should be kind-string form: {body}"
-    );
+    assert_jsonrpc_auth_error(&body, -32040, "invalid_token");
 }
 
 #[tokio::test]
@@ -366,7 +351,7 @@ async fn extended_agent_card_served_to_claims_less_api_key_identity() {
         .unwrap();
     let (status, _, body) = response_with_headers(router, req).await;
     assert_eq!(status, 401);
-    assert_eq!(body, serde_json::json!({"error": "missing_credential"}));
+    assert_auth_body(&body, "missing_credential");
 }
 
 /// The executor builds the extended card for the authenticated caller:
@@ -434,7 +419,7 @@ async fn authenticated_owner_flows_to_storage() {
 }
 
 #[tokio::test]
-async fn jsonrpc_unauthenticated_is_http_401_not_jsonrpc_error() {
+async fn jsonrpc_unauthenticated_is_http_401_with_a_jsonrpc_error() {
     let router = build_router(state_with_auth());
     let req = Request::post("/jsonrpc")
         .header("content-type", "application/json")
@@ -442,14 +427,10 @@ async fn jsonrpc_unauthenticated_is_http_401_not_jsonrpc_error() {
         .body(Body::from(jrpc_body("GetTask", 99)))
         .unwrap();
     let (status, _, body) = response_with_headers(router, req).await;
+    // A2A: auth failures on JSON-RPC are a "JSON-RPC custom error"; the
+    // HTTP status and challenge still apply.
     assert_eq!(status, 401);
-    // NOT a JSON-RPC error
-    assert!(
-        body.get("jsonrpc").is_none(),
-        "Must be HTTP error, not JSON-RPC"
-    );
-    // body is `{"error": "<kind_string>"}`
-    assert_eq!(body["error"].as_str(), Some("invalid_token"));
+    assert_jsonrpc_auth_error(&body, -32040, "invalid_token");
 }
 
 #[tokio::test]
@@ -551,5 +532,44 @@ async fn push_config_owner_isolation() {
     assert_eq!(
         status, 404,
         "Non-owner should not create push config on another user's task"
+    );
+}
+
+/// An HTTP+JSON auth failure body: a code, a human-readable message, and
+/// the stable kind as the `ErrorInfo` reason in the turul auth domain.
+fn assert_auth_body(body: &serde_json::Value, kind: &str) {
+    assert!(body["error"]["code"].is_u64(), "code: {body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "message: {body}"
+    );
+    assert_eq!(
+        body["error"]["details"][0]["reason"],
+        kind.to_ascii_uppercase(),
+        "reason: {body}"
+    );
+    assert_eq!(
+        body["error"]["details"][0]["domain"], "turul-a2a",
+        "domain: {body}"
+    );
+}
+
+/// A JSON-RPC auth failure envelope with the turul custom code, a message,
+/// and the stable kind as the `ErrorInfo` reason.
+fn assert_jsonrpc_auth_error(body: &serde_json::Value, code: i64, kind: &str) {
+    assert_eq!(body["jsonrpc"], "2.0", "{body}");
+    assert_eq!(body["error"]["code"], code, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "{body}"
+    );
+    assert_eq!(
+        body["error"]["data"][0]["reason"],
+        kind.to_ascii_uppercase(),
+        "{body}"
     );
 }

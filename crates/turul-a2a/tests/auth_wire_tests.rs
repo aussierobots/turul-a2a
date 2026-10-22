@@ -66,7 +66,7 @@ async fn bearer_invalid_token_emits_kind_body_and_rfc6750_challenge() {
     let (status, headers, body) = drain_body(resp).await;
 
     assert_eq!(status, 401);
-    assert_eq!(body["error"].as_str(), Some("invalid_token"));
+    assert_auth_body(&body, "invalid_token");
 
     let www = headers
         .get(http::header::WWW_AUTHENTICATE)
@@ -93,7 +93,7 @@ async fn bearer_missing_credential_emits_bare_challenge() {
     let (status, headers, body) = drain_body(resp).await;
 
     assert_eq!(status, 401);
-    assert_eq!(body["error"].as_str(), Some("missing_credential"));
+    assert_auth_body(&body, "missing_credential");
     let www = headers
         .get(http::header::WWW_AUTHENTICATE)
         .unwrap()
@@ -115,7 +115,7 @@ async fn api_key_invalid_emits_body_only_no_challenge() {
     let (status, headers, body) = drain_body(resp).await;
 
     assert_eq!(status, 401);
-    assert_eq!(body["error"].as_str(), Some("invalid_api_key"));
+    assert_auth_body(&body, "invalid_api_key");
     assert!(
         headers.get(http::header::WWW_AUTHENTICATE).is_none(),
         "API-key rejection must not emit a Bearer challenge header"
@@ -133,7 +133,7 @@ async fn api_key_missing_credential_emits_body_only() {
     let (status, headers, body) = drain_body(resp).await;
 
     assert_eq!(status, 401);
-    assert_eq!(body["error"].as_str(), Some("missing_credential"));
+    assert_auth_body(&body, "missing_credential");
     assert!(
         headers.get(http::header::WWW_AUTHENTICATE).is_none(),
         "Unauthenticated variant never emits challenge headers"
@@ -151,7 +151,7 @@ async fn empty_principal_via_unauthenticated_body_only() {
     let (status, headers, body) = drain_body(resp).await;
 
     assert_eq!(status, 401);
-    assert_eq!(body["error"].as_str(), Some("empty_principal"));
+    assert_auth_body(&body, "empty_principal");
     assert!(headers.get(http::header::WWW_AUTHENTICATE).is_none());
 }
 
@@ -174,11 +174,7 @@ async fn charset_safety_no_quote_or_backslash_in_www_authenticate() {
         let req = Request::post("/message:send").body(Body::empty()).unwrap();
         let resp = router.oneshot(req).await.unwrap();
         let (status, headers, body) = drain_body(resp).await;
-        assert_eq!(
-            body,
-            serde_json::json!({"error": kind.body_string()}),
-            "body for {kind:?}"
-        );
+        assert_auth_body(&body, kind.body_string());
         // RFC 6750 §3: scope rejection is 403 with a Bearer challenge.
         // All other Bearer challenges are 401.
         let expected_status = match kind {
@@ -212,4 +208,25 @@ async fn charset_safety_no_quote_or_backslash_in_www_authenticate() {
             "header must match the fixed shape for {kind:?}"
         );
     }
+}
+
+/// An HTTP+JSON auth failure body: a code, a human-readable message, and
+/// the stable kind as the `ErrorInfo` reason in the turul auth domain.
+fn assert_auth_body(body: &serde_json::Value, kind: &str) {
+    assert!(body["error"]["code"].is_u64(), "code: {body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "message: {body}"
+    );
+    assert_eq!(
+        body["error"]["details"][0]["reason"],
+        kind.to_ascii_uppercase(),
+        "reason: {body}"
+    );
+    assert_eq!(
+        body["error"]["details"][0]["domain"], "turul-a2a",
+        "domain: {body}"
+    );
 }

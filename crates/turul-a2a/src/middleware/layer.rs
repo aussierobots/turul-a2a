@@ -84,8 +84,8 @@ where
                     inner.call(req).await
                 }
                 Err(err) => {
-                    // Auth failed — return HTTP error directly, never reach handler
-                    Ok(middleware_error_to_response(&err))
+                    // Auth failed — return the error directly, never reach handler
+                    Ok(middleware_error_to_response(&err, &path))
                 }
             }
         })
@@ -95,25 +95,32 @@ where
 /// Convert a MiddlewareError to an HTTP response.
 ///
 /// Wire surface:
-/// - Body: `{"error": "<kind_wire_string>"}` where the kind string comes
-///   from [`AuthFailureKind::body_string`].
+/// - Body: on the JSON-RPC endpoint a JSON-RPC error envelope
+///   ([`MiddlewareError::jsonrpc_body`]); elsewhere the HTTP+JSON error
+///   body ([`MiddlewareError::http_body`]). Both carry a code, a message
+///   and the stable kind as an `ErrorInfo` reason.
 /// - `WWW-Authenticate`: emitted only on `HttpChallenge` variants whose kind
 ///   is a Bearer failure ([`super::AuthFailureKind::bearer_challenge`]): a
 ///   bare `Bearer realm="a2a"` when the credential is missing (RFC 6750
 ///   Section 3.1), otherwise with the fixed `error=` code.
 ///   `error_description` is intentionally omitted to prevent leaking
 ///   validator internals.
-/// - `Internal` is not auth-failure and uses a fixed `internal_error`
-///   body string.
-fn middleware_error_to_response(err: &MiddlewareError) -> Response<Body> {
+/// - `Internal` is not auth-failure and uses the fixed `internal_error`
+///   kind.
+fn middleware_error_to_response(err: &MiddlewareError, path: &str) -> Response<Body> {
     let status = axum::http::StatusCode::from_u16(err.http_status())
         .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
 
-    let body = serde_json::json!({ "error": err.wire_body_string() });
+    let body = if path == crate::jsonrpc::JSONRPC_PATH {
+        err.jsonrpc_body()
+    } else {
+        err.http_body()
+    };
 
-    let mut builder = Response::builder()
-        .status(status)
-        .header(http::header::CONTENT_TYPE, "application/json");
+    let mut builder = Response::builder().status(status).header(
+        http::header::CONTENT_TYPE,
+        turul_a2a_types::wire::protocol::MEDIA_TYPE_A2A_JSON,
+    );
 
     if let MiddlewareError::HttpChallenge(kind) = err
         && let Some(challenge) = kind.bearer_challenge()

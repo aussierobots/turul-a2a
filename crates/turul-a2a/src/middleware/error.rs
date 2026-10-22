@@ -143,6 +143,72 @@ impl MiddlewareError {
             None => "internal_error",
         }
     }
+
+    /// Human-readable description for the error body. Fixed per kind so
+    /// nothing from the validator or the request leaks.
+    pub fn message(&self) -> &'static str {
+        match self.kind() {
+            Some(AuthFailureKind::MissingCredential) => "authentication credentials are required",
+            Some(AuthFailureKind::InvalidToken) => "the bearer token is invalid",
+            Some(AuthFailureKind::InvalidApiKey) => "the API key is invalid",
+            Some(AuthFailureKind::EmptyPrincipal) => "the credential does not identify a principal",
+            Some(AuthFailureKind::InsufficientScope) => "the credential lacks a required scope",
+            None => "authentication failed due to an internal error",
+        }
+    }
+
+    /// google.rpc.Code name for the HTTP error body.
+    fn status_name(&self) -> &'static str {
+        match self.http_status() {
+            401 => "UNAUTHENTICATED",
+            403 => "PERMISSION_DENIED",
+            _ => "INTERNAL",
+        }
+    }
+
+    /// The stable kind as a google.rpc.ErrorInfo detail: `reason` is the
+    /// kind in upper snake case, `domain` is the turul auth domain.
+    fn error_info(&self) -> serde_json::Value {
+        use turul_a2a_types::wire::errors;
+        serde_json::json!({
+            "@type": errors::ERROR_INFO_TYPE,
+            "reason": self.wire_body_string().to_ascii_uppercase(),
+            "domain": errors::AUTH_ERROR_DOMAIN,
+        })
+    }
+
+    /// HTTP+JSON error body (spec: every error response carries a code and
+    /// a message): `{"error": {code, status, message, details}}`.
+    pub fn http_body(&self) -> serde_json::Value {
+        serde_json::json!({
+            "error": {
+                "code": self.http_status(),
+                "status": self.status_name(),
+                "message": self.message(),
+                "details": [self.error_info()],
+            }
+        })
+    }
+
+    /// JSON-RPC error envelope for a request to the JSON-RPC endpoint (the
+    /// request id is unknown at this point, so it is null).
+    pub fn jsonrpc_body(&self) -> serde_json::Value {
+        use turul_a2a_types::wire::errors;
+        let code = match self.http_status() {
+            401 => errors::JSONRPC_UNAUTHENTICATED,
+            403 => errors::JSONRPC_PERMISSION_DENIED,
+            _ => -32603,
+        };
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": serde_json::Value::Null,
+            "error": {
+                "code": code,
+                "message": self.message(),
+                "data": [self.error_info()],
+            }
+        })
+    }
 }
 
 #[cfg(test)]

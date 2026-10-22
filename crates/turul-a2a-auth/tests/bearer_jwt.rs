@@ -289,7 +289,16 @@ async fn wire_insufficient_scope_is_403_with_body_and_challenge() {
     let token = issuer.sign(&claims("alice", json!({"scope": "a2a.read"})));
     let (status, challenge, body) = call_through_auth_layer(mw, Some(&token)).await;
     assert_eq!(status, 403);
-    assert_eq!(body, json!({"error": "insufficient_scope"}));
+    assert_eq!(
+        body["error"]["details"][0]["reason"], "INSUFFICIENT_SCOPE",
+        "{body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "{body}"
+    );
     assert_eq!(
         challenge.as_deref(),
         Some(r#"Bearer realm="a2a", error="insufficient_scope""#)
@@ -302,7 +311,16 @@ async fn wire_missing_token_is_401_bare_challenge() {
     let mw = BearerMiddleware::new(issuer.validator());
     let (status, challenge, body) = call_through_auth_layer(mw, None).await;
     assert_eq!(status, 401);
-    assert_eq!(body, json!({"error": "missing_credential"}));
+    assert_eq!(
+        body["error"]["details"][0]["reason"], "MISSING_CREDENTIAL",
+        "{body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "{body}"
+    );
     assert_eq!(challenge.as_deref(), Some(r#"Bearer realm="a2a""#));
 }
 
@@ -316,7 +334,16 @@ async fn wire_expired_token_is_401_invalid_token_without_description() {
     ));
     let (status, challenge, body) = call_through_auth_layer(mw, Some(&token)).await;
     assert_eq!(status, 401);
-    assert_eq!(body, json!({"error": "invalid_token"}));
+    assert_eq!(
+        body["error"]["details"][0]["reason"], "INVALID_TOKEN",
+        "{body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "{body}"
+    );
     assert_eq!(
         challenge.as_deref(),
         Some(r#"Bearer realm="a2a", error="invalid_token""#)

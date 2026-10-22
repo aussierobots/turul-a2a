@@ -142,19 +142,37 @@ Each variant maps to a stable wire-kind string (`snake_case`):
 `missing_credential`, `invalid_token`, `invalid_api_key`,
 `empty_principal`, `insufficient_scope`.
 
-### 2.2 JSON body — all schemes, all failures
+### 2.2 Error body — all schemes, all failures
+
+> **Amended 2026-10-22.** The original body was `{"error": "<kind_wire_string>"}`
+> with no code and no message. A2A v1.0.1 requires every error response,
+> whatever the binding, to carry a machine-readable code **and** a
+> human-readable message (spec "Error Payload Structure"), and names a
+> "JSON-RPC custom error" for authentication failures on JSON-RPC.
+
+HTTP+JSON (every path except the JSON-RPC endpoint):
 
 ```json
-{ "error": "<kind_wire_string>" }
+{ "error": { "code": 401, "status": "UNAUTHENTICATED",
+             "message": "the bearer token is invalid",
+             "details": [ { "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                            "reason": "INVALID_TOKEN", "domain": "turul-a2a" } ] } }
 ```
 
-The body is scheme-agnostic and stable across minor releases. Callers
-parsing the body pattern-match on `error` string values from the fixed
-taxonomy.
+JSON-RPC endpoint: a JSON-RPC error envelope (`id` null — the request id is
+not read before authentication) with code `-32040` (unauthenticated) or
+`-32041` (forbidden), the same message, and the same `ErrorInfo` in `data`.
+gRPC: `UNAUTHENTICATED` / `PERMISSION_DENIED` with the same message and the
+same `ErrorInfo` in `Status.details`.
 
-No `code` field (HTTP status is on the response status line). No
-`message` field (stable kind string is the adopter-observable label;
-human-readable text belongs in adopter UI, not in wire).
+The stable kind is the `ErrorInfo.reason` — the kind string in upper snake
+case (`MISSING_CREDENTIAL`, `INVALID_TOKEN`, `INVALID_API_KEY`,
+`EMPTY_PRINCIPAL`, `INSUFFICIENT_SCOPE`; `INTERNAL_ERROR` for an internal
+failure) — in the `turul-a2a` domain, distinct from the A2A protocol domain
+because these are transport failures, not A2A errors. Messages are fixed per
+kind and never echo validator or request detail. The owner is
+`MiddlewareError::{http_body, jsonrpc_body, message}`. The HTTP status and
+the `WWW-Authenticate` challenge (§2.3) are unchanged.
 
 ### 2.3 WWW-Authenticate — Bearer challenges only
 
@@ -463,3 +481,9 @@ any affected adopter sees them.
 - `crates/turul-a2a/src/middleware/error.rs`
 - `crates/turul-a2a-auth/src/bearer.rs`
 - `crates/turul-a2a-auth/src/api_key.rs`
+
+## Revision log
+
+- 2026-04-24 — Initial acceptance.
+- 2026-10-22 — A request with no credentials gets a bare `WWW-Authenticate` challenge with no `error` code (RFC 6750 §3.1).
+- 2026-10-22 — §2.2: the error body carries a code and a human-readable message as A2A v1.0.1 requires — AIP-193 on HTTP+JSON, a JSON-RPC custom error (-32040 / -32041) on the JSON-RPC endpoint, and the same message on gRPC; the stable kind becomes the `ErrorInfo.reason` in the `turul-a2a` domain.

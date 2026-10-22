@@ -146,11 +146,11 @@ fn check_a2a_version<B>(req: &Request<B>) -> Result<(), crate::error::A2aError> 
 /// gRPC trailers (`grpc-status`, `grpc-message`) — `tonic::Status` is
 /// the canonical encoding for transport-level auth failure.
 ///
-/// Wire surface parity with the HTTP path: the `grpc-message` value is
-/// the same stable snake_case string the HTTP body uses, sourced from
-/// [`MiddlewareError::wire_body_string`]. `Internal(msg)` deliberately
-/// collapses to `"internal_error"` — the inner String payload is never
-/// exposed on the wire.
+/// Wire surface parity with the HTTP path: the `grpc-message` is the same
+/// human-readable [`MiddlewareError::message`], and `Status.details` carry
+/// the stable kind as an `ErrorInfo` reason in the turul auth domain.
+/// `Internal(msg)` deliberately collapses to the fixed `internal_error`
+/// kind — the inner String payload is never exposed on the wire.
 ///
 /// Status-code mapping:
 /// - `Unauthenticated` / `HttpChallenge(*)` → `UNAUTHENTICATED`
@@ -161,16 +161,22 @@ fn check_a2a_version<B>(req: &Request<B>) -> Result<(), crate::error::A2aError> 
 /// - `Forbidden(*)` → `PERMISSION_DENIED`
 /// - `Internal(_)` → `INTERNAL`
 fn middleware_error_to_grpc_response(err: &MiddlewareError) -> Response<Body> {
-    let message = err.wire_body_string();
-    let status = match err {
+    use tonic::Code;
+    use tonic_types::{ErrorDetails, StatusExt};
+    let code = match err {
         MiddlewareError::HttpChallenge(crate::middleware::AuthFailureKind::InsufficientScope) => {
-            tonic::Status::permission_denied(message)
+            Code::PermissionDenied
         }
         MiddlewareError::Unauthenticated(_) | MiddlewareError::HttpChallenge(_) => {
-            tonic::Status::unauthenticated(message)
+            Code::Unauthenticated
         }
-        MiddlewareError::Forbidden(_) => tonic::Status::permission_denied(message),
-        MiddlewareError::Internal(_) => tonic::Status::internal(message),
+        MiddlewareError::Forbidden(_) => Code::PermissionDenied,
+        MiddlewareError::Internal(_) => Code::Internal,
     };
-    status.into_http()
+    let details = ErrorDetails::with_error_info(
+        err.wire_body_string().to_ascii_uppercase(),
+        turul_a2a_types::wire::errors::AUTH_ERROR_DOMAIN,
+        [],
+    );
+    tonic::Status::with_error_details(code, err.message(), details).into_http()
 }

@@ -119,6 +119,15 @@ pub mod errors {
     pub const JSONRPC_EXTENSION_SUPPORT_REQUIRED: i32 = -32008;
     pub const JSONRPC_VERSION_NOT_SUPPORTED: i32 = -32009;
 
+    /// JSON-RPC codes for transport authentication failures. The A2A spec
+    /// leaves these to the implementation ("JSON-RPC custom error"); they
+    /// sit in the JSON-RPC server-error range outside the A2A error codes.
+    pub const JSONRPC_UNAUTHENTICATED: i32 = -32040;
+    pub const JSONRPC_PERMISSION_DENIED: i32 = -32041;
+    /// `ErrorInfo.domain` of authentication-failure details. These are not
+    /// A2A protocol errors, so they do not use [`ERROR_DOMAIN`].
+    pub const AUTH_ERROR_DOMAIN: &str = "turul-a2a";
+
     /// HTTP status codes for A2A errors (spec Section 5.4). Most A2A errors
     /// share 400; clients tell them apart by the `ErrorInfo.reason`.
     pub const HTTP_TASK_NOT_FOUND: u16 = 404;

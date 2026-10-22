@@ -809,6 +809,15 @@ async fn drive_get_task_err(err: MiddlewareError) -> Status {
         .expect_err("auth denied")
 }
 
+/// A gRPC auth failure: a human-readable message and the stable kind as
+/// the `ErrorInfo` reason in the turul auth domain, as on HTTP.
+fn assert_grpc_auth_kind(s: &Status, kind: &str) {
+    assert!(!s.message().is_empty());
+    let info = s.get_details_error_info().expect("ErrorInfo");
+    assert_eq!(info.reason, kind.to_ascii_uppercase());
+    assert_eq!(info.domain, "turul-a2a");
+}
+
 #[tokio::test]
 async fn grpc_auth_message_invalid_api_key() {
     let s = drive_get_task_err(MiddlewareError::Unauthenticated(
@@ -816,11 +825,7 @@ async fn grpc_auth_message_invalid_api_key() {
     ))
     .await;
     assert_eq!(s.code(), tonic::Code::Unauthenticated);
-    assert_eq!(
-        s.message(),
-        "invalid_api_key",
-        "gRPC message must match HTTP body string"
-    );
+    assert_grpc_auth_kind(&s, "invalid_api_key");
 }
 
 #[tokio::test]
@@ -830,7 +835,7 @@ async fn grpc_auth_message_invalid_token() {
     ))
     .await;
     assert_eq!(s.code(), tonic::Code::Unauthenticated);
-    assert_eq!(s.message(), "invalid_token");
+    assert_grpc_auth_kind(&s, "invalid_token");
 }
 
 #[tokio::test]
@@ -843,7 +848,7 @@ async fn grpc_auth_message_insufficient_scope_is_permission_denied() {
     ))
     .await;
     assert_eq!(s.code(), tonic::Code::PermissionDenied);
-    assert_eq!(s.message(), "insufficient_scope");
+    assert_grpc_auth_kind(&s, "insufficient_scope");
 }
 
 #[tokio::test]
@@ -855,7 +860,7 @@ async fn grpc_auth_internal_never_leaks_inner_string() {
     let secret = "secret-jwks-fetch-failed-https://internal.example/jwks";
     let s = drive_get_task_err(MiddlewareError::Internal(secret.into())).await;
     assert_eq!(s.code(), tonic::Code::Internal);
-    assert_eq!(s.message(), "internal_error");
+    assert_grpc_auth_kind(&s, "internal_error");
     assert!(
         !s.message().contains("secret"),
         "Internal payload must never leak: got {:?}",
