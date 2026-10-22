@@ -233,6 +233,7 @@ async fn tenant_send_message_handler(
 ) -> Result<axum::response::Response, A2aError> {
     let claims = ctx.identity.claims().cloned();
     let echoed = negotiate_profile_extensions(&state, &headers)?;
+    crate::profile_dispatch::check_skill_invocation_body(&echoed, &body)?;
     let Json(value) = core_send_message(state, &tenant, ctx.identity.owner(), claims, body).await?;
     Ok(attach_extension_echo(Json(value).into_response(), &echoed))
 }
@@ -395,6 +396,7 @@ async fn send_streaming_message_handler(
 ) -> Result<axum::response::Response, A2aError> {
     let claims = ctx.identity.claims().cloned();
     let echoed = negotiate_profile_extensions(&state, &headers)?;
+    crate::profile_dispatch::check_skill_invocation_body(&echoed, &body)?;
     let response =
         core_send_streaming_message(state, DEFAULT_TENANT, ctx.identity.owner(), claims, body)
             .await?;
@@ -410,6 +412,7 @@ async fn tenant_send_streaming_message_handler(
 ) -> Result<axum::response::Response, A2aError> {
     let claims = ctx.identity.claims().cloned();
     let echoed = negotiate_profile_extensions(&state, &headers)?;
+    crate::profile_dispatch::check_skill_invocation_body(&echoed, &body)?;
     let response =
         core_send_streaming_message(state, &tenant, ctx.identity.owner(), claims, body).await?;
     Ok(attach_extension_echo(response, &echoed))
@@ -432,6 +435,7 @@ pub(crate) async fn open_send_stream(
         serde_json::from_str(&body).map_err(|e| A2aError::InvalidRequest {
             message: format!("Invalid request body: {e}"),
         })?;
+    let (accepted_output_modes, request_metadata) = executor_request_inputs(&request);
     let history_length = request
         .configuration
         .as_ref()
@@ -478,6 +482,8 @@ pub(crate) async fn open_send_stream(
         context_id: target.context_id.clone(),
         message,
         claims,
+        accepted_output_modes,
+        request_metadata,
     };
     let _spawn = crate::server::spawn::spawn_tracked_executor(spawn_deps, scope)?;
 
@@ -602,6 +608,7 @@ async fn send_message_handler(
 ) -> Result<axum::response::Response, A2aError> {
     let claims = ctx.identity.claims().cloned();
     let echoed = negotiate_profile_extensions(&state, &headers)?;
+    crate::profile_dispatch::check_skill_invocation_body(&echoed, &body)?;
     let Json(value) =
         core_send_message(state, DEFAULT_TENANT, ctx.identity.owner(), claims, body).await?;
     Ok(attach_extension_echo(Json(value).into_response(), &echoed))
@@ -822,6 +829,25 @@ pub(crate) async fn start_task_turn(
     Ok(())
 }
 
+/// Request-level executor inputs carried by a `SendMessageRequest`:
+/// `configuration.accepted_output_modes` and `metadata` (as a JSON
+/// object). The single extraction point for the blocking, streaming and
+/// durable-queue send paths.
+fn executor_request_inputs(
+    request: &turul_a2a_proto::SendMessageRequest,
+) -> (Vec<String>, Option<serde_json::Value>) {
+    let accepted_output_modes = request
+        .configuration
+        .as_ref()
+        .map(|c| c.accepted_output_modes.clone())
+        .unwrap_or_default();
+    let request_metadata = request
+        .metadata
+        .as_ref()
+        .and_then(|m| serde_json::to_value(m).ok());
+    (accepted_output_modes, request_metadata)
+}
+
 pub async fn core_send_message(
     state: AppState,
     tenant: &str,
@@ -833,6 +859,7 @@ pub async fn core_send_message(
         serde_json::from_str(&body).map_err(|e| A2aError::InvalidRequest {
             message: format!("Invalid request body: {e}"),
         })?;
+    let (accepted_output_modes, request_metadata) = executor_request_inputs(&request);
 
     let proto_message = request.message.ok_or(A2aError::InvalidRequest {
         message: "message field is required".into(),
@@ -927,6 +954,8 @@ pub async fn core_send_message(
                 context_id: context_id.clone(),
                 message: message.as_proto().clone(),
                 claims: claims.clone(),
+                accepted_output_modes: accepted_output_modes.clone(),
+                request_metadata: request_metadata.clone(),
                 enqueued_at_micros: now_micros,
             };
             if let Err(e) = queue.check_payload_size(&job) {
@@ -1096,6 +1125,8 @@ pub async fn core_send_message(
         context_id: context_id.clone(),
         message: message.clone(),
         claims: claims.clone(),
+        accepted_output_modes,
+        request_metadata,
     };
     let spawn = crate::server::spawn::spawn_tracked_executor(spawn_deps, scope)?;
 

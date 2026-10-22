@@ -72,7 +72,10 @@ pub mod profile_dispatch;
 /// transports). Re-export new profile URIs and header names here as
 /// further profiles are added.
 pub mod profiles {
-    pub use crate::profile_dispatch::{A2A_EXTENSIONS_HEADER, SKILL_INVOCATION_PROFILE_V1};
+    pub use crate::profile_dispatch::{
+        A2A_EXTENSIONS_HEADER, SKILL_ID_METADATA_KEY, SKILL_INVOCATION_PROFILE_V1,
+        SKILL_PARAMS_METADATA_KEY,
+    };
 }
 pub mod push;
 pub mod router;

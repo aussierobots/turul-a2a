@@ -78,6 +78,11 @@ pub struct SpawnDeps {
 /// layer through to the executor's `ExecutionContext`. All three
 /// transports (HTTP, JSON-RPC, gRPC) populate this where they have
 /// claims; gRPC passes `None` until gRPC auth is wired.
+///
+/// `accepted_output_modes` and `request_metadata` carry
+/// `SendMessageConfiguration.accepted_output_modes` and
+/// `SendMessageRequest.metadata` to the same-named `ExecutionContext`
+/// fields on the blocking, streaming and durable-queue paths alike.
 pub struct SpawnScope {
     pub tenant: String,
     pub owner: String,
@@ -85,6 +90,8 @@ pub struct SpawnScope {
     pub context_id: String,
     pub message: Message,
     pub claims: Option<serde_json::Value>,
+    pub accepted_output_modes: Vec<String>,
+    pub request_metadata: Option<serde_json::Value>,
 }
 
 /// Result of a successful spawn. The caller awaits `yielded_rx`
@@ -146,14 +153,7 @@ pub(crate) fn spawn_tracked_executor(
     );
 
     let exec_deps = deps.clone();
-    let exec_scope = SpawnScope {
-        tenant: scope.tenant.clone(),
-        owner: scope.owner.clone(),
-        task_id: scope.task_id.clone(),
-        context_id: scope.context_id.clone(),
-        message: scope.message.clone(),
-        claims: scope.claims.clone(),
-    };
+    let exec_scope = scope;
     let exec_cancellation = cancellation.clone();
     let exec_sink = sink.clone();
 
@@ -240,6 +240,8 @@ pub(crate) async fn run_executor_for_existing_task(
         context_id,
         message,
         claims,
+        accepted_output_modes,
+        request_metadata,
     } = scope;
 
     let mut task = match deps
@@ -299,6 +301,8 @@ pub(crate) async fn run_executor_for_existing_task(
         claims,
         cancellation,
         events: sink.clone(),
+        accepted_output_modes,
+        request_metadata,
     };
 
     let result = deps.executor.execute(&mut task, &message, &ctx).await;

@@ -1,9 +1,12 @@
 //! Offline smoke test for the skill-dispatch profile example agent.
 //!
-//! Spins up the agent binary on an isolated port and verifies the
-//! end-to-end dispatch paths produce the expected structured artifacts.
-//! The third test exercises the failure mode when the profile is not
-//! activated (no `a2a.skillId` metadata key).
+//! Runs the already-built agent binary (`CARGO_BIN_EXE_*`) on a free
+//! loopback port per test, so tests run in parallel without nested
+//! `cargo run` or fixed ports. Covers the advertised card, dispatch to
+//! both skills (with the activation echo), the framework's InvalidParams
+//! rejection when the profile is activated without `a2a.skillId`, and
+//! the executor's own failure paths (profile not activated, unknown
+//! skill id).
 //!
 //! No network egress.
 
@@ -16,7 +19,7 @@ const PROFILE_URI: &str = "https://turul.dev/a2a/extensions/skill-invocation/v1"
 
 struct AgentGuard {
     child: Child,
-    port: u16,
+    base: String,
 }
 
 impl Drop for AgentGuard {
@@ -26,49 +29,47 @@ impl Drop for AgentGuard {
     }
 }
 
-/// Each test gets a unique port so the four `#[tokio::test]` cases — which
-/// `cargo test` runs in parallel within one binary — do not collide on a
-/// shared listener. 38015 is the base; the offset is the caller-provided
-/// nonce.
-fn spawn_agent(port_offset: u16) -> AgentGuard {
-    let port = 38015 + port_offset;
-    let child = Command::new(env!("CARGO"))
-        .args([
-            "run",
-            "--quiet",
-            "-p",
-            "skill-dispatch-profile-agent",
-            "--bin",
-            "skill-dispatch-profile-agent",
-        ])
+/// A port the OS reports free right now. The listener is dropped before
+/// the agent binds it.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("0.0.0.0:0")
+        .and_then(|l| l.local_addr())
+        .expect("reserve free port")
+        .port()
+}
+
+async fn spawn_agent() -> AgentGuard {
+    let port = free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_skill-dispatch-profile-agent"))
         .env("A2A_PORT", port.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn agent");
-    AgentGuard { child, port }
+    let guard = AgentGuard {
+        child,
+        base: format!("http://127.0.0.1:{port}"),
+    };
+    wait_for_card(&guard.base).await;
+    guard
 }
 
-async fn wait_for_card(client: &reqwest::Client, base: &str) {
+async fn wait_for_card(base: &str) {
+    let client = reqwest::Client::new();
     let url = format!("{base}/.well-known/agent-card.json");
-    for _ in 0..240 {
+    for _ in 0..150 {
         if let Ok(r) = client.get(&url).send().await
             && r.status().is_success()
         {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("agent did not become ready at {url} within 60s");
+    panic!("agent did not become ready at {url} within 15s");
 }
 
-async fn send_message(
-    client: &reqwest::Client,
-    base: &str,
-    body: Value,
-    activate_profile: bool,
-) -> reqwest::Response {
-    let mut req = client
+async fn send_message(base: &str, body: Value, activate_profile: bool) -> reqwest::Response {
+    let mut req = reqwest::Client::new()
         .post(format!("{base}/message:send"))
         .header("a2a-version", "1.0")
         .json(&body);
@@ -78,24 +79,30 @@ async fn send_message(
     req.send().await.expect("send req")
 }
 
+/// The first text part of the first artifact of a spec
+/// `SendMessageResponse` (`{"task": {...}}`).
 fn first_artifact_text(resp: &Value) -> &str {
-    let artifacts = resp["artifacts"]
-        .as_array()
-        .or_else(|| resp["task"]["artifacts"].as_array())
-        .unwrap_or_else(|| panic!("no artifacts in response: {resp:#}"));
-    assert!(
-        !artifacts.is_empty(),
-        "artifacts must be non-empty: {resp:#}"
-    );
-    artifacts[0]["parts"][0]["text"]
-        .as_str()
-        .unwrap_or_else(|| panic!("missing text part: {resp:#}"))
+    resp.pointer("/task/artifacts/0/parts/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("expected SendMessageResponse.task with an artifact: {resp:#}"))
 }
 
-fn dispatch_body(message_id: &str, skill_id: &str, params: Value) -> Value {
+fn task_state(resp: &Value) -> &str {
+    resp.pointer("/task/status/state")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("expected SendMessageResponse.task.status.state: {resp:#}"))
+}
+
+fn status_text(resp: &Value) -> &str {
+    resp.pointer("/task/status/message/parts/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+fn dispatch_body(skill_id: &str, params: Value) -> Value {
     json!({
         "message": {
-            "messageId": message_id,
+            "messageId": format!("smoke-{skill_id}"),
             "role": "ROLE_USER",
             "parts": [ { "text": format!("dispatch:{skill_id}") } ],
             "metadata": {
@@ -106,18 +113,18 @@ fn dispatch_body(message_id: &str, skill_id: &str, params: Value) -> Value {
     })
 }
 
+fn assert_echo(resp: &reqwest::Response) {
+    let echo = resp
+        .headers()
+        .get("a2a-extensions")
+        .expect("response must echo A2A-Extensions");
+    assert_eq!(echo.to_str().unwrap(), PROFILE_URI);
+}
+
 #[tokio::test]
-async fn agent_card_advertises_profile_extension() {
-    // see spawn_agent — unique port per test for parallel-safe execution.
-    let guard = spawn_agent(0);
-    let base = format!("http://127.0.0.1:{}", guard.port);
-    let client = reqwest::Client::new();
-
-    wait_for_card(&client, &base).await;
-
-    let card: Value = client
-        .get(format!("{base}/.well-known/agent-card.json"))
-        .send()
+async fn agent_card_advertises_profile_extension_as_not_required() {
+    let agent = spawn_agent().await;
+    let card: Value = reqwest::get(format!("{}/.well-known/agent-card.json", agent.base))
         .await
         .expect("card req")
         .json()
@@ -127,85 +134,111 @@ async fn agent_card_advertises_profile_extension() {
     let extensions = card["capabilities"]["extensions"]
         .as_array()
         .expect("capabilities.extensions array");
-    let uris: Vec<&str> = extensions
+    let profile = extensions
         .iter()
-        .filter_map(|e| e["uri"].as_str())
-        .collect();
+        .find(|e| e["uri"] == PROFILE_URI)
+        .unwrap_or_else(|| panic!("card must advertise profile URI: {extensions:?}"));
+    // proto3 JSON omits a false bool; anything else must be `false`.
     assert!(
-        uris.contains(&PROFILE_URI),
-        "card must advertise profile URI, got: {uris:?}"
+        matches!(profile.get("required"), None | Some(Value::Bool(false))),
+        "profile must be advertised with required = false: {profile:#}"
     );
 
-    let skills = card["skills"].as_array().expect("skills array");
-    let ids: Vec<&str> = skills.iter().filter_map(|s| s["id"].as_str()).collect();
-    assert!(
-        ids.contains(&"echo_loud") && ids.contains(&"reverse"),
-        "agent card must advertise echo_loud + reverse, got: {ids:?}"
-    );
+    let mut ids: Vec<&str> = card["skills"]
+        .as_array()
+        .expect("skills array")
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["echo_loud", "reverse"]);
 }
 
 #[tokio::test]
 async fn dispatches_to_echo_loud() {
-    // see spawn_agent — unique port per test for parallel-safe execution.
-    let guard = spawn_agent(1);
-    let base = format!("http://127.0.0.1:{}", guard.port);
-    let client = reqwest::Client::new();
-
-    wait_for_card(&client, &base).await;
-
-    let body = dispatch_body("smoke-echo", "echo_loud", json!({ "text": "hello" }));
-    let resp = send_message(&client, &base, body, true).await;
-
-    // Echo header must be present on the response.
-    let echo = resp
-        .headers()
-        .get("a2a-extensions")
-        .expect("response must echo A2A-Extensions");
-    assert_eq!(echo.to_str().unwrap(), PROFILE_URI);
+    let agent = spawn_agent().await;
+    let resp = send_message(
+        &agent.base,
+        dispatch_body("echo_loud", json!({ "text": "hello" })),
+        true,
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_echo(&resp);
 
     let payload: Value = resp.json().await.expect("send json");
-    let text = first_artifact_text(&payload);
-    let artifact: Value = serde_json::from_str(text).expect("artifact is JSON");
-    assert_eq!(
-        artifact["shouted"].as_str(),
-        Some("HELLO"),
-        "echo_loud should uppercase input; got payload: {artifact:#}"
-    );
+    assert_eq!(task_state(&payload), "TASK_STATE_COMPLETED");
+    let artifact: Value =
+        serde_json::from_str(first_artifact_text(&payload)).expect("artifact is JSON");
+    assert_eq!(artifact, json!({ "shouted": "HELLO" }));
 }
 
 #[tokio::test]
 async fn dispatches_to_reverse() {
-    // see spawn_agent — unique port per test for parallel-safe execution.
-    let guard = spawn_agent(2);
-    let base = format!("http://127.0.0.1:{}", guard.port);
-    let client = reqwest::Client::new();
-
-    wait_for_card(&client, &base).await;
-
-    let body = dispatch_body("smoke-reverse", "reverse", json!({ "text": "abc" }));
-    let resp = send_message(&client, &base, body, true).await;
+    let agent = spawn_agent().await;
+    let resp = send_message(
+        &agent.base,
+        dispatch_body("reverse", json!({ "text": "abc" })),
+        true,
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_echo(&resp);
 
     let payload: Value = resp.json().await.expect("send json");
-    let text = first_artifact_text(&payload);
-    let artifact: Value = serde_json::from_str(text).expect("artifact is JSON");
-    assert_eq!(
-        artifact["reversed"].as_str(),
-        Some("cba"),
-        "reverse should reverse characters; got payload: {artifact:#}"
+    assert_eq!(task_state(&payload), "TASK_STATE_COMPLETED");
+    let artifact: Value =
+        serde_json::from_str(first_artifact_text(&payload)).expect("artifact is JSON");
+    assert_eq!(artifact, json!({ "reversed": "cba" }));
+}
+
+/// The executor owns routing: an id no skill is registered under fails
+/// the task, citing the id.
+#[tokio::test]
+async fn unknown_skill_id_fails_task() {
+    let agent = spawn_agent().await;
+    let resp = send_message(
+        &agent.base,
+        dispatch_body("no_such_skill", json!({ "text": "x" })),
+        true,
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let payload: Value = resp.json().await.expect("send json");
+    assert_eq!(task_state(&payload), "TASK_STATE_FAILED", "{payload:#}");
+    assert!(
+        status_text(&payload).contains("no_such_skill"),
+        "failure message should cite the unknown id: {payload:#}"
     );
 }
 
+/// Activated without `a2a.skillId`: the framework rejects the request
+/// as InvalidParams (HTTP 400) before the executor runs.
 #[tokio::test]
-async fn missing_skill_id_fails_task() {
-    // see spawn_agent — unique port per test for parallel-safe execution.
-    let guard = spawn_agent(3);
-    let base = format!("http://127.0.0.1:{}", guard.port);
-    let client = reqwest::Client::new();
+async fn activated_without_skill_id_is_invalid_params() {
+    let agent = spawn_agent().await;
+    let body = json!({
+        "message": {
+            "messageId": "smoke-activated-missing",
+            "role": "ROLE_USER",
+            "parts": [ { "text": "no dispatch intent here" } ]
+        }
+    });
+    let resp = send_message(&agent.base, body, true).await;
+    assert_eq!(resp.status().as_u16(), 400);
+    let payload: Value = resp.json().await.expect("error json");
+    let message = payload
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(message.contains("a2a.skillId"), "{payload:#}");
+}
 
-    wait_for_card(&client, &base).await;
-
-    // No metadata, no activation header — the executor falls into its
-    // failure path because there is no `a2a.skillId` to dispatch on.
+/// Not activated (the profile is optional): the executor's default path
+/// fails the task explaining how to target a skill.
+#[tokio::test]
+async fn not_activated_fails_task_with_guidance() {
+    let agent = spawn_agent().await;
     let body = json!({
         "message": {
             "messageId": "smoke-missing",
@@ -213,28 +246,17 @@ async fn missing_skill_id_fails_task() {
             "parts": [ { "text": "no dispatch intent here" } ]
         }
     });
-    let resp = send_message(&client, &base, body, false).await;
-    assert!(
-        resp.status().is_success(),
+    let resp = send_message(&agent.base, body, false).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
         "task-level failure is reported via TaskStatus, not HTTP error"
     );
+    assert!(resp.headers().get("a2a-extensions").is_none());
     let payload: Value = resp.json().await.expect("send json");
-    let state = payload
-        .pointer("/status/state")
-        .or_else(|| payload.pointer("/task/status/state"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("missing task status.state: {payload:#}"));
-    assert_eq!(
-        state, "TASK_STATE_FAILED",
-        "missing a2a.skillId must produce a Failed task; got payload: {payload:#}"
-    );
-    let message_text = payload
-        .pointer("/status/message/parts/0/text")
-        .or_else(|| payload.pointer("/task/status/message/parts/0/text"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    assert_eq!(task_state(&payload), "TASK_STATE_FAILED", "{payload:#}");
     assert!(
-        message_text.contains("a2a.skillId"),
-        "failure message should cite the missing metadata key; got: {message_text}"
+        status_text(&payload).contains("a2a.skillId"),
+        "failure message should cite the missing metadata key: {payload:#}"
     );
 }

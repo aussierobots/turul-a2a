@@ -11,21 +11,36 @@ now satisfied. Recorded here for the audit trail; the live status is
 `Accepted` (top of file).
 
 1. **Red-phase test suite landed.** `crates/turul-a2a/tests/profile_dispatch_tests.rs`
-   (343 LOC, 13 tests) pins:
+   pins (corrected 2026-10-22 — the original entry claimed it pinned
+   skill routing, which the framework does not perform):
    - `A2A-Extensions` request-header parsing,
-   - `Message.metadata["a2a.skillId"]` + `["a2a.skillParams"]` keyed routing,
-   - `UnsupportedOperationError` on a `required` extension the server doesn't honour,
-   - echo of activated URIs on the response header.
+   - echo of negotiated URIs on HTTP blocking + streaming send,
+     JSON-RPC and gRPC (unary + streaming) responses,
+   - the request-shape check: profile negotiated but
+     `Message.metadata["a2a.skillId"]` absent or not a string →
+     InvalidParams (HTTP 400 / JSON-RPC `-32602` / gRPC
+     `INVALID_ARGUMENT`) before any task is created,
+   - the message (with its `a2a.skillId`) reaching the executor
+     unchanged, including an id the agent does not recognise,
+   - `UnsupportedOperationError` on a `required` extension the client
+     did not activate.
 
 2. **First-profile placement decided.** Per ADR-021 §5 (single
    profile inhabitant lives in the transport-owning crate), the
-   dispatcher is implemented inside `crates/turul-a2a/src/profile_dispatch.rs`
-   (197 LOC; `#[doc(hidden)] pub mod` — internal plumbing) and wired
+   profile's wire contract — activation, echo, required-extension
+   rejection and the `a2a.skillId` request-shape check — is
+   implemented inside `crates/turul-a2a/src/profile_dispatch.rs`
+   (`#[doc(hidden)] pub mod` — internal plumbing) and wired
    into router (`src/router.rs`), JSON-RPC (`src/jsonrpc.rs`), and
-   gRPC (`src/grpc/service.rs`). The stable adopter-facing surface
+   gRPC (`src/grpc/service.rs`). **Skill routing is not in the
+   framework**: looking up `a2a.skillId`, handling unknown ids and
+   consuming `a2a.skillParams` are `AgentExecutor` code (reference:
+   `examples/skill-dispatch-profile-agent`), because `turul-a2a` owns
+   no skill registry. The stable adopter-facing surface
    is `turul_a2a::profiles` — a thin re-export module that exposes
-   only the URI constants and header names, leaving the parse /
-   validate / response-header helpers hidden. A new
+   the URI constant, the header name and the two reserved metadata
+   keys (`SKILL_ID_METADATA_KEY`, `SKILL_PARAMS_METADATA_KEY`),
+   leaving the parse / validate / response-header helpers hidden. A new
    profile/extensions crate is not introduced; the trigger for one
    remains ≥2 profile inhabitants.
 
@@ -250,10 +265,13 @@ full rejection rationale):
   approach) conflates payload with routing and is not
   proto-idiomatic.
 
-**Absent keys.** If either key is missing when the extension is
-activated, the server SHOULD respond with `InvalidParamsError`
-(A2A error model: `-32602`, HTTP 400) citing the missing key.
-`a2a.skillParams` is optional; its absence is not an error.
+**Absent keys.** If `a2a.skillId` is missing (or not a string) when
+the extension is activated, the server responds with
+`InvalidParamsError` (A2A error model: `-32602`, HTTP 400, gRPC
+`INVALID_ARGUMENT`) citing the missing key, before any task is
+created. `turul-a2a` enforces this on every send transport once the
+profile is negotiated (activated by the client *and* advertised by the
+agent). `a2a.skillParams` is optional; its absence is not an error.
 
 **Additional metadata.** Clients MAY include other keys in
 `Message.metadata` alongside the reserved keys; the server MUST
@@ -303,23 +321,26 @@ Per ADR-021 §1.2, the code that:
 2. Identifies whether the skill-invocation URI is present,
 3. Echoes activated URIs on the response,
 4. Enforces the `required = true` rejection path (§2.4), and
-5. Passes the resolved `a2a.skillId` and `a2a.skillParams` to the
-   registered dispatcher,
+5. Enforces the §2.3 request shape (`a2a.skillId` present and a
+   string once the profile is negotiated),
 
 belongs in `turul-a2a`'s transport/router layer
 (`crates/turul-a2a/src/router.rs`) and its gRPC/Lambda equivalents.
 NOT in `turul-a2a-patterns`.
 
-`turul-a2a-patterns` MAY host:
+*Amended 2026-10-22.* The draft's fifth point — "passes the resolved
+`a2a.skillId` and `a2a.skillParams` to the registered dispatcher" —
+assumed a framework-owned dispatcher registry. None exists: the
+framework hands the unchanged `Message` (metadata included) to the
+`AgentExecutor`, and the executor routes. Adding a framework skill
+registry would be a new feature requiring its own decision.
 
-- The URI constant (`pub const SKILL_INVOCATION_V1_URI: &str = "…"`),
-- A `SkillDispatchPayload { skill_id, params }` parsed-value struct,
-- A validator that reads `Message.metadata` and extracts the two
-  reserved keys into a `SkillDispatchPayload`,
-
-because none of those touch the wire directly — they are parsing
-helpers. The router layer consumes them; it does not move them into
-the patterns crate's public surface.
+The URI constant and the two reserved metadata keys live in
+`turul-a2a` (`turul_a2a::profiles::{SKILL_INVOCATION_PROFILE_V1,
+SKILL_ID_METADATA_KEY, SKILL_PARAMS_METADATA_KEY}`), next to the check
+that uses them; adopters import them rather than redefining the
+strings. The draft's optional `SkillDispatchPayload` parsed-value
+struct and metadata validator in `turul-a2a-patterns` were not built.
 
 The `turul-a2a-patterns` crate MUST NOT gain a dependency on
 `turul-a2a` (ADR-021 §2.3, §6 dep direction rule). The above
@@ -387,9 +408,9 @@ The `a2a.` prefix is a Turul-local reservation. Other Turul-owned
 extensions that carry per-message metadata SHOULD use distinct
 prefixes (e.g. `turul.` for fully internal keys not intended for
 other consumers). Adopters MUST NOT use the `a2a.skillId` or
-`a2a.skillParams` keys for non-dispatcher purposes; the patterns
-crate validator (§2.5) will interpret them as skill-routing intent
-when the extension is activated.
+`a2a.skillParams` keys for non-dispatcher purposes; once the
+extension is activated the framework's request-shape check (§2.5)
+and the adopter's executor interpret them as skill-routing intent.
 
 ## 5. Rejected Alternatives
 
@@ -456,8 +477,10 @@ mechanisms are needed simultaneously.
 >   `SKILL_INVOCATION_PROFILE_V1` inside `turul-a2a` and re-exporting
 >   it from the stable `turul_a2a::profiles` module, rather than
 >   waiting on `turul-a2a-patterns` to become publishable. The
->   patterns crate stays internal; the URI constant lives in the
->   transport-owning crate per ADR-021 §5 single-profile placement.
+>   URI constant (and, since 2026-10-22, the reserved metadata keys)
+>   live in the transport-owning crate per ADR-021 §5 single-profile
+>   placement; `turul-a2a-patterns` has since been published but
+>   does not host profile constants.
 > - The reference example is `examples/skill-dispatch-profile-agent/`
 >   (port 3015) with Python/Go/Rust interop clients.
 
@@ -525,6 +548,20 @@ must be reviewable alongside this ADR.
    `InvalidParamsError`; test documents both branches and the
    adopter-configuration point.
 
+*As implemented (recorded 2026-10-22)* in
+`crates/turul-a2a/tests/profile_dispatch_tests.rs`: case 1 is
+`extension_not_activated_runs_default_executor`; case 2, with routing
+left to the executor, is
+`extension_activated_passes_skill_id_to_executor_and_echoes`; case 3
+is `http_send_required_extension_missing_returns_unsupported_operation`;
+case 4 is `extension_activated_missing_skill_id_returns_invalid_params`
+plus its non-string, streaming, JSON-RPC and gRPC variants; case 5's
+framework half is
+`extension_activated_unknown_skill_id_is_left_to_the_executor` (the
+executor's choice is exercised by the
+`examples/skill-dispatch-profile-agent` smoke test). Cases 6-8 target
+a patterns-crate `SkillDispatchPayload` that was not built (§2.5).
+
 **`turul-a2a-patterns` unit tests (live in
 `crates/turul-a2a-patterns/tests/` once the crate exists):**
 
@@ -582,3 +619,4 @@ must be reviewable alongside this ADR.
 ## Revision log
 
 - 2026-10-22 — gRPC status for the missing-activation-header rejection corrected `UNIMPLEMENTED` → `FAILED_PRECONDITION`. The code has always returned `FAILED_PRECONDITION`; this aligns the ADR with the code and with the A2A v1.0.1 error-mapping table.
+- 2026-10-22 — Code and ADR reconciled on where the profile's rules live. The framework now enforces the §2.3 request shape on every send transport (HTTP blocking + streaming, JSON-RPC, gRPC): once the profile is negotiated, a missing or non-string `Message.metadata["a2a.skillId"]` is rejected as InvalidParams (`-32602` / HTTP 400 / gRPC `INVALID_ARGUMENT`) before any task is created. §2.5 point 5 ("passes to the registered dispatcher") amended: the framework owns no skill registry, so routing and unknown-id handling stay in the `AgentExecutor`. The reserved metadata keys are exported from `turul_a2a::profiles`. The acceptance-gates entry no longer claims `profile_dispatch_tests` pins routing; §7.2 maps each sketch case to its test and records cases 6-8 (patterns-crate `SkillDispatchPayload`) as not built.

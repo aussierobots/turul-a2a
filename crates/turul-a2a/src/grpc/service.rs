@@ -144,6 +144,8 @@ impl pb::grpc::A2aService for GrpcService {
         // received — serialize the proto request back to JSON to reuse the
         // existing input path (including `configuration.returnImmediately`).
         let body = serde_json::to_string(request.get_ref()).map_err(internal_from_json)?;
+        crate::profile_dispatch::check_skill_invocation_body(&echoed, &body)
+            .map_err(a2a_to_status)?;
 
         // gRPC auth claims are not yet wired. Pass None for now; executors
         // observe `ctx.claims = None` on this path.
@@ -367,6 +369,8 @@ impl pb::grpc::A2aService for GrpcService {
         let echoed = negotiate_profile_extensions_grpc(&self.state, request.metadata())
             .map_err(a2a_to_status)?;
         let body = serde_json::to_string(request.get_ref()).map_err(internal_from_json)?;
+        crate::profile_dispatch::check_skill_invocation_body(&echoed, &body)
+            .map_err(a2a_to_status)?;
 
         let stream = crate::grpc::streaming::handle_send_streaming_message(
             self.state.clone(),
