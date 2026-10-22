@@ -5,7 +5,7 @@
 
 ## Context
 
-turul-a2a v0.1 hardcodes `DEFAULT_OWNER = "anonymous"` in all handlers. The A2A proto defines `security_schemes` and `security_requirements` on `AgentCard`, and `security_requirements` on `AgentSkill`. GPS Trust deployments need JWT validation, but turul-a2a must remain usable by anyone without GPS Trust code coupling.
+turul-a2a v0.1 hardcodes `DEFAULT_OWNER = "anonymous"` in all handlers. The A2A proto defines `security_schemes` and `security_requirements` on `AgentCard`, and `security_requirements` on `AgentSkill`. Deployments need JWT validation, but turul-a2a must remain usable by anyone without coupling to a particular identity provider.
 
 The turul-mcp-framework provides a reference pattern: generic middleware trait in the server crate, optional auth crate with JWT validator, middleware wired via builder.
 
@@ -96,7 +96,7 @@ If Lambda uses API Gateway authorizers instead of (or in addition to) applicatio
 
 ## Consequences
 
-- GPS Trust auth is configuration (JWKS URI + issuer + audience), not a code dependency.
+- An identity provider is configuration (JWKS URI + issuer + audience), not a code dependency.
 - Any A2A consumer can implement `A2aMiddleware` for custom auth.
 - Existing 202 tests pass unchanged (empty middleware stack = anonymous access).
 - AgentCard always reflects actual auth configuration — scheme definitions match enforcement.
@@ -106,3 +106,4 @@ If Lambda uses API Gateway authorizers instead of (or in addition to) applicatio
 ## Revision log
 
 - **2026-10-22** — §4: ADR-016 superseded merging `WWW-Authenticate` headers from every failing `HttpChallenge` child with precedence selection — one error is selected and the transport builds its single challenge from the selected kind. Text updated to what ships. §5: the validator is the published `turul-jwt-validator` crate, not a workspace member.
+- **2026-10-23** — Context and Consequences restated without naming a specific identity provider. No contract change.

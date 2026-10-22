@@ -20,9 +20,7 @@ When working on `turul-a2a`, use these authorities in this order:
 2. The current A2A specification and topic pages from `https://a2a-protocol.org/latest/`.
 3. Local repository policy in this file.
 4. Local repository guidance in `CLAUDE.md`.
-5. Existing patterns from:
-   - `/home/nick/turul-mcp-framework`
-   - `/home/nick/gps-trust-auth`
+5. Existing patterns from [`turul-mcp-framework`](https://github.com/aussierobots/turul-mcp-framework).
 
 If these conflict, the normative A2A proto wins for wire-level behavior.
 
@@ -85,14 +83,14 @@ If these conflict, the normative A2A proto wins for wire-level behavior.
 
 - The core protocol/types crate must remain publishable independently.
 - Do not couple the publishable core to:
-  - GPS Trust private crates
+  - private or adopter-specific crates
   - auth middleware
   - storage backends
   - AWS Lambda runtime
 
 ### Preferred Boundary Split
 
-Mirror the good parts of `/home/nick/turul-mcp-framework`, but do not force a one-to-one crate explosion before it is earned.
+Mirror the good parts of `turul-mcp-framework`, but do not force a one-to-one crate explosion before it is earned.
 
 Preferred separation:
 
@@ -108,11 +106,11 @@ Rules:
 - Keep protocol concerns out of storage and transport crates.
 - Keep auth optional and middleware-based.
 - Keep deployment adapters thin.
-- Avoid baking GPS Trust-specific assumptions into general-purpose crates.
+- Avoid baking adopter-specific assumptions into general-purpose crates.
 
 ### Storage Pattern
 
-Storage should follow the trait-plus-backends pattern used in `/home/nick/turul-mcp-framework`:
+Storage should follow the trait-plus-backends pattern used in `turul-mcp-framework`:
 
 - in-memory
 - SQLite
@@ -131,17 +129,13 @@ Do not add backend-specific behavior to the public semantics unless the protocol
 
 ### Auth Pattern
 
-Auth should be evaluated in two separate roles:
-
-1. Can `gps-trust-auth` serve as the Authorization Server for A2A deployments?
-2. Can `gps-trust-jwt-validator` or a similar validator support A2A resource-server middleware cleanly?
+Auth is resource-server side only: middleware validates caller credentials (JWT via `turul-jwt-validator` in `turul-a2a-auth`, API keys, or a custom `A2aMiddleware`); issuing tokens is out of scope.
 
 Rules:
 
 - Keep auth out of the core crate.
-- Do not assume GPS Trust auth is appropriate for all downstream users.
-- If a GPS Trust dependency is introduced, isolate it to an opt-in auth crate.
-- Preserve a path for non-GPS-Trust adopters.
+- Do not assume any one identity provider; issuer, audience and JWKS are configuration.
+- Identity providers are configuration; if a provider-specific dependency is ever unavoidable, it goes in an opt-in auth crate, never the core.
 
 ## Testing Policy
 
@@ -212,7 +206,7 @@ When reviewing plans, docs, or code in this repo, always check:
 
 - No unnecessary new abstraction layers
 - No speculative crates without a clear boundary
-- No private GPS Trust coupling in public core APIs
+- No coupling to private or adopter-specific code in public core APIs
 - No docs that claim behavior without tests
 
 ## Planning Rules
@@ -229,17 +223,16 @@ When reviewing plans, docs, or code in this repo, always check:
 
 ## Guidance For This Repo Specifically
 
-- Use `/home/nick/turul-mcp-framework` as the reference for:
+- Use `turul-mcp-framework` as the reference for:
   - storage traits/backends
   - builder ergonomics
   - middleware boundaries
   - Lambda adapter layering
   - parity-test patterns
-- Use `/home/nick/gps-trust-auth` as the reference for:
-  - OAuth 2.1 Authorization Server constraints
+- For auth, follow OAuth 2.1 and RFC 6750:
   - JWT issuer/audience discipline
   - JWKS validation expectations
-  - separation between AS and RS responsibilities
+  - separation between Authorization Server and resource server responsibilities
 - Do not assume MCP semantics transfer directly to A2A:
   - A2A tasks are the state carrier
   - transport/session assumptions differ
