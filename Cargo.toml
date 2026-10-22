@@ -37,12 +37,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.32"
+version = "0.1.33"
 edition = "2024"
 authors = ["Nick Hortovanyi <nick@aussierobots.com.au>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/aussierobots/turul-a2a"
-homepage = "https://github.com/aussierobots/turul-a2a"
 keywords = ["a2a", "agent", "protocol", "async", "tokio"]
 categories = ["network-programming", "asynchronous", "web-programming::http-server", "api-bindings"]
 rust-version = "1.94"
@@ -57,13 +56,15 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 url = "2"
 tracing = "0.1"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Proto dependencies
 prost = "0.14"
 prost-types = "0.14"
+prost-build = "0.14"
 pbjson = "0.9"
 pbjson-types = "0.9"
+pbjson-build = "0.9"
 
 # gRPC (ADR-014; feature-gated, default off)
 tonic = "0.14"
@@ -81,13 +82,12 @@ futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors"] }
 hyper = "1"
 http = "1"
 http-body-util = "0.1"
 
 # Auth / JWT
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 
@@ -107,31 +107,36 @@ lambda_http = "1"
 lambda_runtime = "1"
 aws_lambda_events = { version = "1.2", default-features = false, features = ["dynamodb", "eventbridge", "sqs"] }
 aws-sdk-sqs = "1"
+serde_dynamo = "4"
 
 # Testing / crypto
-rsa = { version = "0.9", features = ["pem"] }
 rand = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 wiremock = "0.6"
 static_assertions = "1.1"
 
 # Misc
 bytes = "1"
 
-# turul-a2a-patterns (publish = false) — YAML frontmatter + JSON Schema 2020-12 validation.
-# Confined to the internal patterns crate; not pulled in by any publishable crate (ADR-021 §2.1).
-# serde_yaml is upstream-deprecated but remains the most-tested YAML/Serde option; switching to
-# a fork would add risk without offsetting value while this crate stays publish = false.
+# turul-a2a-patterns — YAML frontmatter + JSON Schema 2020-12 validation.
+# Used only by the patterns crate; no core crate depends on these.
+# serde_yaml is upstream-deprecated (archived March 2024) and ships in a published crate.
 # jsonschema supports Draft 2020-12 and is the most widely used Rust validator.
 serde_yaml = "0.9"
-jsonschema = "0.46"
+jsonschema = "0.59"
 
-turul-a2a = { version = "0.1.32", path = "crates/turul-a2a" }
-turul-a2a-proto = { version = "0.1.32", path = "crates/turul-a2a-proto" }
-turul-a2a-types = { version = "0.1.32", path = "crates/turul-a2a-types" }
+turul-a2a = { version = "0.1.33", path = "crates/turul-a2a" }
+turul-a2a-proto = { version = "0.1.33", path = "crates/turul-a2a-proto" }
+turul-a2a-types = { version = "0.1.33", path = "crates/turul-a2a-types" }
+turul-a2a-aws-lambda = { version = "0.1.33", path = "crates/turul-a2a-aws-lambda" }
+# Path-only: turul-a2a dev-depends on the client and auth crates, and both
+# depend on turul-a2a. A versioned dev-dep would make `cargo publish` of
+# turul-a2a wait on a release that cannot exist yet; cargo strips path-only
+# dev-deps at package time.
 turul-a2a-client = { path = "crates/turul-a2a-client" }
-turul-a2a-patterns = { version = "0.1.32", path = "crates/turul-a2a-patterns" }
-turul-jwt-validator = "0.2"
+turul-a2a-auth = { path = "crates/turul-a2a-auth" }
+turul-a2a-patterns = { version = "0.1.33", path = "crates/turul-a2a-patterns" }
+turul-jwt-validator = "0.3"
 
 # Sibling repo turul-llm — provider-neutral LLM client abstraction +
 # adapters. Published to crates.io as of 2026-05-23 at v0.1.0; consumed
@@ -148,4 +153,10 @@ turul-llm-ollama = "0.1"
 # the inner non-streaming dispatch table; the outer wire boundary stays in
 # turul-a2a (parse, envelope validation, notifications, params shape, compat-
 # v03, method-not-found wording, streaming, batch).
-turul-rpc = { version = "0.1", default-features = false, features = ["async"] }
+turul-rpc = { version = "0.2", default-features = false, features = ["async"] }
+
+# Applies to binaries built in this workspace (examples, Lambda bootstraps).
+# Published library crates take the consuming workspace's profile.
+[profile.release]
+lto = "fat"
+codegen-units = 1

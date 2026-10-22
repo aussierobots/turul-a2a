@@ -5,9 +5,9 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-turul-a2a = { path = "../../crates/turul-a2a" }
-turul-a2a-types = { path = "../../crates/turul-a2a-types" }
-turul-a2a-proto = { path = "../../crates/turul-a2a-proto" }
+turul-a2a = { workspace = true }
+turul-a2a-types = { workspace = true }
+turul-a2a-proto = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
@@ -16,6 +16,6 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-turul-a2a-client = { path = "../../crates/turul-a2a-client" }
+turul-a2a-client = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }

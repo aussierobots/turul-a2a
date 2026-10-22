@@ -6,7 +6,6 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
@@ -19,9 +18,9 @@ in-memory = []
 # Opt-in: enables method normalization, root POST route, optional A2A-Version header.
 # Removal condition: when a2a-sdk ships v1.0 support.
 compat-v03 = []
-sqlite = ["sqlx"]
-postgres = ["sqlx"]
-dynamodb = ["aws-config", "aws-sdk-dynamodb"]
+sqlite = ["sqlx", "dep:sha2"]
+postgres = ["sqlx", "dep:sha2"]
+dynamodb = ["aws-config", "aws-sdk-dynamodb", "dep:sha2"]
 # gRPC transport (ADR-014). Off by default — HTTP+JSON adopters pay zero
 # tonic weight. Enabling this transitively activates turul-a2a-proto/grpc
 # and pulls in the tonic runtime + ErrorInfo support.
@@ -43,7 +42,7 @@ uuid = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
+sha2 = { workspace = true, optional = true }
 tracing = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
@@ -54,9 +53,6 @@ tokio-util = { workspace = true }
 sqlx = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
-# Secret redaction for credentials/tokens used by later phases.
-# Scoped to turul-a2a only; NOT added to turul-a2a-types.
-secrecy = { workspace = true }
 # Push delivery worker (ADR-011): outbound HTTP client.
 reqwest = { workspace = true }
 # Retry jitter (push delivery).
@@ -73,10 +69,11 @@ sqlx = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
-turul-a2a-client = { path = "../turul-a2a-client" }
-turul-a2a-auth = { path = "../turul-a2a-auth" }
+turul-a2a-client = { workspace = true }
+turul-a2a-auth = { workspace = true }
+secrecy = { workspace = true }
 reqwest = { workspace = true }
-# Structured-event capture for observability-contract tests (phase A onward).
+# Structured-event capture for observability-contract tests.
 tracing-subscriber = { workspace = true }
 # Mock HTTP server for push-delivery integration tests (ADR-011 §13).
 wiremock = { workspace = true }

@@ -5,12 +5,11 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 readme = "README.md"
-description = "Reusable A2A skill-authoring patterns: SKILL.md manifest, SkillHandler / SkillRegistry / SkillProgressSink / TerminalHook (ADR-021)."
+description = "Reusable A2A skill-authoring patterns: SKILL.md manifest, SkillHandler / SkillRegistry / SkillProgressSink / TerminalHook."
 
 [dependencies]
 turul-a2a-proto = { workspace = true }
@@ -19,10 +18,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
-futures = { workspace = true }
-static_assertions = { workspace = true }
 serde_yaml = { workspace = true }
 jsonschema = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+static_assertions = { workspace = true }

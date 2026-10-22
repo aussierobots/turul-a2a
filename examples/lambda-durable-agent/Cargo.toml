@@ -13,10 +13,10 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-turul-a2a = { path = "../../crates/turul-a2a", features = ["dynamodb"] }
-turul-a2a-aws-lambda = { path = "../../crates/turul-a2a-aws-lambda", features = ["sqs"] }
-turul-a2a-types = { path = "../../crates/turul-a2a-types" }
-turul-a2a-proto = { path = "../../crates/turul-a2a-proto" }
+turul-a2a = { workspace = true, features = ["dynamodb"] }
+turul-a2a-aws-lambda = { workspace = true, features = ["sqs"] }
+turul-a2a-types = { workspace = true }
+turul-a2a-proto = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 lambda_http = { workspace = true }

@@ -6,7 +6,6 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
@@ -21,7 +20,6 @@ grpc = ["dep:tonic", "dep:tonic-prost", "dep:tonic-prost-build", "dep:tonic-buil
 
 [dependencies]
 prost = { workspace = true }
-prost-types = { workspace = true }
 pbjson = { workspace = true }
 pbjson-types = { workspace = true }
 serde = { workspace = true }
@@ -34,7 +32,7 @@ serde_json = { workspace = true }
 [build-dependencies]
 prost = { workspace = true }
 prost-types = { workspace = true }
-prost-build = "0.14"
-pbjson-build = "0.9"
+prost-build = { workspace = true }
+pbjson-build = { workspace = true }
 tonic-prost-build = { workspace = true, optional = true }
 tonic-build = { workspace = true, optional = true }

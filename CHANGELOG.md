@@ -4,6 +4,19 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.33] — 2026-10-22
+
+### Changed
+
+- Dependency updates (semver-incompatible lines, no API change in these crates): `turul-rpc 0.1 → 0.2`, `turul-jwt-validator 0.2 → 0.3`, `jsonwebtoken 10 → 11`, `sha2 0.10 → 0.11`, `base64 0.22 → 0.23`, `jsonschema 0.46 → 0.59`. `turul-rpc 0.2` accepts `"id": null` JSON-RPC requests per JSON-RPC 2.0 §4.2 (previously rejected as Invalid Request). `turul-jwt-validator 0.3` adds opt-in stale-while-revalidate and bounded retry for JWKS fetches; defaults are unchanged.
+- `turul-a2a` no longer carries `sha2` or `secrecy` in a default (in-memory) build: `sha2` is now pulled in only by the `sqlite` / `postgres` / `dynamodb` features that use it, and `secrecy` was only used by tests.
+- Every crate manifest now declares dependencies via `workspace = true`; the workspace root is the single owner of all versions (previously `serde_dynamo`, `prost-build` and `pbjson-build` carried their own). Unused `tower-http`, `rsa`, `futures` and `prost-types` entries removed.
+- Workspace `[profile.release]` now sets `lto = "fat"` and `codegen-units = 1`. This applies to binaries built from this workspace (examples, Lambda bootstraps); library adopters are governed by their own profile.
+
+### Verification
+
+Workspace tests (944), SQLite parity tests, gRPC end-to-end + spec-compliance, clippy deny-warnings across default / sqlite / postgres / dynamodb / all / grpc feature sets, `cargo doc`, and `cargo package` for all seven publish crates passed.
+
 ## [0.1.32] — 2026-06-10
 
 ### Fixed

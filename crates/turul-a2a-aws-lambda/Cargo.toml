@@ -6,7 +6,6 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
@@ -27,7 +26,7 @@ lambda_http = { workspace = true }
 lambda_runtime = { workspace = true }
 aws_lambda_events = { workspace = true }
 aws-sdk-sqs = { workspace = true, optional = true }
-serde_dynamo = { version = "4" }
+serde_dynamo = { workspace = true }
 thiserror = { workspace = true }
 axum = { workspace = true }
 http = { workspace = true }

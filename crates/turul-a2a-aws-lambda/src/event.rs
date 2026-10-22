@@ -96,18 +96,11 @@ fn is_sqs_event_shape(event: &serde_json::Value) -> bool {
 }
 
 fn is_http_event_shape(event: &serde_json::Value) -> bool {
-    if event.get("httpMethod").is_some() {
-        return true;
-    }
-    if let Some(req_ctx) = event.get("requestContext")
-        && req_ctx.pointer("/http/method").is_some()
-    {
-        return true;
-    }
-    if event.get("routeKey").is_some() {
-        return true;
-    }
-    false
+    event.get("httpMethod").is_some()
+        || event
+            .get("requestContext")
+            .is_some_and(|req_ctx| req_ctx.pointer("/http/method").is_some())
+        || event.get("routeKey").is_some()
 }
 
 #[cfg(test)]
