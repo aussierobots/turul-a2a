@@ -1,18 +1,87 @@
 //! A2A transport compliance middleware.
 //!
-//! Validates A2A-Version header and Content-Type on POST requests.
-//! Runs as the outermost Tower layer, before auth.
+//! Validates the `A2A-Version` service parameter and the Content-Type of
+//! POST requests. Runs as the outermost Tower layer, before auth.
+//!
+//! Rejections on the JSON-RPC endpoint are JSON-RPC error envelopes (HTTP
+//! 200, `id: null` because the body has not been read); every other path
+//! gets the HTTP+JSON error body.
 
 use std::task::{Context, Poll};
 
 use axum::body::Body;
+use axum::response::IntoResponse;
 use http::{Request, Response};
 use tower::{Layer, Service};
+use turul_a2a_types::wire::protocol;
 
 use crate::error::A2aError;
 
-/// Supported A2A protocol version.
-const SUPPORTED_VERSION: &str = "1.0";
+/// Whether `requested` names the protocol version this server speaks.
+///
+/// Only `Major.Minor` is compared: spec Section 3.6 says patch numbers
+/// "MUST not be considered when clients and servers negotiate protocol
+/// versions", so `1.0.1` is treated as `1.0`.
+pub(crate) fn version_supported(requested: &str) -> bool {
+    let mut ours = protocol::VERSION.split('.');
+    let mut theirs = requested.trim().split('.');
+    ours.next() == theirs.next()
+        && ours.next() == theirs.next()
+        && theirs.all(|patch| !patch.is_empty() && patch.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Validate the requested `A2A-Version` (header, gRPC metadata or query
+/// parameter value).
+///
+/// Spec Section 3.6.2: an absent or empty value means version 0.3. Without
+/// the `compat-v03` feature 0.3 is not served, so it is rejected with
+/// `VersionNotSupportedError`; with the feature it is accepted.
+pub(crate) fn check_version(requested: Option<&str>) -> Result<(), A2aError> {
+    match requested.map(str::trim) {
+        Some(v) if !v.is_empty() => {
+            if version_supported(v) {
+                Ok(())
+            } else {
+                Err(A2aError::VersionNotSupported {
+                    version: v.to_string(),
+                })
+            }
+        }
+        _ => {
+            if cfg!(feature = "compat-v03") {
+                Ok(())
+            } else {
+                Err(A2aError::VersionNotSupported {
+                    version: "0.3 (A2A-Version absent or empty)".to_string(),
+                })
+            }
+        }
+    }
+}
+
+/// The requested version on an HTTP request: the `A2A-Version` header, or
+/// failing that the `A2A-Version` query parameter (spec Section 3.6.1:
+/// "Clients MAY provide the `A2A-Version` as a request parameter instead
+/// of a header"). Service-parameter names are case-insensitive.
+fn requested_version<B>(req: &Request<B>) -> Option<String> {
+    if let Some(v) = req.headers().get(protocol::VERSION_PARAM) {
+        return Some(v.to_str().unwrap_or_default().to_string());
+    }
+    req.uri().query()?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        key.eq_ignore_ascii_case(protocol::VERSION_PARAM)
+            .then(|| value.to_string())
+    })
+}
+
+/// Whether a Content-Type names a JSON body this server accepts:
+/// `application/json` or the registered `application/a2a+json` (spec
+/// Section 14.1), with any media-type parameters such as `charset`.
+fn is_accepted_json_media_type(content_type: &str) -> bool {
+    let essence = content_type.split(';').next().unwrap_or_default().trim();
+    essence.eq_ignore_ascii_case(protocol::MEDIA_TYPE_JSON)
+        || essence.eq_ignore_ascii_case(protocol::MEDIA_TYPE_A2A_JSON)
+}
 
 /// Tower Layer for A2A transport compliance.
 #[derive(Clone)]
@@ -50,73 +119,102 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            let path = req.uri().path().to_string();
-            let method = req.method().clone();
-
-            // 1. A2A-Version validation (skip for discovery)
-            if !super::is_bypass_path(&path) {
-                match req
-                    .headers()
-                    .get("a2a-version")
-                    .and_then(|v| v.to_str().ok())
-                {
-                    Some(v) if v == SUPPORTED_VERSION => {} // OK
-                    Some(v) => {
-                        let err = A2aError::VersionNotSupported {
-                            version: v.to_string(),
-                        };
-                        return Ok(err.into_response_body());
-                    }
-                    None => {
-                        // compat-v03: accept missing header (a2a-sdk 0.3.x doesn't send it)
-                        // strict v1.0: reject missing header
-                        #[cfg(not(feature = "compat-v03"))]
-                        {
-                            let err = A2aError::VersionNotSupported {
-                                version: "missing (A2A-Version header is required)".to_string(),
-                            };
-                            return Ok(err.into_response_body());
-                        }
-                    }
-                }
+            if let Err(err) = check_request(&req) {
+                let response = if crate::jsonrpc::is_jsonrpc_path(req.uri().path()) {
+                    axum::Json(err.to_jsonrpc_error(None)).into_response()
+                } else {
+                    err.into_response()
+                };
+                return Ok(response);
             }
-
-            // 2. Content-Type validation for POST requests with a body
-            if method == http::Method::POST {
-                let has_content_type = req.headers().contains_key(http::header::CONTENT_TYPE);
-                if has_content_type {
-                    let content_type = req
-                        .headers()
-                        .get(http::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-
-                    if !content_type.contains("application/json") {
-                        let err = A2aError::ContentTypeNotSupported {
-                            content_type: content_type.to_string(),
-                        };
-                        return Ok(err.into_response_body());
-                    }
-                }
-                // POST without Content-Type header is allowed (e.g., cancel with empty body)
-            }
-
             inner.call(req).await
         })
     }
 }
 
-impl A2aError {
-    /// Convert to an HTTP response body for transport-level errors.
-    #[allow(clippy::wrong_self_convention)] // `into_*` on &self is intentional: we never consume the error, we render it
-    fn into_response_body(&self) -> Response<Body> {
-        let status = axum::http::StatusCode::from_u16(self.http_status())
-            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-        let body = self.to_http_error_body();
-        Response::builder()
-            .status(status)
-            .header(http::header::CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_string(&body).unwrap_or_default()))
-            .unwrap_or_else(|_| Response::builder().status(500).body(Body::empty()).unwrap())
+fn check_request<B>(req: &Request<B>) -> Result<(), A2aError> {
+    // Discovery is public and version-independent.
+    if !super::is_bypass_path(req.uri().path()) {
+        check_version(requested_version(req).as_deref())?;
+    }
+
+    // A POST without a Content-Type is allowed (e.g. cancel with an empty
+    // body); one that declares a type must declare JSON.
+    if req.method() == http::Method::POST
+        && let Some(value) = req.headers().get(http::header::CONTENT_TYPE)
+    {
+        let content_type = value.to_str().unwrap_or_default();
+        if !is_accepted_json_media_type(content_type) {
+            return Err(A2aError::ContentTypeNotSupported {
+                content_type: content_type.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_match_ignores_patch() {
+        assert!(version_supported("1.0"));
+        assert!(version_supported("1.0.1"));
+        assert!(version_supported(" 1.0 "));
+        assert!(!version_supported("1.1"));
+        assert!(!version_supported("0.3"));
+        assert!(!version_supported("1"));
+        assert!(!version_supported("1.0.x"));
+        assert!(!version_supported("10.0"));
+    }
+
+    #[test]
+    fn absent_or_empty_version_is_0_3() {
+        for requested in [None, Some(""), Some("  ")] {
+            let result = check_version(requested);
+            if cfg!(feature = "compat-v03") {
+                assert!(result.is_ok(), "{requested:?}");
+            } else {
+                assert!(
+                    matches!(result, Err(A2aError::VersionNotSupported { .. })),
+                    "{requested:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn version_query_parameter_is_read_when_header_absent() {
+        let req = Request::get("/tasks?pageSize=5&a2a-version=1.0")
+            .body(())
+            .unwrap();
+        assert_eq!(requested_version(&req).as_deref(), Some("1.0"));
+
+        let req = Request::get("/tasks?A2A-Version=0.9")
+            .header("A2A-Version", "1.0")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            requested_version(&req).as_deref(),
+            Some("1.0"),
+            "header wins over query parameter"
+        );
+    }
+
+    #[test]
+    fn json_media_types() {
+        assert!(is_accepted_json_media_type("application/json"));
+        assert!(is_accepted_json_media_type("application/a2a+json"));
+        assert!(is_accepted_json_media_type(
+            "application/a2a+json; charset=utf-8"
+        ));
+        assert!(is_accepted_json_media_type(
+            "Application/JSON;charset=UTF-8"
+        ));
+        assert!(!is_accepted_json_media_type("application/jsonx"));
+        assert!(!is_accepted_json_media_type("text/plain; application/json"));
+        assert!(!is_accepted_json_media_type("text/xml"));
+        assert!(!is_accepted_json_media_type(""));
     }
 }

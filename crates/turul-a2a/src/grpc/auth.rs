@@ -78,6 +78,10 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
+            if let Err(err) = check_a2a_version(&req) {
+                return Ok(crate::grpc::error::a2a_to_status(err).into_http());
+            }
+
             let headers = req.headers().clone();
 
             // Matches the HTTP layer's "no middleware configured" short
@@ -99,6 +103,32 @@ where
             }
         })
     }
+}
+
+/// Validate the `a2a-version` metadata on A2AService calls, before auth —
+/// the same order as the HTTP transport-compliance layer. Spec Section
+/// 10.2: servers "SHOULD validate required service parameters (e.g.,
+/// `A2A-Version`) from metadata"; Section 3.6.2 makes an unsupported
+/// version a `VersionNotSupportedError`. Other services co-hosted on the
+/// same server (health, reflection) are not A2A calls and are not checked.
+fn check_a2a_version<B>(req: &Request<B>) -> Result<(), crate::error::A2aError> {
+    use tonic::server::NamedService;
+    let service =
+        <turul_a2a_proto::grpc::A2aServiceServer<crate::grpc::GrpcService> as NamedService>::NAME;
+    let is_a2a_call = req
+        .uri()
+        .path()
+        .strip_prefix('/')
+        .and_then(|p| p.strip_prefix(service))
+        .is_some_and(|rest| rest.starts_with('/'));
+    if !is_a2a_call {
+        return Ok(());
+    }
+    let requested = req
+        .headers()
+        .get("a2a-version")
+        .map(|v| v.to_str().unwrap_or_default());
+    crate::middleware::transport::check_version(requested)
 }
 
 /// Map a `MiddlewareError` to a gRPC-formatted HTTP response.

@@ -327,12 +327,28 @@ async fn jsonrpc_stream(h: &Harness, method: &str, params: Value, resume: Option
 }
 
 #[cfg(feature = "grpc")]
-async fn grpc_client(
-    h: &Harness,
-) -> turul_a2a_proto::grpc::A2aServiceClient<tonic::transport::Channel> {
-    turul_a2a_proto::grpc::A2aServiceClient::connect(format!("http://{}", h.grpc_addr))
+type VersionedChannel = tonic::service::interceptor::InterceptedService<
+    tonic::transport::Channel,
+    fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+>;
+
+#[cfg(feature = "grpc")]
+fn with_a2a_version(mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+    req.metadata_mut().insert(
+        "a2a-version",
+        tonic::metadata::MetadataValue::from_static("1.0"),
+    );
+    Ok(req)
+}
+
+#[cfg(feature = "grpc")]
+async fn grpc_client(h: &Harness) -> turul_a2a_proto::grpc::A2aServiceClient<VersionedChannel> {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", h.grpc_addr))
+        .expect("grpc endpoint")
+        .connect()
         .await
-        .expect("grpc connect")
+        .expect("grpc connect");
+    turul_a2a_proto::grpc::A2aServiceClient::with_interceptor(channel, with_a2a_version as _)
 }
 
 #[cfg(feature = "grpc")]

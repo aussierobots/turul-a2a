@@ -13,7 +13,7 @@ use tower::ServiceExt;
 use turul_a2a::executor::AgentExecutor;
 use turul_a2a::router::{AppState, build_router};
 use turul_a2a::storage::InMemoryA2aStorage;
-use turul_a2a_types::{Message, Task};
+use turul_a2a_types::{Message, Task, TaskState};
 
 /// Minimal test executor that returns the agent card and stubs execute.
 struct TestExecutor;
@@ -158,10 +158,13 @@ async fn post_message_send_routes() {
         .header("a2a-version", "1.0")
         .body(Body::from("{}"))
         .unwrap();
-    let status = response_status(router, req).await;
-    // Handler is stub — returns 400 (UnsupportedOperation)
-    // What matters: the route matched, not 404
-    assert_ne!(status, 404, "/message:send must route, not 404");
+    let resp = router.oneshot(req).await.unwrap();
+    // `{}` carries no `message`, so the send handler itself rejects it as an
+    // invalid request — proof the route reached the handler.
+    assert_eq!(resp.status().as_u16(), 400);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["status"], "INVALID_ARGUMENT");
 }
 
 #[tokio::test]
@@ -210,6 +213,54 @@ async fn cancel_task_routes() {
         .body(Body::empty())
         .unwrap();
     assert_route_dispatches(router, req).await;
+}
+
+/// Seed a WORKING task in the given tenant for the anonymous owner.
+async fn seed_working_task(state: &AppState, tenant: &str, id: &str) {
+    let task = Task::new(id, turul_a2a_types::TaskStatus::new(TaskState::Working))
+        .with_context_id("ctx-subscribe");
+    state
+        .task_storage
+        .create_task(tenant, "anonymous", task)
+        .await
+        .unwrap();
+}
+
+/// Spec Section 11.3.2 lists `POST /tasks/{id}:subscribe`; the proto
+/// annotation is `GET`. Both must open the SSE stream.
+async fn assert_subscribe_opens_stream(method: &str, tenant: &str) {
+    let state = test_state();
+    seed_working_task(&state, tenant, "sub-1").await;
+    let prefix = if tenant.is_empty() {
+        String::new()
+    } else {
+        format!("/{tenant}")
+    };
+    let req = Request::builder()
+        .method(method)
+        .uri(format!("{prefix}/tasks/sub-1:subscribe"))
+        .header("a2a-version", "1.0")
+        .body(Body::empty())
+        .unwrap();
+    let resp = build_router(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "{method} {prefix} subscribe");
+    let content_type = resp.headers()[http::header::CONTENT_TYPE].to_str().unwrap();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "{method} {prefix} subscribe content-type: {content_type}"
+    );
+}
+
+#[tokio::test]
+async fn subscribe_get_and_post_open_stream_on_default_route() {
+    assert_subscribe_opens_stream("GET", "").await;
+    assert_subscribe_opens_stream("POST", "").await;
+}
+
+#[tokio::test]
+async fn subscribe_get_and_post_open_stream_on_tenant_route() {
+    assert_subscribe_opens_stream("GET", "acme-corp").await;
+    assert_subscribe_opens_stream("POST", "acme-corp").await;
 }
 
 #[tokio::test]
@@ -344,16 +395,14 @@ async fn http_error_includes_error_info() {
         .unwrap();
     let body = response_body(router, req).await;
 
-    let details = body["error"]["details"].as_array();
-    assert!(details.is_some(), "HTTP error must have details array");
-    let details = details.unwrap();
-    assert!(!details.is_empty(), "details must not be empty");
     assert_eq!(
-        details[0]["@type"],
-        "type.googleapis.com/google.rpc.ErrorInfo"
+        body["error"]["details"],
+        serde_json::json!([{
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": "EXTENDED_AGENT_CARD_NOT_CONFIGURED",
+            "domain": "a2a-protocol.org",
+        }])
     );
-    assert_eq!(details[0]["domain"], "a2a-protocol.org");
-    assert!(details[0]["reason"].is_string());
 }
 
 // =========================================================
@@ -361,12 +410,16 @@ async fn http_error_includes_error_info() {
 // =========================================================
 
 #[tokio::test]
-async fn unknown_route_returns_404() {
+async fn unknown_route_returns_router_404() {
     let router = build_router(test_state());
     let req = Request::get("/nonexistent/path")
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
-    let status = response_status(router, req).await;
-    assert_eq!(status, 404);
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+    // The router's own 404 has an empty body; a handler's TaskNotFound
+    // would carry a JSON error body.
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(body.is_empty(), "unmatched route must be the router 404");
 }

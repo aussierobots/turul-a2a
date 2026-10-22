@@ -39,8 +39,8 @@
 //!   request `id`),
 //! - error paths carry the spec-mandated HTTP status and JSON-RPC
 //!   code, plus a `google.rpc.ErrorInfo` under `error.details`
-//!   (HTTP, AIP-193) or `error.data` (JSON-RPC 2.0) — spec §5.4 /
-//!   .
+//!   (HTTP, AIP-193) or `error.data` (JSON-RPC 2.0) — spec §5.4,
+//!   §9.5, §11.6.
 //!
 //! The tests stand up a single `A2aServer` router via `into_router()`
 //! so the compliance harness is hermetic — no external ports, no
@@ -200,29 +200,52 @@ async fn jsonrpc_call(
     json
 }
 
-/// A2A spec §5.4: every A2A error response carries a
-/// `google.rpc.ErrorInfo` record with `reason` + `domain`.
-///
-/// The slot name differs by transport, but both carry an array of
-/// `@type`-tagged detail objects:
-/// - HTTP (AIP-193): `error.details: [{"@type": "...ErrorInfo", ...}]`
-/// - JSON-RPC 2.0: `error.data: [{"@type": "...ErrorInfo", ...}]`
-fn assert_has_error_info(json: &serde_json::Value, expected_reason: &str) {
+/// Where a binding carries its error detail objects.
+#[derive(Clone, Copy, Debug)]
+enum ErrorSlot {
+    /// HTTP+JSON (spec §11.6, AIP-193): `error.details`.
+    HttpDetails,
+    /// JSON-RPC 2.0 (spec §9.5): `error.data`.
+    JsonRpcData,
+}
+
+/// A2A spec §5.4 / §9.5 / §11.6: every A2A error response carries a
+/// `google.rpc.ErrorInfo` record with `reason` + `domain`, in the detail
+/// array of the binding's own slot. Every detail object MUST carry
+/// `@type`, and exactly one of them is the ErrorInfo.
+fn assert_has_error_info(json: &serde_json::Value, slot: ErrorSlot, expected_reason: &str) {
     let error = json.get("error").expect("error envelope present");
+    let (key, other) = match slot {
+        ErrorSlot::HttpDetails => ("details", "data"),
+        ErrorSlot::JsonRpcData => ("data", "details"),
+    };
+    assert!(
+        error.get(other).is_none(),
+        "{slot:?} error must not carry `{other}`; got {json}"
+    );
     let details = error
-        .get("details")
-        .or_else(|| error.get("data"))
+        .get(key)
         .and_then(|d| d.as_array())
-        .unwrap_or_else(|| {
-            panic!("error must carry a `details` (HTTP) or `data` (JSON-RPC) array; got {json}")
-        });
-    let info = details
+        .unwrap_or_else(|| panic!("{slot:?} error must carry a `{key}` array; got {json}"));
+    for entry in details {
+        assert!(
+            entry.get("@type").and_then(|t| t.as_str()).is_some(),
+            "every error detail object must carry `@type`; got {json}"
+        );
+    }
+    let infos: Vec<&serde_json::Value> = details
         .iter()
-        .find(|entry| {
+        .filter(|entry| {
             entry.get("@type").and_then(|t| t.as_str())
                 == Some("type.googleapis.com/google.rpc.ErrorInfo")
         })
-        .unwrap_or_else(|| panic!("google.rpc.ErrorInfo in error details; got {json}"));
+        .collect();
+    assert_eq!(
+        infos.len(),
+        1,
+        "exactly one google.rpc.ErrorInfo in `{key}`; got {json}"
+    );
+    let info = infos[0];
     assert_eq!(
         info.get("reason").and_then(|v| v.as_str()),
         Some(expected_reason),
@@ -387,7 +410,7 @@ async fn get_task_not_found_maps_to_404_and_minus_32001() {
     let (status, _, http_err) =
         http_call(router.clone(), Method::GET, "/tasks/does-not-exist", None).await;
     assert_eq!(status, 404, "TaskNotFoundError HTTP status");
-    assert_has_error_info(&http_err, "TASK_NOT_FOUND");
+    assert_has_error_info(&http_err, ErrorSlot::HttpDetails, "TASK_NOT_FOUND");
 
     // JSON-RPC.
     let jrpc = jsonrpc_call(
@@ -406,7 +429,7 @@ async fn get_task_not_found_maps_to_404_and_minus_32001() {
         code, -32001,
         "TaskNotFoundError JSON-RPC code per spec §5.4"
     );
-    assert_has_error_info(&jrpc, "TASK_NOT_FOUND");
+    assert_has_error_info(&jrpc, ErrorSlot::JsonRpcData, "TASK_NOT_FOUND");
 }
 
 // ---------------------------------------------------------------------------
@@ -416,22 +439,24 @@ async fn get_task_not_found_maps_to_404_and_minus_32001() {
 #[tokio::test]
 async fn list_tasks_http_carries_required_pagination_fields() {
     let router = compliance_router();
-    // Seed a task so the list is non-empty.
-    let _ = http_call(
+    let (_, _, sent) = http_call(
         router.clone(),
         Method::POST,
         "/message:send",
         Some(http_send_body("m-compliance-list", "first")),
     )
     .await;
+    let seeded_id = sent["task"]["id"].as_str().expect("seeded task id");
 
     let (status, _, page) = http_call(router, Method::GET, "/tasks", None).await;
     assert_eq!(status, 200);
     // ListTasksResponse REQUIRED fields per spec.
-    assert!(page.get("tasks").and_then(|v| v.as_array()).is_some());
-    assert!(page.get("nextPageToken").is_some());
+    let tasks = page["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 1, "exactly the seeded task: {page}");
+    assert_eq!(tasks[0]["id"], seeded_id);
+    assert_eq!(page["nextPageToken"], "", "single page has no next token");
     assert!(page.get("pageSize").and_then(|v| v.as_i64()).is_some());
-    assert!(page.get("totalSize").and_then(|v| v.as_i64()).is_some());
+    assert_eq!(page["totalSize"], 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -467,7 +492,7 @@ async fn cancel_terminal_task_returns_400_and_task_not_cancelable_error() {
     )
     .await;
     assert_eq!(status, 400, "TaskNotCancelableError HTTP status");
-    assert_has_error_info(&http_err, "TASK_NOT_CANCELABLE");
+    assert_has_error_info(&http_err, ErrorSlot::HttpDetails, "TASK_NOT_CANCELABLE");
 
     // JSON-RPC.
     let jrpc = jsonrpc_call(router, "CancelTask", serde_json::json!({"id": task_id}), 11).await;
@@ -480,15 +505,15 @@ async fn cancel_terminal_task_returns_400_and_task_not_cancelable_error() {
         Some(-32002),
         "TaskNotCancelableError JSON-RPC code per spec §5.4"
     );
-    assert_has_error_info(&jrpc, "TASK_NOT_CANCELABLE");
+    assert_has_error_info(&jrpc, ErrorSlot::JsonRpcData, "TASK_NOT_CANCELABLE");
 }
 
 #[tokio::test]
-async fn cancel_nonexistent_task_returns_404_not_cancel_error() {
+async fn cancel_nonexistent_task_is_task_not_found() {
     let router = compliance_router();
     let (status, _, err) = http_call(router, Method::POST, "/tasks/ghost:cancel", None).await;
     assert_eq!(status, 404);
-    assert_has_error_info(&err, "TASK_NOT_FOUND");
+    assert_has_error_info(&err, ErrorSlot::HttpDetails, "TASK_NOT_FOUND");
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +666,7 @@ async fn subscribe_to_task_terminal_returns_unsupported_operation() {
     )
     .await;
     assert_eq!(status, 400, "UnsupportedOperationError HTTP status");
-    assert_has_error_info(&err, "UNSUPPORTED_OPERATION");
+    assert_has_error_info(&err, ErrorSlot::HttpDetails, "UNSUPPORTED_OPERATION");
 }
 
 #[tokio::test]
@@ -763,7 +788,7 @@ async fn a2a_version_missing_rejected_with_400_strict() {
     );
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_has_error_info(&body, "VERSION_NOT_SUPPORTED");
+    assert_has_error_info(&body, ErrorSlot::HttpDetails, "VERSION_NOT_SUPPORTED");
 }
 
 #[cfg(feature = "compat-v03")]
@@ -803,7 +828,7 @@ async fn a2a_version_unsupported_value_always_rejected() {
     );
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_has_error_info(&body, "VERSION_NOT_SUPPORTED");
+    assert_has_error_info(&body, ErrorSlot::HttpDetails, "VERSION_NOT_SUPPORTED");
 }
 
 // ---------------------------------------------------------------------------
@@ -826,8 +851,8 @@ async fn jsonrpc_unknown_method_returns_method_not_found() {
 }
 
 // ---------------------------------------------------------------------------
-// — skill-level security_requirements round-trip
-// across every build-materializable card transport.
+// Skill-level security_requirements round-trip across every
+// build-materializable card transport.
 //
 // The A2A proto has exactly one public-card RPC: HTTP discovery at
 // `/.well-known/agent-card.json`. The extended card is served over
@@ -840,10 +865,10 @@ async fn jsonrpc_unknown_method_returns_method_not_found() {
 /// Executor whose public + extended cards both carry the same
 /// skill-level `SecurityRequirement`, declaring the scheme in
 /// `security_schemes` so build-time validation is satisfied.
-struct Adr015RoundtripExecutor;
+struct SkillSecurityRoundtripExecutor;
 
 #[async_trait]
-impl AgentExecutor for Adr015RoundtripExecutor {
+impl AgentExecutor for SkillSecurityRoundtripExecutor {
     async fn execute(
         &self,
         task: &mut Task,
@@ -861,18 +886,20 @@ impl AgentExecutor for Adr015RoundtripExecutor {
     }
 
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
-        adr015_card("ADR-015 round-trip agent")
+        skill_security_card("skill-security round-trip agent")
     }
 
     fn extended_agent_card(
         &self,
         _claims: Option<&serde_json::Value>,
     ) -> Option<turul_a2a_proto::AgentCard> {
-        Some(adr015_card("ADR-015 round-trip agent (extended)"))
+        Some(skill_security_card(
+            "skill-security round-trip agent (extended)",
+        ))
     }
 }
 
-fn adr015_card(description: &str) -> turul_a2a_proto::AgentCard {
+fn skill_security_card(description: &str) -> turul_a2a_proto::AgentCard {
     let mut schemes_map = HashMap::new();
     schemes_map.insert(
         "bearer".to_string(),
@@ -896,7 +923,7 @@ fn adr015_card(description: &str) -> turul_a2a_proto::AgentCard {
         },
     );
     turul_a2a_proto::AgentCard {
-        name: "adr015-roundtrip".into(),
+        name: "skill-security-roundtrip".into(),
         description: description.into(),
         supported_interfaces: vec![turul_a2a_proto::AgentInterface {
             url: "http://127.0.0.1:0".into(),
@@ -920,8 +947,8 @@ fn adr015_card(description: &str) -> turul_a2a_proto::AgentCard {
         skills: vec![turul_a2a_proto::AgentSkill {
             id: "search".into(),
             name: "Search".into(),
-            description: "Skill with ADR-015 skill-level security".into(),
-            tags: vec!["adr015".into()],
+            description: "Skill with skill-level security".into(),
+            tags: vec!["skill-security".into()],
             examples: vec![],
             input_modes: vec!["text/plain".into()],
             output_modes: vec!["text/plain".into()],
@@ -934,12 +961,12 @@ fn adr015_card(description: &str) -> turul_a2a_proto::AgentCard {
     }
 }
 
-fn adr015_compliance_router() -> axum::Router {
+fn skill_security_compliance_router() -> axum::Router {
     A2aServer::builder()
-        .executor(Adr015RoundtripExecutor)
+        .executor(SkillSecurityRoundtripExecutor)
         .storage(InMemoryA2aStorage::new())
         .build()
-        .expect("ADR-015 round-trip server build")
+        .expect("skill-security round-trip server build")
         .into_router()
 }
 
@@ -971,7 +998,7 @@ fn skill_requirements_of(card: &serde_json::Value) -> serde_json::Value {
 
 #[tokio::test]
 async fn agent_card_with_skill_level_security_roundtrips_via_all_card_paths() {
-    let router = adr015_compliance_router();
+    let router = skill_security_compliance_router();
 
     // HTTP public discovery — the only normative path for the public card.
     let (status, _, public_card) = http_call(
@@ -1020,8 +1047,25 @@ async fn agent_card_with_skill_level_security_roundtrips_via_all_card_paths() {
     );
 }
 
+/// Raw tonic client channel that stamps every call with the `a2a-version`
+/// metadata a conforming client sends (spec §3.6.1).
 #[cfg(feature = "grpc")]
-mod adr015_grpc_roundtrip {
+type VersionedChannel = tonic::service::interceptor::InterceptedService<
+    tonic::transport::Channel,
+    fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+>;
+
+#[cfg(feature = "grpc")]
+fn with_a2a_version(mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+    req.metadata_mut().insert(
+        "a2a-version",
+        tonic::metadata::MetadataValue::from_static("1.0"),
+    );
+    Ok(req)
+}
+
+#[cfg(feature = "grpc")]
+mod skill_security_grpc_roundtrip {
     use super::*;
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
@@ -1034,7 +1078,7 @@ mod adr015_grpc_roundtrip {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         let server = A2aServer::builder()
-            .executor(Adr015RoundtripExecutor)
+            .executor(SkillSecurityRoundtripExecutor)
             .storage(InMemoryA2aStorage::new())
             .bind(([127, 0, 0, 1], 0))
             .build()
@@ -1052,14 +1096,15 @@ mod adr015_grpc_roundtrip {
     /// gRPC `A2AService.GetExtendedAgentCard` arm of the extended-card
     /// skill-requirements round-trip parity check.
     #[tokio::test]
-    async fn adr015_extended_card_skill_requirements_roundtrip_over_grpc() {
+    async fn extended_card_skill_requirements_roundtrip_over_grpc() {
         let (addr, _handle) = spawn_grpc().await;
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
             .expect("endpoint")
             .connect()
             .await
             .expect("connect");
-        let mut client = A2aServiceClient::new(channel);
+        let mut client: A2aServiceClient<VersionedChannel> =
+            A2aServiceClient::with_interceptor(channel, with_a2a_version as _);
         let resp = client
             .get_extended_agent_card(Request::new(turul_a2a_proto::GetExtendedAgentCardRequest {
                 tenant: String::new(),
@@ -1072,7 +1117,7 @@ mod adr015_grpc_roundtrip {
 
         // Fetch the public card via HTTP for parity.
         let http_router = A2aServer::builder()
-            .executor(Adr015RoundtripExecutor)
+            .executor(SkillSecurityRoundtripExecutor)
             .storage(InMemoryA2aStorage::new())
             .build()
             .expect("http server build")
@@ -1206,13 +1251,16 @@ mod grpc_parity {
         (addr, handle)
     }
 
-    async fn grpc_client(addr: SocketAddr) -> A2aServiceClient<tonic::transport::Channel> {
-        let ch = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+    async fn channel(addr: SocketAddr) -> tonic::transport::Channel {
+        tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
             .expect("endpoint")
             .connect()
             .await
-            .expect("connect");
-        A2aServiceClient::new(ch)
+            .expect("connect")
+    }
+
+    async fn grpc_client(addr: SocketAddr) -> A2aServiceClient<VersionedChannel> {
+        A2aServiceClient::with_interceptor(channel(addr).await, with_a2a_version as _)
     }
 
     /// Build a fresh compliance axum router and a gRPC server against
@@ -1276,7 +1324,7 @@ mod grpc_parity {
         let (http_status, _, http_body) =
             http_call(router.clone(), Method::GET, "/tasks/does-not-exist", None).await;
         assert_eq!(http_status, 404);
-        assert_has_error_info(&http_body, "TASK_NOT_FOUND");
+        assert_has_error_info(&http_body, ErrorSlot::HttpDetails, "TASK_NOT_FOUND");
 
         // JSON-RPC
         let jr = jsonrpc_call(
@@ -1292,7 +1340,7 @@ mod grpc_parity {
                 .and_then(|v| v.as_i64()),
             Some(-32001)
         );
-        assert_has_error_info(&jr, "TASK_NOT_FOUND");
+        assert_has_error_info(&jr, ErrorSlot::JsonRpcData, "TASK_NOT_FOUND");
 
         // gRPC
         let mut grpc = grpc_client(grpc_addr).await;
@@ -1347,7 +1395,7 @@ mod grpc_parity {
                 .and_then(|v| v.as_i64()),
             Some(-32004)
         );
-        assert_has_error_info(&jr, "UNSUPPORTED_OPERATION");
+        assert_has_error_info(&jr, ErrorSlot::JsonRpcData, "UNSUPPORTED_OPERATION");
 
         // gRPC SubscribeToTask → FAILED_PRECONDITION + UNSUPPORTED_OPERATION.
         let mut grpc = grpc_client(grpc_addr).await;
@@ -1362,5 +1410,109 @@ mod grpc_parity {
         let info = err.get_details_error_info().expect("ErrorInfo");
         assert_eq!(info.reason, "UNSUPPORTED_OPERATION");
         assert_eq!(info.domain, "a2a-protocol.org");
+    }
+
+    /// Cancel of a terminal task: `TaskNotCancelable` surfaces with the
+    /// spec §5.4 code on every transport — 400, -32002, FAILED_PRECONDITION.
+    #[tokio::test]
+    async fn task_not_cancelable_error_parity_http_jsonrpc_grpc() {
+        let (router, grpc_addr, _guard) = dual_transport_harness().await;
+        let (status, _, body) = http_call(
+            router.clone(),
+            Method::POST,
+            "/message:send",
+            Some(http_send_body("t-cancel", "terminal for cancel parity")),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let task_id = body["task"]["id"].as_str().expect("task id").to_string();
+
+        let (http_status, _, http_body) = http_call(
+            router.clone(),
+            Method::POST,
+            &format!("/tasks/{task_id}:cancel"),
+            None,
+        )
+        .await;
+        assert_eq!(http_status, 400);
+        assert_has_error_info(&http_body, ErrorSlot::HttpDetails, "TASK_NOT_CANCELABLE");
+
+        let jr = jsonrpc_call(router, "CancelTask", serde_json::json!({"id": task_id}), 1).await;
+        assert_eq!(jr["error"]["code"], -32002);
+        assert_has_error_info(&jr, ErrorSlot::JsonRpcData, "TASK_NOT_CANCELABLE");
+
+        let mut grpc = grpc_client(grpc_addr).await;
+        let err = grpc
+            .cancel_task(Request::new(turul_a2a_proto::CancelTaskRequest {
+                tenant: String::new(),
+                id: task_id,
+                metadata: None,
+            }))
+            .await
+            .expect_err("grpc must reject cancel of a terminal task");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let info = err.get_details_error_info().expect("ErrorInfo");
+        assert_eq!(info.reason, "TASK_NOT_CANCELABLE");
+        assert_eq!(info.domain, "a2a-protocol.org");
+    }
+
+    async fn grpc_get_task_with_version(
+        addr: SocketAddr,
+        version: Option<&'static str>,
+    ) -> Result<turul_a2a_proto::Task, tonic::Status> {
+        let mut client = A2aServiceClient::new(channel(addr).await);
+        let mut req = Request::new(turul_a2a_proto::GetTaskRequest {
+            tenant: String::new(),
+            id: "no-such-task".into(),
+            history_length: None,
+        });
+        if let Some(v) = version {
+            req.metadata_mut().insert(
+                "a2a-version",
+                tonic::metadata::MetadataValue::from_static(v),
+            );
+        }
+        client.get_task(req).await.map(|r| r.into_inner())
+    }
+
+    fn assert_version_not_supported(status: &tonic::Status) {
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+        let info = status.get_details_error_info().expect("ErrorInfo");
+        assert_eq!(info.reason, "VERSION_NOT_SUPPORTED");
+        assert_eq!(info.domain, "a2a-protocol.org");
+    }
+
+    /// Spec §3.6.2 / §10.2: the server validates `a2a-version` metadata;
+    /// an unsupported version is `VersionNotSupportedError`.
+    #[tokio::test]
+    async fn grpc_unsupported_a2a_version_is_version_not_supported() {
+        let (_router, grpc_addr, _guard) = dual_transport_harness().await;
+        let err = grpc_get_task_with_version(grpc_addr, Some("2.0"))
+            .await
+            .expect_err("unsupported version must be rejected");
+        assert_version_not_supported(&err);
+    }
+
+    /// Spec §3.6: patch numbers are not considered — `1.0.1` is `1.0`, and
+    /// the call reaches the handler (here: TaskNotFound).
+    #[tokio::test]
+    async fn grpc_patch_version_reaches_handler() {
+        let (_router, grpc_addr, _guard) = dual_transport_harness().await;
+        let err = grpc_get_task_with_version(grpc_addr, Some("1.0.1"))
+            .await
+            .expect_err("unknown task");
+        assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+    }
+
+    /// Spec §3.6.2: an absent version means 0.3, which the strict build
+    /// does not serve.
+    #[cfg(not(feature = "compat-v03"))]
+    #[tokio::test]
+    async fn grpc_missing_a2a_version_is_version_not_supported_strict() {
+        let (_router, grpc_addr, _guard) = dual_transport_harness().await;
+        let err = grpc_get_task_with_version(grpc_addr, None)
+            .await
+            .expect_err("missing version must be rejected");
+        assert_version_not_supported(&err);
     }
 }

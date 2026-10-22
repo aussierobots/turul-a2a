@@ -67,7 +67,7 @@ pub enum CompatMode {
 pub fn detect_compat_mode(method: &str, headers: &http::HeaderMap) -> CompatMode {
     // Explicit v1.0 header takes priority — never enter compat mode
     if let Some(version) = headers.get("a2a-version").and_then(|v| v.to_str().ok()) {
-        if version == "1.0" {
+        if crate::middleware::transport::version_supported(version) {
             return CompatMode::V10;
         }
     }

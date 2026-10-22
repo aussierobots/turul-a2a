@@ -19,6 +19,16 @@ use turul_a2a_types::wire::jsonrpc as methods;
 use crate::error::A2aError;
 use crate::router::AppState;
 
+/// Path of the JSON-RPC endpoint.
+pub(crate) const JSONRPC_PATH: &str = "/jsonrpc";
+
+/// Whether `path` is served by the JSON-RPC dispatcher: the canonical
+/// endpoint, plus the root path the `compat-v03` feature routes for v0.3
+/// clients that POST to the agent card URL.
+pub(crate) fn is_jsonrpc_path(path: &str) -> bool {
+    path == JSONRPC_PATH || (cfg!(feature = "compat-v03") && path == "/")
+}
+
 /// JSON-RPC 2.0 dispatch handler.
 ///
 /// POST /jsonrpc — accepts JSON-RPC 2.0 requests and dispatches to core handlers.

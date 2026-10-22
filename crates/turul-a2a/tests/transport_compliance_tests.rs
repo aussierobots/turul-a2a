@@ -1,4 +1,4 @@
-//! B0: Transport compliance tests — A2A-Version header and Content-Type validation.
+//! Transport compliance tests — A2A-Version service parameter and Content-Type validation.
 
 use std::sync::Arc;
 
@@ -76,6 +76,42 @@ async fn json_response(router: axum::Router, req: Request<Body>) -> (u16, serde_
     (status, serde_json::from_slice(&body).unwrap_or_default())
 }
 
+/// Assert an HTTP+JSON error body carries exactly one ErrorInfo with the
+/// given reason, plus the AIP-193 `status` name.
+fn assert_http_error(body: &serde_json::Value, status: &str, reason: &str) {
+    assert_eq!(body["error"]["status"], status, "body: {body}");
+    assert_eq!(
+        body["error"]["details"],
+        serde_json::json!([{
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": reason,
+            "domain": "a2a-protocol.org",
+        }]),
+        "body: {body}"
+    );
+}
+
+/// Assert a JSON-RPC error envelope (`id: null`, since the transport layer
+/// rejects before reading the request) with the given code and reason.
+fn assert_jsonrpc_error(body: &serde_json::Value, code: i64, reason: &str) {
+    assert_eq!(body["jsonrpc"], "2.0", "body: {body}");
+    assert!(body["id"].is_null(), "body: {body}");
+    assert_eq!(body["error"]["code"], code, "body: {body}");
+    assert_eq!(
+        body["error"]["data"],
+        serde_json::json!([{
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": reason,
+            "domain": "a2a-protocol.org",
+        }]),
+        "body: {body}"
+    );
+}
+
+fn jsonrpc_list_body() -> String {
+    serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ListTasks", "params": {}}).to_string()
+}
+
 // =========================================================
 // A2A-Version header (spec §3.6)
 // =========================================================
@@ -121,13 +157,22 @@ async fn request_without_a2a_version_rejects_strict() {
     let (status, body) = json_response(router, req).await;
     assert_eq!(
         status, 400,
-        "Missing A2A-Version header → VersionNotSupportedError"
+        "Missing A2A-Version means 0.3 (spec Section 3.6.2) → VersionNotSupportedError"
     );
-    if let Some(details) = body["error"]["details"].as_array()
-        && !details.is_empty()
-    {
-        assert_eq!(details[0]["reason"], "VERSION_NOT_SUPPORTED");
-    }
+    assert_http_error(&body, "FAILED_PRECONDITION", "VERSION_NOT_SUPPORTED");
+}
+
+#[tokio::test]
+#[cfg(not(feature = "compat-v03"))]
+async fn empty_a2a_version_is_0_3_and_rejected_strict() {
+    let router = build_router(test_state());
+    let req = Request::get("/tasks")
+        .header("a2a-version", "")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = json_response(router, req).await;
+    assert_eq!(status, 400);
+    assert_http_error(&body, "FAILED_PRECONDITION", "VERSION_NOT_SUPPORTED");
 }
 
 #[tokio::test]
@@ -140,11 +185,64 @@ async fn request_with_unsupported_version_returns_400() {
         .unwrap();
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 400);
-    if let Some(details) = body["error"]["details"].as_array()
-        && !details.is_empty()
-    {
-        assert_eq!(details[0]["reason"], "VERSION_NOT_SUPPORTED");
-    }
+    assert_http_error(&body, "FAILED_PRECONDITION", "VERSION_NOT_SUPPORTED");
+}
+
+#[tokio::test]
+async fn patch_version_is_ignored_in_negotiation() {
+    // Spec Section 3.6: patch numbers MUST NOT be considered.
+    let router = build_router(test_state());
+    let req = Request::get("/tasks")
+        .header("a2a-version", "1.0.1")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = json_response(router, req).await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn version_query_parameter_is_honoured() {
+    // Spec Section 3.6.1: clients MAY send A2A-Version as a request parameter.
+    let router = build_router(test_state());
+    let req = Request::get("/tasks?A2A-Version=1.0")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = json_response(router, req).await;
+    assert_eq!(status, 200);
+
+    let router = build_router(test_state());
+    let req = Request::get("/tasks?A2A-Version=2.0")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = json_response(router, req).await;
+    assert_eq!(status, 400);
+    assert_http_error(&body, "FAILED_PRECONDITION", "VERSION_NOT_SUPPORTED");
+}
+
+#[tokio::test]
+async fn jsonrpc_unsupported_version_is_jsonrpc_error_envelope() {
+    let router = build_router(test_state());
+    let req = Request::post("/jsonrpc")
+        .header("content-type", "application/json")
+        .header("a2a-version", "99.0")
+        .body(Body::from(jsonrpc_list_body()))
+        .unwrap();
+    let (status, body) = json_response(router, req).await;
+    assert_eq!(status, 200, "JSON-RPC errors travel in a 200 response");
+    assert_jsonrpc_error(&body, -32009, "VERSION_NOT_SUPPORTED");
+}
+
+#[tokio::test]
+async fn jsonrpc_wrong_content_type_is_jsonrpc_error_envelope() {
+    let router = build_router(test_state());
+    let req = Request::post("/jsonrpc")
+        .header("content-type", "text/plain")
+        .header("a2a-version", "1.0")
+        .body(Body::from(jsonrpc_list_body()))
+        .unwrap();
+    let (status, body) = json_response(router, req).await;
+    assert_eq!(status, 200, "JSON-RPC errors travel in a 200 response");
+    assert_jsonrpc_error(&body, -32005, "CONTENT_TYPE_NOT_SUPPORTED");
 }
 
 #[tokio::test]
@@ -172,10 +270,7 @@ async fn post_with_wrong_content_type_is_rejected() {
         .unwrap();
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 400, "ContentTypeNotSupportedError is HTTP 400");
-    assert_eq!(
-        body["error"]["details"][0]["reason"],
-        "CONTENT_TYPE_NOT_SUPPORTED"
-    );
+    assert_http_error(&body, "INVALID_ARGUMENT", "CONTENT_TYPE_NOT_SUPPORTED");
 }
 
 #[tokio::test]
@@ -203,10 +298,40 @@ async fn post_with_xml_content_type_is_content_type_not_supported() {
         .unwrap();
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 400, "ContentTypeNotSupportedError is HTTP 400");
-    assert_eq!(
-        body["error"]["details"][0]["reason"],
-        "CONTENT_TYPE_NOT_SUPPORTED"
-    );
+    assert_http_error(&body, "INVALID_ARGUMENT", "CONTENT_TYPE_NOT_SUPPORTED");
+}
+
+#[tokio::test]
+async fn post_with_json_lookalike_content_type_is_rejected() {
+    let router = build_router(test_state());
+    let req = Request::post("/message:send")
+        .header("content-type", "application/jsonx")
+        .header("a2a-version", "1.0")
+        .body(Body::from(send_body()))
+        .unwrap();
+    let (status, body) = json_response(router, req).await;
+    assert_eq!(status, 400);
+    assert_http_error(&body, "INVALID_ARGUMENT", "CONTENT_TYPE_NOT_SUPPORTED");
+}
+
+#[tokio::test]
+async fn post_with_a2a_json_media_type_and_charset_succeeds() {
+    // Spec Section 14.1 registers application/a2a+json; Section 11.1 says
+    // it SHOULD be used for HTTP+JSON requests.
+    for content_type in [
+        "application/a2a+json",
+        "application/a2a+json; charset=utf-8",
+        "application/json; charset=utf-8",
+    ] {
+        let router = build_router(test_state());
+        let req = Request::post("/message:send")
+            .header("content-type", content_type)
+            .header("a2a-version", "1.0")
+            .body(Body::from(send_body()))
+            .unwrap();
+        let (status, body) = json_response(router, req).await;
+        assert_eq!(status, 200, "{content_type}: {body}");
+    }
 }
 
 #[tokio::test]
