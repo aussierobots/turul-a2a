@@ -2,7 +2,8 @@
 
 ## Current State
 
-- 7 publish crates, 5 workspace examples, 13 ADRs.
+- 7 publish crates (proto, types, server, client, auth, aws-lambda, patterns), 20 example crates, 27 ADRs.
+- Targets A2A v1.0.1: the vendored `proto/a2a.proto` is byte-identical to upstream `main`, which differs from the v1.0.1 tag only in comments.
 - **Strong for** (server deployment):
   - Durable event coordination: atomic task+event writes with terminal-preservation CAS on all four storage backends (in-memory, SQLite, PostgreSQL, DynamoDB).
   - Multi-instance request/response correctness and cross-instance streaming subscription via shared backend. Verified by `tests/distributed_tests.rs` and `tests/d3_streaming_tests.rs`.
@@ -20,8 +21,8 @@ When working on `turul-a2a`, use these authorities in this order:
 3. Local repository policy in this file.
 4. Local repository guidance in `CLAUDE.md`.
 5. Existing patterns from:
-   - `/Users/nick/turul-mcp-framework`
-   - `/Users/nick/gps-trust-auth`
+   - `/home/nick/turul-mcp-framework`
+   - `/home/nick/gps-trust-auth`
 
 If these conflict, the normative A2A proto wins for wire-level behavior.
 
@@ -91,7 +92,7 @@ If these conflict, the normative A2A proto wins for wire-level behavior.
 
 ### Preferred Boundary Split
 
-Mirror the good parts of `/Users/nick/turul-mcp-framework`, but do not force a one-to-one crate explosion before it is earned.
+Mirror the good parts of `/home/nick/turul-mcp-framework`, but do not force a one-to-one crate explosion before it is earned.
 
 Preferred separation:
 
@@ -111,7 +112,7 @@ Rules:
 
 ### Storage Pattern
 
-Storage should follow the trait-plus-backends pattern used in `/Users/nick/turul-mcp-framework`:
+Storage should follow the trait-plus-backends pattern used in `/home/nick/turul-mcp-framework`:
 
 - in-memory
 - SQLite
@@ -228,13 +229,13 @@ When reviewing plans, docs, or code in this repo, always check:
 
 ## Guidance For This Repo Specifically
 
-- Use `/Users/nick/turul-mcp-framework` as the reference for:
+- Use `/home/nick/turul-mcp-framework` as the reference for:
   - storage traits/backends
   - builder ergonomics
   - middleware boundaries
   - Lambda adapter layering
   - parity-test patterns
-- Use `/Users/nick/gps-trust-auth` as the reference for:
+- Use `/home/nick/gps-trust-auth` as the reference for:
   - OAuth 2.1 Authorization Server constraints
   - JWT issuer/audience discipline
   - JWKS validation expectations

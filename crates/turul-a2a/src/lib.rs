@@ -35,11 +35,11 @@
 //!
 //! Task state and streaming events are written atomically via
 //! [`storage::A2aAtomicStore`]. The in-process event broker is a local
-//! wake-up signal; the storage backend is the source of truth. Subscribers
-//! attached while a task is non-terminal receive replay of prior events and
-//! then live delivery, supporting `Last-Event-ID` reconnection across
-//! instances when the same backend is used (e.g., shared DynamoDB or
-//! PostgreSQL). Subscribing to an already-terminal task returns
+//! wake-up signal; the storage backend is the source of truth. Both
+//! streaming RPCs open with the `Task` snapshot and then deliver only events
+//! committed after it, across instances when the same backend is used
+//! (e.g., shared DynamoDB or PostgreSQL). A client that loses its stream
+//! subscribes again and receives a fresh snapshot. Subscribing to an already-terminal task returns
 //! `UnsupportedOperationError` per A2A v1.0 §3.1.6 — use [`storage`] or
 //! `GetTask` to retrieve the final state.
 //!
@@ -47,7 +47,7 @@
 //!
 //! The in-process [`streaming`] broker fans out to clients on the same
 //! process only. Cross-instance streaming relies on the shared durable event
-//! store for replay. For horizontally scaled deployments, configure all
+//! store. For horizontally scaled deployments, configure all
 //! instances against the same backend.
 
 pub mod card_builder;

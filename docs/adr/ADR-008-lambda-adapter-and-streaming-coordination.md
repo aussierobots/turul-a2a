@@ -78,7 +78,7 @@ Lambda uses the existing `DynamoDbA2aStorage` from D1. No new tables or traits n
 Cross-instance streaming requires durable event coordination that works for **any** multi-instance deployment, not just Lambda. The architecture needs:
 
 1. **Durable event store** — source of truth for task events with monotonic IDs. DynamoDB table (`a2a_task_events`, PK=taskId, SK=eventSequence) or equivalent.
-2. **Replay semantics** — `Last-Event-ID` header parsing, `get_events_after(event_id)` query for reconnection catch-up.
+2. **Replay semantics** — `get_events_after(sequence)` from the snapshot's sequence. (Client-driven `Last-Event-ID` replay was removed on 2026-10-22; see ADR-014 §2.3 item 3.)
 3. **Cross-instance notification** — optional SNS/EventBridge/Redis for wake/fanout. Polling the durable store is acceptable but higher latency.
 4. **New trait** — `A2aEventStore` or extension of existing storage traits.
 
@@ -108,3 +108,7 @@ D3 gets its own ADR when prioritized.
 - Auth mapping from API Gateway authorizers uses the same middleware stack
 - Distributed multi-instance verification (two instances, shared backend, alternating requests) is a separate future task
 - Full streaming parity (D3) applies to all multi-instance deployments, not just Lambda
+
+## Revision log
+
+- 2026-10-22 — `Last-Event-ID` replay removed (ADR-014 §2.3 item 3).

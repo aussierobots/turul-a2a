@@ -3,7 +3,9 @@
 //! Every test runs the same assertions over HTTP+SSE, JSON-RPC+SSE and,
 //! with the `grpc` feature, gRPC server streaming:
 //!
-//! - both streaming RPCs open with a `Task` snapshot (§3.1.2, §3.1.6);
+//! - both streaming RPCs open with a `Task` snapshot (§3.1.2, §3.1.6),
+//!   including a client reconnecting with `Last-Event-ID`, which is
+//!   ignored (§3.5.2: reconnecting opens a new stream);
 //! - no event already reflected in the snapshot is replayed after it;
 //! - streaming send honours `message.taskId`: unknown id →
 //!   TaskNotFound, terminal task → UnsupportedOperation, mismatched
@@ -220,21 +222,6 @@ async fn sse_request(router: &axum::Router, req: Request<Body>) -> (u16, Vec<u8>
         .to_bytes()
         .to_vec();
     (status, body)
-}
-
-/// Raw HTTP+SSE frames for `SendStreamingMessage`, used where a test
-/// needs the SSE `id:` lines.
-async fn http_stream_frames(h: &Harness, msg: Value) -> Vec<(Option<String>, Value)> {
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/message:stream")
-        .header("A2A-Version", "1.0")
-        .header("content-type", "application/json")
-        .body(Body::from(json!({"message": msg}).to_string()))
-        .unwrap();
-    let (status, body) = sse_request(&h.router, req).await;
-    assert_eq!(status, 200);
-    sse_frames(&body)
 }
 
 async fn stream_send(h: &Harness, t: Transport, msg: Value) -> Outcome {
@@ -576,38 +563,6 @@ async fn subscribe_to_an_input_required_task_yields_the_snapshot_and_closes() {
     }
 }
 
-#[tokio::test]
-async fn http_snapshot_event_id_resumes_after_the_snapshot() {
-    let h = harness().await;
-    let frames = http_stream_frames(&h, message("m1", "hello", None, None)).await;
-    let (snapshot_id, snapshot) = &frames[0];
-    assert!(snapshot.get("task").is_some());
-    let task_id = snapshot["task"]["id"].as_str().unwrap();
-    let snapshot_seq: u64 = snapshot_id
-        .as_deref()
-        .and_then(|id| id.strip_prefix(&format!("{task_id}:")))
-        .and_then(|s| s.parse().ok())
-        .expect("snapshot id is {task_id}:{sequence}");
-    assert!(
-        snapshot_seq > 0,
-        "the snapshot id carries the sequence it reflects, so Last-Event-ID resumes after it"
-    );
-    for (id, _) in &frames[1..] {
-        let seq: u64 = id
-            .as_deref()
-            .unwrap()
-            .rsplit(':')
-            .next()
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(
-            seq > snapshot_seq,
-            "events after the snapshot have higher sequences"
-        );
-    }
-}
-
 /// One stream loop and one poll interval: the transports only encode
 /// items from the shared core stream, so they cannot drift apart.
 #[test]
@@ -780,7 +735,7 @@ async fn follow_up_while_the_executor_is_still_running_is_refused_without_side_e
 }
 
 #[tokio::test]
-async fn resume_replays_only_later_events_and_closes_when_caught_up() {
+async fn reconnecting_with_last_event_id_still_opens_with_the_snapshot() {
     for t in transports() {
         let h = harness().await;
         // SUBMITTED (1), WORKING (2), INPUT_REQUIRED (3).
@@ -792,21 +747,12 @@ async fn resume_replays_only_later_events_and_closes_when_caught_up() {
         let items = subscribe(&h, t, &task_id, Some(&format!("{task_id}:1")))
             .await
             .items();
-        assert!(
-            items.iter().all(|i| i.get("task").is_none()),
-            "{t:?}: no snapshot on resume"
-        );
+        assert_eq!(items.len(), 1, "{t:?}: the snapshot only, got {items:?}");
         assert_eq!(
-            status_states(&items),
-            ["TASK_STATE_WORKING", "TASK_STATE_INPUT_REQUIRED"],
+            state_of(&items[0]),
+            Some("TASK_STATE_INPUT_REQUIRED"),
             "{t:?}"
         );
-
-        // Already caught up on a task whose state closes streams: the
-        // resumed stream closes at once instead of idling.
-        let items = subscribe(&h, t, &task_id, Some(&format!("{task_id}:3")))
-            .await
-            .items();
-        assert!(items.is_empty(), "{t:?}: got {items:?}");
+        assert!(items[0].get("task").is_some(), "{t:?}");
     }
 }

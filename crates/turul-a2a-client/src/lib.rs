@@ -297,13 +297,11 @@ impl A2aClient {
     /// Subscribe to task events. Returns a typed event stream.
     ///
     /// The first event is a `StreamEvent::Task` snapshot (spec §3.1.6).
-    /// Subsequent events are `StatusUpdate` / `ArtifactUpdate` from the durable store.
-    pub async fn subscribe_to_task(
-        &self,
-        task_id: &str,
-        last_event_id: Option<&str>,
-    ) -> Result<TypedSseStream, A2aClientError> {
-        let raw = self.subscribe_to_task_raw(task_id, last_event_id).await?;
+    /// Subsequent events are `StatusUpdate` / `ArtifactUpdate` committed after it.
+    /// To recover from a dropped stream, subscribe again: the new stream opens
+    /// with a fresh snapshot of the full task state.
+    pub async fn subscribe_to_task(&self, task_id: &str) -> Result<TypedSseStream, A2aClientError> {
+        let raw = self.subscribe_to_task_raw(task_id).await?;
         Ok(TypedSseStream::from_raw(raw))
     }
 
@@ -329,21 +327,13 @@ impl A2aClient {
     }
 
     /// Subscribe to task events, returning raw SSE events (untyped JSON).
-    pub async fn subscribe_to_task_raw(
-        &self,
-        task_id: &str,
-        last_event_id: Option<&str>,
-    ) -> Result<SseStream, A2aClientError> {
+    pub async fn subscribe_to_task_raw(&self, task_id: &str) -> Result<SseStream, A2aClientError> {
         let url = self.url(&format!("/tasks/{task_id}:subscribe"));
-        let mut req = self
+        let resp = self
             .request(reqwest::Method::GET, &url)
-            .header("accept", "text/event-stream");
-
-        if let Some(lei) = last_event_id {
-            req = req.header("Last-Event-ID", lei);
-        }
-
-        let resp = req.send().await?;
+            .header("accept", "text/event-stream")
+            .send()
+            .await?;
 
         if !resp.status().is_success() {
             return Err(self.parse_error_from_status(resp).await);

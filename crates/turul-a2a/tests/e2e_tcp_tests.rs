@@ -468,10 +468,18 @@ async fn e2e_tcp_send_streaming_message() {
 
     assert!(!events.is_empty(), "Should receive streaming events");
 
-    // Events should have IDs
-    for (i, event) in events.iter().enumerate() {
-        assert!(event.id.is_some(), "Event {i} should have an id");
-    }
+    // A2A §3.1.2: the stream begins with the Task object, exactly once.
+    assert!(
+        matches!(events[0].event, StreamEvent::Task(_)),
+        "first item is the Task snapshot"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e.event, StreamEvent::Task(_)))
+            .count(),
+        1
+    );
 
     // Should see terminal event via typed enum
     let has_completed = events.iter().any(|e| {
@@ -492,7 +500,7 @@ async fn e2e_tcp_subscribe_to_non_terminal_task() {
     let task_id = resp.task().expect("Expected Task").id().to_string();
 
     // Subscribe — should get Task snapshot as first event
-    let mut stream = client.subscribe_to_task(&task_id, None).await.unwrap();
+    let mut stream = client.subscribe_to_task(&task_id).await.unwrap();
 
     // Collect first event (Task snapshot)
     let first = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next()).await;
@@ -522,7 +530,7 @@ async fn e2e_tcp_subscribe_terminal_task_returns_error() {
     let task_id = resp.task().expect("Expected Task").id().to_string();
 
     // Subscribe to terminal task — should error
-    match client.subscribe_to_task(&task_id, None).await {
+    match client.subscribe_to_task(&task_id).await {
         Err(err) => {
             assert_eq!(
                 err.status(),

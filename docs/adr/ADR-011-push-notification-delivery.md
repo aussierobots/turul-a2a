@@ -55,25 +55,32 @@ Producer (executor / framework / handler commit)
 
 ### 2. Which Events Trigger Delivery
 
+> **Amendment 2026-10-22 — Proposed.** The 2026-04 text below said every status update is delivered. The code has only ever delivered **terminal** status events: the pending-dispatch marker is written inside the atomic commit for terminal states only, on all four backends, and the dispatcher filters on `is_terminal`. This amendment states what ships. Whether interrupted states (INPUT_REQUIRED, AUTH_REQUIRED) should also be pushed is a separate, open decision.
+
 **In scope for 0.1.x**:
-- All **TaskStatusUpdateEvent** commits (state changes). This includes framework-committed CANCELED (ADR-012 §8), framework-committed FAILED (ADR-010 §4.1 timeout path), and all executor-emitted terminal / interrupted / WORKING events.
+- **Terminal TaskStatusUpdateEvent commits** (COMPLETED, FAILED, CANCELED, REJECTED). This includes framework-committed CANCELED (ADR-012 §8) and framework-committed FAILED (ADR-010 §4.1 timeout path).
 - Terminal events MUST be delivered (as long as retry budget allows). The spec expects adopters to receive notification when a task finishes.
+- WORKING and interrupted states are **not** delivered today. A client using `returnImmediately` + push is therefore not told when its task needs input; it has to poll `GetTask` or subscribe.
 
 **Deferred to future ADR**:
 - **TaskArtifactUpdateEvent**: artifact chunks fire at whatever cadence the executor emits. Delivering every chunk floods webhooks. For 0.1.x, artifact events are NOT delivered via push. An optional `deliver_artifacts: bool` field on `TaskPushNotificationConfig` could opt in later, but that's a wire format addition and requires a separate proposal.
-- **Explicit filtering** (e.g., "only terminal", "only WORKING+terminal"). Current behavior is "all status updates." Configurability can be added later without wire changes if done via a new config field.
+- **Explicit filtering** (e.g., "only terminal", "only WORKING+terminal"). Current behavior is "terminal only." Configurability can be added later without wire changes if done via a new config field.
 
 **Rationale**: the A2A spec §9 wording treats push as "notification of task state change." Sticking to `TaskStatusUpdateEvent` events matches this spec intent (each status update IS a state change) and avoids flooding receivers with per-chunk artifact traffic. If our reading proves narrower than the spec intends — i.e., if reviewers of the implementation find §9 mandates artifact delivery — we widen scope via a minor bump. The 0.1.x choice is conservative-by-default.
 
 **Relationship to `AgentCapabilities.push_notifications` (`a2a.proto:410`)**: if an agent's card declares `push_notifications = false`, this ADR does NOT specify framework-level config rejection. The current CRUD handler accepts registrations regardless of the capability flag. A future tightening — reject `CreateTaskPushNotificationConfig` with `UnsupportedOperationError` when the agent card declares `push_notifications = false` — is worth doing but is out of scope for ADR-011. Tracking item for a follow-up.
 
-### 3. Payload — Task Object, Per Spec §9
+### 3. Payload — `StreamResponse` Carrying the Task Snapshot
 
-POST body is the current `Task` object (full snapshot at the time of the triggering event), serialized via proto JSON mapping (camelCase keys). This is what spec §9 prescribes.
+> **Amendment 2026-10-22 — Proposed.** A2A v1.0.1 §4.3.3 requires the webhook body to be a `StreamResponse`, "the same format as streaming operations". The original decision POSTed a bare `Task`, which is not a `StreamResponse`.
+
+POST body is a `StreamResponse` whose `task` member is the current `Task` (full snapshot at the time of the triggering event): `{"task": { … }}`, serialized via proto JSON mapping (camelCase keys). This keeps every property of the original decision (the receiver still gets the full latest state) while matching the spec's envelope. `Content-Type` is `application/a2a+json`, the registered A2A media type used in the §4.3.3 example.
+
+Using the `task` member rather than `statusUpdate` is deliberate: a terminal push is the receiver's last word on the task, and the snapshot carries artifacts and status message that a bare status event would not.
 
 **Not in the body**: event-specific data beyond what's in `Task.status` and `Task.history`. The receiver can derive which transition occurred by comparing against prior snapshots if they care. If receivers genuinely need the specific triggering event, they can additionally subscribe via SSE — push delivery is a "something changed, here's the latest state" signal, not a streaming transport.
 
-**Serialization path**: `serde_json::to_vec(&task.as_proto())` via pbjson's serialization. Produces spec-compliant camelCase JSON. Compliance agent will verify.
+**Serialization path**: the `Task` is wrapped as `{"task": …}` and serialised via pbjson, the same encoding the stream encoders use for the snapshot item. Produces spec-compliant camelCase JSON. Compliance agent will verify.
 
 **History size note**: `Task.history` can grow unbounded over long conversations. Receivers SHOULD NOT assume they receive the full history in every POST — the payload may be truncated to respect `push_max_payload_bytes` (R5). For authoritative history, receivers can `GetTask` the canonical server using the delivered `task_id`. The POST is a "something changed" signal with a best-effort snapshot, not a message bus.
 
@@ -81,7 +88,7 @@ POST body is the current `Task` object (full snapshot at the time of the trigger
 
 Request headers:
 - `Authorization: {authentication.scheme} {authentication.credentials}` — if `authentication` is present. Empty `credentials` means scheme-only (rare but legal for some IANA schemes).
-- `X-Turul-Push-Token: {token}` — if `token` is set on the config. Purpose: the receiver can verify the delivery corresponds to the expected task/session. **This is a turul-specific header**, not standardized by the A2A spec. Spec §9 does not mandate a conveyance mechanism for `config.token`, so each A2A implementation chooses its own. The `X-Turul-` prefix makes the non-interop nature explicit: receivers expecting to switch between A2A server implementations without code changes MUST NOT rely on this header name. If the spec later standardizes a header name (e.g., `X-Turul-Push-Token`), we will migrate with a deprecation cycle.
+- `X-Turul-Push-Token: {token}` — if `token` is set on the config. A2A v1.0.1 still names no header for conveying `token`, so this stays turul-specific. Purpose: the receiver can verify the delivery corresponds to the expected task/session. **This is a turul-specific header**, not standardized by the A2A spec. Spec §9 does not mandate a conveyance mechanism for `config.token`, so each A2A implementation chooses its own. The `X-Turul-` prefix makes the non-interop nature explicit: receivers expecting to switch between A2A server implementations without code changes MUST NOT rely on this header name. If the spec later standardizes a header name (e.g., `X-Turul-Push-Token`), we will migrate with a deprecation cycle.
 - `Content-Type: application/json`
 - `X-Turul-Event-Sequence: {event_sequence}` — the durable event sequence that triggered this delivery. Implementation-specific; receivers MAY use this alongside `{task_id, status.state, status.timestamp}` as an idempotency key to dedup retries.
 - `User-Agent: turul-a2a/{version}` (informational).
@@ -372,18 +379,18 @@ If no configs are registered, the event is effectively dropped from the push per
 
 ### 12. Proto and Wire Compliance
 
-- Delivery body: `Task` proto message serialized via pbjson (camelCase JSON).
-- Wire headers: `Authorization`, `X-Turul-Push-Token` (if token set), `X-Turul-Event-Sequence`, `Content-Type`, `User-Agent`. The `X-Turul-*` headers are implementation-prefixed and not A2A-spec standardized; see §4 and R6 for scope.
+- Delivery body: `StreamResponse` JSON `{"task": <Task>}` serialized via pbjson (camelCase JSON), per A2A §4.3.3.
+- Wire headers: `Authorization`, `X-Turul-Push-Token` (if token set), `X-Turul-Event-Sequence`, `Content-Type: application/a2a+json`, `User-Agent`. The `X-Turul-*` headers are implementation-prefixed and not A2A-spec standardized; see §4 and R6 for scope.
 - Delivery path is outbound; no changes to the A2A inbound wire surface.
 - No new proto fields. All delivery coordination is storage-internal. Spec-compliant.
 
 ### 13. Required Tests Before GREEN
 
 1. **Basic delivery on terminal event**
-   Non-blocking send, executor completes. Wiremock webhook registered via push config before send. Assert: exactly one POST arrives at the wiremock within 1s of terminal commit. Body is the Task JSON with status.state = "TASK_STATE_COMPLETED". `Authorization` header matches config.authentication. `X-Turul-Push-Token` matches config.token.
+   Non-blocking send, executor completes. Wiremock webhook registered via push config before send. Assert: exactly one POST arrives at the wiremock within 1s of terminal commit. Body is `{"task": …}` with task.status.state = "TASK_STATE_COMPLETED"; `Content-Type` is `application/a2a+json`. `Authorization` header matches config.authentication. `X-Turul-Push-Token` matches config.token.
 
 2. **Multiple configs fire independently**
-   Three push configs on same task. Executor completes. Assert: three POSTs, one to each URL. Orderings are not guaranteed across configs. Each config receives the same Task body.
+   Three push configs on same task. Executor completes. Assert: three POSTs, one to each URL. Orderings are not guaranteed across configs. Each config receives the same `{"task": …}` body.
 
 3. **Retry on 5xx**
    Wiremock responds 503 twice, then 200. Assert: exactly 3 POST attempts, first two at 0ms and ~1s (±jitter), third at ~3s. Final claim status is `Succeeded`. Metrics: `succeeded` incremented once, `failed` incremented twice with label `5xx`.
@@ -416,7 +423,7 @@ If no configs are registered, the event is effectively dropped from the push per
     Three sub-cases. For each auth scheme: verify wiremock received the exact `Authorization` header value. Schemes tested: `Bearer <token>`, `Basic <base64>`, `ApiKey <key>` (custom scheme per IANA registry).
 
 13. **Framework-committed CANCELED triggers delivery**
-    Orphaned task: create in storage as WORKING with no executor, register push config, send `CancelTask`, let grace expire so framework commits CANCELED (per ADR-012 §2.5). Assert: webhook receives POST with task.status.state = "TASK_STATE_CANCELED" — framework-committed terminals deliver identically to executor-emitted.
+    Orphaned task: create in storage as WORKING with no executor, register push config, send `CancelTask`, let grace expire so framework commits CANCELED (per ADR-012 §2.5). Assert: webhook receives POST with body `task.status.state` = "TASK_STATE_CANCELED" — framework-committed terminals deliver identically to executor-emitted.
 
 14. **Push config CRUD parity — unchanged**
     Existing CRUD tests from `handler_tests::push_config_crud_through_http` continue to pass. ADR-011 is purely additive to the CRUD surface.
@@ -558,3 +565,7 @@ Framework-enforced production protections:
 - **Leader election (one "push leader" instance)**: rejected — adds coordination complexity (raft, distributed lock, etc.). Storage-claim dedup is simpler and matches ADR-009's philosophy.
 - **Per-event dedicated delivery tasks (no dispatcher)**: rejected — hard to bound concurrency, harder to reason about backpressure. Single dispatcher + per-config delivery tasks gives both bounded concurrency and failure isolation.
 - **Synchronous delivery blocking the executor**: rejected for all the reasons in §1. Also violates the spirit of "push is a side-effect signal," not "client's response depends on it."
+
+## Revision log
+
+- 2026-10-22 — Proposed: §2 corrected to the terminal-only delivery the code has always had (it said all status updates). §3/§12/§13: body becomes the A2A v1.0.1 §4.3.3 `StreamResponse` envelope `{"task": <Task>}` with `Content-Type: application/a2a+json`, instead of a bare `Task`. `X-Turul-Push-Token` unchanged: the spec names no token header.

@@ -42,6 +42,7 @@ cargo test -p turul-a2a --features dynamodb --lib -- storage::dynamodb --test-th
 cargo test -p turul-a2a --features grpc --lib grpc::                # grpc module unit tests (error + service)
 cargo test -p turul-a2a --features grpc --test grpc_tests           # gRPC end-to-end (all 11 RPCs + auth)
 cargo test -p turul-a2a --features grpc --test spec_compliance      # 3-transport parity axis
+cargo test -p turul-a2a --features grpc --test stream_contract_tests # stream contract on HTTP, JSON-RPC, gRPC (ADR-014 §2.3)
 
 # Examples
 cargo run -p echo-agent                    # Echo agent on :3000
@@ -74,18 +75,18 @@ cargo lambda watch -p lambda-agent         # Lambda agent via cargo-lambda
 
 ## Release & Publish (crates.io)
 
-The workspace publishes 6 crates. Publishing is irreversible (yank only hides). Never run `cargo publish` without explicit user instruction.
+The workspace publishes 7 crates (proto, types, server, client, auth, aws-lambda, patterns). Publishing is irreversible (yank only hides). Never run `cargo publish` without explicit user instruction.
 
 ### Sequence (always in this order)
 
-1. **Bump versions.** Edit `[workspace.package].version` in root `Cargo.toml`; every crate inherits via `version.workspace = true`. Also bump intra-workspace deps that carry an explicit version: `[workspace.dependencies]` entries for `turul-a2a-proto` / `turul-a2a-types`, plus the `{ version = "X.Y.Z", path = "..." }` lines inside crates that depend on other workspace crates (crates.io rejects path-only deps, so both fields are required).
+1. **Bump versions.** Edit `[workspace.package].version` in root `Cargo.toml`; every crate inherits via `version.workspace = true`. Also bump intra-workspace deps that carry an explicit version: the `[workspace.dependencies]` entries for `turul-a2a`, `turul-a2a-proto`, `turul-a2a-types`, `turul-a2a-aws-lambda` and `turul-a2a-patterns`, plus the `{ version = "X.Y.Z", path = "..." }` lines inside crates that depend on other workspace crates (crates.io rejects path-only deps, so both fields are required).
 2. **Write the CHANGELOG entry.**
 3. **Run the pre-publish gate:**
    - `cargo test --workspace` green
    - `cargo clippy --workspace --all-targets -- -D warnings` clean — and **lint each storage feature in isolation**, not just default and all-features. Dead code hides under any *superset* of features: an all-features run (`--features sqlite,postgres,dynamodb`) marks a helper used by *any* backend as live, so it cannot catch code that is dead under one backend alone. Run the matrix: default (no features), `--features sqlite`, `--features postgres`, `--features dynamodb`, and all three together — each must be clean. (Example: the TEXT-column JSON helpers are used by SQLite/DynamoDB but not PostgreSQL, which uses JSONB; they are gated to `any(feature = "sqlite", feature = "dynamodb")` so a Postgres-only build carries no dead code.) A module consumed only by feature-gated backends must itself be gated on those features.
    - `cargo fmt --all -- --check` clean
    - `cargo doc --no-deps --workspace` no warnings
-   - `cargo package -p <crate> --no-verify --allow-dirty` warning-free for every publish crate
+   - `cargo package` warning-free for all publish crates **as one set** (`cargo package -p turul-a2a-proto -p turul-a2a-types -p turul-a2a -p turul-a2a-auth -p turul-a2a-client -p turul-a2a-aws-lambda -p turul-a2a-patterns --no-verify --allow-dirty`). Packaging crates one at a time misses dependency cycles: `turul-a2a` dev-depends on `turul-a2a-client` and `turul-a2a-auth`, which depend on `turul-a2a`, so those two root entries stay path-only (cargo strips path-only dev-deps).
 4. **Commit the release-prep changes.** `cargo publish` refuses a dirty tree. Do not use `--allow-dirty` on real publishes — it is only for `cargo package` dry-runs.
 5. **Push main.** `git push origin main`. If the push fails (merge conflict, branch protection, auth), stop and fix the local repo first. Do not publish from a tree that cannot be pushed.
 6. **Tag and push the tag.** `git tag -a vX.Y.Z -m "Release X.Y.Z — <one-liner>"` then `git push origin vX.Y.Z`. The tag marks the commit that is about to be published.
@@ -94,6 +95,7 @@ The workspace publishes 6 crates. Publishing is irreversible (yank only hides). 
    2. `turul-a2a-types`
    3. `turul-a2a`
    4. `turul-a2a-client`, `turul-a2a-auth`, `turul-a2a-aws-lambda` (any order; none depend on each other)
+   5. `turul-a2a-patterns` (depends only on proto + types, so it may go any time after step 2)
 
 Authorize each `cargo publish` call separately. A prior "go ahead" does not authorize future releases.
 
@@ -123,7 +125,7 @@ Authorize each `cargo publish` call separately. A prior "go ahead" does not auth
 ### Preludes
 
 - `turul_a2a::prelude::*` — server/agent authoring: `A2aServer`, `AgentExecutor`, `ExecutionContext`, `A2aError`, `AgentCardBuilder`, `Task`, `Message`, `Part`, `Artifact`, `TaskState`, `TaskStatus`
-- `turul_a2a_client::prelude::*` — client/caller: `A2aClient`, `ClientAuth`, `MessageBuilder`, `SseEvent`, `SseStream`, `A2aClientError`, `ListTasksParams`; under `--features grpc` also re-exports `A2aGrpcClient` and `GrpcStreamResponses` (ADR-014 §2.7)
+- `turul_a2a_client::prelude::*` — client/caller: `A2aClient`, `ClientAuth`, `MessageBuilder`, `A2aClientError`, `ListTasksParams`, `SendResponse`, `ListResponse`, `StreamEvent`, `TypedSseEvent`, `TypedSseStream`, `artifact_text`, `first_data_artifact`; under `--features grpc` also re-exports `A2aGrpcClient` and `GrpcStreamResponses` (ADR-014 §2.7)
 
 These are separate by design. Only add types that are genuinely part of the common happy path — do not turn preludes into "export everything."
 
@@ -165,7 +167,7 @@ For non-trivial architecture changes, the ADR should be accepted before implemen
 Before committing any change that touches `crates/`, `examples/`, `docs/adr/`, `CLAUDE.md`, `CHANGELOG.md`, or the root `Cargo.toml`, **dispatch the project-shared `adr-review` subagent** (`.claude/agents/adr-review.md`). It runs read-only checks for:
 
 - Comment-style violations (ADR/§/Phase/Wave refs in code).
-- Crate-visibility invariants (`turul-a2a-patterns` stays `publish = false`; not a dep of any publishable crate).
+- Crate-visibility invariants (`turul-a2a-patterns` is published but stays out of every other publish crate's `[dependencies]`).
 - Dep-direction invariants (`turul-a2a-patterns` does not depend on `turul-a2a`).
 - Newtype bridge pattern (no orphan-rule-violating impls in examples).
 - async_trait ergonomics (no visible `Pin<Box<dyn Future>>` in adopter-facing code).
@@ -245,7 +247,7 @@ Our vendored `proto/a2a.proto` is byte-identical to upstream `a2aproject/A2A:mai
 **HTTP route patterns follow the proto's `google.api.http` annotations** (`/message:send`, `/tasks/{id=*}`, etc.).
 
 **Spec-aligned behaviors:**
-- SubscribeToTask: first event is Task object (spec §3.1.6), terminal tasks return UnsupportedOperationError
+- Streaming (both `SendStreamingMessage` and `SubscribeToTask`, all transports): first item is the Task snapshot (spec §3.1.2, §3.1.6), then only events above its sequence; streams close on terminal states and INPUT_REQUIRED, stay open across AUTH_REQUIRED. Terminal-task subscribe returns UnsupportedOperationError. Contract owned by ADR-014 §2.3, tested in `tests/stream_contract_tests.rs`
 - Error codes: see the A2A v1.0.1 §5.4 table above (409/415/502 from v1.0.0 are gone)
 - Query params: camelCase (historyLength, pageSize, pageToken, contextId)
 - contextId/taskId mismatch rejection on continuation (spec §3.4.3)
@@ -257,7 +259,7 @@ Our vendored `proto/a2a.proto` is byte-identical to upstream `a2aproject/A2A:mai
 - Deployment-layer transport requirements: TLS 1.2+ (spec §7.1) and gzip (§11.4) are met at the reverse proxy / load balancer, not framework-enforced.
 - Deeper per-skill security-scheme semantics (agent-level only; see "Deferred").
 
-Before describing a release as "A2A v1.0 compliant", re-verify the vendored `proto/a2a.proto` SHA256 still matches `a2aproject/A2A:main/specification/a2a.proto` (AGENTS.md §55+§173).
+Before describing a release as "A2A v1.0 compliant", re-verify the vendored `proto/a2a.proto` SHA256 still matches `a2aproject/A2A:main/specification/a2a.proto` (AGENTS.md "Version Hygiene" and "Compliance Audit Gate").
 
 ### Deferred (ordered by priority)
 

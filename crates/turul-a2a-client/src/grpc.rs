@@ -290,24 +290,17 @@ impl A2aGrpcClient {
         Ok(Box::pin(map_stream(stream)))
     }
 
-    /// Subscribe to a task. `last_event_id` is optional — when set,
-    /// the server replays events after that `(task_id, sequence)`
-    /// marker
+    /// Subscribe to a task. The stream opens with the task snapshot; to
+    /// recover from a dropped stream, subscribe again.
     pub async fn subscribe_to_task(
         &mut self,
         task_id: impl Into<String>,
-        last_event_id: Option<String>,
     ) -> Result<GrpcStreamResponses, A2aClientError> {
         let req = pb::SubscribeToTaskRequest {
             tenant: self.scoped_tenant(),
             id: task_id.into(),
         };
-        let mut tonic_req = self.prepare(req);
-        if let Some(id) = last_event_id
-            && let Ok(v) = MetadataValue::try_from(id)
-        {
-            tonic_req.metadata_mut().insert("a2a-last-event-id", v);
-        }
+        let tonic_req = self.prepare(req);
         let stream = self.inner.subscribe_to_task(tonic_req).await?.into_inner();
         Ok(Box::pin(map_stream(stream)))
     }

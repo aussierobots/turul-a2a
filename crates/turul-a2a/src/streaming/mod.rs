@@ -7,7 +7,6 @@
 //!
 //! Used by `POST /message:stream` and `GET /tasks/{id}:subscribe`.
 
-pub mod replay;
 pub(crate) mod task_stream;
 
 use std::collections::HashMap;

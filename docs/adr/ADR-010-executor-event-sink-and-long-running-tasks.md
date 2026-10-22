@@ -112,7 +112,7 @@ impl EventSink {
 
 ### 3. Ordering and Durability
 
-**Every `EventSink` call writes through `A2aAtomicStore` before returning.** No in-memory buffering, no broker-first, no "maybe we'll flush later." The contract: when `sink.emit_artifact(…).await` returns `Ok(seq)`, that event is persisted, sequence number `seq` is assigned, and replay from `Last-Event-ID < seq` will include it.
+**Every `EventSink` call writes through `A2aAtomicStore` before returning.** No in-memory buffering, no broker-first, no "maybe we'll flush later." The contract: when `sink.emit_artifact(…).await` returns `Ok(seq)`, that event is persisted, sequence number `seq` is assigned, and any stream whose snapshot sequence is below `seq` will deliver it.
 
 **Terminal emits participate in the single-terminal-writer contract from §7.1.** The four terminal sink methods (`complete`, `fail`, `cancelled`, `reject`) go through `A2aAtomicStore::update_task_status_with_events`, which MUST return `TerminalStateAlreadySet` if the task is already terminal. The sink translates this error into `A2aError::InvalidRequest { message: "EventSink is closed: terminal already set" }` and sets `is_closed() = true`. No two terminal events can ever appear in the durable store for the same task.
 
@@ -205,7 +205,7 @@ Behavior:
 
 `SubscribeToTask` on a **terminal** task returns `UnsupportedOperationError` (HTTP 400, JSON-RPC −32004). This aligns with A2A v1.0 §3.1.6 / §9.4.6: *"SubscribeToTask is used to reconnect to the event stream of a task that is not in a terminal state. If the task is already in a terminal state, the server MUST return UnsupportedOperationError."* This is also the current implementation per CLAUDE.md.
 
-**ADR-010 explicitly supersedes ADR-009 §12 "Terminal Task Replay"**. That section proposed that terminal tasks could be subscribed to for event replay if events remained within TTL. This was never implemented, and is out of spec with A2A v1.0. It is withdrawn. `Last-Event-ID` replay applies only to streams that were active while the task was non-terminal — if a client disconnects after terminal event delivery and then reconnects with `Last-Event-ID ≥ terminal_sequence`, the server returns `UnsupportedOperationError`. Clients that need to know the terminal state after disconnection MUST either (a) track the terminal locally before disconnecting, or (b) call `GetTask` for a snapshot (which remains valid on terminal tasks). This is a history API, not a stream API.
+**ADR-010 explicitly supersedes ADR-009 §12 "Terminal Task Replay"**. That section proposed that terminal tasks could be subscribed to for event replay if events remained within TTL. This was never implemented, and is out of spec with A2A v1.0. It is withdrawn. A client that disconnects after terminal event delivery and then re-subscribes gets `UnsupportedOperationError`. Clients that need to know the terminal state after disconnection MUST either (a) track the terminal locally before disconnecting, or (b) call `GetTask` for a snapshot (which remains valid on terminal tasks). This is a history API, not a stream API.
 
 **In-flight implication**: the new spawn-and-track path MUST check task state before accepting a `SubscribeToTask` request. Non-terminal → attach to stream. Terminal → reject with `UnsupportedOperationError`. The check runs against task storage (`get_task`), not the in-flight registry (which is only populated while the executor is alive — absence from the registry does not imply terminal).
 
@@ -470,3 +470,4 @@ These tests gate ADR-010 acceptance and phase-2 completion. All must be green on
 ## Revision log
 
 - 2026-10-22 — HTTP status for `TaskNotCancelable` updated 409 → 400 to follow the A2A v1.0.1 error-mapping table (see ADR-004). No behavioural change to the cancellation contract.
+- 2026-10-22 — `Last-Event-ID` replay references removed; resume no longer exists (ADR-014 §2.3 item 3).

@@ -17,8 +17,8 @@ use crate::storage::{
     A2aAtomicStore, A2aPushNotificationStorage, A2aStorageError, A2aTaskStorage, TaskFilter,
     TaskListPage,
 };
-use crate::streaming::task_stream::{StreamItem, StreamStart, TaskEventStream, task_event_stream};
-use crate::streaming::{StreamEvent, replay};
+use crate::streaming::StreamEvent;
+use crate::streaming::task_stream::{StreamItem, TaskEventStream, task_event_stream};
 use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
 
 /// Shared server state.
@@ -197,24 +197,10 @@ fn parse_task_path(rest: &str) -> Option<TaskAction> {
 async fn task_get_dispatch(
     State(state): State<AppState>,
     axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
-    headers: axum::http::HeaderMap,
     Path(rest): Path<String>,
     Query(query): Query<TaskGetCombinedQuery>,
 ) -> Result<axum::response::Response, A2aError> {
-    let last_event_id = headers
-        .get("Last-Event-ID")
-        .or_else(|| headers.get("last-event-id"))
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-    dispatch_task_get(
-        state,
-        DEFAULT_TENANT,
-        ctx.identity.owner(),
-        &rest,
-        &query,
-        last_event_id.as_deref(),
-    )
-    .await
+    dispatch_task_get(state, DEFAULT_TENANT, ctx.identity.owner(), &rest, &query).await
 }
 
 async fn task_post_dispatch(
@@ -263,24 +249,10 @@ async fn tenant_list_tasks_handler(
 async fn tenant_task_get_dispatch(
     State(state): State<AppState>,
     axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
-    headers: axum::http::HeaderMap,
     Path((tenant, rest)): Path<(String, String)>,
     Query(query): Query<TaskGetCombinedQuery>,
 ) -> Result<axum::response::Response, A2aError> {
-    let last_event_id = headers
-        .get("Last-Event-ID")
-        .or_else(|| headers.get("last-event-id"))
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-    dispatch_task_get(
-        state,
-        &tenant,
-        ctx.identity.owner(),
-        &rest,
-        &query,
-        last_event_id.as_deref(),
-    )
-    .await
+    dispatch_task_get(state, &tenant, ctx.identity.owner(), &rest, &query).await
 }
 
 async fn tenant_task_post_dispatch(
@@ -323,7 +295,6 @@ async fn dispatch_task_get(
     owner: &str,
     rest: &str,
     query: &TaskGetCombinedQuery,
-    last_event_id: Option<&str>,
 ) -> Result<axum::response::Response, A2aError> {
     match parse_task_path(rest) {
         Some(TaskAction::GetTask(id)) => {
@@ -331,7 +302,7 @@ async fn dispatch_task_get(
             Ok(Json(v).into_response())
         }
         Some(TaskAction::SubscribeToTask(id)) => {
-            core_subscribe_to_task(state, tenant, owner, &id, last_event_id).await
+            core_subscribe_to_task(state, tenant, owner, &id).await
         }
         Some(TaskAction::PushConfigCollection(task_id)) => {
             let pq = PushConfigQuery {
@@ -514,18 +485,17 @@ pub(crate) async fn open_send_stream(
         state.event_store,
         tenant.to_string(),
         target.task_id,
-        StreamStart::Snapshot {
-            task: Box::new(task),
-            sequence,
-        },
+        task,
+        sequence,
         wake_rx,
     ))
 }
 
 /// Open the stream for `SubscribeToTask`. Unknown or foreign tasks are
 /// `TaskNotFound`; terminal tasks are `UnsupportedOperation` (A2A
-/// §3.1.6). A `Last-Event-ID` for this task resumes after that event
-/// without a snapshot; otherwise the stream opens with one.
+/// §3.1.6). Every subscription — including a client reconnecting after
+/// a dropped stream — opens with the task snapshot, which carries the
+/// full current state (§3.1.6 first-event rule; §3.5.2 reconnection).
 ///
 /// Shared by every transport.
 pub(crate) async fn open_subscribe_stream(
@@ -533,7 +503,6 @@ pub(crate) async fn open_subscribe_stream(
     tenant: &str,
     owner: &str,
     task_id: &str,
-    last_event_id: Option<&str>,
 ) -> Result<TaskEventStream, A2aError> {
     // Read the sequence before the snapshot: an event committed in
     // between may appear in both, but none can be missed.
@@ -559,28 +528,14 @@ pub(crate) async fn open_subscribe_stream(
             message: format!("Task {task_id} is already in terminal state {s:?}"),
         });
     }
-
-    let start = match last_event_id
-        .and_then(replay::parse_last_event_id)
-        .filter(|parsed| parsed.task_id == task_id)
-    {
-        Some(parsed) => StreamStart::Resume {
-            after_sequence: parsed.sequence,
-            current_state: task.status().and_then(|s| s.state().ok()),
-            current_sequence: sequence,
-        },
-        None => StreamStart::Snapshot {
-            task: Box::new(task),
-            sequence,
-        },
-    };
     let wake_rx = state.event_broker.subscribe(task_id).await;
 
     Ok(task_event_stream(
         state.event_store,
         tenant.to_string(),
         task_id.to_string(),
-        start,
+        task,
+        sequence,
         wake_rx,
     ))
 }
@@ -601,39 +556,31 @@ pub(crate) async fn core_subscribe_to_task(
     tenant: &str,
     owner: &str,
     task_id: &str,
-    last_event_id_header: Option<&str>,
 ) -> Result<axum::response::Response, A2aError> {
-    let stream = open_subscribe_stream(state, tenant, owner, task_id, last_event_id_header).await?;
+    let stream = open_subscribe_stream(state, tenant, owner, task_id).await?;
     Ok(sse_response(stream, |item| item))
 }
 
 /// Encode a task stream as SSE. Each item becomes one event whose
 /// `data:` is `wrap` applied to the `StreamResponse` JSON
-/// (`{"task": …}` / `{"statusUpdate": …}` / `{"artifactUpdate": …}`)
-/// and whose `id:` is `{task_id}:{sequence}` for `Last-Event-ID`
-/// resume. A storage error ends the stream.
+/// (`{"task": …}` / `{"statusUpdate": …}` / `{"artifactUpdate": …}`).
+/// A storage error ends the stream.
 pub(crate) fn sse_response(
     stream: TaskEventStream,
     wrap: impl Fn(serde_json::Value) -> serde_json::Value + Send + 'static,
 ) -> axum::response::Response {
     use tokio_stream::StreamExt;
 
-    let task_id = stream.task_id;
     let events = stream.items.map_while(move |item| {
-        let (sequence, body) = match item.ok()? {
-            StreamItem::Task { task, sequence } => (
-                sequence,
-                serde_json::json!({"task": serde_json::to_value(&task).unwrap_or_default()}),
-            ),
-            StreamItem::Event { sequence, event } => {
-                (sequence, serde_json::to_value(&event).unwrap_or_default())
+        let body = match item.ok()? {
+            StreamItem::Task(task) => {
+                serde_json::json!({"task": serde_json::to_value(&task).unwrap_or_default()})
             }
+            StreamItem::Event(event) => serde_json::to_value(&event).unwrap_or_default(),
         };
         let data = serde_json::to_string(&wrap(body)).unwrap_or_default();
         Some(Ok::<_, std::convert::Infallible>(
-            Event::default()
-                .id(replay::format_event_id(&task_id, sequence))
-                .data(data),
+            Event::default().data(data),
         ))
     });
     Sse::new(events)

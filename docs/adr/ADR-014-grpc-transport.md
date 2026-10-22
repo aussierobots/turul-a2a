@@ -210,12 +210,14 @@ only.
    update. That at-least-once overlap is accepted; the alternative
    (dropping it) loses events. Closing the overlap would need an atomic
    task-plus-sequence read on the storage traits, which is out of scope.
-3. **Resume.** With `Last-Event-ID` / `a2a-last-event-id` present for
-   this task, the snapshot is skipped and events after the given
-   sequence are replayed. `{task_id}:0` is a resume from the start
-   (full replay, no snapshot); previously it was treated as a fresh
-   attach. A resumed stream that is already caught up on a task in a
-   closing state (item 4) ends at once rather than idling.
+3. **Reconnection.** There is no resume. A client that loses a stream
+   reconnects by opening a new `SubscribeToTask`, which, like every
+   stream, opens with the snapshot (§3.1.6 L311 has no reconnect
+   exception; §3.5.2 L699 defines reconnecting as opening a new
+   stream; L762 accepts that a reconnecting client may miss
+   intermediate status updates — the snapshot carries the full current
+   state). `Last-Event-ID` and `a2a-last-event-id` are ignored, and SSE
+   events carry no `id:` field.
 4. **Close policy.** The stream closes after emitting a terminal status
    (COMPLETED, FAILED, CANCELED, REJECTED; §3.1.2, §3.1.6 MUST) and
    after emitting INPUT_REQUIRED (§11.7). It stays **open** on
@@ -226,8 +228,8 @@ only.
    the snapshot: subscribing to an INPUT_REQUIRED task yields the
    snapshot and then closes.
 5. **`last_chunk`** keeps the two-layer contract of ADR-006: not task
-   state, but persisted in `ArtifactUpdatePayload` so replay preserves
-   chunk boundaries on every transport.
+   state, but persisted in `ArtifactUpdatePayload` so events read from
+   the store preserve chunk boundaries on every transport.
 
 **Send-target resolution (normative, shared by blocking and streaming send).**
 
@@ -254,9 +256,6 @@ only.
 - Terminal `SubscribeToTask` → `UnsupportedOperation` from the core
   (§3.1.6). Transports MUST NOT add their own terminal check; §2.5 maps
   the error to gRPC `FAILED_PRECONDITION`.
-- gRPC resume uses `a2a-last-event-id` ASCII metadata
-  (`"{task_id}:{sequence}"`, no `-bin` suffix), parsed by the same
-  helper as the SSE `Last-Event-ID` header.
 
 **Test obligations.** These are cross-transport tests in
 `stream_contract_tests.rs`, each run on HTTP, JSON-RPC and gRPC:
@@ -269,8 +268,8 @@ only.
 - the stream closes after INPUT_REQUIRED and after terminal states, and
   stays open across AUTH_REQUIRED → WORKING;
 - subscribe to a live task emits no event at or below the snapshot
-  sequence; `Last-Event-ID` / `a2a-last-event-id` resume replays only
-  later events and closes when caught up on a closing state;
+  sequence; a reconnect carrying `Last-Event-ID` /
+  `a2a-last-event-id` still opens with the snapshot;
 - a follow-up while the previous turn's executor is still running is
   refused before any write;
 - the old `sse_tests.rs` assertion that "first event should be
@@ -502,7 +501,7 @@ around the same tonic server.
   functions.
 - Auth via the existing `A2aMiddleware` Tower stack.
 - Streaming (SendStreamingMessage / SubscribeToTask) from the durable
-  event store with `a2a-last-event-id` resume.
+  event store.
 - Error mapping per §2.5.
 - Spec-compliance suite (`crates/turul-a2a/tests/spec_compliance.rs`)
   extended with a third transport axis under `--features grpc` —
@@ -582,10 +581,8 @@ include three cases:
 - `SubscribeToTask` (gRPC):
   - Attach-to-non-terminal: the `Task` snapshot, then only events
     above its sequence — identical to the SSE equivalent.
-  - `Last-Event-ID` reconnection: client sends
-    `a2a-last-event-id: {task_id}:{sequence}` ASCII metadata;
-    adapter delivers only events with `event_sequence >` the
-    given value; no duplicates; no gaps within the stored range.
+  - Reconnection opens with the snapshot like any subscribe;
+    `a2a-last-event-id` metadata is ignored.
   - Terminal-subscribe rejection: subscribing to a task in a
     terminal state MUST fail with the A2A
     `UnsupportedOperationError`, surfaced as
@@ -783,3 +780,4 @@ theirs. Opt-in is the correct posture for both.
 - 2026-04-21 — Initial acceptance against A2A v1.0.0.
 - 2026-10-22 — Error-mapping table aligned to A2A v1.0.1 §5.4: `PushNotificationNotSupported` and `ExtendedAgentCardNotConfigured` UNIMPLEMENTED→FAILED_PRECONDITION; HTTP column TaskNotCancelable 409→400, ContentTypeNotSupported 415→400, InvalidAgentResponse 502→500, ExtendedAgentCardNotConfigured 404→400 (the 404 row never matched `wire.rs`). The "capability absence → UNIMPLEMENTED" rationale is withdrawn because the spec no longer makes that split.
 - 2026-10-22 — §2.3 rewritten and accepted: one core stream for all three transports. Both streaming RPCs open with a `Task` snapshot, with no history replayed after it. Streams close on terminal states and INPUT_REQUIRED and stay open on AUTH_REQUIRED. Send-target resolution is shared by blocking and streaming send, which fixes streaming send ignoring `message.taskId`. Withdraws the earlier rule, in §2.3 and §2.11, that streaming send does not open with a `Task`. Follow-ups are refused while the previous turn's executor is still running; `Last-Event-ID: {task_id}:0` is now a resume; an already-caught-up resumed stream on a closing state ends at once.
+- 2026-10-22 — §2.3 item 3: `Last-Event-ID` / `a2a-last-event-id` resume removed and SSE `id:` fields dropped. Resuming without a snapshot broke A2A §3.1.6 L311 (every SubscribeToTask stream MUST open with the Task); reconnecting is a new subscribe (§3.5.2).

@@ -390,18 +390,11 @@ impl pb::grpc::A2aService for GrpcService {
         let tenant = tenant_from(&request, &request.get_ref().tenant);
         let task_id = request.get_ref().id.clone();
 
-        let last_event_id = request
-            .metadata()
-            .get(crate::grpc::streaming::LAST_EVENT_ID_METADATA)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-
         let stream = crate::grpc::streaming::handle_subscribe_to_task(
             self.state.clone(),
             tenant,
             owner,
             task_id,
-            last_event_id,
         )
         .await?;
         Ok(Response::new(stream))

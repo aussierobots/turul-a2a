@@ -55,6 +55,7 @@ pub async fn jsonrpc_dispatch_handler(
 async fn jsonrpc_dispatch_inner(
     State(state): State<AppState>,
     axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
+    #[cfg_attr(not(feature = "compat-v03"), allow(unused_variables))]
     headers: axum::http::HeaderMap,
     body: String,
 ) -> axum::response::Response {
@@ -173,26 +174,8 @@ async fn jsonrpc_dispatch_inner(
             return axum::http::StatusCode::NO_CONTENT.into_response();
         }
 
-        // Extract Last-Event-ID from HTTP header (Turul extension for JSON-RPC resume).
-        // The proto SubscribeToTaskRequest has no cursor field, but since JSON-RPC
-        // streaming runs over HTTP, clients MAY send this header for resumable replay.
-        let last_event_id = headers
-            .get("Last-Event-ID")
-            .or_else(|| headers.get("last-event-id"))
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-
-        return match dispatch_streaming(
-            state,
-            &method,
-            &tenant,
-            &owner,
-            claims,
-            params,
-            id.clone(),
-            last_event_id.as_deref(),
-        )
-        .await
+        return match dispatch_streaming(state, &method, &tenant, &owner, claims, params, id.clone())
+            .await
         {
             Ok(response) => response,
             Err(e) => Json(e.to_jsonrpc_error(Some(&id))).into_response(),
@@ -397,15 +380,13 @@ async fn dispatch_streaming(
     claims: Option<serde_json::Value>,
     params: Value,
     request_id: Value,
-    last_event_id: Option<&str>,
 ) -> Result<axum::response::Response, A2aError> {
     match method {
         methods::SEND_STREAMING_MESSAGE => {
             dispatch_send_streaming_message(state, tenant, owner, claims, params, request_id).await
         }
         methods::SUBSCRIBE_TO_TASK => {
-            dispatch_subscribe_to_task(state, tenant, owner, params, request_id, last_event_id)
-                .await
+            dispatch_subscribe_to_task(state, tenant, owner, params, request_id).await
         }
         _ => Err(A2aError::Internal("Unknown streaming method".into())),
     }
@@ -430,7 +411,6 @@ async fn dispatch_subscribe_to_task(
     owner: &str,
     params: Value,
     request_id: Value,
-    last_event_id: Option<&str>,
 ) -> Result<axum::response::Response, A2aError> {
     let task_id = params
         .get("id")
@@ -438,8 +418,7 @@ async fn dispatch_subscribe_to_task(
         .ok_or(A2aError::InvalidRequest {
             message: "Missing required field: id".into(),
         })?;
-    let stream =
-        crate::router::open_subscribe_stream(state, tenant, owner, task_id, last_event_id).await?;
+    let stream = crate::router::open_subscribe_stream(state, tenant, owner, task_id).await?;
     Ok(jsonrpc_sse_response(stream, request_id))
 }
 

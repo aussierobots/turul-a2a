@@ -126,8 +126,8 @@
 //!   invocation and returns all events.
 //! - `GET /tasks/{id}:subscribe` is for tasks that are **not** in a
 //!   terminal state. Within one invocation it emits the initial `Task`
-//!   snapshot, replays stored events via `Last-Event-ID`, and closes
-//!   when the task reaches a terminal state. Subscribing to an
+//!   snapshot, delivers events committed after it, and closes when the
+//!   task reaches a terminal state or INPUT_REQUIRED. Subscribing to an
 //!   already-terminal task returns `UnsupportedOperationError` per
 //!   A2A v1.0 §3.1.6. For retrieving a terminal task's final state
 //!   use `GetTask`.
@@ -160,8 +160,8 @@
 //! `examples/lambda-scheduled-worker`.
 //!
 //! Lambda streaming is request-scoped (not persistent SSE connections). The durable
-//! event store ensures events survive across invocations. Clients reconnect with
-//! `Last-Event-ID` for continuation.
+//! event store ensures events survive across invocations. A client that loses
+//! its stream subscribes again and receives a fresh `Task` snapshot.
 //!
 //! # Cross-instance cancellation
 //!

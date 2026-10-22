@@ -4,7 +4,6 @@
 //! - Subscribe first event is Task object (spec §3.1.6)
 //! - Terminal tasks return UnsupportedOperationError (spec §3.1.6)
 //! - Non-terminal subscribe replays stored events from durable store
-//! - Reconnect with Last-Event-ID (partial replay)
 //! - Cross-instance subscriber/producer via shared store
 //! - No correctness dependence on same-instance broker delivery
 
@@ -216,13 +215,12 @@ async fn d3_subscribe_first_event_is_task_object() {
     assert!(!events.is_empty(), "Subscribe should emit events");
 
     // First event MUST be a Task object (spec §3.1.6)
-    let (id, first) = &events[0];
+    let (_, first) = &events[0];
     assert!(
         first.get("task").is_some(),
         "First event MUST be Task object, got: {first}"
     );
     assert_eq!(first["task"]["id"], "d3-first-1");
-    assert!(id.is_some(), "Task snapshot should have an SSE id");
 
     // Subsequent events are stored StreamEvents from the durable store
     if events.len() > 1 {
@@ -312,81 +310,6 @@ fn commit_input_required_later(state: &AppState, task_id: &str, delay: Duration)
 }
 
 // =========================================================
-// D3-03: Last-Event-ID replays stored events from the store
-// =========================================================
-
-#[tokio::test]
-async fn d3_last_event_id_zero_replays_all_stored_events() {
-    let state = single_instance_state();
-    let num_events = create_non_terminal_task(&state, "d3-replay-1").await;
-
-    let router = build_router(state);
-    let req = Request::get("/tasks/d3-replay-1:subscribe")
-        .header("a2a-version", "1.0")
-        .header("Last-Event-ID", "d3-replay-1:0")
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), 200);
-
-    let events = collect_sse(resp.into_body(), Duration::from_secs(3)).await;
-
-    // Resume from 0: every stored event, no snapshot.
-    assert_eq!(events.len(), num_events, "got {events:?}");
-    for (i, (id, data)) in events.iter().enumerate() {
-        assert_eq!(
-            id.as_deref(),
-            Some(format!("d3-replay-1:{}", i + 1).as_str())
-        );
-        assert!(data.get("statusUpdate").is_some(), "event {i}: {data}");
-    }
-}
-
-// =========================================================
-// D3-04: Reconnect with Last-Event-ID (partial replay)
-// =========================================================
-
-#[tokio::test]
-async fn d3_reconnect_with_last_event_id() {
-    let state = single_instance_state();
-    let num_events = create_non_terminal_task(&state, "d3-reconn-1").await;
-
-    // A fresh subscribe is only the snapshot; its id carries the
-    // sequence it reflects.
-    let router = build_router(state.clone());
-    let req = Request::get("/tasks/d3-reconn-1:subscribe")
-        .header("a2a-version", "1.0")
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    let initial = collect_sse(resp.into_body(), Duration::from_secs(3)).await;
-    assert_eq!(initial.len(), 1, "snapshot only, got {initial:?}");
-    assert!(initial[0].1.get("task").is_some());
-    assert_eq!(
-        initial[0].0.as_deref(),
-        Some(format!("d3-reconn-1:{num_events}").as_str())
-    );
-
-    // Reconnect after the first stored event: only later events, no snapshot.
-    let router = build_router(state);
-    let req = Request::get("/tasks/d3-reconn-1:subscribe")
-        .header("a2a-version", "1.0")
-        .header("Last-Event-ID", "d3-reconn-1:1")
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), 200);
-
-    let reconnected = collect_sse(resp.into_body(), Duration::from_secs(3)).await;
-    assert_eq!(reconnected.len(), num_events - 1, "got {reconnected:?}");
-    assert!(
-        reconnected.iter().all(|(_, d)| d.get("task").is_none()),
-        "Reconnect should NOT re-emit Task snapshot"
-    );
-    assert_eq!(reconnected[0].0.as_deref(), Some("d3-reconn-1:2"));
-}
-
-// =========================================================
 // D3-05: Cross-instance subscriber/producer (shared store)
 // =========================================================
 
@@ -440,9 +363,6 @@ async fn d3_no_broker_correctness_dependency() {
 
     let events = collect_sse(resp.into_body(), Duration::from_secs(5)).await;
     assert_eq!(events.len(), 2, "snapshot + polled event, got {events:?}");
-    for (i, (id, _)) in events.iter().enumerate() {
-        assert!(id.is_some(), "Event {i} should have a durable ID");
-    }
     assert_eq!(
         events[1].1["statusUpdate"]["status"]["state"],
         "TASK_STATE_INPUT_REQUIRED"
@@ -450,11 +370,11 @@ async fn d3_no_broker_correctness_dependency() {
 }
 
 // =========================================================
-// D3-07: Streaming send produces events with durable IDs
+// D3-07: Streaming send delivers through the durable store
 // =========================================================
 
 #[tokio::test]
-async fn d3_streaming_send_produces_durable_events() {
+async fn d3_streaming_send_reaches_terminal_through_the_store() {
     let state = single_instance_state();
 
     let router = build_router(state);
@@ -469,10 +389,10 @@ async fn d3_streaming_send_produces_durable_events() {
     let events = collect_sse(resp.into_body(), Duration::from_secs(3)).await;
     assert!(!events.is_empty(), "Streaming send should produce events");
 
-    // Every event should have an id: field
-    for (i, (id, _)) in events.iter().enumerate() {
-        assert!(id.is_some(), "Event {i} should have durable ID");
-    }
+    assert!(
+        events[0].1.get("task").is_some(),
+        "first item is the Task snapshot"
+    );
 
     // Should include terminal event
     let has_terminal = events.iter().any(|(_, data)| {

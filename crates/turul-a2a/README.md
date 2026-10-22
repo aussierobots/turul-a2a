@@ -39,11 +39,11 @@ A2aServer::builder()
 
 Task state and streaming events are written atomically via
 `storage::A2aAtomicStore`. The event store is the source of truth; the
-in-process broker is a local wake-up signal. Terminal replay and
-Last-Event-ID reconnection work across instances when all replicas
-share a backend (PostgreSQL, DynamoDB). Subscribers attached while a
-task is non-terminal receive replay of prior events and then live
-delivery; subscribing to an already-terminal task returns
+in-process broker is a local wake-up signal. Streaming works across
+instances when all replicas share a backend (PostgreSQL, DynamoDB).
+Both streaming RPCs open with the `Task` snapshot and then deliver only
+events committed after it; a client that loses its stream reconnects
+by subscribing again and receives a fresh snapshot. Subscribing to an already-terminal task returns
 `UnsupportedOperationError` per A2A v1.0 §3.1.6 — use `GetTask` to
 retrieve the final state.
 
@@ -52,8 +52,8 @@ retrieve the final state.
 The in-process event broker provides local fanout for attached
 clients on the same instance only. Shared task storage solves
 request/response correctness across instances; cross-instance
-streaming coordination relies on the durable event store with
-monotonic IDs and replay semantics.
+streaming coordination relies on the durable event store and its
+per-task event sequence.
 
 ## gRPC
 
@@ -72,8 +72,8 @@ cargo run -p grpc-agent --bin grpc-client -- stream "hello"
 All 11 `lf.a2a.v1.A2AService` RPCs are served via
 `A2aServer::into_tonic_router()` — the single public entry point,
 which always layers the same Tower auth stack as the HTTP path.
-Streaming consumes the same durable event store as SSE, with
-`a2a-last-event-id` ASCII metadata for resume. `grpc-reflection` and
+Streaming consumes the same durable event store and stream contract
+as SSE. `grpc-reflection` and
 `grpc-health` are optional sub-features.
 
 The client wrapper `turul_a2a_client::grpc::A2aGrpcClient` ships

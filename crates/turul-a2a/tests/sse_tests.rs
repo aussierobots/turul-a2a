@@ -128,46 +128,16 @@ async fn collect_sse_events(body: Body, timeout: Duration) -> Vec<serde_json::Va
     collected.unwrap_or_default()
 }
 
-/// Parsed SSE event with both data and id.
-struct ParsedSseEvent {
-    id: Option<String>,
-    data: serde_json::Value,
-}
-
-/// Parse SSE text format into JSON data payloads.
-/// SSE format: "data: {json}\n\n" per event, with optional "event:" and "id:" lines.
+/// Parse SSE text format into JSON `data:` payloads ("data: {json}\n\n" per event).
 fn parse_sse_events(text: &str) -> Vec<serde_json::Value> {
-    parse_sse_events_with_ids(text)
-        .into_iter()
-        .map(|e| e.data)
+    text.split("\n\n")
+        .filter_map(|chunk| {
+            chunk
+                .lines()
+                .find_map(|line| line.strip_prefix("data:"))
+                .and_then(|data| serde_json::from_str(data.trim()).ok())
+        })
         .collect()
-}
-
-/// Parse SSE text format into events with both data and id fields.
-fn parse_sse_events_with_ids(text: &str) -> Vec<ParsedSseEvent> {
-    let mut events = Vec::new();
-    for chunk in text.split("\n\n") {
-        let chunk = chunk.trim();
-        if chunk.is_empty() {
-            continue;
-        }
-        let mut id = None;
-        let mut data = None;
-        for line in chunk.lines() {
-            if let Some(id_val) = line.strip_prefix("id:") {
-                id = Some(id_val.trim().to_string());
-            } else if let Some(data_val) = line.strip_prefix("data:") {
-                let data_val = data_val.trim();
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_val) {
-                    data = Some(json);
-                }
-            }
-        }
-        if let Some(data) = data {
-            events.push(ParsedSseEvent { id, data });
-        }
-    }
-    events
 }
 
 // =========================================================
@@ -331,64 +301,6 @@ async fn message_stream_includes_terminal_event() {
         !terminal_states.is_empty(),
         "Stream should include a terminal status event"
     );
-}
-
-#[tokio::test]
-async fn message_stream_events_have_durable_ids() {
-    let state = test_state();
-    let router = build_router(state);
-    let req = Request::post("/message:stream")
-        .header("content-type", "application/json")
-        .header("a2a-version", "1.0")
-        .body(Body::from(send_message_body("sse-ids", "check ids")))
-        .unwrap();
-
-    let resp = router.oneshot(req).await.unwrap();
-    let bytes = tokio::time::timeout(Duration::from_secs(2), async {
-        resp.into_body().collect().await.unwrap().to_bytes()
-    })
-    .await
-    .unwrap();
-    let text = String::from_utf8_lossy(&bytes);
-    let events = parse_sse_events_with_ids(&text);
-
-    assert!(!events.is_empty(), "Should have events");
-
-    // Every event must have an id in {task_id}:{sequence} format
-    for (i, event) in events.iter().enumerate() {
-        let id = event
-            .id
-            .as_ref()
-            .unwrap_or_else(|| panic!("Event {i} missing id: field"));
-        // Parse with the replay module's format
-        assert!(
-            id.contains(':'),
-            "Event id should be {{task_id}}:{{sequence}}, got: {id}"
-        );
-        let parts: Vec<&str> = id.rsplitn(2, ':').collect();
-        assert!(
-            parts[0].parse::<u64>().is_ok(),
-            "Sequence part should be numeric, got: {}",
-            parts[0]
-        );
-    }
-
-    // Sequences should be monotonically increasing
-    let sequences: Vec<u64> = events
-        .iter()
-        .filter_map(|e| e.id.as_ref())
-        .filter_map(|id| id.rsplit_once(':'))
-        .filter_map(|(_, seq)| seq.parse::<u64>().ok())
-        .collect();
-
-    for window in sequences.windows(2) {
-        assert!(
-            window[0] < window[1],
-            "Event sequences should be monotonically increasing: {} >= {}",
-            window[0],
-            window[1]
-        );
-    }
 }
 
 // =========================================================

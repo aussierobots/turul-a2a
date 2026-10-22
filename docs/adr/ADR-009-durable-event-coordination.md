@@ -41,7 +41,7 @@ A new **durable event store** is the source of truth for streaming events. The i
 
 ### 2. Event Identity and Ordering
 
-Each event gets a **monotonic sequence number per task**, assigned by the event store at write time. This is the event ID used for `Last-Event-ID` replay.
+Each event gets a **monotonic sequence number per task**, assigned by the event store at write time. It orders events within a task and marks the boundary between a stream's snapshot and the events delivered after it.
 
 **Ordering guarantees:**
 - Events within a single task are strictly ordered by `event_sequence`
@@ -49,9 +49,11 @@ Each event gets a **monotonic sequence number per task**, assigned by the event 
 - The store MUST NOT reorder events within a task
 - Gaps in sequence numbers are allowed (e.g., after failed writes) but MUST NOT cause replay to skip events
 
-**SSE event ID format:** `{task_id}:{event_sequence}` — parseable by both client and server for replay.
+**SSE event ID format:** none since 2026-10-22 (see §3).
 
 ### 3. Replay Semantics
+
+> **Superseded 2026-10-22 by ADR-014 §2.3 item 3.** Client-driven replay (`Last-Event-ID`) is removed: A2A §3.1.6 requires every SubscribeToTask stream to open with the Task snapshot, and a reconnect is a new subscribe. Sequences remain the store's internal ordering key and the boundary between the snapshot and the events that follow it; SSE events no longer carry an `id:`. The text below is kept for history.
 
 **On subscribe/reconnect:**
 1. Client sends `Last-Event-ID: {tenant}:{task_id}:{sequence}` header (or equivalent for initial subscribe)
@@ -390,3 +392,8 @@ If finer-grained executor events are wanted later, that gets a **separate ADR** 
 - The implementation can be phased: durable store first, optional bus/fanout later
 - Backward compatible: existing single-instance deployments work unchanged with in-memory defaults
 - Executor redesign (EventSink) is explicitly deferred — clean scope boundary
+
+## Revision log
+
+- 2026-04-17 — §12 amended by ADR-010.
+- 2026-10-22 — §2/§3: `Last-Event-ID` replay and SSE event ids removed (superseded by ADR-014 §2.3 item 3).
