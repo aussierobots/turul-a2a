@@ -103,30 +103,27 @@ impl A2aClient {
         self.agent_card.as_ref()
     }
 
-    /// Build the URL with optional tenant prefix.
-    /// Tenant is percent-encoded to handle special characters safely.
+    /// Build the URL with optional tenant prefix. `path` must already be
+    /// encoded; build caller-supplied segments with [`path_segment`].
     fn url(&self, path: &str) -> String {
         match &self.tenant {
-            Some(tenant) => {
-                let encoded_tenant = reqwest::Url::parse("http://x")
-                    .unwrap()
-                    .join(&format!("{}/", tenant))
-                    .map(|u| {
-                        u.path()
-                            .trim_end_matches('/')
-                            .trim_start_matches('/')
-                            .to_string()
-                    })
-                    .unwrap_or_else(|_| tenant.clone());
-                format!("{}/{}{}", self.base_url, encoded_tenant, path)
-            }
+            Some(tenant) => format!("{}/{}{}", self.base_url, path_segment(tenant), path),
             None => format!("{}{}", self.base_url, path),
         }
     }
 
+    /// URL of a task resource: `/tasks/{task_id}` followed by `suffix`
+    /// (e.g. `:cancel`, `/pushNotificationConfigs`).
+    fn task_url(&self, task_id: &str, suffix: &str) -> String {
+        self.url(&format!("/tasks/{}{suffix}", path_segment(task_id)))
+    }
+
     /// Build a request with auth headers and A2A-Version.
     fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
-        let mut req = self.http.request(method, url).header("a2a-version", "1.0");
+        let mut req = self
+            .http
+            .request(method, url)
+            .header(wire::protocol::VERSION_PARAM, wire::protocol::VERSION);
         match &self.auth {
             ClientAuth::None => {}
             ClientAuth::Bearer(token) => {
@@ -217,7 +214,7 @@ impl A2aClient {
         task_id: &str,
         history_length: Option<i32>,
     ) -> Result<pb::Task, A2aClientError> {
-        let url = self.url(&format!("/tasks/{task_id}"));
+        let url = self.task_url(task_id, "");
         let mut req = self.request(reqwest::Method::GET, &url);
         if let Some(hl) = history_length {
             req = req.query(&[("historyLength", hl.to_string())]);
@@ -233,12 +230,8 @@ impl A2aClient {
 
     /// Cancel a task, returning the raw proto Task.
     pub async fn cancel_task_proto(&self, task_id: &str) -> Result<pb::Task, A2aClientError> {
-        let url = self.url(&format!("/tasks/{task_id}:cancel"));
-        let resp = self
-            .request(reqwest::Method::POST, &url)
-            .header("a2a-version", "1.0")
-            .send()
-            .await?;
+        let url = self.task_url(task_id, ":cancel");
+        let resp = self.request(reqwest::Method::POST, &url).send().await?;
 
         if !resp.status().is_success() {
             return Err(self.parse_error(resp).await);
@@ -265,6 +258,15 @@ impl A2aClient {
         }
         if let Some(ref pt) = params.page_token {
             req = req.query(&[("pageToken", pt.as_str())]);
+        }
+        if let Some(hl) = params.history_length {
+            req = req.query(&[("historyLength", hl.to_string())]);
+        }
+        if let Some(include) = params.include_artifacts {
+            req = req.query(&[("includeArtifacts", include.to_string())]);
+        }
+        if let Some(ref after) = params.status_timestamp_after {
+            req = req.query(&[("statusTimestampAfter", after.as_str())]);
         }
 
         let resp = req.send().await?;
@@ -328,7 +330,7 @@ impl A2aClient {
 
     /// Subscribe to task events, returning raw SSE events (untyped JSON).
     pub async fn subscribe_to_task_raw(&self, task_id: &str) -> Result<SseStream, A2aClientError> {
-        let url = self.url(&format!("/tasks/{task_id}:subscribe"));
+        let url = self.task_url(task_id, ":subscribe");
         let resp = self
             .request(reqwest::Method::GET, &url)
             .header("accept", "text/event-stream")
@@ -371,7 +373,7 @@ impl A2aClient {
         task_id: &str,
         config: turul_a2a_types::PushConfig,
     ) -> Result<turul_a2a_types::PushConfig, A2aClientError> {
-        let endpoint = self.url(&format!("/tasks/{task_id}/pushNotificationConfigs"));
+        let endpoint = self.task_url(task_id, "/pushNotificationConfigs");
         let resp = self
             .request(reqwest::Method::POST, &endpoint)
             .header("content-type", "application/json")
@@ -392,9 +394,10 @@ impl A2aClient {
         task_id: &str,
         config_id: &str,
     ) -> Result<turul_a2a_types::PushConfig, A2aClientError> {
-        let url = self.url(&format!(
-            "/tasks/{task_id}/pushNotificationConfigs/{config_id}"
-        ));
+        let url = self.task_url(
+            task_id,
+            &format!("/pushNotificationConfigs/{}", path_segment(config_id)),
+        );
         let resp = self.request(reqwest::Method::GET, &url).send().await?;
 
         if !resp.status().is_success() {
@@ -411,7 +414,7 @@ impl A2aClient {
         page_size: Option<i32>,
         page_token: Option<&str>,
     ) -> Result<turul_a2a_types::PushConfigPage, A2aClientError> {
-        let url = self.url(&format!("/tasks/{task_id}/pushNotificationConfigs"));
+        let url = self.task_url(task_id, "/pushNotificationConfigs");
         let mut req = self.request(reqwest::Method::GET, &url);
         if let Some(ps) = page_size {
             req = req.query(&[("pageSize", ps.to_string())]);
@@ -437,9 +440,10 @@ impl A2aClient {
         task_id: &str,
         config_id: &str,
     ) -> Result<(), A2aClientError> {
-        let url = self.url(&format!(
-            "/tasks/{task_id}/pushNotificationConfigs/{config_id}"
-        ));
+        let url = self.task_url(
+            task_id,
+            &format!("/pushNotificationConfigs/{}", path_segment(config_id)),
+        );
         let resp = self.request(reqwest::Method::DELETE, &url).send().await?;
 
         if !resp.status().is_success() {
@@ -510,11 +514,30 @@ impl A2aClient {
     }
 }
 
-/// Parameters for listing tasks.
+/// Percent-encode one URL path segment, so caller-supplied ids containing
+/// `/`, `?`, `#`, `%` or spaces stay inside their segment.
+fn path_segment(segment: &str) -> String {
+    let mut url = reqwest::Url::parse("http://segment/").expect("static URL parses");
+    url.path_segments_mut()
+        .expect("http URL has path segments")
+        .push(segment);
+    url.path()[1..].to_string()
+}
+
+/// Parameters for listing tasks (proto `ListTasksRequest`), sent as
+/// camelCase query parameters.
 #[derive(Debug, Clone, Default)]
 pub struct ListTasksParams {
     pub context_id: Option<String>,
+    /// Task state wire name, e.g. `TASK_STATE_WORKING`.
     pub status: Option<String>,
     pub page_size: Option<i32>,
     pub page_token: Option<String>,
+    /// Maximum number of history messages per returned task.
+    pub history_length: Option<i32>,
+    /// Whether returned tasks carry their artifacts.
+    pub include_artifacts: Option<bool>,
+    /// Only tasks whose status changed after this ISO 8601 timestamp
+    /// (e.g. `2025-11-09T10:30:00Z`).
+    pub status_timestamp_after: Option<String>,
 }

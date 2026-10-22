@@ -465,3 +465,320 @@ fn artifact_text_extracts_text_from_task() {
     let text = response::artifact_text(&task);
     assert_eq!(text, "hello world");
 }
+
+// =========================================================
+// Request shape — every request kind, recorded by the mock server
+// =========================================================
+
+fn query_pairs(req: &wiremock::Request) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = req
+        .url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+fn push_config_json(task_id: &str, id: &str) -> serde_json::Value {
+    json!({"id": id, "taskId": task_id, "url": "https://hook.example/cb", "token": "tok"})
+}
+
+fn hello() -> turul_a2a_proto::SendMessageRequest {
+    turul_a2a_client::MessageBuilder::new().text("hi").build()
+}
+
+#[tokio::test]
+async fn a2a_version_header_sent_on_every_request_kind() {
+    let server = MockServer::start().await;
+    let task = json!({"id": "t-1", "status": {"state": "TASK_STATE_WORKING"}});
+    Mock::given(method("POST"))
+        .and(path("/message:send"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"task": task})))
+        .mount(&server)
+        .await;
+    for stream_path in ["/message:stream", "/tasks/t-1:subscribe"] {
+        Mock::given(path(stream_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(""),
+            )
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/tasks/t-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(task.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tasks/t-1:cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(task.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tasks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tasks": [], "nextPageToken": "", "pageSize": 50, "totalSize": 0
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/tasks/t-1/pushNotificationConfigs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(push_config_json("t-1", "c-1")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tasks/t-1/pushNotificationConfigs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"configs": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tasks/t-1/pushNotificationConfigs/c-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(push_config_json("t-1", "c-1")))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/tasks/t-1/pushNotificationConfigs/c-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/extendedAgentCard"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"name": "x"})))
+        .mount(&server)
+        .await;
+
+    let client = A2aClient::new(server.uri());
+    client.send_message(hello()).await.unwrap();
+    client.send_streaming_message_raw(hello()).await.unwrap();
+    client.get_task("t-1", None).await.unwrap();
+    client.cancel_task("t-1").await.unwrap();
+    client
+        .list_tasks(&ListTasksParams::default())
+        .await
+        .unwrap();
+    client.subscribe_to_task_raw("t-1").await.unwrap();
+    client
+        .create_push_config("t-1", "https://hook.example/cb", "tok")
+        .await
+        .unwrap();
+    client.get_push_config("t-1", "c-1").await.unwrap();
+    client.list_push_configs("t-1", None, None).await.unwrap();
+    client.delete_push_config("t-1", "c-1").await.unwrap();
+    client.fetch_extended_agent_card().await.unwrap();
+
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 11, "one request per client call");
+    for req in &received {
+        assert_eq!(
+            req.headers.get("a2a-version").and_then(|v| v.to_str().ok()),
+            Some("1.0"),
+            "{} {} must carry A2A-Version",
+            req.method,
+            req.url.path()
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_tasks_sends_every_param_as_camel_case_query() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tasks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tasks": [], "nextPageToken": "", "pageSize": 7, "totalSize": 0
+        })))
+        .mount(&server)
+        .await;
+
+    let client = A2aClient::new(server.uri());
+    let params = ListTasksParams {
+        context_id: Some("ctx-1".into()),
+        status: Some("TASK_STATE_WORKING".into()),
+        page_size: Some(7),
+        page_token: Some("cursor-2".into()),
+        history_length: Some(3),
+        include_artifacts: Some(true),
+        status_timestamp_after: Some("2025-11-09T10:30:00Z".into()),
+    };
+    client.list_tasks(&params).await.unwrap();
+
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    let mut expected: Vec<(String, String)> = [
+        ("contextId", "ctx-1"),
+        ("status", "TASK_STATE_WORKING"),
+        ("pageSize", "7"),
+        ("pageToken", "cursor-2"),
+        ("historyLength", "3"),
+        ("includeArtifacts", "true"),
+        ("statusTimestampAfter", "2025-11-09T10:30:00Z"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    expected.sort();
+    assert_eq!(query_pairs(&received[0]), expected);
+}
+
+#[tokio::test]
+async fn list_tasks_default_params_send_no_query() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tasks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tasks": [], "nextPageToken": "", "pageSize": 50, "totalSize": 0
+        })))
+        .mount(&server)
+        .await;
+    A2aClient::new(server.uri())
+        .list_tasks(&ListTasksParams::default())
+        .await
+        .unwrap();
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(received[0].url.query(), None);
+}
+
+#[tokio::test]
+async fn task_and_config_ids_are_percent_encoded_in_paths() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(push_config_json("a b", "c/d")))
+        .mount(&server)
+        .await;
+
+    let client = A2aClient::new(server.uri()).with_tenant("ten ant");
+    client.get_push_config("a b/c?d#e", "c/d%").await.unwrap();
+
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(
+        received[0].url.path(),
+        "/ten%20ant/tasks/a%20b%2Fc%3Fd%23e/pushNotificationConfigs/c%2Fd%25"
+    );
+    assert_eq!(received[0].url.query(), None);
+}
+
+#[tokio::test]
+async fn create_push_config_posts_config_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/tasks/t-9/pushNotificationConfigs"))
+        .and(header("content-type", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(push_config_json("t-9", "cfg-1")))
+        .mount(&server)
+        .await;
+
+    let client = A2aClient::new(server.uri());
+    let created = client
+        .create_push_config("t-9", "https://hook.example/cb", "tok")
+        .await
+        .unwrap();
+    assert_eq!(created.id(), "cfg-1");
+    assert_eq!(created.task_id(), "t-9");
+
+    let received = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(body["taskId"], "t-9");
+    assert_eq!(body["url"], "https://hook.example/cb");
+    assert_eq!(body["token"], "tok");
+}
+
+#[tokio::test]
+async fn list_push_configs_sends_page_params_and_reads_next_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tasks/t-9/pushNotificationConfigs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "configs": [push_config_json("t-9", "cfg-1")],
+            "nextPageToken": "next-2"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = A2aClient::new(server.uri());
+    let page = client
+        .list_push_configs("t-9", Some(1), Some("page-1"))
+        .await
+        .unwrap();
+    assert_eq!(page.configs.len(), 1);
+    assert_eq!(page.configs[0].id(), "cfg-1");
+    assert_eq!(page.next_page_token.as_deref(), Some("next-2"));
+
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(
+        query_pairs(&received[0]),
+        vec![
+            ("pageSize".to_string(), "1".to_string()),
+            ("pageToken".to_string(), "page-1".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn list_push_configs_last_page_has_no_next_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tasks/t-9/pushNotificationConfigs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "configs": [], "nextPageToken": ""
+        })))
+        .mount(&server)
+        .await;
+    let page = A2aClient::new(server.uri())
+        .list_push_configs("t-9", None, None)
+        .await
+        .unwrap();
+    assert!(page.configs.is_empty());
+    assert_eq!(page.next_page_token, None);
+}
+
+#[tokio::test]
+async fn get_and_delete_push_config_use_item_path() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tasks/t-9/pushNotificationConfigs/cfg-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(push_config_json("t-9", "cfg-1")))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/tasks/t-9/pushNotificationConfigs/cfg-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = A2aClient::new(server.uri());
+    let cfg = client.get_push_config("t-9", "cfg-1").await.unwrap();
+    assert_eq!(cfg.id(), "cfg-1");
+    assert_eq!(cfg.url(), "https://hook.example/cb");
+    client.delete_push_config("t-9", "cfg-1").await.unwrap();
+}
+
+#[tokio::test]
+async fn push_config_error_surfaces_reason() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tasks/t-9/pushNotificationConfigs/missing"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": {
+                "code": 404,
+                "status": "NOT_FOUND",
+                "message": "Task not found",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": "TASK_NOT_FOUND",
+                    "domain": "a2a-protocol.org"
+                }]
+            }
+        })))
+        .mount(&server)
+        .await;
+    let err = A2aClient::new(server.uri())
+        .get_push_config("t-9", "missing")
+        .await
+        .unwrap_err();
+    assert_eq!(err.status(), Some(404));
+    assert_eq!(err.reason(), Some("TASK_NOT_FOUND"));
+}
