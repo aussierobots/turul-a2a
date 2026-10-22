@@ -35,8 +35,8 @@ cargo test -p turul-a2a-aws-lambda         # Lambda adapter
 
 # Storage backend parity tests (feature-gated)
 cargo test -p turul-a2a --features sqlite --lib -- storage::sqlite
-cargo test -p turul-a2a --features postgres --lib -- storage::postgres --test-threads=1
-cargo test -p turul-a2a --features dynamodb --lib -- storage::dynamodb --test-threads=1
+DATABASE_URL='postgres://user@localhost/a2a_test?host=/var/run/postgresql' cargo test -p turul-a2a --features postgres --lib -- storage::postgres --test-threads=1
+A2A_DYNAMODB_TESTS=1 A2A_DYNAMODB_ENDPOINT=http://127.0.0.1:8000 cargo test -p turul-a2a --features dynamodb --lib -- storage::dynamodb --test-threads=1  # DynamoDB Local; skipped unless A2A_DYNAMODB_TESTS=1
 
 # gRPC transport tests (feature-gated, ADR-014)
 cargo test -p turul-a2a --features grpc --lib grpc::                # grpc module unit tests (error + service)
@@ -52,6 +52,8 @@ cargo lambda watch -p lambda-agent         # Lambda agent via cargo-lambda
 ```
 
 **All crate dependencies MUST use `workspace = true`** — versions are managed in root `Cargo.toml` `[workspace.dependencies]`. This includes dev-dependencies. Never put a version number in a crate's own `Cargo.toml` — add the dependency to the workspace root first, then reference it with `{ workspace = true }` in the crate.
+
+**Parallel worktrees:** give each worktree its own `CARGO_TARGET_DIR`. Workspace crates hash identically across checkouts, so worktrees sharing a target dir overwrite each other's artifacts and link the wrong source.
 
 ## Git Conventions
 
@@ -152,7 +154,7 @@ The builder rejects inconsistent storage/builder configurations (ADR-013 §4.3);
 
 ### Multi-Instance Streaming
 
-- Cross-instance streaming subscription works via the shared event store: the `:subscribe` handler reads events from the durable store, polling at `STORE_POLL_INTERVAL` (`crates/turul-a2a/src/streaming/task_stream.rs`) when no same-instance broker wake-up arrives. That module is the one stream loop behind `SendStreamingMessage` and `SubscribeToTask` on all three transports (ADR-014 §2.3). Verified by `tests/distributed_tests.rs` and `tests/d3_streaming_tests.rs`.
+- Cross-instance streaming subscription works via the shared event store: the `:subscribe` handler reads events from the durable store, polling at `STORE_POLL_INTERVAL` (`crates/turul-a2a/src/streaming/task_stream.rs`) when no same-instance broker wake-up arrives. That module is the one stream loop behind `SendStreamingMessage` and `SubscribeToTask` on all three transports (ADR-014 §2.3). Verified by `tests/d3_streaming_tests.rs` (cross-instance delivery through the store poll) and `tests/stream_contract_tests.rs`. `tests/distributed_tests.rs` covers request/response across instances sharing storage, not streaming.
 - The in-process `TaskEventBroker` is a same-instance fanout optimization, not the source of truth — it short-circuits the poll loop when the subscriber happens to land on the instance that committed the event.
 - Lambda exception: the adapter does not run the persistent cross-instance cancel-marker poller, so cross-instance cancellation propagation to a live executor on a different warm Lambda invocation is not currently supported (see `crates/turul-a2a-aws-lambda/src/lib.rs` module docs). Streaming subscription itself works.
 - See ADR-008 for the durable event coordination contract.
@@ -233,7 +235,9 @@ Tests are written from the A2A proto/spec FIRST, then implementation follows. If
 - Stream: `POST /message:stream`
 - Get task: `GET /tasks/{id=*}`
 - Cancel: `POST /tasks/{id=*}:cancel`
-- Subscribe: `GET /tasks/{id=*}:subscribe`
+- Subscribe: `GET` or `POST /tasks/{id=*}:subscribe` (proto annotation says GET, spec text says POST)
+- Version: `A2A-Version` header or `?A2A-Version=` query; gRPC `a2a-version` metadata (required)
+- Request Content-Type: `application/json` or `application/a2a+json`
 - Extended card: `GET /extendedAgentCard`
 - Discovery: `GET /.well-known/agent-card.json`
 - JSON-RPC: `POST /jsonrpc` (all 11 methods, PascalCase)
@@ -253,7 +257,7 @@ Our vendored `proto/a2a.proto` is byte-identical to upstream `a2aproject/A2A:mai
 - Query params: camelCase (historyLength, pageSize, pageToken, contextId)
 - contextId/taskId mismatch rejection on continuation (spec §3.4.3)
 
-**Release scope.** turul-a2a is tested against the current upstream A2A v1.0 proto (`proto/a2a.proto`) and implements the core HTTP+JSON and JSON-RPC server surfaces covered by that vendored contract. Known open gaps against A2A v1.0.1: the push webhook body is a bare `Task` rather than a `StreamResponse`; `AgentCard.capabilities` flags are not enforced; `ListTasks.statusTimestampAfter` is ignored. Otherwise: ListTasks sorts by `updated_at DESC` across all four backends; pagination cursor encodes `updated_at|task_id` for stable iteration; the spec-compliance suite (`crates/turul-a2a/tests/spec_compliance.rs`) walks every core RPC on both transports.
+**Release scope.** turul-a2a is tested against the current upstream A2A v1.0 proto (`proto/a2a.proto`) and implements the core HTTP+JSON and JSON-RPC server surfaces covered by that vendored contract. As of 0.1.36 there are no known gaps against A2A v1.0.1 on the covered surfaces. ListTasks sorts by status timestamp DESC (task id tie-break) on all four backends, honours `statusTimestampAfter`, rejects `pageSize` outside 1..=100 and returns an empty `nextPageToken` on the final page; the cursor encodes `<status timestamp>|<task id>`. Persisted task state is the proto wire name (`TaskState::wire_name`). The spec-compliance suite (`tests/spec_compliance.rs`), the stream contract suite (`tests/stream_contract_tests.rs`) and the capability suite (`tests/capability_tests.rs`) run on HTTP+JSON, JSON-RPC and gRPC.
 
 **Out of scope for the framework release:**
 - gRPC transport on AWS Lambda (ADR-014 §2.6: Lambda lacks persistent HTTP/2). The feature itself is fully wired for self-hosted targets (ECS / Fargate / AppRunner / Kubernetes / bare VMs) — see [ADR-014](docs/adr/ADR-014-grpc-transport.md) and `examples/grpc-agent`.

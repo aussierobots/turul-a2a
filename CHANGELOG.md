@@ -4,69 +4,102 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.1.35] — 2026-10-22
+## [0.1.36] — 2026-10-22
 
-Streaming now follows the A2A v1.0.1 stream rules on all three transports (HTTP+SSE, JSON-RPC+SSE, gRPC), served from one shared stream implementation. See ADR-014.
+Brings the framework to **A2A v1.0.1** on all three transports (HTTP+JSON, JSON-RPC, gRPC) after a full audit of the code and its tests against the specification and the ADRs. Many of the changes alter what goes on the wire, so read **Compatibility** before upgrading. 0.1.33, 0.1.34 and 0.1.35 were never published; their changes are included here.
+
+### Compatibility (read first)
+
+- **Persistent stores must be re-created.** Task state is now stored as the proto wire name (`TASK_STATE_WORKING`, …) instead of a Rust Debug name. The SQLite/PostgreSQL `a2a_tasks` table gains a `status_timestamp` column, and DynamoDB allocates event sequences from a counter item. There is no migration and no dual reading: drop the `a2a_*` tables (or DynamoDB tables) and let the framework re-create them, or add `status_timestamp TEXT NOT NULL` (PostgreSQL: `TEXT COLLATE "C" NOT NULL`) yourself if you use `assume_schema_initialized`. Re-run in-flight tasks rather than migrating them.
+- **Agent cards must declare the capabilities they use** (spec §3.3.4: "false or not present" means unsupported). `AgentCardBuilder` leaves them unset, so call `.streaming(true)`, `.push_notifications(true)` and/or `.extended_agent_card(true)`. Otherwise SendStreamingMessage/SubscribeToTask and GetExtendedAgentCard return `UnsupportedOperationError`, and push-config operations, including an inline `taskPushNotificationConfig` on a send, return `PushNotificationNotSupportedError`.
+- **Error codes follow the v1.0.1 table** (§5.4): `TaskNotCancelable` and `ContentTypeNotSupported` are HTTP 400 (were 409/415); `InvalidAgentResponse` is HTTP 500 (was 502); `PushNotificationNotSupported` and `ExtendedAgentCardNotConfigured` are gRPC `FAILED_PRECONDITION` (were `UNIMPLEMENTED`). Several errors share HTTP 400, so match on `ErrorInfo.reason`, which `A2aClientError::reason()` exposes.
+- **JSON-RPC `error.data` is an array** of `@type`-tagged details: read `error.data[0].reason`.
+- **Streams open with the `Task`.** Both `SendStreamingMessage` and `SubscribeToTask` start with a `Task` snapshot, followed only by events newer than it. Subscribe no longer replays history. Streams close on a terminal state **or INPUT_REQUIRED**, and stay open across AUTH_REQUIRED. `Last-Event-ID` / `a2a-last-event-id` resume is removed and SSE events carry no `id:`; to reconnect, subscribe again and you get a fresh snapshot. `turul-a2a-client`'s `subscribe_to_task` / `subscribe_to_task_raw` (HTTP and gRPC) lose their `last_event_id` parameter.
+- **Push webhook body** is a `StreamResponse`: `{"task": <Task>}` with `Content-Type: application/a2a+json`. Receivers must read `body.task`. `X-Turul-Push-Token` and `Authorization` are unchanged.
+- **Required extensions:** a required extension the client did not activate returns `ExtensionSupportRequiredError` (-32008, HTTP 400, gRPC `FAILED_PRECONDITION`), not `UnsupportedOperationError`. This applies to every A2A operation on every transport; agent-card discovery is exempt.
+- **gRPC calls must send `a2a-version` metadata** (for example `grpcurl -H 'a2a-version: 1.0'`); `A2aGrpcClient` already does. Missing or unsupported values return `FAILED_PRECONDITION` / `VERSION_NOT_SUPPORTED`.
+- **ListTasks:**
+  - ordering is by status timestamp, most recent first, so artifact and history writes no longer move a task;
+  - page tokens from earlier releases are rejected;
+  - `pageSize` outside 1..=100 returns InvalidRequest instead of being clamped;
+  - a negative `historyLength` is rejected on every operation.
+- **Timestamps** are serialised RFC 3339 with `Z`, for example `2026-10-22T10:11:13.794556Z` (previously `+00:00`), and are now present on every status. Generated `google.protobuf.Timestamp` fields have the type `turul_a2a_proto::Timestamp`.
+- **Bearer/API-key:** a request with no credentials gets a bare `WWW-Authenticate` challenge with no `error` code (RFC 6750 §3.1).
+- **Source-level API changes:**
+  - `A2aStorageError::TerminalState` and `InvalidTransition` carry the task id;
+  - `A2aStorageError` gains `InvalidListRequest`;
+  - `QueuedExecutorJob` and `SpawnScope` are `#[non_exhaustive]`; build them with `QueuedExecutorJob::new` / `SpawnScope::from_queued_job`;
+  - `DeliveryOutcome::GaveUp` gains `retained_until`;
+  - `DeliveryErrorClass::{ConfigDeleted, TaskDeleted}` are removed (deletion is `AbandonedReason`);
+  - `turul_a2a::streaming::replay`, `turul_a2a::storage::terminal_cas`, `push::ssrf::decide`, `compat_v03::root_post_compat_mode` and `in_flight::poll_once_for_tests` are removed;
+  - `turul-a2a-patterns` `SkillCard` no longer implements `Serialize`/`Deserialize`, and `SkillCard::parse` is the only constructor;
+  - client `ListTasksParams` gained fields, so struct literals need `..Default::default()`.
+- **turul-a2a-client SSE** yields `Err(A2aClientError::Json)` for an event that is not JSON, where before it was silently skipped.
+
+### Added
+
+- `A2aServer::into_routers()` (feature `grpc`): HTTP and gRPC routers over one shared server state. `A2aServer::bind()` returns a `BoundA2aServer` whose `local_addr()` reports the bound address (port 0 supported).
+- `ExecutionContext` gains:
+  - `accepted_output_modes` (from `SendMessageConfiguration.acceptedOutputModes`);
+  - `request_metadata` (from `SendMessageRequest.metadata`);
+  - `activated_extensions` (the URIs the client activated that the agent advertises).
+
+  All three are set on the blocking, streaming and durable-queue paths.
+- **Push delivery:**
+  - `push_read_timeout`, `push_config_cache_ttl` (opt-in; default off) and `push_failed_delivery_retention` (default 7 days) now take effect;
+  - `outbound_url_validator` setters on `A2aServerBuilder` and `LambdaA2aServerBuilder` install a webhook URL allowlist;
+  - an inline push config is honoured on SendStreamingMessage.
+- **Wire:**
+  - `application/a2a+json` request bodies are accepted;
+  - the version can be given as a `?A2A-Version=` query parameter;
+  - `POST /tasks/{id}:subscribe` is accepted alongside GET;
+  - HTTP error bodies carry the AIP-193 `status` field;
+  - ListTasks honours `statusTimestampAfter`;
+  - gRPC ListTasks honours `includeArtifacts`.
+- `TaskState::wire_name()` / `from_wire_name()` and `state_machine::TERMINAL_STATES` as the single owner of state names; `turul_a2a::profiles::{SKILL_ID_METADATA_KEY, SKILL_PARAMS_METADATA_KEY}`; client `ListTasksParams` gains `history_length`, `include_artifacts` and `status_timestamp_after`.
 
 ### Fixed
 
-- `SendStreamingMessage` now opens with the `Task` object, as A2A §3.1.2 requires. Previously the first item was a `SUBMITTED` status update. The snapshot is taken once the task is WORKING, so a new stream never shows `SUBMITTED`. `configuration.historyLength` is applied to the snapshot.
-- `SendStreamingMessage` now honours `message.taskId`. Previously it always created a new task. Multi-turn conversations now work over streaming: an unknown `taskId` returns `TaskNotFoundError`, a task in a terminal state returns `UnsupportedOperationError`, a `contextId` that does not match the task is rejected, and a missing `contextId` is taken from the task.
-- `SubscribeToTask` no longer replays the task's whole event history after the snapshot. Only events newer than the snapshot follow it.
-- A follow-up message to a task whose previous turn's executor is still running (for example, one parked on AUTH_REQUIRED) is now refused with `UnsupportedOperationError` before anything is written. Previously it marked the task WORKING, then failed with an internal error, leaving the task stuck in WORKING.
-- Blocking `SendMessage` to a task in a terminal state now returns `UnsupportedOperationError` (HTTP 400 / JSON-RPC -32004 / gRPC `FAILED_PRECONDITION`, with ErrorInfo), as the spec lists. Previously it returned a generic invalid-params error (-32602) with no ErrorInfo.
+- `SendStreamingMessage` honours `message.taskId`, so multi-turn conversations work over streaming:
+  - an unknown task → `TaskNotFoundError`;
+  - a terminal task → `UnsupportedOperationError`;
+  - a mismatched `contextId` is rejected, and a missing one is taken from the task.
+
+  Blocking send to a terminal task also returns `UnsupportedOperationError`, where it used to return -32602.
+- A follow-up message while the previous turn's executor is still running is refused before anything is written. Previously the task was left stuck in WORKING.
+- An executor that calls `require_input` / `require_auth` and then returns `Ok` leaves the task interrupted; it used to be forced to FAILED.
+- `AgentExecutor::extended_agent_card` and the executor on gRPC sends now receive the caller's claims.
+- A storage error mid-stream ends HTTP+SSE and JSON-RPC streams with an error frame instead of closing them silently.
+- SQLite/PostgreSQL no longer return a non-empty `nextPageToken` on the final page when the count is an exact multiple of the page size (tasks and push configs).
+- **DynamoDB:**
+  - pending-dispatch markers are written, so the terminal-push recovery path works (the existence check used the wrong key);
+  - concurrent event writers get distinct sequences;
+  - ListTasks pages through the whole table.
+- PostgreSQL: concurrent event writes to one task no longer collide on the primary key.
+- Push:
+  - a delivery stops once its config or task is deleted;
+  - a TLS handshake failure gives up immediately;
+  - a non-https URL in production is recorded as `Abandoned(NonHttpsUrlInProduction)`;
+  - the allowlist and scheme checks run before DNS resolution.
+- The hard blocking-send deadline aborts an executor that ignored cancellation even when another writer committed the terminal first.
+- turul-a2a-client:
+  - SSE parsing follows the W3C format (CRLF/CR line endings, multi-line `data:`, UTF-8 split across chunks);
+  - ids are percent-encoded in paths;
+  - `discover` / `fetch_agent_card` send `A2A-Version`.
+- Examples: `streaming-agent` starts its artifact with `append=false`; `remote-delegate-agent` forwards the caller's activated extensions; smoke tests run the built binary on an OS-assigned port.
+- `turul-a2a-patterns` ships its LICENSE files.
+- Runtime strings and published `Cargo.toml` comments no longer cite internal ADR numbers.
 
 ### Changed
 
-- Streams close after a terminal state **or INPUT_REQUIRED**. To continue, send a new message with the same `taskId`; it opens a fresh stream for the next turn. Streams stay open across AUTH_REQUIRED, so work resumed by an out-of-band credential arrives on the same stream.
-- `Last-Event-ID: {taskId}:0` (and gRPC `a2a-last-event-id`) now means "resume from the start": the full stored history is replayed, without a snapshot. Previously `:0` was treated as a fresh attach. Omit the header for a fresh attach. A resumed stream that is already caught up on a task that is INPUT_REQUIRED or terminal now closes at once instead of idling.
-- The SSE `id:` of the `Task` snapshot is now `{taskId}:{sequence}`, where `sequence` is the latest event the snapshot reflects (previously `{taskId}:0`). Reconnecting with that `Last-Event-ID` resumes after the snapshot without replaying earlier events.
-
-### Compatibility
-
-- Clients that expected a `statusUpdate` as the first stream item, or that rebuilt task state by replaying the history `SubscribeToTask` used to send after the snapshot, must read the initial state from the `Task` snapshot instead. `turul-a2a-client` already exposes it as `StreamEvent::Task`.
-- Clients that keep a stream open waiting past INPUT_REQUIRED will now see it close.
-- A rare overlap is possible on `SubscribeToTask`: an event committed while the snapshot is being taken can appear both inside the snapshot and as the next update. No event is ever lost.
+- Dependencies: `turul-rpc` 0.2, `turul-jwt-validator` 0.3, `jsonwebtoken` 11, `sha2` 0.11, `base64` 0.23, `jsonschema` 0.59; every manifest uses `workspace = true`; unused `tower-http`, `rsa`, `futures` and `prost-types` dropped; `sha2` only with a persistent backend. JSON-RPC requests with `"id": null` are now accepted (JSON-RPC 2.0 §4.2).
+- The workspace `[profile.release]` sets `lto = "fat"` and `codegen-units = 1` for the example and Lambda binaries.
+- The vendored `a2a.proto` is re-synced with upstream (comment-only changes).
+- `compat-v03` is documented as supporting Strands Agents clients, which pin a2a-sdk 0.3.x.
 
 ### Verification
 
-New cross-transport stream-contract tests (HTTP, JSON-RPC, gRPC), the SSE, JSON-RPC, gRPC, cross-instance and broker-independence streaming suites, workspace tests, and SQLite storage parity tests passed.
-
-## [0.1.34] — 2026-10-22
-
-Aligns the error model with A2A v1.0.1 (§5.4 error-mapping table). See ADR-004 and ADR-014.
-
-### Changed
-
-- HTTP status for three A2A errors: `TaskNotCancelableError` 409 → **400**, `ContentTypeNotSupportedError` 415 → **400**, `InvalidAgentResponseError` 502 → **500**. The `turul_a2a_types::wire::errors::HTTP_*` constants change accordingly.
-- gRPC status for two A2A errors: `PushNotificationNotSupportedError` and `ExtendedAgentCardNotConfiguredError` `UNIMPLEMENTED` → **`FAILED_PRECONDITION`**.
-- Vendored `a2a.proto` re-synced with upstream. The changes are comment-only, so generated types are unchanged. The `tenant` field docs now define it as an opaque routing value that must match the selected `AgentInterface.tenant`. `AgentInterface.url` now documents a gRPC address as `hostname:port` rather than an HTTPS URL, which matters if you advertise a gRPC interface.
-
-### Fixed
-
-- JSON-RPC error responses now carry `error.data` as an **array** of `@type`-tagged detail objects (`[{"@type": "type.googleapis.com/google.rpc.ErrorInfo", ...}]`), as the spec requires. It was previously a bare ErrorInfo object.
-
-### Compatibility
-
-- Clients that branch on HTTP 409/415/502 or gRPC `UNIMPLEMENTED` to recognise these errors must match on `ErrorInfo.reason` instead. Seven of the nine A2A errors now share HTTP 400, and most share gRPC `FAILED_PRECONDITION`. `turul-a2a-client` already exposes `A2aClientError::reason()`.
-- JSON-RPC clients that read `error.data.reason` must read `error.data[0].reason` (or find the entry whose `@type` is ErrorInfo).
-
-### Verification
-
-Workspace tests with and without the `grpc` feature, the HTTP/JSON-RPC/gRPC spec-compliance and parity suites, and SQLite storage parity tests passed.
-
-## [0.1.33] — 2026-10-22
-
-### Changed
-
-- Dependency updates (semver-incompatible lines, no API change in these crates): `turul-rpc 0.1 → 0.2`, `turul-jwt-validator 0.2 → 0.3`, `jsonwebtoken 10 → 11`, `sha2 0.10 → 0.11`, `base64 0.22 → 0.23`, `jsonschema 0.46 → 0.59`. `turul-rpc 0.2` accepts `"id": null` JSON-RPC requests per JSON-RPC 2.0 §4.2 (previously rejected as Invalid Request). `turul-jwt-validator 0.3` adds opt-in stale-while-revalidate and bounded retry for JWKS fetches; defaults are unchanged.
-- `turul-a2a` no longer carries `sha2` or `secrecy` in a default (in-memory) build: `sha2` is now pulled in only by the `sqlite` / `postgres` / `dynamodb` features that use it, and `secrecy` was only used by tests.
-- Every crate manifest now declares dependencies via `workspace = true`; the workspace root is the single owner of all versions (previously `serde_dynamo`, `prost-build` and `pbjson-build` carried their own). Unused `tower-http`, `rsa`, `futures` and `prost-types` entries removed.
-- Workspace `[profile.release]` now sets `lto = "fat"` and `codegen-units = 1`. This applies to binaries built from this workspace (examples, Lambda bootstraps); library adopters are governed by their own profile.
-
-### Verification
-
-Workspace tests (944), SQLite parity tests, gRPC end-to-end + spec-compliance, clippy deny-warnings across default / sqlite / postgres / dynamodb / all / grpc feature sets, `cargo doc`, and `cargo package` for all seven publish crates passed.
+Workspace tests (1,182) passed with default features and with gRPC + SQS. Storage parity passed on in-memory, SQLite (88), PostgreSQL (87) and DynamoDB Local (108). New cross-transport stream-contract and capability suites cover HTTP, JSON-RPC and gRPC. Clippy `-D warnings` is clean on eight feature sets on nightly and stable. `cargo doc` and `cargo package` of all seven publish crates are clean.
 
 ## [0.1.32] — 2026-06-10
 
