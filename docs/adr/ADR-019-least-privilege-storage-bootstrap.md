@@ -5,7 +5,7 @@
 
 ## Context
 
-`PostgresA2aStorage::new()` and `SqliteA2aStorage::new()` unconditionally call `create_tables()` on every process start (`crates/turul-a2a/src/storage/postgres.rs:43-56`, `crates/turul-a2a/src/storage/sqlite.rs:42-56`). `create_tables()` runs `CREATE TABLE IF NOT EXISTS` × 5 plus `ALTER TABLE … ADD COLUMN IF NOT EXISTS` × 3 (Postgres) on every boot.
+`PostgresA2aStorage::new()` and `SqliteA2aStorage::new()` unconditionally call `create_tables()` on every process start (`crates/turul-a2a/src/storage/postgres.rs:43-56`, `crates/turul-a2a/src/storage/sqlite.rs:42-56`). `create_tables()` runs `CREATE TABLE IF NOT EXISTS` (and `CREATE INDEX IF NOT EXISTS`) on every boot. *(As of 2026-10-22 it is CREATE-only; it used to add columns with `ALTER TABLE … ADD COLUMN`, which consequence 2 below describes.)*
 
 Two consequences:
 
@@ -23,7 +23,7 @@ Add an opt-in field `assume_schema_initialized: bool` (default `false`) to `Post
 When `assume_schema_initialized: true`:
 
 - **Operator owns provisioning.** Tables must exist with the schema shipped by the matching `turul-a2a` release **before** the process starts. The canonical schema is `create_tables()` in the respective backend module. (A separate, checked-in migration directory is a follow-up — see "Follow-ups" below.)
-- **Operator owns forward migrations.** The runtime no longer silently `ALTER TABLE`s on upgrade. Adopters running with this flag MUST review the CHANGELOG of every release that bumps `turul-a2a-types` or storage internals, and apply any schema deltas manually with a higher-privilege role before rolling the new binary.
+- **Operator owns schema changes.** The runtime never alters an existing schema (since 2026-10-22 it does not do so even without the flag: `create_tables()` only creates missing tables). When a release changes the schema its CHANGELOG says so, and stores written by earlier releases are re-created rather than migrated.
 - **Runtime role can be narrowed.** Postgres: `INSERT, UPDATE, DELETE, SELECT` on the six `a2a_*` tables; no `CREATE`, `ALTER`, or `DROP` on the schema. SQLite: filesystem read+write on the database file; the file can be owned by a different user that performs the bootstrap.
 
 SQLite is included for symmetry, not for the privilege case (SQLite's authorization model is filesystem-based, not role-based). The flag is useful there for read-replica-style setups and to keep config shapes uniform across backends.
@@ -51,12 +51,17 @@ PostgresConfig {
 - **Extract DDL into a shipped SQL file and run it from a separate binary.** Correct end-state, but a larger surface (file ownership, hashing/versioning, optional migration framework dep). Deferred — see follow-ups.
 - **Detect the privilege at runtime and skip DDL transparently.** Implicit behavior. Adopters who *want* the framework to provision and silently get the least-privilege path because credentials happened to be narrow would see "first boot succeeded, first INSERT failed" with no signal. Explicit opt-in is honest.
 
-## Follow-ups (not in this slice)
+## Scope notes
 
-- **Ship canonical migration files** under `crates/turul-a2a/migrations/{postgres,sqlite}/` so operators have an authoritative source for the schema without reading Rust source. Open question: do we adopt a migration framework (sqlx-migrate, refinery) or hand-rolled numbered SQL files? Decision deferred until at least one adopter requests it.
-- **Reconsider the `let _ = …` swallow of `ALTER TABLE` errors** in `create_tables()`. With the new flag this is mostly moot for the least-privilege case (those callers don't enter `create_tables()`), but for adopters who stay on default behavior with narrowed creds, silent migration is still a footgun. Out of scope for ADR-019.
+- **No migration files ship.** The canonical schema is `create_tables()` in each SQL backend; there is no migration framework and no numbered SQL files. Stores written by an earlier release with a different schema are re-created, not migrated.
+- **The swallowed `ALTER TABLE` errors are gone.** `create_tables()` no longer issues `ALTER TABLE`, so there is no silent migration path to fail.
 
 ## Verification
 
 - Unit tests in `storage::postgres::tests` and `storage::sqlite::tests`: construct each backend with `assume_schema_initialized: true` against a database with the `a2a_*` tables absent, assert `create_task` fails with a relation-not-exist error (proves DDL was skipped). With the flag unset, all existing parity tests continue to pass unchanged.
 - No new transport tests (no wire surface change).
+
+## Revision log
+
+- 2026-05-18 — Initial acceptance.
+- 2026-10-22 — `create_tables()` is CREATE-only: the additive `ALTER TABLE` steps were deleted when releases stopped reading stores written by earlier releases (see ADR-003). The silent-migration concern is resolved; migration files are not shipped.
