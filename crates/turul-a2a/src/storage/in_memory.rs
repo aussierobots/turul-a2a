@@ -938,19 +938,27 @@ impl A2aEventStore for InMemoryA2aStorage {
         let task_ttl_seconds = self.retention.task_ttl_seconds;
         let event_ttl_seconds = self.retention.event_ttl_seconds;
         let batch = self.retention.batch();
+        let now = std::time::SystemTime::now();
 
-        // Zero TTLs disable expiry for that row class; nothing to do
-        // when both are off.
+        // Failed push deliveries past their retention, independent of
+        // the task and event TTLs.
+        let mut removed: u64 = {
+            let mut claims = self.push_delivery_claims.write().await;
+            let before = claims.len();
+            claims.retain(|_, row| !(row.status == ClaimStatus::GaveUp && row.expires_at <= now));
+            (before - claims.len()) as u64
+        };
+
+        // Zero TTLs disable expiry for that row class; nothing more to
+        // do when both are off.
         if task_ttl_seconds == 0 && event_ttl_seconds == 0 {
-            return Ok(0);
+            return Ok(removed);
         }
 
-        let now = std::time::SystemTime::now();
         let now_secs = now
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mut removed: u64 = 0;
 
         // Tasks: age-based on `updated_at`, state-independent. A task
         // older than the window is reaped even if still live. Removed in
@@ -1565,8 +1573,12 @@ impl A2aPushDeliveryStore for InMemoryA2aStorage {
                 reason,
                 last_error_class,
                 last_http_status,
+                retained_until,
             } => {
                 row.status = ClaimStatus::GaveUp;
+                // A terminal row is never re-claimed, so its expiry now
+                // marks the end of the failed-delivery retention.
+                row.expires_at = retained_until;
                 row.gave_up_at = Some(now);
                 row.gave_up_reason = Some(reason);
                 row.last_error_class = Some(last_error_class);
@@ -2105,6 +2117,12 @@ mod tests {
     async fn test_push_claim_terminal_gaveup_blocks_reclaim() {
         let s = storage();
         parity_tests::test_push_claim_terminal_gaveup_blocks_reclaim(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_reaps_failed_deliveries_past_retention() {
+        let s = storage();
+        parity_tests::test_cleanup_reaps_failed_deliveries_past_retention(&s, &s).await;
     }
 
     #[tokio::test]

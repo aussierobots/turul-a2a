@@ -50,9 +50,14 @@ pub trait A2aEventStore: Send + Sync {
     /// terminal task and a long-running live task past the window are
     /// reaped alike.
     ///
-    /// Returns the total count of deleted rows (events + tasks combined).
-    /// Idempotent: safe to call repeatedly. When a backend has no TTL
-    /// configured (`0`), the corresponding row class is never deleted.
+    /// Failed push-delivery records past their retention (see
+    /// [`crate::push::DeliveryOutcome::GaveUp`]) are deleted too,
+    /// whatever the task and event TTLs.
+    ///
+    /// Returns the total count of deleted rows (events, tasks and
+    /// failed-delivery records combined). Idempotent: safe to call
+    /// repeatedly. When a backend has no TTL configured (`0`), the
+    /// corresponding row class is never deleted.
     ///
     /// DynamoDB returns `Ok(0)`: it reaps expired items via native TTL
     /// attributes, so application-level cleanup is bypassed there.

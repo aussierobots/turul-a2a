@@ -227,11 +227,13 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     ///   **not** changed (it was advanced by the preceding
     ///   `record_attempt_started`). The caller schedules the retry
     ///   at `next_attempt_at`; the store does not dispatch retries.
-    /// - `GaveUp { reason, last_error_class, last_http_status }` →
-    ///   status transitions to `GaveUp`; the failure record is
-    ///   retained until the backend expires it (DynamoDB item TTL)
-    ///   or the operator removes it; the framework never prunes it.
-    ///   `list_failed_deliveries` surfaces it.
+    /// - `GaveUp { reason, last_error_class, last_http_status,
+    ///   retained_until }` → status transitions to `GaveUp`;
+    ///   `list_failed_deliveries` surfaces it. The record is kept
+    ///   until `retained_until`: after that
+    ///   [`crate::storage::A2aEventStore::cleanup_expired`] deletes it
+    ///   (SQL and in-memory backends), and DynamoDB sets the item's
+    ///   `ttl` attribute to it so the engine expires it.
     /// - `Abandoned { reason }` → status transitions to `Abandoned`;
     ///   the row is retained for audit. `list_failed_deliveries`
     ///   does NOT surface `Abandoned` rows — nothing failed on the
@@ -509,6 +511,10 @@ pub enum DeliveryOutcome {
         reason: GaveUpReason,
         last_error_class: DeliveryErrorClass,
         last_http_status: Option<u16>,
+        /// When the failed-delivery record may be removed: the
+        /// time of giving up plus the deployment's failed-delivery
+        /// retention.
+        retained_until: SystemTime,
     },
 
     /// Terminal but not failed — delivery abandoned without a final

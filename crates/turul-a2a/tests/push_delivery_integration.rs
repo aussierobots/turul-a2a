@@ -2078,6 +2078,69 @@ async fn expired_claim_is_resumed_by_another_instance_within_the_budget() {
 }
 
 // ---------------------------------------------------------------------------
+// Failed-delivery retention. A delivery that gives up stays listed until
+// its retention ends; the storage cleanup entry point then removes it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn failed_delivery_is_removed_by_cleanup_once_retention_ends() {
+    use turul_a2a::storage::A2aEventStore;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(InMemoryA2aStorage::new());
+    let kept = PushDeliveryWorker::new(
+        store.clone(),
+        test_config(3, |c| {
+            c.failed_delivery_retention = Duration::from_secs(3600)
+        }),
+        None,
+        "instance-kept".into(),
+    )
+    .expect("worker");
+    let expiring = PushDeliveryWorker::new(
+        store.clone(),
+        test_config(3, |c| c.failed_delivery_retention = Duration::ZERO),
+        None,
+        "instance-expiring".into(),
+    )
+    .expect("worker");
+    let kept_target = sentinel_target(&server.uri());
+    let expiring_target = sentinel_target(&server.uri());
+
+    for (worker, target) in [(&kept, &kept_target), (&expiring, &expiring_target)] {
+        assert_eq!(
+            worker.deliver(target, b"{}").await,
+            DeliveryReport::GaveUp(GaveUpReason::NonRetryableHttpStatus)
+        );
+    }
+    let listed = |failed: Vec<FailedDelivery>| {
+        let mut ids: Vec<String> = failed.into_iter().map(|f| f.task_id).collect();
+        ids.sort();
+        ids
+    };
+    let failed = store
+        .list_failed_deliveries(&kept_target.tenant, SystemTime::UNIX_EPOCH, 10)
+        .await
+        .unwrap();
+    let mut both = vec![kept_target.task_id.clone(), expiring_target.task_id.clone()];
+    both.sort();
+    assert_eq!(listed(failed), both, "both are listed until cleanup runs");
+
+    assert_eq!(store.cleanup_expired().await.unwrap(), 1);
+    let failed = store
+        .list_failed_deliveries(&kept_target.tenant, SystemTime::UNIX_EPOCH, 10)
+        .await
+        .unwrap();
+    assert_eq!(listed(failed), vec![kept_target.task_id.clone()]);
+}
+
+// ---------------------------------------------------------------------------
 // Read timeout. A receiver that accepts the request and then stays silent
 // fails the attempt after `read_timeout`, well inside `request_timeout`.
 // ---------------------------------------------------------------------------

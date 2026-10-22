@@ -224,7 +224,8 @@ impl LambdaScheduledRecoveryHandler {
 /// EventBridge Scheduler cron invokes the function, the adopter routes
 /// the event here, and this calls `cleanup_expired` on the event store
 /// to reap expired events and tasks (age-based, state-independent — see
-/// [`A2aEventStore::cleanup_expired`]).
+/// [`A2aEventStore::cleanup_expired`]) and failed push-delivery records
+/// past their retention.
 ///
 /// `cleanup_expired` is defined on [`A2aEventStore`], so the store is
 /// taken as `Arc<dyn A2aEventStore>` (not the atomic store). The TTL

@@ -142,7 +142,7 @@ impl Default for RuntimeConfig {
             push_read_timeout: push.read_timeout,
             push_claim_expiry: push.claim_expiry,
             push_config_cache_ttl: push.config_cache_ttl,
-            push_failed_delivery_retention: Duration::from_secs(7 * 24 * 60 * 60),
+            push_failed_delivery_retention: push.failed_delivery_retention,
             push_max_payload_bytes: push.max_payload_bytes,
             allow_insecure_push_urls: push.allow_insecure_urls,
             push_reclaim_sweep_interval: Duration::from_secs(60),
@@ -301,12 +301,13 @@ impl A2aServerBuilder {
         self
     }
 
-    /// Retention for failed push delivery records (operator inspection).
-    ///
-    /// Accepted but currently has no effect: the framework never prunes
-    /// claim rows. DynamoDB expires them through its own
-    /// `push_delivery_ttl_seconds` item TTL; the SQL and in-memory
-    /// backends keep them until the operator removes them.
+    /// How long a failed push delivery stays listed by
+    /// `list_failed_deliveries` after it gives up. Past that, the
+    /// storage cleanup entry point (`cleanup_expired`, run by
+    /// [`Self::maintenance`] or a scheduled handler) removes it from
+    /// the SQL and in-memory backends; on DynamoDB the record's `ttl`
+    /// attribute is set to the end of the retention and the engine
+    /// expires it. Default 7 days.
     pub fn push_failed_delivery_retention(mut self, d: Duration) -> Self {
         self.runtime_config.push_failed_delivery_retention = d;
         self
@@ -358,7 +359,9 @@ impl A2aServerBuilder {
     /// Enable the opt-in retention-maintenance loop.
     ///
     /// `A2aServer::run` spawns a background task that calls
-    /// `cleanup_expired` on the storage backend every `interval`.
+    /// `cleanup_expired` on the storage backend every `interval`. Each
+    /// call also removes failed push-delivery records past
+    /// [`Self::push_failed_delivery_retention`].
     /// Disabled by default — without this call the server never deletes
     /// on a timer.
     ///

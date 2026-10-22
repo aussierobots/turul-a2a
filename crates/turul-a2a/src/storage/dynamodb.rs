@@ -49,9 +49,11 @@ pub struct DynamoDbConfig {
     /// Written as a native `ttl` attribute (epoch seconds) per item; the
     /// engine reaps expired rows.
     pub event_ttl_seconds: u64,
-    /// TTL for push-delivery claim items in seconds. 0 = no expiry.
-    /// Default: 7 days (604800); GaveUp rows are retained for operator
-    /// inspection within this window.
+    /// TTL for push-delivery claim and pending-dispatch items in
+    /// seconds, from when the item is written. 0 = no expiry. Default:
+    /// 7 days (604800). A delivery that gives up has its `ttl` replaced
+    /// by the end of the server's failed-delivery retention
+    /// (`push_failed_delivery_retention`).
     pub push_delivery_ttl_seconds: u64,
 }
 
@@ -2924,18 +2926,30 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
                 reason,
                 last_error_class,
                 last_http_status,
+                retained_until,
             } => {
                 if matches!(cur_status, Some(ClaimStatus::GaveUp)) {
                     return Ok(());
                 }
+                // The engine expires the failed-delivery record at the
+                // end of its retention, replacing the claim-time `ttl`.
+                let retained_until_epoch = retained_until
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
                 let mut b = builder
                     .update_expression(
                         "SET #status = :st, gaveUpAtMicros = :now, \
-                         gaveUpReason = :gr, lastErrorClass = :ec, \
+                         gaveUpReason = :gr, lastErrorClass = :ec, #ttl = :ttl, \
                          firstAttemptedAtMicros = if_not_exists(firstAttemptedAtMicros, :claimedGuard), \
                          lastAttemptedAtMicros = if_not_exists(lastAttemptedAtMicros, :now)",
                     )
                     .expression_attribute_names("#status", "status")
+                    .expression_attribute_names("#ttl", "ttl")
+                    .expression_attribute_values(
+                        ":ttl",
+                        AttributeValue::N(retained_until_epoch.to_string()),
+                    )
                     .expression_attribute_values(":st", AttributeValue::S("GaveUp".into()))
                     .expression_attribute_values(":now", AttributeValue::N(now_micros.to_string()))
                     .expression_attribute_values(
@@ -2954,7 +2968,7 @@ impl A2aPushDeliveryStore for DynamoDbA2aStorage {
                     b = b
                         .update_expression(
                             "SET #status = :st, gaveUpAtMicros = :now, \
-                             gaveUpReason = :gr, lastErrorClass = :ec, lastHttpStatus = :hs, \
+                             gaveUpReason = :gr, lastErrorClass = :ec, lastHttpStatus = :hs, #ttl = :ttl, \
                              firstAttemptedAtMicros = if_not_exists(firstAttemptedAtMicros, :claimedGuard), \
                              lastAttemptedAtMicros = if_not_exists(lastAttemptedAtMicros, :now)",
                         )
@@ -4430,6 +4444,69 @@ mod tests {
             (before + event_ttl..=after + event_ttl).contains(&ttl),
             "event ttl {ttl} not within now + event_ttl_seconds"
         );
+    }
+
+    /// A delivery that gives up carries a `ttl` at the end of its
+    /// failed-delivery retention, replacing the claim-time `ttl`, so the
+    /// engine expires the failed-delivery record then.
+    #[tokio::test]
+    async fn test_gave_up_delivery_ttl_is_retention_end() {
+        skip_unless_dynamodb_env!(s);
+        let tenant = s.scoped_tenant("default");
+        let claim = s
+            .inner
+            .claim_delivery(
+                &tenant,
+                "ddb-ret-1",
+                1,
+                "cfg-ret",
+                "A",
+                "owner",
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let retention_end = DynamoDbA2aStorage::now_epoch() + 90_000;
+        s.inner
+            .record_delivery_outcome(
+                &tenant,
+                "ddb-ret-1",
+                1,
+                "cfg-ret",
+                "A",
+                claim.generation,
+                DeliveryOutcome::GaveUp {
+                    reason: GaveUpReason::MaxAttemptsExhausted,
+                    last_error_class: DeliveryErrorClass::Timeout,
+                    last_http_status: None,
+                    retained_until: std::time::UNIX_EPOCH
+                        + std::time::Duration::from_secs(retention_end),
+                },
+            )
+            .await
+            .unwrap();
+
+        let item = s
+            .inner
+            .client
+            .get_item()
+            .consistent_read(true)
+            .table_name(&s.inner.config.push_deliveries_table)
+            .key(
+                "pk",
+                AttributeValue::S(DynamoDbA2aStorage::push_delivery_pk(
+                    &tenant,
+                    "ddb-ret-1",
+                    1,
+                )),
+            )
+            .key("sk", AttributeValue::S("cfg-ret".into()))
+            .send()
+            .await
+            .unwrap()
+            .item
+            .expect("claim item");
+        assert_eq!(epoch_attr(&item, "ttl"), retention_end);
     }
 
     /// The persisted `statusState` attribute is the proto wire name owned

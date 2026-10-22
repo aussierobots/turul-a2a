@@ -87,6 +87,9 @@ pub struct PushDeliveryConfig {
     /// check is trusted without re-reading storage. `ZERO` re-reads
     /// before every attempt.
     pub config_cache_ttl: Duration,
+    /// How long a failed-delivery record is kept after the delivery
+    /// gives up; see [`DeliveryOutcome::GaveUp`].
+    pub failed_delivery_retention: Duration,
 }
 
 impl Default for PushDeliveryConfig {
@@ -103,6 +106,7 @@ impl Default for PushDeliveryConfig {
             max_payload_bytes: 1024 * 1024,
             allow_insecure_urls: false,
             config_cache_ttl: Duration::from_secs(5),
+            failed_delivery_retention: Duration::from_secs(7 * 24 * 60 * 60),
         }
     }
 }
@@ -123,6 +127,7 @@ impl PushDeliveryConfig {
             max_payload_bytes: runtime.push_max_payload_bytes,
             allow_insecure_urls: runtime.allow_insecure_push_urls,
             config_cache_ttl: runtime.push_config_cache_ttl,
+            failed_delivery_retention: runtime.push_failed_delivery_retention,
         }
     }
 }
@@ -351,11 +356,11 @@ impl PushDeliveryWorker {
                 .persist_terminal(
                     target,
                     &claim,
-                    DeliveryOutcome::GaveUp {
-                        reason: GaveUpReason::PayloadTooLarge,
-                        last_error_class: DeliveryErrorClass::PayloadTooLarge,
-                        last_http_status: None,
-                    },
+                    self.gave_up(
+                        GaveUpReason::PayloadTooLarge,
+                        DeliveryErrorClass::PayloadTooLarge,
+                        None,
+                    ),
                 )
                 .await;
         }
@@ -377,11 +382,11 @@ impl PushDeliveryWorker {
                     .persist_terminal(
                         target,
                         &claim,
-                        DeliveryOutcome::GaveUp {
-                            reason: GaveUpReason::MaxAttemptsExhausted,
-                            last_error_class: DeliveryErrorClass::Timeout,
-                            last_http_status: None,
-                        },
+                        self.gave_up(
+                            GaveUpReason::MaxAttemptsExhausted,
+                            DeliveryErrorClass::Timeout,
+                            None,
+                        ),
                     )
                     .await;
             }
@@ -441,11 +446,11 @@ impl PushDeliveryWorker {
                         .persist_terminal(
                             target,
                             &claim,
-                            DeliveryOutcome::GaveUp {
-                                reason: GaveUpReason::SsrfBlocked,
-                                last_error_class: DeliveryErrorClass::SSRFBlocked,
-                                last_http_status: None,
-                            },
+                            self.gave_up(
+                                GaveUpReason::SsrfBlocked,
+                                DeliveryErrorClass::SSRFBlocked,
+                                None,
+                            ),
                         )
                         .await;
                 }
@@ -502,21 +507,21 @@ impl PushDeliveryWorker {
                     // `NonRetryableHttpStatus` (not `MaxAttemptsExhausted`)
                     // because the retry budget was never consumed — the
                     // receiver rejected the payload outright.
-                    DeliveryOutcome::GaveUp {
-                        reason: GaveUpReason::NonRetryableHttpStatus,
-                        last_error_class: DeliveryErrorClass::HttpError4xx {
+                    self.gave_up(
+                        GaveUpReason::NonRetryableHttpStatus,
+                        DeliveryErrorClass::HttpError4xx {
                             status: status.as_u16(),
                         },
-                        last_http_status: Some(status.as_u16()),
-                    }
+                        Some(status.as_u16()),
+                    )
                 }
                 // A TLS handshake failure is a receiver misconfiguration
                 // that retrying within the horizon does not fix.
-                Err(DeliveryErrorClass::TlsRejected) => DeliveryOutcome::GaveUp {
-                    reason: GaveUpReason::TlsRejected,
-                    last_error_class: DeliveryErrorClass::TlsRejected,
-                    last_http_status: None,
-                },
+                Err(DeliveryErrorClass::TlsRejected) => self.gave_up(
+                    GaveUpReason::TlsRejected,
+                    DeliveryErrorClass::TlsRejected,
+                    None,
+                ),
                 Err(err_class) => DeliveryOutcome::Retry {
                     next_attempt_at: SystemTime::now() + self.backoff_for(new_count),
                     http_status: None,
@@ -572,11 +577,11 @@ impl PushDeliveryWorker {
                             .persist_terminal(
                                 target,
                                 &claim,
-                                DeliveryOutcome::GaveUp {
-                                    reason: GaveUpReason::MaxAttemptsExhausted,
-                                    last_error_class: error_class,
-                                    last_http_status: http_status,
-                                },
+                                self.gave_up(
+                                    GaveUpReason::MaxAttemptsExhausted,
+                                    error_class,
+                                    http_status,
+                                ),
                             )
                             .await;
                     }
@@ -584,6 +589,22 @@ impl PushDeliveryWorker {
                     continue;
                 }
             }
+        }
+    }
+
+    /// A final failure, retained for `failed_delivery_retention` from
+    /// now.
+    fn gave_up(
+        &self,
+        reason: GaveUpReason,
+        last_error_class: DeliveryErrorClass,
+        last_http_status: Option<u16>,
+    ) -> DeliveryOutcome {
+        DeliveryOutcome::GaveUp {
+            reason,
+            last_error_class,
+            last_http_status,
+            retained_until: SystemTime::now() + self.config.failed_delivery_retention,
         }
     }
 
@@ -935,6 +956,35 @@ mod tests {
             failed[0].last_error_class,
             DeliveryErrorClass::PayloadTooLarge
         ));
+    }
+
+    /// Every push setting of the builders' runtime config reaches the
+    /// worker's delivery config.
+    #[test]
+    fn runtime_config_maps_onto_delivery_config() {
+        let mut runtime = crate::server::RuntimeConfig::default();
+        runtime.push_max_attempts = 3;
+        runtime.push_read_timeout = Duration::from_millis(250);
+        runtime.push_config_cache_ttl = Duration::from_secs(9);
+        runtime.push_failed_delivery_retention = Duration::from_secs(60);
+        runtime.allow_insecure_push_urls = true;
+        let cfg = PushDeliveryConfig::from_runtime_config(&runtime);
+        assert_eq!(cfg.max_attempts, 3);
+        assert_eq!(cfg.read_timeout, Duration::from_millis(250));
+        assert_eq!(cfg.config_cache_ttl, Duration::from_secs(9));
+        assert_eq!(cfg.failed_delivery_retention, Duration::from_secs(60));
+        assert!(cfg.allow_insecure_urls);
+    }
+
+    /// The runtime config's push defaults are the delivery config's.
+    #[test]
+    fn runtime_config_push_defaults_are_delivery_defaults() {
+        let from_runtime =
+            PushDeliveryConfig::from_runtime_config(&crate::server::RuntimeConfig::default());
+        assert_eq!(
+            format!("{from_runtime:?}"),
+            format!("{:?}", PushDeliveryConfig::default())
+        );
     }
 
     #[test]
