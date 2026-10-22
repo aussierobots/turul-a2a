@@ -64,10 +64,10 @@ async fn ok_sink_dispatches_through_dyn_reference() {
 // `ProgressState` and `SinkError` are `#[non_exhaustive]`, so matches in
 // this consumer crate need a wildcard arm and cannot detect an added
 // variant. The guarantee that `ProgressState` holds only the three
-// non-terminal states (and that `SinkError` holds only `Closed` and
-// `Backend`) is enforced by the wildcard-free matches in the crate's own
-// `sink` and `error` module tests, which stop compiling if a variant is
-// added.
+// non-terminal states is enforced by the wildcard-free match in the
+// crate's own `sink` module test, which stops compiling if a variant is
+// added. `SinkError` is deliberately open: `Closed` and `Backend` are its
+// minimum, and further variants may be added.
 
 /// Consumer view: the three non-terminal states are constructible and
 /// distinct.

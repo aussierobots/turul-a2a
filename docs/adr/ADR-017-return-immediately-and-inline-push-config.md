@@ -95,7 +95,7 @@ Explicitly deferred:
 - Proto `a2a.proto:155-160`: `return_immediately` is a server capability, not a MUST-accept. The MUST clause applies only to `false`. `UnsupportedOperationError` is the correct reason code — same surface the Lambda adapter already uses for terminal `:subscribe`.
 - Proto `a2a.proto:147-149`: `task_push_notification_config` SHOULD be honored when present on `SendMessage`. Silent drop is a latent interoperability bug.
 - Proto `a2a.proto:154`: `history_length` is a response-shape hint; the `trim_task` helper is already the normative implementation on `GetTask`.
-- ADR-004: `UnsupportedOperation` maps to HTTP 400 / JSON-RPC -32004 / gRPC `INVALID_ARGUMENT` with `google.rpc.ErrorInfo reason=UNSUPPORTED_OPERATION`.
+- ADR-004: `UnsupportedOperation` maps to HTTP 400 / JSON-RPC -32004 / gRPC `FAILED_PRECONDITION` (A2A v1.0.1 §5.4) with `google.rpc.ErrorInfo reason=UNSUPPORTED_OPERATION`.
 - ADR-008: Lambda is request/response only; persistent background executors are out of scope.
 - ADR-010 §4.2: non-blocking send is a runtime capability the server MAY advertise.
 - ADR-011 §R1: push-config URL MUST be validated at CRUD time (this ADR tightens it to "before any task persists").
@@ -179,3 +179,4 @@ Adopters on Lambda:
 
 - 2026-10-22 — Bug 1: recorded the spec justification for refusing `return_immediately` on Lambda (A2A v1.0.1 §3.3.2 "a specific aspect of it is not supported") and that ADR-018's durable executor turns the capability back on. Bug 2: inline push config now also honoured on `SendStreamingMessage` (§3.2.2, "operates independently of execution mode") through helpers shared with `SendMessage`; the compensation returns the original storage error unchanged. Test obligations renamed to the tests that exist, the Lambda gate tested through `LambdaA2aServerBuilder::build`, `history_length` tests moved onto real continuations, gRPC inline-config tests added. Migration text corrected to the actual status-message wording.
 - 2026-10-22 — Bug 3: a negative `historyLength` is an invalid request, refused before any write on SendMessage and SendStreamingMessage on every transport; one check (`checked_history_length`) also guards GetTask and ListTasks.
+- 2026-10-22 — Compliance: the gRPC code for `UnsupportedOperation` corrected from `INVALID_ARGUMENT` to `FAILED_PRECONDITION`, the A2A v1.0.1 §5.4 mapping that `wire::errors::GRPC_UNSUPPORTED_OPERATION` already implements.
