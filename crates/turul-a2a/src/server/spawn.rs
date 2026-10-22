@@ -79,10 +79,12 @@ pub struct SpawnDeps {
 /// transports (HTTP, JSON-RPC, gRPC) populate this where they have
 /// claims; gRPC passes `None` until gRPC auth is wired.
 ///
-/// `accepted_output_modes` and `request_metadata` carry
-/// `SendMessageConfiguration.accepted_output_modes` and
-/// `SendMessageRequest.metadata` to the same-named `ExecutionContext`
-/// fields on the blocking, streaming and durable-queue paths alike.
+/// `accepted_output_modes`, `request_metadata` and
+/// `activated_extensions` carry
+/// `SendMessageConfiguration.accepted_output_modes`,
+/// `SendMessageRequest.metadata` and the negotiated extension URIs to
+/// the same-named `ExecutionContext` fields on the blocking, streaming
+/// and durable-queue paths alike.
 pub struct SpawnScope {
     pub tenant: String,
     pub owner: String,
@@ -92,6 +94,7 @@ pub struct SpawnScope {
     pub claims: Option<serde_json::Value>,
     pub accepted_output_modes: Vec<String>,
     pub request_metadata: Option<serde_json::Value>,
+    pub activated_extensions: Vec<String>,
 }
 
 /// Result of a successful spawn. The caller awaits `yielded_rx`
@@ -242,6 +245,7 @@ pub(crate) async fn run_executor_for_existing_task(
         claims,
         accepted_output_modes,
         request_metadata,
+        activated_extensions,
     } = scope;
 
     let mut task = match deps
@@ -303,6 +307,7 @@ pub(crate) async fn run_executor_for_existing_task(
         events: sink.clone(),
         accepted_output_modes,
         request_metadata,
+        activated_extensions,
     };
 
     let result = deps.executor.execute(&mut task, &message, &ctx).await;

@@ -66,7 +66,8 @@ through the delegate's artifact re-emit (with a fresh local
 ## What this client does NOT exercise
 
 - Streaming (`/message:stream` SSE). The delegate's v1 advertises
-  `streaming: false`; this client uses the buffered path.
+  `streaming: false` and refuses streaming calls with
+  `UnsupportedOperationError`; this client uses the buffered path.
 - Auth forwarding. The delegate does not propagate caller credentials
   (confused-deputy avoidance). Adding an `Authorization` header to
   the client request changes nothing about what the delegate sends

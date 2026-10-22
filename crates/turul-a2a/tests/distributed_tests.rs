@@ -43,6 +43,7 @@ impl AgentExecutor for TestExecutor {
             .url("http://localhost", "JSONRPC", "1.0")
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
+            .push_notifications(true)
             .build()
             .unwrap()
     }

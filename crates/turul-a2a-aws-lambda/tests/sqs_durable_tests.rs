@@ -214,6 +214,7 @@ fn job_for(tenant: &str, owner: &str, task_id: &str, context_id: &str) -> Queued
         claims: None,
         accepted_output_modes: vec![],
         request_metadata: None,
+        activated_extensions: vec![],
         enqueued_at_micros: 0,
     }
 }
@@ -759,8 +760,9 @@ fn sqs_durable_executor_queue_max_payload_bytes_is_256kib() {
 // drive_sqs_batch — request-level inputs reach the executor
 // ---------------------------------------------------------------------------
 
-/// `(accepted_output_modes, request_metadata)` per execution.
-type SeenInputs = Arc<std::sync::Mutex<Vec<(Vec<String>, Option<serde_json::Value>)>>>;
+/// `(accepted_output_modes, request_metadata, activated_extensions)` per
+/// execution.
+type SeenInputs = Arc<std::sync::Mutex<Vec<(Vec<String>, Option<serde_json::Value>, Vec<String>)>>>;
 
 /// Records the request-level inputs the executor observed.
 struct InputsSpy {
@@ -778,6 +780,7 @@ impl AgentExecutor for InputsSpy {
         self.seen.lock().unwrap().push((
             ctx.accepted_output_modes.clone(),
             ctx.request_metadata.clone(),
+            ctx.activated_extensions.clone(),
         ));
         ctx.events.complete(None).await?;
         Ok(())
@@ -788,7 +791,7 @@ impl AgentExecutor for InputsSpy {
 }
 
 #[tokio::test]
-async fn sqs_job_delivers_accepted_output_modes_and_request_metadata_to_executor() {
+async fn sqs_job_delivers_request_inputs_to_executor() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (state, storage) = state_with_executor(Arc::new(InputsSpy { seen: seen.clone() }));
     let (tenant, owner, task_id) = ("", "carol", "task-inputs");
@@ -797,6 +800,7 @@ async fn sqs_job_delivers_accepted_output_modes_and_request_metadata_to_executor
     let mut job = job_for(tenant, owner, task_id, &context_id);
     job.accepted_output_modes = vec!["application/json".into()];
     job.request_metadata = Some(serde_json::json!({"traceId": "sqs-1"}));
+    job.activated_extensions = vec!["https://example.test/ext/a".into()];
     let body = serde_json::to_string(&job).unwrap();
     let resp = drive_sqs_batch(&state, sqs_event_with_body(body)).await;
     assert!(resp.batch_item_failures.is_empty());
@@ -805,7 +809,8 @@ async fn sqs_job_delivers_accepted_output_modes_and_request_metadata_to_executor
         *seen.lock().unwrap(),
         vec![(
             vec!["application/json".to_string()],
-            Some(serde_json::json!({"traceId": "sqs-1"}))
+            Some(serde_json::json!({"traceId": "sqs-1"})),
+            vec!["https://example.test/ext/a".to_string()],
         )]
     );
 }

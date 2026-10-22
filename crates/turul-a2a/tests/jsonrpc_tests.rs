@@ -53,10 +53,10 @@ impl AgentExecutor for CompletingExecutor {
             version: "1.0.0".into(),
             documentation_url: None,
             capabilities: Some(turul_a2a_proto::AgentCapabilities {
-                streaming: Some(false),
+                streaming: Some(true),
                 push_notifications: Some(true),
                 extensions: vec![],
-                extended_agent_card: Some(false),
+                extended_agent_card: Some(true),
             }),
             security_schemes: HashMap::new(),
             security_requirements: vec![],

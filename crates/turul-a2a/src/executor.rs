@@ -51,6 +51,13 @@ pub struct ExecutionContext {
     /// which the executor reads from the message itself. `None` when the
     /// client sent none.
     pub request_metadata: Option<serde_json::Value>,
+    /// Extension URIs negotiated for the request that started this
+    /// execution: those the client activated (the `A2A-Extensions`
+    /// header / gRPC metadata) that this agent advertises in
+    /// `AgentCard.capabilities.extensions`, sorted. Empty when none were
+    /// activated. An executor whose behaviour depends on an extension
+    /// applies it only when the URI is listed here.
+    pub activated_extensions: Vec<String>,
 }
 
 impl ExecutionContext {
@@ -74,6 +81,7 @@ impl ExecutionContext {
             events: EventSink::detached(),
             accepted_output_modes: Vec::new(),
             request_metadata: None,
+            activated_extensions: Vec::new(),
         }
     }
 }
@@ -103,6 +111,11 @@ pub trait AgentExecutor: Send + Sync {
 
     /// Return the extended agent card for authenticated callers.
     /// Return `None` if extended card is not supported.
+    ///
+    /// Served only when [`Self::agent_card`] declares
+    /// `capabilities.extendedAgentCard = true`; otherwise
+    /// `GetExtendedAgentCard` is an `UnsupportedOperationError`. Declared
+    /// but `None` here is `ExtendedAgentCardNotConfiguredError`.
     fn extended_agent_card(
         &self,
         _claims: Option<&serde_json::Value>,

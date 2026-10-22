@@ -51,6 +51,7 @@ client  ────────────────────────
                      advertised extensions)
                             ▼
                     AgentExecutor::execute
+                    ├─ profile in ctx.activated_extensions?
                     ├─ read message.metadata["a2a.skillId"]
                     ├─ SkillRegistry::handler(id) → SkillHandler
                     └─ SkillHandler::run(params) → JSON output
@@ -136,13 +137,16 @@ The artifact's text part is a JSON object that satisfies the skill's
 3. The framework router validates the activation set against the
    advertised extensions. Any extension advertised as `required = true`
    that the client did not activate is rejected with
-   `UnsupportedOperationError`.
+   `ExtensionSupportRequiredError`.
 4. The server echoes the intersection of advertised and activated URIs
    in the response `A2A-Extensions` header so the client can confirm
-   what was honoured.
-5. The agent executor reads `Message.metadata["a2a.skillId"]` and
-   dispatches via the `SkillRegistry`. Missing metadata produces a
-   `Failed` task with an explanatory message.
+   what was honoured. The same intersection reaches the executor as
+   `ExecutionContext::activated_extensions`.
+5. When the profile is in `ctx.activated_extensions`, the agent
+   executor reads `Message.metadata["a2a.skillId"]` and dispatches via
+   the `SkillRegistry`. Without activation the request is un-targeted:
+   `a2a.skillId` is ignored and the task ends `Failed` with an
+   explanatory message.
 
 ## Per-client usage
 
@@ -239,8 +243,8 @@ Working end-to-end at
 
 | Trigger | Outcome |
 | --- | --- |
-| Activation header missing and extension is `required = false` (default in this example) | Request reaches the executor; if `a2a.skillId` is absent the executor returns a `Failed` task. |
-| Activation header missing and extension is `required = true` | Transport returns `UnsupportedOperationError` (HTTP 400 / JSON-RPC `-32004`). |
+| Activation header missing and extension is `required = false` (default in this example) | Request reaches the executor un-targeted: no skill runs (even if `a2a.skillId` is present) and the executor returns a `Failed` task explaining how to activate the profile. |
+| Activation header missing and extension is `required = true` | Transport returns `ExtensionSupportRequiredError` (HTTP 400 / JSON-RPC `-32008` / gRPC `FAILED_PRECONDITION`). |
 | Activation header set but `a2a.skillId` metadata absent (or not a string) | The framework rejects the request with `InvalidParamsError` (HTTP 400 / JSON-RPC `-32602`) before the executor runs. |
 | `a2a.skillId` references an unregistered skill | The executor errors; the task ends `Failed` with a status message citing the unknown id. |
 | `a2a.skillParams` violates the skill's `inputSchema` | `SkillHandler` returns `SkillError::InvalidRequest`; the task ends `Failed` with the validation reason. |

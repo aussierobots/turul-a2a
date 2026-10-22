@@ -7,8 +7,8 @@
 //!   value into a set of URIs.
 //! - [`validate_activation`] reconciles activated URIs with the agent
 //!   card's advertised extensions, returning the intersection or an
-//!   `UnsupportedOperationError` when a `required = true` extension is
-//!   advertised but not activated by the client.
+//!   `ExtensionSupportRequiredError` when a `required = true` extension
+//!   is advertised but not activated by the client (A2A v1.0.1 §3.3.4).
 //! - [`response_header_value`] formats a non-empty intersection back
 //!   into a header value for echo on the response.
 //!
@@ -134,7 +134,8 @@ pub fn parse_a2a_extensions(header_value: Option<&str>) -> HashSet<String> {
 /// Returns the intersection (URIs both advertised by the server and
 /// activated by the client). When the server advertises any extension
 /// with `required = true` whose URI is *not* present in `activated`,
-/// returns `UnsupportedOperationError`.
+/// returns `ExtensionSupportRequiredError` naming that URI (A2A v1.0.1
+/// §3.3.4: JSON-RPC `-32008`, HTTP 400, gRPC `FAILED_PRECONDITION`).
 ///
 /// Unknown URIs in `activated` (not advertised by the server) are
 /// silently ignored, mirroring A2A spec guidance: a server is not
@@ -151,11 +152,8 @@ pub fn validate_activation(
     // did not meet.
     for ext in advertised {
         if ext.required && !activated.contains(&ext.uri) {
-            return Err(A2aError::UnsupportedOperation {
-                message: format!(
-                    "Required extension '{}' not activated by client (send A2A-Extensions header)",
-                    ext.uri
-                ),
+            return Err(A2aError::ExtensionSupportRequired {
+                extension: ext.uri.clone(),
             });
         }
     }
@@ -236,7 +234,7 @@ mod tests {
         let activated = HashSet::new();
         assert!(matches!(
             validate_activation(&activated, &advertised),
-            Err(A2aError::UnsupportedOperation { .. })
+            Err(A2aError::ExtensionSupportRequired { extension }) if extension == "uri-1"
         ));
     }
 

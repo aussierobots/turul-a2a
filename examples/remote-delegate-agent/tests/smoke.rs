@@ -7,9 +7,9 @@
 //! Tests are hermetic and parallel-safe.
 //!
 //! Asserts that the delegate re-emits the upstream's artifacts in a
-//! spec `SendMessageResponse`, and that it activates the profile on the
-//! upstream call (`A2A-Extensions` header) only when the forwarded
-//! message carries `a2a.skillId` routing metadata.
+//! spec `SendMessageResponse`, and that it forwards the caller's
+//! activation of the profile to the upstream call (`A2A-Extensions`
+//! header): routing metadata alone activates nothing.
 
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -139,10 +139,14 @@ async fn spawn_delegate(upstream: &MockServer) -> AgentGuard {
     guard
 }
 
-async fn send_through(delegate: &AgentGuard, message: Value) -> Value {
-    let resp = reqwest::Client::new()
+async fn send_through(delegate: &AgentGuard, message: Value, activate: Option<&str>) -> Value {
+    let mut req = reqwest::Client::new()
         .post(format!("{}/message:send", delegate.base))
-        .header("a2a-version", "1.0")
+        .header("a2a-version", "1.0");
+    if let Some(uri) = activate {
+        req = req.header("a2a-extensions", uri);
+    }
+    let resp = req
         .json(&json!({ "message": message }))
         .send()
         .await
@@ -181,6 +185,7 @@ async fn delegate_reemits_upstream_artifacts_in_a_spec_response() {
             "role": "ROLE_USER",
             "parts": [ { "text": "hi" } ]
         }),
+        None,
     )
     .await;
 
@@ -214,24 +219,41 @@ async fn delegate_reemits_upstream_artifacts_in_a_spec_response() {
     );
 }
 
+fn skill_targeted(message_id: &str) -> Value {
+    json!({
+        "messageId": message_id,
+        "role": "ROLE_USER",
+        "parts": [ { "text": "dispatch" } ],
+        "metadata": {
+            "a2a.skillId": "echo_loud",
+            "a2a.skillParams": { "text": "hi" }
+        }
+    })
+}
+
 #[tokio::test]
-async fn delegate_activates_skill_invocation_upstream_for_skill_targeted_message() {
+async fn delegate_advertises_the_profile_the_upstream_advertises() {
+    let upstream = mock_upstream().await;
+    let delegate = spawn_delegate(&upstream).await;
+    let card: Value = reqwest::get(format!("{}/.well-known/agent-card.json", delegate.base))
+        .await
+        .expect("card")
+        .json()
+        .await
+        .expect("card JSON");
+    assert_eq!(
+        card.pointer("/capabilities/extensions/0/uri"),
+        Some(&json!(PROFILE_URI)),
+        "{card:#}"
+    );
+}
+
+#[tokio::test]
+async fn delegate_forwards_the_callers_profile_activation_upstream() {
     let upstream = mock_upstream().await;
     let delegate = spawn_delegate(&upstream).await;
 
-    let payload = send_through(
-        &delegate,
-        json!({
-            "messageId": "smoke-2",
-            "role": "ROLE_USER",
-            "parts": [ { "text": "dispatch" } ],
-            "metadata": {
-                "a2a.skillId": "echo_loud",
-                "a2a.skillParams": { "text": "hi" }
-            }
-        }),
-    )
-    .await;
+    let payload = send_through(&delegate, skill_targeted("smoke-2"), Some(PROFILE_URI)).await;
     assert_eq!(
         payload
             .pointer("/task/status/state")
@@ -246,5 +268,23 @@ async fn delegate_activates_skill_invocation_upstream_for_skill_targeted_message
         body.pointer("/message/metadata/a2a.skillId"),
         Some(&json!("echo_loud")),
         "routing metadata is forwarded: {body:#}"
+    );
+}
+
+/// Routing metadata without the caller's activation header: the delegate
+/// forwards the metadata but activates nothing upstream.
+#[tokio::test]
+async fn delegate_does_not_activate_upstream_without_caller_activation() {
+    let upstream = mock_upstream().await;
+    let delegate = spawn_delegate(&upstream).await;
+
+    send_through(&delegate, skill_targeted("smoke-3"), None).await;
+
+    let (activation, body) = upstream_send(&upstream).await;
+    assert_eq!(activation, None);
+    assert_eq!(
+        body.pointer("/message/metadata/a2a.skillId"),
+        Some(&json!("echo_loud")),
+        "routing metadata is still forwarded: {body:#}"
     );
 }

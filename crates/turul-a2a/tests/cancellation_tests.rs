@@ -55,7 +55,13 @@ impl AgentExecutor for NoopExecutor {
         Ok(())
     }
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
-        turul_a2a_proto::AgentCard::default()
+        turul_a2a_proto::AgentCard {
+            capabilities: Some(turul_a2a_proto::AgentCapabilities {
+                streaming: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 }
 
@@ -257,9 +263,10 @@ async fn start_non_blocking(state: &AppState, owner: &str) -> String {
         "configuration": {"returnImmediately": true},
     })
     .to_string();
-    let axum::Json(v) = core_send_message(state.clone(), "", owner, None, body)
-        .await
-        .expect("non-blocking send");
+    let axum::Json(v) =
+        core_send_message(state.clone(), "", owner, None, &Default::default(), body)
+            .await
+            .expect("non-blocking send");
     v["task"]["id"].as_str().expect("task id").to_string()
 }
 
@@ -749,7 +756,8 @@ async fn blocking_send_in_flight_and_cancel_both_return_canceled() {
         })
         .to_string();
         let start = tokio::time::Instant::now();
-        let result = core_send_message(send_state, "", "owner-b", None, body).await;
+        let result =
+            core_send_message(send_state, "", "owner-b", None, &Default::default(), body).await;
         (result, start.elapsed())
     });
 

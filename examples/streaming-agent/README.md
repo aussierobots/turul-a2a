@@ -44,8 +44,10 @@ curl -s http://localhost:3002/.well-known/agent-card.json | jq .capabilities.str
   `ctx.events.cancelled(...)` — real cooperative cancel.
 - `ctx.events.complete(None)` at the end commits the terminal status update
   the client is waiting for before the stream closes.
-- `AgentCardBuilder::streaming(true)` toggles the capability bit on the
+- `AgentCardBuilder::streaming(true)` sets the capability bit on the
   public agent card so discovery clients know the agent supports it.
+  The server enforces it: without the bit, `/message:stream` and
+  `:subscribe` are refused with `UnsupportedOperationError`.
 
 ## Expected SSE wire sequence
 

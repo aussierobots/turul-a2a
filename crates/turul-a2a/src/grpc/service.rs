@@ -149,10 +149,11 @@ impl pb::grpc::A2aService for GrpcService {
 
         // gRPC auth claims are not yet wired. Pass None for now; executors
         // observe `ctx.claims = None` on this path.
-        let value = router::core_send_message(self.state.clone(), &tenant, &owner, None, body)
-            .await
-            .map_err(a2a_to_status)?
-            .0;
+        let value =
+            router::core_send_message(self.state.clone(), &tenant, &owner, None, &echoed, body)
+                .await
+                .map_err(a2a_to_status)?
+                .0;
 
         let response: pb::SendMessageResponse =
             serde_json::from_value(value).map_err(internal_from_json)?;
@@ -329,16 +330,9 @@ impl pb::grpc::A2aService for GrpcService {
         &self,
         _request: Request<pb::GetExtendedAgentCardRequest>,
     ) -> Result<Response<pb::AgentCard>, Status> {
-        // No core_* helper — the HTTP handler calls the executor directly.
-        // Mirror that path verbatim: claims are `None` for now (the HTTP
-        // GET endpoint passes `None` too; passing JWT claims through is
-        // future work).
-        match self.state.executor.extended_agent_card(None) {
-            Some(card) => Ok(Response::new(card)),
-            None => Err(a2a_to_status(
-                crate::error::A2aError::ExtendedAgentCardNotConfigured,
-            )),
-        }
+        router::core_get_extended_agent_card(&self.state)
+            .map(Response::new)
+            .map_err(a2a_to_status)
     }
 
     // --- Streaming RPCs -------------------------------------------------
@@ -361,6 +355,7 @@ impl pb::grpc::A2aService for GrpcService {
             self.state.clone(),
             tenant,
             owner,
+            &echoed,
             body,
         )
         .await?;

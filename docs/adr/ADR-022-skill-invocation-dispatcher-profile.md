@@ -22,8 +22,9 @@ now satisfied. Recorded here for the audit trail; the live status is
      `INVALID_ARGUMENT`) before any task is created,
    - the message (with its `a2a.skillId`) reaching the executor
      unchanged, including an id the agent does not recognise,
-   - `UnsupportedOperationError` on a `required` extension the client
-     did not activate.
+   - `ExtensionSupportRequiredError` on a `required` extension the
+     client did not activate (`UnsupportedOperationError` until
+     2026-10-22; see §2.4).
 
 2. **First-profile placement decided.** Per ADR-021 §5 (single
    profile inhabitant lives in the transport-owning crate), the
@@ -200,17 +201,18 @@ executor logic without skill dispatch. No error is returned for
 the absence of the header unless the extension was advertised as
 `required = true` (see §2.4).
 
-*Amended 2026-10-22.* What ships: the framework applies activation
-only at the router — echo, the §2.3 request-shape check, and (later)
-the §2.4 rejection. The negotiated extension set is **not** passed to
-the `AgentExecutor`; `ExecutionContext` carries no such field. An
-executor therefore cannot tell "header absent" from "header present"
-and routes on `Message.metadata` alone. The reference executor
-(`examples/skill-dispatch-profile-agent`) dispatches whenever
-`a2a.skillId` is present, header or not; "un-targeted" in practice
-means "no `a2a.skillId`". Making routing conditional on activation
-needs the negotiated set exposed on `ExecutionContext`, which is a
-separate decision (an additive public field) not taken here.
+*Amended 2026-10-22 (second amendment, superseding the first).* The
+negotiated extension set — URIs the client activated that the agent
+advertises, sorted — reaches the executor as
+`ExecutionContext::activated_extensions` on the blocking, streaming and
+durable-queue paths (one extraction point in the router, carried with
+`accepted_output_modes`). The no-header default above therefore holds
+in the reference executor: `examples/skill-dispatch-profile-agent`
+dispatches on `a2a.skillId` only when the profile is in
+`activated_extensions`; without activation the request is un-targeted
+even if `a2a.skillId` is present. `examples/remote-delegate-agent`
+advertises the profile when its upstream does and forwards the
+caller's negotiated set on the upstream `A2A-Extensions` header.
 
 **gRPC transport.** Per ADR-014, gRPC transport mirrors HTTP
 behaviour. The `A2A-Extensions` header is carried as a gRPC
@@ -290,22 +292,28 @@ agent). `a2a.skillParams` is optional; its absence is not an error.
 NOT reject messages solely because `metadata` contains keys
 outside the `a2a.*` namespace.
 
-### 2.4 Rejection — `UnsupportedOperationError` for required extensions
+### 2.4 Rejection — `ExtensionSupportRequiredError` for required extensions
 
 **When `required = true` and the client does not activate:**
 
 If `AgentExtension.required = true` (proto L424) and the inbound
 request does not include the activation header (§2.2), the server
-MUST return `UnsupportedOperationError`:
+MUST return `ExtensionSupportRequiredError` (A2A v1.0.1 §3.3.4:
+"When a server requests use of an extension marked as `required:
+true` in the Agent Card but the client does not declare support for
+it, the agent MUST return `ExtensionSupportRequiredError`"):
 
-- HTTP transport: `400 Bad Request`, JSON-RPC error code `-32004`.
+- HTTP transport: `400 Bad Request`; JSON-RPC error code `-32008`.
 - gRPC transport: `FAILED_PRECONDITION` status with A2A error detail
-  (`google.rpc.ErrorInfo`, `reason = "UNSUPPORTED_OPERATION"`,
+  (`google.rpc.ErrorInfo`, `reason = "EXTENSION_SUPPORT_REQUIRED"`,
   `domain = "a2a-protocol.org"`).
 
-This aligns with the A2A error model as used elsewhere in
-turul-a2a (e.g. SubscribeToTask on a terminal task) and with
-ADR-021 §2.5 point 4.
+*Amended 2026-10-22.* This section originally mandated
+`UnsupportedOperationError` (`-32004`, reason `UNSUPPORTED_OPERATION`).
+A2A v1.0.1 §3.3.4 names a dedicated error for exactly this case, so
+the framework returns it. Owner: `profile_dispatch::validate_activation`,
+called by every transport before dispatch (HTTP and gRPC on
+`SendMessage` / `SendStreamingMessage`; JSON-RPC on every method).
 
 **When `required = false` and the client does not activate:**
 
@@ -548,7 +556,9 @@ must be reviewable alongside this ADR.
 3. **`extension_required_no_header_returns_unsupported_operation`** —
    extension advertised as `required = true`; request has no
    header; server returns `UnsupportedOperationError` (HTTP 400,
-   JSON-RPC `-32004`).
+   JSON-RPC `-32004`). *Superseded 2026-10-22:*
+   `ExtensionSupportRequiredError` (HTTP 400, JSON-RPC `-32008`, gRPC
+   `FAILED_PRECONDITION`), §2.4.
 
 4. **`extension_activated_missing_skill_id_returns_invalid_params`** —
    activation header present; `Message.metadata` does not contain
@@ -565,7 +575,9 @@ must be reviewable alongside this ADR.
 `extension_not_activated_runs_default_executor`; case 2, with routing
 left to the executor, is
 `extension_activated_passes_skill_id_to_executor_and_echoes`; case 3
-is `http_send_required_extension_missing_returns_unsupported_operation`;
+is `http_send_required_extension_missing_returns_extension_support_required`
+(blocking, streaming and tenant routes) with its JSON-RPC and gRPC
+variants;
 case 4 is `extension_activated_missing_skill_id_returns_invalid_params`
 plus its non-string, streaming, JSON-RPC and gRPC variants; case 5's
 framework half is
@@ -633,3 +645,4 @@ a patterns-crate `SkillDispatchPayload` that was not built (§2.5).
 - 2026-10-22 — gRPC status for the missing-activation-header rejection corrected `UNIMPLEMENTED` → `FAILED_PRECONDITION`. The code has always returned `FAILED_PRECONDITION`; this aligns the ADR with the code and with the A2A v1.0.1 error-mapping table.
 - 2026-10-22 — Code and ADR reconciled on where the profile's rules live. The framework now enforces the §2.3 request shape on every send transport (HTTP blocking + streaming, JSON-RPC, gRPC): once the profile is negotiated, a missing or non-string `Message.metadata["a2a.skillId"]` is rejected as InvalidParams (`-32602` / HTTP 400 / gRPC `INVALID_ARGUMENT`) before any task is created. §2.5 point 5 ("passes to the registered dispatcher") amended: the framework owns no skill registry, so routing and unknown-id handling stay in the `AgentExecutor`. The reserved metadata keys are exported from `turul_a2a::profiles`. The acceptance-gates entry no longer claims `profile_dispatch_tests` pins routing; §7.2 maps each sketch case to its test and records cases 6-8 (patterns-crate `SkillDispatchPayload`) as not built.
 - 2026-10-22 — §2.2 no-header default amended to what ships: the negotiated extension set is not visible to the executor, so the reference executor routes on `a2a.skillId` whether or not the activation header was sent. Gating executor routing on activation requires exposing the negotiated set on `ExecutionContext` — an open decision.
+- 2026-10-22 — §2.4: a required extension the client did not activate is `ExtensionSupportRequiredError` (JSON-RPC `-32008`, HTTP 400, gRPC `FAILED_PRECONDITION`, reason `EXTENSION_SUPPORT_REQUIRED`), as A2A v1.0.1 §3.3.4 requires, replacing `UnsupportedOperationError`. §2.2: the negotiated extension set is now exposed to the executor as `ExecutionContext::activated_extensions`; the reference executor dispatches only when the profile is activated (the no-header default holds), and the remote-delegate example forwards the caller's negotiated extensions upstream. The earlier §2.2 amendment ("not passed to the executor") is superseded. Tests: `profile_dispatch_tests` (`*_required_extension_missing_returns_extension_support_required` on HTTP/JSON-RPC/gRPC, `executor_sees_activated_extensions`), `execution_context_request_tests`.

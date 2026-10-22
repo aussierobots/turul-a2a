@@ -9,9 +9,10 @@
 //! `Message.metadata["a2a.skillParams"]`).
 //!
 //! The framework's transport layer handles header parsing, advertisement
-//! validation, and echo on the response. This example focuses on the
-//! adopter side: reading the metadata keys and dispatching to the
-//! registered skill.
+//! validation, and echo on the response, and reports the negotiated
+//! extensions to the executor as `ExecutionContext::activated_extensions`.
+//! This example focuses on the adopter side: dispatching on the metadata
+//! keys only when the client activated the profile.
 //!
 //! Run:
 //!   cargo run -p skill-dispatch-profile-agent
@@ -243,6 +244,14 @@ impl DispatcherExecutor {
     }
 }
 
+/// Whether the client activated the skill-invocation profile on this
+/// request (the framework lists only extensions this agent advertises).
+fn profile_activated(ctx: &ExecutionContext) -> bool {
+    ctx.activated_extensions
+        .iter()
+        .any(|uri| uri == SKILL_INVOCATION_PROFILE_V1)
+}
+
 /// Inspect `Message.metadata` for the two reserved profile keys and
 /// return `(skill_id, params)`. Returns `None` for `skill_id` if the key
 /// is absent (the caller treats this as "profile not activated" and
@@ -278,21 +287,19 @@ impl AgentExecutor for DispatcherExecutor {
         message: &Message,
         ctx: &ExecutionContext,
     ) -> Result<(), A2aError> {
-        let (skill_id, params) = extract_dispatch_payload(message);
-
-        let Some(skill_id) = skill_id else {
-            // No `a2a.skillId`: the un-targeted path. The executor cannot
-            // see whether the client sent the activation header, so it
-            // routes on metadata alone. A client that did activate the
-            // profile without `a2a.skillId` never reaches here — the
-            // framework rejects that request as InvalidParams first.
-            // Fail the task with guidance.
+        // Dispatch only when the client activated the profile. Without
+        // activation, `a2a.skillId` (if any) is not a routing request:
+        // the un-targeted path fails the task with guidance. A client
+        // that activated the profile without a string `a2a.skillId`
+        // never reaches here — the framework rejects that as
+        // InvalidParams.
+        let payload = profile_activated(ctx).then(|| extract_dispatch_payload(message));
+        let Some((Some(skill_id), params)) = payload else {
             let metadata_keys = message.metadata_keys();
             task.fail(format!(
-                "Skill dispatch requires Message.metadata[\"{SKILL_ID_METADATA_KEY}\"] (string). \
-                 Send the request with header `A2A-Extensions: {SKILL_INVOCATION_PROFILE_V1}` \
-                 and set the skill id in `metadata` (and inputs in `{SKILL_PARAMS_METADATA_KEY}`). \
-                 Observed metadata keys: {metadata_keys:?}."
+                "Skill dispatch requires header `A2A-Extensions: {SKILL_INVOCATION_PROFILE_V1}` \
+                 and Message.metadata[\"{SKILL_ID_METADATA_KEY}\"] (string), with inputs in \
+                 `{SKILL_PARAMS_METADATA_KEY}`. Observed metadata keys: {metadata_keys:?}."
             ));
             return Ok(());
         };
