@@ -1165,11 +1165,10 @@ pub async fn core_send_message(
 /// 2. **Cooperative window** (through `timeout_abort_grace`): the
 ///    cancellation token is already set; a well-behaved executor
 ///    observes it and emits `sink.cancelled(...)` (or another terminal).
-/// 3. **Hard deadline** (`soft + grace`): force-commit `FAILED` via
-///    `update_task_status_with_events` — CAS-guarded. On
-///    `TerminalStateAlreadySet` the executor won the race at the last
-///    moment; re-read and return the persisted terminal. On success,
-///    abort the spawned JoinHandle as best-effort cleanup.
+/// 3. **Hard deadline** (`soft + grace`): abort the executor, then
+///    force-commit `FAILED` via `update_task_status_with_events` —
+///    CAS-guarded. On `TerminalStateAlreadySet` another writer committed
+///    a terminal first; re-read and return the persisted terminal.
 ///
 /// Returns the Task the caller should hand back to the client.
 #[allow(clippy::too_many_arguments)] // router glue: all args are request-derived
@@ -1222,7 +1221,15 @@ async fn await_yielded_with_two_deadlines(
     // Yielded-None during the cooperative wait also falls through to the
     // hard timeout.
 
-    // Hard timeout: force-commit FAILED via CAS.
+    // Hard timeout. The executor has overrun its cooperative window, so
+    // it is aborted whichever way the terminal CAS below resolves. The
+    // cloneable AbortHandle is independent of the supervisor's
+    // JoinHandle ownership; the supervisor's `.await` returns
+    // `JoinError::Cancelled` once the abort takes effect at the
+    // executor's next yield point, and its sentinel cleans the registry.
+    handle.abort();
+
+    // Force-commit FAILED via CAS.
     let reason_msg = Message::new(
         uuid::Uuid::now_v7().to_string(),
         turul_a2a_types::Role::Agent,
@@ -1247,15 +1254,6 @@ async fn await_yielded_with_two_deadlines(
 
     match result {
         Ok((task, seqs)) => {
-            // Abort the spawned executor. The cloneable AbortHandle
-            // is independent of the supervisor's JoinHandle
-            // ownership, so this works whether or not the supervisor
-            // has already taken the JoinHandle to `.await` it. The
-            // supervisor continues to track the task for registry
-            // cleanup — its `.await` returns `JoinError::Cancelled`
-            // once the abort propagates at the next executor yield
-            // point.
-            handle.abort();
             // framework-committed terminals fan out
             // to push configs identically to executor-emitted ones.
             // Hard-timeout FAILED lands here.
@@ -1272,9 +1270,9 @@ async fn await_yielded_with_two_deadlines(
             Ok(task)
         }
         Err(crate::storage::A2aStorageError::TerminalStateAlreadySet { .. }) => {
-            // Executor emitted its own terminal while we were
-            // racing the hard deadline. Return the actually-persisted
-            // terminal.
+            // Another writer (the executor's own sink, or a CancelTask
+            // on any instance) committed a terminal first. Return the
+            // actually-persisted terminal.
             state.event_broker.notify(task_id).await;
             let persisted = state
                 .task_storage

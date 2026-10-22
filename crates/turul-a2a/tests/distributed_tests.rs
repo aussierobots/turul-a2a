@@ -2,7 +2,9 @@
 //!
 //! Two router instances sharing the same storage backend.
 //! Requests alternate between instances to prove request/response
-//! correctness across instances with shared state.
+//! correctness across instances with shared state. Cross-instance
+//! cancellation of a live executor is covered in `cancellation_tests.rs`;
+//! cross-instance streaming in `d3_streaming_tests.rs`.
 
 use std::sync::Arc;
 
@@ -61,7 +63,7 @@ fn two_instances() -> (axum::Router, axum::Router) {
         middleware_stack: Arc::new(MiddlewareStack::new(vec![])),
         runtime_config: turul_a2a::server::RuntimeConfig::default(),
         in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
-        cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
+        cancellation_supervisor: Arc::new(shared_storage.clone()),
         push_delivery_store: None,
         push_dispatcher: None,
         durable_executor_queue: None,
@@ -72,12 +74,12 @@ fn two_instances() -> (axum::Router, axum::Router) {
         task_storage: Arc::new(shared_storage.clone()),
         push_storage: Arc::new(shared_storage.clone()),
         event_store: Arc::new(shared_storage.clone()),
-        atomic_store: Arc::new(shared_storage),
+        atomic_store: Arc::new(shared_storage.clone()),
         event_broker: TaskEventBroker::new(), // instance B's separate broker
         middleware_stack: Arc::new(MiddlewareStack::new(vec![])),
         runtime_config: turul_a2a::server::RuntimeConfig::default(),
         in_flight: std::sync::Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
-        cancellation_supervisor: std::sync::Arc::new(turul_a2a::storage::InMemoryA2aStorage::new()),
+        cancellation_supervisor: Arc::new(shared_storage),
         push_delivery_store: None,
         push_dispatcher: None,
         durable_executor_queue: None,
@@ -161,11 +163,11 @@ async fn create_on_a_list_on_b() {
 }
 
 // =========================================================
-// Create on A, cancel on B
+// Task completed on A is not cancelable on B
 // =========================================================
 
 #[tokio::test]
-async fn create_on_a_cancel_on_b() {
+async fn cancel_on_b_of_task_completed_on_a_is_not_cancelable() {
     let (router_a, router_b) = two_instances();
 
     // Create task on A (executor completes it)
