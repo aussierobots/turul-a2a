@@ -236,7 +236,20 @@ async fn get_task_history_length_zero_omits_history() {
     let (_, send_body) = json_response(router, req).await;
     let task_id = send_body["task"]["id"].as_str().unwrap();
 
-    // Get with historyLength=0
+    // Baseline: without historyLength the task's history holds the user
+    // message, so omission below is a real effect of the parameter.
+    let router = build_router(state.clone());
+    let req = Request::get(format!("/tasks/{task_id}"))
+        .header("a2a-version", "1.0")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = json_response(router, req).await;
+    assert_eq!(status, 200);
+    let history = body["history"].as_array().expect("baseline history");
+    assert_eq!(history.len(), 1, "{body}");
+    assert_eq!(history[0]["messageId"], "m-hl");
+
+    // Spec 3.2.4: historyLength=0 → the `history` field SHOULD be omitted.
     let router = build_router(state);
     let req = Request::get(format!("/tasks/{task_id}?historyLength=0"))
         .header("a2a-version", "1.0")
@@ -244,11 +257,9 @@ async fn get_task_history_length_zero_omits_history() {
         .unwrap();
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 200);
-    // History should be empty or absent (proto3 omits empty repeated)
-    let history = body.get("history");
     assert!(
-        history.is_none() || history.unwrap().as_array().is_none_or(|a| a.is_empty()),
-        "historyLength=0 should omit history"
+        body.get("history").is_none(),
+        "historyLength=0 should omit history: {body}"
     );
 }
 
@@ -445,7 +456,7 @@ async fn well_known_agent_card_has_all_required_fields() {
 }
 
 // =========================================================
-// [P1] Tenant isolation — tenant from path actually scopes data
+// Tenant isolation — tenant from path actually scopes data
 // =========================================================
 
 #[tokio::test]
@@ -542,7 +553,7 @@ async fn tenant_prefixed_cancel_scopes_to_tenant() {
 }
 
 // =========================================================
-// [P2] ListTasks status filter — actually narrows results
+// ListTasks status filter — actually narrows results
 // =========================================================
 
 #[tokio::test]
@@ -607,7 +618,7 @@ async fn list_tasks_invalid_status_returns_400() {
 }
 
 // =========================================================
-// [P2] Push config list pagination through HTTP
+// Push config list pagination through HTTP
 // =========================================================
 
 #[tokio::test]
@@ -655,9 +666,40 @@ async fn push_config_list_pagination_through_http() {
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 200);
     let configs = body["configs"].as_array().unwrap();
-    assert!(configs.len() <= 2, "pageSize=2 should return at most 2");
-    assert!(
-        !body["nextPageToken"].as_str().unwrap_or("").is_empty(),
-        "Should have nextPageToken for next page"
-    );
+    assert_eq!(configs.len(), 2, "first page of five with pageSize=2");
+    let mut seen: Vec<String> = configs
+        .iter()
+        .map(|c| c["url"].as_str().unwrap().to_string())
+        .collect();
+    let mut token = body["nextPageToken"].as_str().unwrap_or("").to_string();
+    assert!(!token.is_empty(), "Should have nextPageToken for next page");
+
+    // Follow the page tokens to the end: 2 + 2 + 1, no repeats, no gaps.
+    let mut page_sizes = vec![configs.len()];
+    while !token.is_empty() {
+        let router = build_router(state.clone());
+        let req = Request::get(format!(
+            "/tasks/{task_id}/pushNotificationConfigs?pageSize=2&pageToken={token}"
+        ))
+        .header("a2a-version", "1.0")
+        .body(Body::empty())
+        .unwrap();
+        let (status, body) = json_response(router, req).await;
+        assert_eq!(status, 200, "{body}");
+        let configs = body["configs"].as_array().unwrap();
+        page_sizes.push(configs.len());
+        seen.extend(
+            configs
+                .iter()
+                .map(|c| c["url"].as_str().unwrap().to_string()),
+        );
+        token = body["nextPageToken"].as_str().unwrap_or("").to_string();
+        assert!(page_sizes.len() <= 3, "pagination must terminate");
+    }
+    assert_eq!(page_sizes, vec![2, 2, 1]);
+    seen.sort();
+    let expected: Vec<String> = (0..5)
+        .map(|i| format!("https://example.com/hook-{i}"))
+        .collect();
+    assert_eq!(seen, expected);
 }

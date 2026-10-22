@@ -189,7 +189,7 @@ async fn send_message_returns_send_message_response() {
 
 #[tokio::test]
 async fn send_message_with_tenant_in_params() {
-    let router = build_router(test_state());
+    let state = test_state();
     let params = serde_json::json!({
         "tenant": "acme",
         "message": {
@@ -199,9 +199,38 @@ async fn send_message_with_tenant_in_params() {
         }
     });
     let req = jsonrpc_request("SendMessage", params, 11);
-    let (_, body) = jsonrpc_call(router, &req).await;
-    assert!(body.get("error").is_none());
-    assert!(body["result"]["task"]["id"].is_string());
+    let (_, body) = jsonrpc_call(build_router(state.clone()), &req).await;
+    assert!(body.get("error").is_none(), "{body}");
+    let task_id = body["result"]["task"]["id"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+
+    // Readback proves the task was scoped to tenant "acme": visible with
+    // params.tenant = "acme", invisible from the default tenant and from
+    // another tenant.
+    let get = |tenant: Option<&str>| {
+        let mut params = serde_json::json!({"id": task_id});
+        if let Some(t) = tenant {
+            params["tenant"] = serde_json::json!(t);
+        }
+        jsonrpc_request("GetTask", params, 12)
+    };
+    let (_, body) = jsonrpc_call(build_router(state.clone()), &get(Some("acme"))).await;
+    assert_eq!(body["result"]["id"], task_id.as_str(), "{body}");
+
+    for other in [None, Some("other-tenant")] {
+        let (_, body) = jsonrpc_call(build_router(state.clone()), &get(other)).await;
+        assert_eq!(body["error"]["code"], -32001, "tenant {other:?}: {body}");
+    }
+
+    // The HTTP tenant route sees the same scoping.
+    let req = Request::get(format!("/acme/tasks/{task_id}"))
+        .header("a2a-version", "1.0")
+        .body(Body::empty())
+        .unwrap();
+    let resp = build_router(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
 }
 
 // =========================================================
@@ -340,7 +369,7 @@ async fn string_id_preserved() {
 }
 
 // =========================================================
-// [P1] Notifications (no id) must not receive a response
+// Notifications (no id) must not receive a response
 // =========================================================
 
 #[tokio::test]
@@ -362,10 +391,10 @@ async fn notification_without_id_returns_empty_body() {
     let status = resp.status().as_u16();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
 
-    // Server should return 204 No Content or 200 with empty body
+    assert_eq!(status, 204, "notification gets 204 No Content");
     assert!(
-        status == 204 || bytes.is_empty(),
-        "Notification must not produce a response body, got status={status} body={}",
+        bytes.is_empty(),
+        "Notification must not produce a response body, got {}",
         String::from_utf8_lossy(&bytes)
     );
 }
@@ -389,14 +418,15 @@ async fn notification_error_still_suppressed() {
     let status = resp.status().as_u16();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
 
+    assert_eq!(status, 204, "notification gets 204 No Content");
     assert!(
-        status == 204 || bytes.is_empty(),
+        bytes.is_empty(),
         "Notification error must not produce a response body"
     );
 }
 
 // =========================================================
-// [P2] Non-object params must be rejected as invalid params
+// Non-object params must be rejected as invalid params
 // =========================================================
 
 #[tokio::test]

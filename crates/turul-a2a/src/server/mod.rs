@@ -477,7 +477,7 @@ impl A2aServerBuilder {
                 "Storage backend mismatch: task={task_backend}, push={push_backend}, \
                  event={event_backend}, atomic={atomic_backend}, \
                  cancellation_supervisor={supervisor_backend}. \
-                 ADR-009 requires all storage traits to share the same backend."
+                 All storage traits must share one backend so atomic commits span them."
             )));
         }
 
@@ -520,7 +520,7 @@ impl A2aServerBuilder {
                     return Err(A2aError::Internal(format!(
                         "Storage backend mismatch: task={task_backend}, \
                          push_delivery={push_delivery_backend}. \
-                         ADR-009 requires all storage traits to share the same backend."
+                         All storage traits must share one backend so atomic commits span them."
                     )));
                 }
 

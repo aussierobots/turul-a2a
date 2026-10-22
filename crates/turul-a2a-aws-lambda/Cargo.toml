@@ -14,8 +14,8 @@ readme = "README.md"
 [features]
 default = []
 dynamodb = ["turul-a2a/dynamodb"]
-# ADR-018 §Phase 2: durable executor continuation via AWS SQS. Off by
-# default — adopters opt in via `LambdaA2aServerBuilder::with_sqs_return_immediately`.
+# Durable executor continuation via AWS SQS. Off by default — adopters
+# opt in via `LambdaA2aServerBuilder::with_sqs_return_immediately`.
 sqs = ["dep:aws-sdk-sqs"]
 
 [dependencies]

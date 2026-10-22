@@ -322,6 +322,20 @@ auth pipeline. Specifically:
   different metadata value) is NOT an error but MUST yield a
   defined result: the proto value wins and the metadata is
   ignored. This is tested under §2.11.
+- **Protocol version (normative).** Before authentication, the
+  gRPC layer validates the `a2a-version` metadata on every
+  `A2AService` call (spec Section 3.6.2; Section 10.2 "SHOULD
+  validate required service parameters"). The value is compared on
+  `Major.Minor` only, by the same `check_version` the HTTP
+  transport-compliance layer uses. A missing or empty value means
+  0.3 (spec Section 3.6.2), which gRPC never serves — even with the
+  `compat-v03` feature, which serves 0.3 on JSON-RPC only — so a
+  missing, empty, `0.3` or otherwise unsupported value is rejected
+  with `FAILED_PRECONDITION` carrying `ErrorInfo.reason =
+  VERSION_NOT_SUPPORTED`. Co-hosted services (`grpc.health.v1`,
+  reflection) are not A2A calls and are not checked. The first-party
+  `A2aGrpcClient` sends `a2a-version` on every call; generic clients
+  such as grpcurl must pass `-H 'a2a-version: 1.0'`.
 - ADR-007 §6 anti-spoofing rules apply identically: if a client sends
   `x-authenticated-user` or `x-authenticated-tenant` metadata, the
   middleware MUST strip or reject it before dispatching. The adapter
@@ -346,8 +360,13 @@ MUST NOT be relied upon — every `A2aError` variant passes through a
 centralised `A2aError` → `tonic::Status` conversion, mirroring the
 existing centralised HTTP and JSON-RPC conversions (ADR-004).
 
-The mapping table is normative and is the single source of truth for
-the gRPC column. Every row was verified against
+The gRPC column is owned by `A2aError::grpc_status` (backed by the
+`wire::errors::GRPC_*` constants), per ADR-004, and is asserted with
+literal values by the spec-table test in `crates/turul-a2a/src/error.rs`.
+`grpc::error::a2a_to_status` only translates that code name into a
+`tonic::Code`. The table below restates the owner for reference; where
+it and the code disagree, the code and its spec-table test win and this
+ADR is corrected. Every row was verified against
 `crates/turul-a2a-types/src/wire.rs` (HTTP / JSON-RPC constants and
 REASON strings) and `crates/turul-a2a/src/error.rs` (`A2aError`
 variants) on 2026-10-22 against the A2A v1.0.1 §5.4 table.
@@ -382,12 +401,10 @@ under gRPC they surface from the Tower auth layer as
 `tonic::Status::unauthenticated` / `tonic::Status::permission_denied`
 with a human-readable message, no `ErrorInfo`.
 
-A2A v1.0's gRPC binding does not publish a normative A2A-variant →
-gRPC-status table independent of the `google.rpc.Code` conventions
-applied above; this table is the workspace's adoption of those
-conventions, mechanically consistent with ADR-004 §"Key mappings".
-If the upstream spec later publishes a divergent table, this ADR
-is amended; until then this table is the authority.
+The A2A v1.0.1 error table (spec Section 5.4) publishes the gRPC
+status for every A2A error; `A2aError::grpc_status` follows it
+exactly. If the upstream table changes, the owner and its spec-table
+test change first and this ADR is amended in the same change.
 
 ### 2.6 Lambda — out-of-scope for `turul-a2a-aws-lambda` in the current release
 
@@ -813,3 +830,4 @@ theirs. Opt-in is the correct posture for both.
 - 2026-10-22 — §2.3 item 3: `Last-Event-ID` / `a2a-last-event-id` resume removed and SSE `id:` fields dropped. Resuming without a snapshot broke A2A §3.1.6 L311 (every SubscribeToTask stream MUST open with the Task); reconnecting is a new subscribe (§3.5.2).
 - 2026-10-22 — §2.11 test obligations: the one-server rule now names `A2aServer::into_routers()` (shared broker and in-flight registry, not only storage), and a stream and send-target parity list records what `stream_contract_tests.rs` asserts on all three transports — exact §5.4 error mapping, close policy, send-target rules on blocking and streaming send, follow-up refusal while an executor runs, terminal/unknown subscribe, and `append`/`lastChunk` as stored.
 - 2026-10-22 — §2.2: `A2aServer::into_routers()` added as a second public gRPC entry point (HTTP and gRPC routers over one shared server state, gRPC side auth-layered exactly as `into_tonic_router()`); the "only public entry point" sentence now names both.
+- 2026-10-22 — §2.5: ownership of the gRPC column moved to `A2aError::grpc_status` (`wire::errors::GRPC_*`), per ADR-004; this ADR's table is a restatement, not a second source of truth. The claim that A2A publishes no gRPC table is withdrawn — v1.0.1 §5.4 does. §2.4: the gRPC layer now validates `a2a-version` metadata on `A2AService` calls before auth; missing, empty, `0.3` or unsupported values are rejected with FAILED_PRECONDITION / VERSION_NOT_SUPPORTED regardless of `compat-v03`; health and reflection are exempt.

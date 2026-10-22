@@ -22,6 +22,8 @@
 //! - artifact chunks keep `append` / `lastChunk` as stored.
 
 mod common;
+#[cfg(feature = "grpc")]
+use common::{VersionedChannel, with_a2a_version};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -406,12 +408,13 @@ fn grpc_failure(status: &tonic::Status) -> Failure {
 }
 
 #[cfg(feature = "grpc")]
-async fn grpc_client(
-    h: &Harness,
-) -> turul_a2a_proto::grpc::A2aServiceClient<tonic::transport::Channel> {
-    turul_a2a_proto::grpc::A2aServiceClient::connect(format!("http://{}", h.grpc_addr))
+async fn grpc_client(h: &Harness) -> turul_a2a_proto::grpc::A2aServiceClient<VersionedChannel> {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", h.grpc_addr))
+        .expect("grpc endpoint")
+        .connect()
         .await
-        .expect("grpc connect")
+        .expect("grpc connect");
+    turul_a2a_proto::grpc::A2aServiceClient::with_interceptor(channel, with_a2a_version as _)
 }
 
 /// The stream's items after it closed. A status arriving after the

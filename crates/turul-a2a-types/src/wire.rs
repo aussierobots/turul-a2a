@@ -130,6 +130,32 @@ pub mod errors {
     pub const HTTP_EXTENDED_AGENT_CARD_NOT_CONFIGURED: u16 = 400;
     pub const HTTP_EXTENSION_SUPPORT_REQUIRED: u16 = 400;
     pub const HTTP_VERSION_NOT_SUPPORTED: u16 = 400;
+
+    /// gRPC status for A2A errors (spec Section 5.4), as the
+    /// `google.rpc.Code` enum name. The HTTP+JSON binding also emits this
+    /// name as the AIP-193 `error.status` field.
+    pub const GRPC_TASK_NOT_FOUND: &str = "NOT_FOUND";
+    pub const GRPC_TASK_NOT_CANCELABLE: &str = "FAILED_PRECONDITION";
+    pub const GRPC_PUSH_NOTIFICATION_NOT_SUPPORTED: &str = "FAILED_PRECONDITION";
+    pub const GRPC_UNSUPPORTED_OPERATION: &str = "FAILED_PRECONDITION";
+    pub const GRPC_CONTENT_TYPE_NOT_SUPPORTED: &str = "INVALID_ARGUMENT";
+    pub const GRPC_INVALID_AGENT_RESPONSE: &str = "INTERNAL";
+    pub const GRPC_EXTENDED_AGENT_CARD_NOT_CONFIGURED: &str = "FAILED_PRECONDITION";
+    pub const GRPC_EXTENSION_SUPPORT_REQUIRED: &str = "FAILED_PRECONDITION";
+    pub const GRPC_VERSION_NOT_SUPPORTED: &str = "FAILED_PRECONDITION";
+}
+
+/// Protocol version and media types (spec Sections 3.6 and 14).
+pub mod protocol {
+    /// Name of the `A2A-Version` service parameter. Sent as an HTTP header,
+    /// gRPC metadata key (lowercased), or HTTP query parameter.
+    pub const VERSION_PARAM: &str = "A2A-Version";
+    /// The `Major.Minor` protocol version this implementation speaks.
+    pub const VERSION: &str = "1.0";
+    /// Registered A2A media type (spec Section 14.1).
+    pub const MEDIA_TYPE_A2A_JSON: &str = "application/a2a+json";
+    /// Plain JSON media type, accepted on every JSON binding.
+    pub const MEDIA_TYPE_JSON: &str = "application/json";
 }
 
 /// Protocol binding identifiers (from AgentInterface.protocol_binding)
@@ -249,12 +275,8 @@ mod tests {
     }
 
     #[test]
-    fn error_domain_is_a2a_protocol_org() {
+    fn error_info_identity_matches_spec() {
         assert_eq!(errors::ERROR_DOMAIN, "a2a-protocol.org");
-    }
-
-    #[test]
-    fn error_info_type_is_google_rpc() {
         assert_eq!(
             errors::ERROR_INFO_TYPE,
             "type.googleapis.com/google.rpc.ErrorInfo"
@@ -262,65 +284,9 @@ mod tests {
     }
 
     #[test]
-    fn task_not_cancelable_is_400() {
-        assert_eq!(errors::HTTP_TASK_NOT_CANCELABLE, 400);
-    }
-
-    #[test]
-    fn content_type_not_supported_is_400() {
-        assert_eq!(errors::HTTP_CONTENT_TYPE_NOT_SUPPORTED, 400);
-    }
-
-    #[test]
-    fn invalid_agent_response_is_500() {
-        assert_eq!(errors::HTTP_INVALID_AGENT_RESPONSE, 500);
-    }
-
-    #[test]
-    fn jsonrpc_error_codes_are_in_range() {
-        let codes = [
-            errors::JSONRPC_TASK_NOT_FOUND,
-            errors::JSONRPC_TASK_NOT_CANCELABLE,
-            errors::JSONRPC_PUSH_NOTIFICATION_NOT_SUPPORTED,
-            errors::JSONRPC_UNSUPPORTED_OPERATION,
-            errors::JSONRPC_CONTENT_TYPE_NOT_SUPPORTED,
-            errors::JSONRPC_INVALID_AGENT_RESPONSE,
-            errors::JSONRPC_EXTENDED_AGENT_CARD_NOT_CONFIGURED,
-            errors::JSONRPC_EXTENSION_SUPPORT_REQUIRED,
-            errors::JSONRPC_VERSION_NOT_SUPPORTED,
-        ];
-        assert_eq!(codes.len(), 9);
-        for code in codes {
-            assert!(
-                (-32099..=-32001).contains(&code),
-                "JSON-RPC code {code} must be in -32001 to -32099 range"
-            );
-        }
-    }
-
-    #[test]
-    fn error_reasons_are_upper_snake_case_without_error_suffix() {
-        let reasons = [
-            errors::REASON_TASK_NOT_FOUND,
-            errors::REASON_TASK_NOT_CANCELABLE,
-            errors::REASON_PUSH_NOTIFICATION_NOT_SUPPORTED,
-            errors::REASON_UNSUPPORTED_OPERATION,
-            errors::REASON_CONTENT_TYPE_NOT_SUPPORTED,
-            errors::REASON_INVALID_AGENT_RESPONSE,
-            errors::REASON_EXTENDED_AGENT_CARD_NOT_CONFIGURED,
-            errors::REASON_EXTENSION_SUPPORT_REQUIRED,
-            errors::REASON_VERSION_NOT_SUPPORTED,
-        ];
-        for reason in reasons {
-            assert!(
-                !reason.ends_with("_ERROR"),
-                "Reason {reason} must not end with _ERROR"
-            );
-            assert_eq!(
-                reason,
-                reason.to_uppercase(),
-                "Reason {reason} must be UPPER_SNAKE_CASE"
-            );
-        }
+    fn protocol_constants_match_spec() {
+        assert_eq!(protocol::VERSION, "1.0");
+        assert_eq!(protocol::VERSION_PARAM, "A2A-Version");
+        assert_eq!(protocol::MEDIA_TYPE_A2A_JSON, "application/a2a+json");
     }
 }

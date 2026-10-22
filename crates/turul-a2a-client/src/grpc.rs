@@ -12,8 +12,8 @@
 //! this client — the server prefers the proto field anyway, so
 //! emitting metadata alongside it would be redundant.
 //!
-//! Auth metadata: `authorization: Bearer ...` /
-//! `x-api-key: ...`. All ASCII; no `-bin`.
+//! Metadata: `a2a-version` on every call, plus auth as
+//! `authorization: Bearer ...` / `x-api-key: ...`. All ASCII; no `-bin`.
 
 use std::pin::Pin;
 
@@ -76,6 +76,11 @@ impl A2aGrpcClient {
     /// it on the proto request itself (see per-verb helpers below).
     fn prepare<T>(&self, value: T) -> Request<T> {
         let mut req = Request::new(value);
+        // Spec Section 3.6.1: clients MUST send the protocol version.
+        req.metadata_mut().insert(
+            "a2a-version",
+            MetadataValue::from_static(turul_a2a_types::wire::protocol::VERSION),
+        );
         match &self.auth {
             ClientAuth::None => {}
             ClientAuth::Bearer(token) => {

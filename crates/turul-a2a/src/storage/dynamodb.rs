@@ -1023,11 +1023,16 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         turul_a2a_types::state_machine::validate_transition(current_state, new_state).map_err(
             |e| match e {
                 turul_a2a_types::A2aTypeError::InvalidTransition { current, requested } => {
-                    A2aStorageError::InvalidTransition { current, requested }
+                    A2aStorageError::InvalidTransition {
+                        task_id: task_id.to_string(),
+                        current,
+                        requested,
+                    }
                 }
-                turul_a2a_types::A2aTypeError::TerminalState(s) => {
-                    A2aStorageError::TerminalState(s)
-                }
+                turul_a2a_types::A2aTypeError::TerminalState(s) => A2aStorageError::TerminalState {
+                    task_id: task_id.to_string(),
+                    state: s,
+                },
                 other => A2aStorageError::TypeError(other),
             },
         )?;
@@ -1175,7 +1180,10 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
                             if let Some(s) = state
                                 && turul_a2a_types::state_machine::is_terminal(s)
                             {
-                                return Err(A2aStorageError::TerminalState(s));
+                                return Err(A2aStorageError::TerminalState {
+                                    task_id: task_id.to_string(),
+                                    state: s,
+                                });
                             }
                             // get_task succeeded but state is non-terminal —
                             // means owner check must have been the failing
@@ -1959,7 +1967,11 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         turul_a2a_types::state_machine::validate_transition(current_state, new_state).map_err(
             |e| match e {
                 turul_a2a_types::A2aTypeError::InvalidTransition { current, requested } => {
-                    A2aStorageError::InvalidTransition { current, requested }
+                    A2aStorageError::InvalidTransition {
+                        task_id: task_id.to_string(),
+                        current,
+                        requested,
+                    }
                 }
                 turul_a2a_types::A2aTypeError::TerminalState(s) => {
                     A2aStorageError::TerminalStateAlreadySet {

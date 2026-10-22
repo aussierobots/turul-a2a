@@ -1,8 +1,9 @@
-//! Helpers shared by the streaming integration tests: reading an SSE
-//! body while telling "the server closed the stream" apart from "the
-//! wait elapsed with the stream still open", listing the states of a
-//! stream's status updates, and waiting for a spawned server to answer
-//! before the first request.
+//! Helpers shared by the integration tests: reading an SSE body while
+//! telling "the server closed the stream" apart from "the wait elapsed
+//! with the stream still open", listing the states of a stream's status
+//! updates, waiting for a spawned server to answer before the first
+//! request, and (with `grpc`) a tonic channel that sends the
+//! `a2a-version` metadata a conforming client sends.
 
 // Each test binary uses a different subset of these helpers.
 #![allow(dead_code)]
@@ -148,4 +149,24 @@ pub async fn wait_grpc_ready(addr: std::net::SocketAddr) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("gRPC server at {addr} never became ready");
+}
+
+/// Raw tonic client channel that stamps every call with the `a2a-version`
+/// metadata a conforming client sends (spec Section 3.6.1).
+#[cfg(feature = "grpc")]
+pub type VersionedChannel = tonic::service::interceptor::InterceptedService<
+    tonic::transport::Channel,
+    fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+>;
+
+/// Interceptor that adds `a2a-version: <supported version>` to a call.
+#[cfg(feature = "grpc")]
+pub fn with_a2a_version(mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+    use turul_a2a_types::wire::protocol;
+    req.metadata_mut().insert(
+        tonic::metadata::MetadataKey::from_bytes(protocol::VERSION_PARAM.as_bytes())
+            .expect("valid metadata key"),
+        tonic::metadata::MetadataValue::from_static(protocol::VERSION),
+    );
+    Ok(req)
 }

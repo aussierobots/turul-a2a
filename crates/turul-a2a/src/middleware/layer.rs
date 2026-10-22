@@ -97,9 +97,12 @@ where
 /// Wire surface:
 /// - Body: `{"error": "<kind_wire_string>"}` where the kind string comes
 ///   from [`AuthFailureKind::body_string`].
-/// - `WWW-Authenticate`: emitted only on `HttpChallenge` variants, and
-///   only when the kind has a Bearer RFC 6750 mapping. `error_description`
-///   is intentionally omitted to prevent leaking validator internals.
+/// - `WWW-Authenticate`: emitted only on `HttpChallenge` variants whose kind
+///   is a Bearer failure ([`super::AuthFailureKind::bearer_challenge`]): a
+///   bare `Bearer realm="a2a"` when the credential is missing (RFC 6750
+///   Section 3.1), otherwise with the fixed `error=` code.
+///   `error_description` is intentionally omitted to prevent leaking
+///   validator internals.
 /// - `Internal` is not auth-failure and uses a fixed `internal_error`
 ///   body string.
 fn middleware_error_to_response(err: &MiddlewareError) -> Response<Body> {
@@ -113,10 +116,9 @@ fn middleware_error_to_response(err: &MiddlewareError) -> Response<Body> {
         .header(http::header::CONTENT_TYPE, "application/json");
 
     if let MiddlewareError::HttpChallenge(kind) = err
-        && let Some(code) = kind.bearer_rfc6750_code()
+        && let Some(challenge) = kind.bearer_challenge()
     {
-        let header = format!("Bearer realm=\"a2a\", error=\"{code}\"");
-        builder = builder.header(http::header::WWW_AUTHENTICATE, header);
+        builder = builder.header(http::header::WWW_AUTHENTICATE, challenge);
     }
 
     builder

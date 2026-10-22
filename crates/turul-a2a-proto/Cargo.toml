@@ -12,7 +12,7 @@ rust-version.workspace = true
 readme = "README.md"
 
 [features]
-# gRPC transport (ADR-014). Off by default — HTTP+JSON adopters pay
+# gRPC transport. Off by default — HTTP+JSON adopters pay
 # zero tonic weight. Enabling this activates optional runtime and
 # build-time tonic dependencies and regenerates the protos with
 # tonic service + client stubs.

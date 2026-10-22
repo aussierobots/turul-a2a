@@ -111,7 +111,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "  grpcurl -plaintext -import-path $(git rev-parse --show-toplevel)/proto -proto a2a.proto \\"
     );
-    println!("    127.0.0.1:{GRPC_PORT} lf.a2a.v1.A2AService/ListTasks");
+    // Every A2AService call must carry `a2a-version` metadata.
+    println!("    -H 'a2a-version: 1.0' 127.0.0.1:{GRPC_PORT} lf.a2a.v1.A2AService/ListTasks");
 
     router.serve(addr).await?;
     Ok(())

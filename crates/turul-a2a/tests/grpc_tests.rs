@@ -36,7 +36,6 @@ use futures::StreamExt;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Channel;
 use tonic::{Request, Status};
 use tonic_types::StatusExt;
 
@@ -49,6 +48,8 @@ use turul_a2a::server::A2aServer;
 use turul_a2a::storage::InMemoryA2aStorage;
 use turul_a2a_proto::grpc::A2aServiceClient;
 use turul_a2a_types::{Artifact, Message, Part, Task};
+
+use common::{VersionedChannel, with_a2a_version};
 
 // =========================================================
 // Executors
@@ -188,14 +189,14 @@ impl Harness {
         Self { addr, handle }
     }
 
-    async fn client(&self) -> A2aServiceClient<Channel> {
+    async fn client(&self) -> A2aServiceClient<VersionedChannel> {
         let endpoint = format!("http://{}", self.addr);
         let channel = tonic::transport::Endpoint::from_shared(endpoint)
             .expect("parse endpoint")
             .connect()
             .await
             .expect("connect tonic channel");
-        A2aServiceClient::new(channel)
+        A2aServiceClient::with_interceptor(channel, with_a2a_version as _)
     }
 }
 

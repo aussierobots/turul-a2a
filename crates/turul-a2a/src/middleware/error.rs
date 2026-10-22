@@ -28,9 +28,9 @@ pub enum AuthFailureKind {
     InvalidApiKey,
     /// Authenticated principal resolved to an empty / whitespace string.
     EmptyPrincipal,
-    /// Reserved. Not produced by any current code path — scope enforcement
-    /// in `BearerMiddleware::required_scopes` is not wired. Kept in the
-    /// taxonomy so the wire mapping is stable when scope checks land.
+    /// The credential is valid but lacks a required scope (Bearer
+    /// `with_required_scopes`). Surfaces as 403 with an RFC 6750
+    /// `insufficient_scope` challenge.
     InsufficientScope,
 }
 
@@ -48,14 +48,30 @@ impl AuthFailureKind {
     }
 
     /// RFC 6750 `error=` code for a Bearer `WWW-Authenticate` challenge.
-    /// Returns `None` when the kind does not map onto a Bearer-scheme
-    /// challenge (for example, API-key-specific rejection).
+    ///
+    /// Returns `None` for a missing credential — RFC 6750 Section 3.1: "If
+    /// the request lacks any authentication information ... the resource
+    /// server SHOULD NOT include an error code or other error information"
+    /// — and for kinds that are not Bearer failures (API-key rejection).
     pub fn bearer_rfc6750_code(self) -> Option<&'static str> {
         match self {
-            Self::MissingCredential => Some("invalid_request"),
             Self::InvalidToken | Self::EmptyPrincipal => Some("invalid_token"),
             Self::InsufficientScope => Some("insufficient_scope"),
-            Self::InvalidApiKey => None,
+            Self::MissingCredential | Self::InvalidApiKey => None,
+        }
+    }
+
+    /// `WWW-Authenticate` value for a Bearer challenge of this kind, or
+    /// `None` when the kind is not a Bearer failure. A missing credential
+    /// gets the bare challenge `Bearer realm="a2a"`; every other Bearer
+    /// failure adds its fixed RFC 6750 `error=` code. `error_description`
+    /// is never emitted, so no validator detail reaches the header.
+    pub fn bearer_challenge(self) -> Option<String> {
+        match self {
+            Self::MissingCredential => Some(r#"Bearer realm="a2a""#.to_string()),
+            other => other
+                .bearer_rfc6750_code()
+                .map(|code| format!(r#"Bearer realm="a2a", error="{code}""#)),
         }
     }
 }
@@ -158,7 +174,8 @@ mod tests {
     fn bearer_rfc6750_mapping() {
         assert_eq!(
             AuthFailureKind::MissingCredential.bearer_rfc6750_code(),
-            Some("invalid_request")
+            None,
+            "RFC 6750 Section 3.1: no error code when credentials are absent"
         );
         assert_eq!(
             AuthFailureKind::InvalidToken.bearer_rfc6750_code(),
@@ -173,6 +190,33 @@ mod tests {
             Some("insufficient_scope")
         );
         assert_eq!(AuthFailureKind::InvalidApiKey.bearer_rfc6750_code(), None);
+    }
+
+    #[test]
+    fn bearer_challenge_values() {
+        assert_eq!(
+            AuthFailureKind::MissingCredential
+                .bearer_challenge()
+                .as_deref(),
+            Some(r#"Bearer realm="a2a""#)
+        );
+        assert_eq!(
+            AuthFailureKind::InvalidToken.bearer_challenge().as_deref(),
+            Some(r#"Bearer realm="a2a", error="invalid_token""#)
+        );
+        assert_eq!(
+            AuthFailureKind::EmptyPrincipal
+                .bearer_challenge()
+                .as_deref(),
+            Some(r#"Bearer realm="a2a", error="invalid_token""#)
+        );
+        assert_eq!(
+            AuthFailureKind::InsufficientScope
+                .bearer_challenge()
+                .as_deref(),
+            Some(r#"Bearer realm="a2a", error="insufficient_scope""#)
+        );
+        assert_eq!(AuthFailureKind::InvalidApiKey.bearer_challenge(), None);
     }
 
     #[test]

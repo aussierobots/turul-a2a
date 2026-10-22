@@ -15,8 +15,16 @@ The router uses axum with wildcard catch-all (`/tasks/{*rest}`) for the proto's 
 
 Notifications (no `id`) return 204 No Content. Non-object `params` return -32602.
 
+SubscribeToTask is routed for both `GET /tasks/{id}:subscribe` (proto `google.api.http` annotation) and `POST /tasks/{id}:subscribe` (spec §11.3.2 text), on the default and tenant-prefixed routes.
+
+Transport-layer rejections that happen before dispatch (`A2A-Version` not supported, request Content-Type not JSON — ADR-004) are rendered in the binding of the endpoint: on the JSON-RPC endpoint they are JSON-RPC 2.0 error envelopes with `id: null` (the request body has not been read) and the A2A code and ErrorInfo in `error.data`; elsewhere the HTTP+JSON error body. The JSON-RPC binding (spec §9) does not specify an HTTP status for error responses; they use HTTP 200, the same as every error the JSON-RPC dispatcher itself returns. Auth failures are the exception and stay HTTP 401/403 on every path (ADR-007, ADR-016).
+
 ## Consequences
 
 - **No behavior fork between transports.** Both HTTP and JSON-RPC exercise the same core functions, so parity is structural rather than aspirational.
 - **Adding a new operation requires three touch-points:** add core function, add HTTP route, add JSON-RPC dispatch case.
 - **Axum wildcard routing adds one level of indirection for task paths** but handles the proto's colon-action syntax cleanly.
+
+## Revision log
+
+- **2026-10-22** — `POST /tasks/{id}:subscribe` accepted alongside `GET`. Transport-layer `A2A-Version` / Content-Type rejections on the JSON-RPC endpoint are JSON-RPC error envelopes (HTTP 200, `id: null`) instead of HTTP+JSON error bodies.

@@ -110,10 +110,8 @@ pub enum AuthFailureKind {
     InvalidApiKey,
     /// Authenticated principal resolved to an empty/whitespace string.
     EmptyPrincipal,
-    /// Reserved for future use. Not produced by any current code path
-    /// — `BearerMiddleware::required_scopes` exists as a field but
-    /// is not evaluated in `before_request`. Kept in the taxonomy so
-    /// the wire mapping is stable when scope enforcement lands.
+    /// The token is valid but its `scope` claim lacks a scope listed in
+    /// `BearerMiddleware::with_required_scopes` (403, RFC 6750 §3.1).
     InsufficientScope,
 }
 ```
@@ -172,12 +170,21 @@ WWW-Authenticate: Bearer realm="a2a", error="<rfc6750-code>"
 
 With the RFC 6750 §3 mapping:
 
-| `AuthFailureKind` | `error=` value |
+| `AuthFailureKind` | `WWW-Authenticate` value |
 |---|---|
-| `MissingCredential` (when Bearer expected) | `invalid_request` |
-| `InvalidToken` | `invalid_token` |
-| `EmptyPrincipal` | `invalid_token` |
-| `InsufficientScope` | `insufficient_scope` |
+| `MissingCredential` (when Bearer expected) | `Bearer realm="a2a"` (no `error=`) |
+| `InvalidToken` | `Bearer realm="a2a", error="invalid_token"` |
+| `EmptyPrincipal` | `Bearer realm="a2a", error="invalid_token"` |
+| `InsufficientScope` | `Bearer realm="a2a", error="insufficient_scope"` |
+
+A request that carries no credential at all gets the bare challenge:
+RFC 6750 §3.1 — "If the request lacks any authentication information
+(e.g., the client was unaware that authentication is necessary or
+attempted using an unsupported authentication method), the resource
+server SHOULD NOT include an error code or other error information."
+`invalid_request` is for a malformed request (duplicate or unsupported
+parameters, more than one credential method), which the framework does
+not distinguish.
 
 `InvalidApiKey` never reaches a Bearer challenge path (§2.3
 scheme-separation); no Bearer mapping applies.
@@ -318,7 +325,11 @@ contract.
 6. **End-to-end Bearer auth failure**: 401 with body
    `{"error": "invalid_token"}` and header
    `WWW-Authenticate: Bearer realm="a2a", error="invalid_token"`
-   (no `error_description`, no validator internals).
+   (no `error_description`, no validator internals). A request with no
+   Bearer token gets 401, body `{"error": "missing_credential"}` and the
+   bare `WWW-Authenticate: Bearer realm="a2a"`. A valid token lacking a
+   required scope gets 403, body `{"error": "insufficient_scope"}` and
+   `error="insufficient_scope"`.
 7. **End-to-end API-key auth failure**: 401 with body
    `{"error": "invalid_api_key"}` and no `WWW-Authenticate` header.
 8. **Charset safety**: property test that emitted `WWW-Authenticate`
@@ -430,7 +441,18 @@ any affected adopter sees them.
   wire coarse and signals the refactor path for richer internal
   discriminants in a follow-up.
 
-## 8. References
+## 8. Revision log
+
+- **2026-10-22** — A missing credential on a Bearer path now emits the
+  bare challenge `WWW-Authenticate: Bearer realm="a2a"` with no `error=`
+  code (RFC 6750 §3.1), replacing `error="invalid_request"`.
+  `AuthFailureKind::bearer_rfc6750_code` returns `None` for
+  `MissingCredential`; `AuthFailureKind::bearer_challenge` owns the full
+  header value. `InsufficientScope` is produced by
+  `BearerMiddleware::with_required_scopes`, no longer reserved. Test
+  obligation 6 extended accordingly.
+
+## 9. References
 
 - [RFC 6750](https://datatracker.ietf.org/doc/html/rfc6750) §3 — "The
   WWW-Authenticate Response Header Field".

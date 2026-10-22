@@ -268,13 +268,16 @@ async fn e2e_multi_turn_input_required() {
     );
     assert_eq!(body["task"]["status"]["state"], "TASK_STATE_COMPLETED");
 
-    // Verify the task has both messages in history
+    // The executor adds no messages, so history is exactly the two user
+    // turns, in order.
     let (_, body) = get_json(build_router(st), &format!("/tasks/{tid}")).await;
-    let history = body["history"].as_array();
-    assert!(
-        history.is_some_and(|h| h.len() >= 2),
-        "Task should have at least 2 messages in history from multi-turn"
-    );
+    let ids: Vec<&str> = body["history"]
+        .as_array()
+        .expect("history")
+        .iter()
+        .map(|m| m["messageId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["mt1", "mt2"], "{body}");
 }
 
 // =========================================================
@@ -457,8 +460,9 @@ async fn e2e_pagination() {
         .await;
     }
 
-    // Page through with pageSize=3
+    // Page through with pageSize=3: pages of 3, 3, 1.
     let mut all_ids = vec![];
+    let mut page_sizes = vec![];
     let mut token: Option<String> = None;
     loop {
         let uri = match &token {
@@ -468,7 +472,8 @@ async fn e2e_pagination() {
         let (_, body) = get_json(build_router(st.clone()), &uri).await;
         assert_eq!(body["totalSize"], 7);
         let tasks = body["tasks"].as_array().unwrap();
-        assert!(tasks.len() <= 3);
+        page_sizes.push(tasks.len());
+        assert!(page_sizes.len() <= 3, "pagination must terminate");
         all_ids.extend(
             tasks
                 .iter()
@@ -481,6 +486,7 @@ async fn e2e_pagination() {
         }
         token = Some(npt.to_string());
     }
+    assert_eq!(page_sizes, vec![3, 3, 1]);
     assert_eq!(all_ids.len(), 7);
     let unique: std::collections::HashSet<_> = all_ids.iter().collect();
     assert_eq!(unique.len(), 7, "No duplicates across pages");

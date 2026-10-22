@@ -110,6 +110,9 @@ aws-sdk-sqs = "1"
 serde_dynamo = "4"
 
 # Testing / crypto
+# aws-lc-rs: test-only P-256 key generation for real JWT round-trips
+# (already in the graph via jsonwebtoken's aws_lc_rs backend).
+aws-lc-rs = "1"
 rand = "0.10"
 base64 = "0.23"
 wiremock = "0.6"

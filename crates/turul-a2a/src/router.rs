@@ -121,11 +121,13 @@ pub fn build_router(state: AppState) -> Router {
         );
 
     // JSON-RPC dispatch: /jsonrpc is the canonical endpoint
-    let router = router.route("/jsonrpc", post(crate::jsonrpc::jsonrpc_dispatch_handler));
+    let router = router.route(
+        crate::jsonrpc::JSONRPC_PATH,
+        post(crate::jsonrpc::jsonrpc_dispatch_handler),
+    );
 
-    // A2A v0.3 compat: root POST route for a2a-sdk 0.3.x clients that POST
-    // to the agent card URL (base URL) rather than /message:send.
-    // Removal condition: when a2a-sdk supports v1.0 routing.
+    // A2A v0.3 compat: root POST route for v0.3-wire clients (Strands
+    // Agents, a2a-sdk 0.3.x) that POST JSON-RPC to the agent card URL.
     #[cfg(feature = "compat-v03")]
     let router = router.route("/", post(crate::jsonrpc::jsonrpc_dispatch_handler));
 
@@ -154,7 +156,8 @@ enum TaskAction {
     GetTask(String),
     /// /tasks/{id}:cancel — POST=CancelTask
     CancelTask(String),
-    /// /tasks/{id}:subscribe — GET=SubscribeToTask (SSE)
+    /// /tasks/{id}:subscribe — GET (proto annotation) or POST (spec
+    /// Section 11.3.2 text) = SubscribeToTask (SSE)
     SubscribeToTask(String),
     /// /tasks/{task_id}/pushNotificationConfigs — GET=list, POST=create
     PushConfigCollection(String),
@@ -333,6 +336,9 @@ async fn dispatch_task_post(
         Some(TaskAction::CancelTask(id)) => {
             let Json(v) = core_cancel_task(state, tenant, owner, &id).await?;
             Ok(Json(v).into_response())
+        }
+        Some(TaskAction::SubscribeToTask(id)) => {
+            core_subscribe_to_task(state, tenant, owner, &id).await
         }
         Some(TaskAction::PushConfigCollection(task_id)) => {
             let Json(v) = core_create_push_config(state, tenant, owner, &task_id, body).await?;
@@ -959,8 +965,7 @@ pub async fn core_send_message(
                     tenant = tenant,
                     owner = owner,
                     task_id = %task_id,
-                    "ADR-017 Bug 2 compensation: transitioning task to FAILED \
-                     after inline push config registration failure"
+                    "inline push config registration failed: transitioning task to FAILED"
                 );
                 let reason_msg = Message::new(
                     uuid::Uuid::now_v7().to_string(),
@@ -998,8 +1003,9 @@ pub async fn core_send_message(
                         owner = owner,
                         task_id = %task_id,
                         error = %compensate_err,
-                        "ADR-017 Bug 2 compensation failed: task may remain \
-                         in WORKING without a callback until supervisor sweep"
+                        "transitioning task to FAILED after inline push config registration \
+                         failure itself failed: task may remain in WORKING without a callback \
+                         until supervisor sweep"
                     );
                 }
                 state.event_broker.notify(&task_id).await;
@@ -1039,7 +1045,7 @@ pub async fn core_send_message(
                     owner = owner,
                     task_id = %task_id,
                     queue_kind = queue.kind(),
-                    "ADR-018 enqueue failed: transitioning task to FAILED"
+                    "durable executor enqueue failed: transitioning task to FAILED"
                 );
                 let reason_msg = Message::new(
                     uuid::Uuid::now_v7().to_string(),
@@ -1070,8 +1076,8 @@ pub async fn core_send_message(
                         owner = owner,
                         task_id = %task_id,
                         error = %compensate_err,
-                        "ADR-018 FAILED-compensation itself failed: task may \
-                         remain in WORKING until supervisor sweep"
+                        "transitioning task to FAILED after enqueue failure itself failed: \
+                         task may remain in WORKING until supervisor sweep"
                     );
                 }
                 state.event_broker.notify(&task_id).await;
@@ -1423,7 +1429,7 @@ pub async fn core_cancel_task(
                 task_id: task_id.to_string(),
             });
         }
-        Err(A2aStorageError::TerminalState(_))
+        Err(A2aStorageError::TerminalState { .. })
         | Err(A2aStorageError::InvalidTransition { .. })
         | Err(A2aStorageError::TerminalStateAlreadySet { .. }) => {
             return Err(A2aError::TaskNotCancelable {
@@ -1542,11 +1548,10 @@ pub async fn core_cancel_task(
             Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
         }
         Err(A2aStorageError::TaskNotFound(id)) => Err(A2aError::TaskNotFound { task_id: id }),
-        Err(A2aStorageError::TerminalState(_)) | Err(A2aStorageError::InvalidTransition { .. }) => {
-            Err(A2aError::TaskNotCancelable {
-                task_id: task_id.to_string(),
-            })
-        }
+        Err(A2aStorageError::TerminalState { .. })
+        | Err(A2aStorageError::InvalidTransition { .. }) => Err(A2aError::TaskNotCancelable {
+            task_id: task_id.to_string(),
+        }),
         Err(other) => Err(A2aError::from(other)),
     }
 }

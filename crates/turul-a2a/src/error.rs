@@ -109,6 +109,25 @@ impl A2aError {
         }
     }
 
+    /// gRPC status per spec Section 5.4, as the `google.rpc.Code` enum name.
+    /// The gRPC binding maps it to a status code; the HTTP+JSON binding
+    /// emits it as the AIP-193 `error.status` field.
+    pub fn grpc_status(&self) -> &'static str {
+        match self {
+            Self::TaskNotFound { .. } => errors::GRPC_TASK_NOT_FOUND,
+            Self::TaskNotCancelable { .. } => errors::GRPC_TASK_NOT_CANCELABLE,
+            Self::PushNotificationNotSupported => errors::GRPC_PUSH_NOTIFICATION_NOT_SUPPORTED,
+            Self::UnsupportedOperation { .. } => errors::GRPC_UNSUPPORTED_OPERATION,
+            Self::ContentTypeNotSupported { .. } => errors::GRPC_CONTENT_TYPE_NOT_SUPPORTED,
+            Self::InvalidAgentResponse { .. } => errors::GRPC_INVALID_AGENT_RESPONSE,
+            Self::ExtendedAgentCardNotConfigured => errors::GRPC_EXTENDED_AGENT_CARD_NOT_CONFIGURED,
+            Self::ExtensionSupportRequired { .. } => errors::GRPC_EXTENSION_SUPPORT_REQUIRED,
+            Self::VersionNotSupported { .. } => errors::GRPC_VERSION_NOT_SUPPORTED,
+            Self::InvalidRequest { .. } => "INVALID_ARGUMENT",
+            Self::Internal(_) => "INTERNAL",
+        }
+    }
+
     /// Build the google.rpc.ErrorInfo JSON object for this error.
     /// Returns `None` for non-A2A errors.
     pub fn error_info(&self) -> Option<Value> {
@@ -121,11 +140,14 @@ impl A2aError {
         })
     }
 
-    /// Build the HTTP error response body per AIP-193.
+    /// Build the HTTP error response body: the `google.rpc.Status` JSON
+    /// shape of AIP-193 (`code`, `status`, `message`, `details`), as in the
+    /// spec Section 11.6 example.
     pub fn to_http_error_body(&self) -> Value {
         let mut body = json!({
             "error": {
                 "code": self.http_status(),
+                "status": self.grpc_status(),
                 "message": self.to_string(),
             }
         });
@@ -174,19 +196,14 @@ impl From<crate::storage::A2aStorageError> for A2aError {
         use crate::storage::A2aStorageError;
         match err {
             A2aStorageError::TaskNotFound(id) => A2aError::TaskNotFound { task_id: id },
-            A2aStorageError::TerminalState(_) => A2aError::TaskNotCancelable {
-                task_id: String::new(),
-            },
-            // CAS loser from atomic-store terminal-CAS:
-            // maps to the same wire error as TerminalState —
-            // TaskNotCancelable. Carry the task_id through for better
-            // diagnostics at the wire layer.
-            A2aStorageError::TerminalStateAlreadySet { task_id, .. } => {
+            // A task already terminal (raw state-machine signal or the
+            // terminal-write CAS loser) or an illegal transition cannot be
+            // moved by the caller: TaskNotCancelable, naming the task.
+            A2aStorageError::TerminalState { task_id, .. }
+            | A2aStorageError::TerminalStateAlreadySet { task_id, .. }
+            | A2aStorageError::InvalidTransition { task_id, .. } => {
                 A2aError::TaskNotCancelable { task_id }
             }
-            A2aStorageError::InvalidTransition { .. } => A2aError::TaskNotCancelable {
-                task_id: String::new(),
-            },
             other => A2aError::Internal(other.to_string()),
         }
     }
@@ -195,202 +212,266 @@ impl From<crate::storage::A2aStorageError> for A2aError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::A2aStorageError;
+    use turul_a2a_types::TaskState;
 
-    // =========================================================
-    // Error model tests — exact HTTP/JSON-RPC/ErrorInfo mapping
-    // =========================================================
+    /// One A2A error with its expected wire mapping, transcribed literally
+    /// from the spec Section 5.4 table (gRPC status by `google.rpc.Code`
+    /// name).
+    struct Row {
+        err: A2aError,
+        http: u16,
+        jsonrpc: i32,
+        grpc: &'static str,
+        reason: &'static str,
+    }
 
-    #[test]
-    fn task_not_found_maps_to_404() {
-        let err = A2aError::TaskNotFound {
-            task_id: "t-1".into(),
-        };
-        assert_eq!(err.http_status(), 404);
-        assert_eq!(err.jsonrpc_code(), errors::JSONRPC_TASK_NOT_FOUND);
-        assert_eq!(err.error_reason(), Some(errors::REASON_TASK_NOT_FOUND));
+    fn spec_table() -> Vec<Row> {
+        vec![
+            Row {
+                err: A2aError::TaskNotFound {
+                    task_id: "t".into(),
+                },
+                http: 404,
+                jsonrpc: -32001,
+                grpc: "NOT_FOUND",
+                reason: "TASK_NOT_FOUND",
+            },
+            Row {
+                err: A2aError::TaskNotCancelable {
+                    task_id: "t".into(),
+                },
+                http: 400,
+                jsonrpc: -32002,
+                grpc: "FAILED_PRECONDITION",
+                reason: "TASK_NOT_CANCELABLE",
+            },
+            Row {
+                err: A2aError::PushNotificationNotSupported,
+                http: 400,
+                jsonrpc: -32003,
+                grpc: "FAILED_PRECONDITION",
+                reason: "PUSH_NOTIFICATION_NOT_SUPPORTED",
+            },
+            Row {
+                err: A2aError::UnsupportedOperation {
+                    message: "x".into(),
+                },
+                http: 400,
+                jsonrpc: -32004,
+                grpc: "FAILED_PRECONDITION",
+                reason: "UNSUPPORTED_OPERATION",
+            },
+            Row {
+                err: A2aError::ContentTypeNotSupported {
+                    content_type: "x".into(),
+                },
+                http: 400,
+                jsonrpc: -32005,
+                grpc: "INVALID_ARGUMENT",
+                reason: "CONTENT_TYPE_NOT_SUPPORTED",
+            },
+            Row {
+                err: A2aError::InvalidAgentResponse {
+                    message: "x".into(),
+                },
+                http: 500,
+                jsonrpc: -32006,
+                grpc: "INTERNAL",
+                reason: "INVALID_AGENT_RESPONSE",
+            },
+            Row {
+                err: A2aError::ExtendedAgentCardNotConfigured,
+                http: 400,
+                jsonrpc: -32007,
+                grpc: "FAILED_PRECONDITION",
+                reason: "EXTENDED_AGENT_CARD_NOT_CONFIGURED",
+            },
+            Row {
+                err: A2aError::ExtensionSupportRequired {
+                    extension: "x".into(),
+                },
+                http: 400,
+                jsonrpc: -32008,
+                grpc: "FAILED_PRECONDITION",
+                reason: "EXTENSION_SUPPORT_REQUIRED",
+            },
+            Row {
+                err: A2aError::VersionNotSupported {
+                    version: "x".into(),
+                },
+                http: 400,
+                jsonrpc: -32009,
+                grpc: "FAILED_PRECONDITION",
+                reason: "VERSION_NOT_SUPPORTED",
+            },
+        ]
     }
 
     #[test]
-    fn task_not_cancelable_maps_to_400() {
-        let err = A2aError::TaskNotCancelable {
-            task_id: "t-1".into(),
-        };
-        assert_eq!(err.http_status(), 400);
-        assert_eq!(err.jsonrpc_code(), errors::JSONRPC_TASK_NOT_CANCELABLE);
-        assert_eq!(err.error_reason(), Some(errors::REASON_TASK_NOT_CANCELABLE));
-    }
+    fn every_a2a_error_maps_exactly_per_spec_table() {
+        let table = spec_table();
+        assert_eq!(table.len(), 9, "spec Section 5.4 defines nine A2A errors");
+        for row in table {
+            let err = &row.err;
+            assert_eq!(err.http_status(), row.http, "HTTP status for {err}");
+            assert_eq!(err.jsonrpc_code(), row.jsonrpc, "JSON-RPC code for {err}");
+            assert_eq!(err.grpc_status(), row.grpc, "gRPC status for {err}");
+            assert_eq!(err.error_reason(), Some(row.reason), "reason for {err}");
 
-    #[test]
-    fn content_type_not_supported_maps_to_400() {
-        let err = A2aError::ContentTypeNotSupported {
-            content_type: "text/xml".into(),
-        };
-        assert_eq!(err.http_status(), 400);
-    }
+            let info = json!({
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": row.reason,
+                "domain": "a2a-protocol.org",
+            });
 
-    #[test]
-    fn invalid_agent_response_maps_to_500() {
-        let err = A2aError::InvalidAgentResponse {
-            message: "bad".into(),
-        };
-        assert_eq!(err.http_status(), 500);
-    }
+            let body = err.to_http_error_body();
+            assert_eq!(body["error"]["code"], row.http, "{err}");
+            assert_eq!(body["error"]["status"], row.grpc, "{err}");
+            assert_eq!(body["error"]["details"], json!([info]), "{err}");
 
-    #[test]
-    fn push_notification_not_supported_maps_to_400() {
-        let err = A2aError::PushNotificationNotSupported;
-        assert_eq!(err.http_status(), 400);
-        assert_eq!(
-            err.jsonrpc_code(),
-            errors::JSONRPC_PUSH_NOTIFICATION_NOT_SUPPORTED
-        );
-    }
+            let rpc = err.to_jsonrpc_error(Some(&json!(7)));
+            assert_eq!(rpc["error"]["code"], row.jsonrpc, "{err}");
+            assert_eq!(rpc["error"]["data"], json!([info]), "{err}");
 
-    #[test]
-    fn all_a2a_errors_have_error_info() {
-        let a2a_errors: Vec<A2aError> = vec![
-            A2aError::TaskNotFound {
-                task_id: "t".into(),
-            },
-            A2aError::TaskNotCancelable {
-                task_id: "t".into(),
-            },
-            A2aError::PushNotificationNotSupported,
-            A2aError::UnsupportedOperation {
-                message: "x".into(),
-            },
-            A2aError::ContentTypeNotSupported {
-                content_type: "x".into(),
-            },
-            A2aError::InvalidAgentResponse {
-                message: "x".into(),
-            },
-            A2aError::ExtendedAgentCardNotConfigured,
-            A2aError::ExtensionSupportRequired {
-                extension: "x".into(),
-            },
-            A2aError::VersionNotSupported {
-                version: "x".into(),
-            },
-        ];
-
-        for err in &a2a_errors {
-            let info = err.error_info();
-            assert!(info.is_some(), "{err} should have ErrorInfo");
-            let info = info.unwrap();
-            assert_eq!(
-                info["@type"],
-                errors::ERROR_INFO_TYPE,
-                "{err} ErrorInfo @type"
-            );
-            assert_eq!(
-                info["domain"],
-                errors::ERROR_DOMAIN,
-                "{err} ErrorInfo domain"
-            );
-            assert!(
-                info["reason"].is_string(),
-                "{err} ErrorInfo reason should be string"
-            );
+            #[cfg(feature = "grpc")]
+            {
+                use tonic_types::StatusExt;
+                let status = crate::grpc::error::a2a_to_status(row.err);
+                let code = match row.grpc {
+                    "NOT_FOUND" => tonic::Code::NotFound,
+                    "FAILED_PRECONDITION" => tonic::Code::FailedPrecondition,
+                    "INVALID_ARGUMENT" => tonic::Code::InvalidArgument,
+                    "INTERNAL" => tonic::Code::Internal,
+                    other => panic!("unexpected status {other}"),
+                };
+                assert_eq!(status.code(), code, "gRPC code for {}", row.reason);
+                let info = status.get_details_error_info().expect("ErrorInfo");
+                assert_eq!(info.reason, row.reason);
+                assert_eq!(info.domain, "a2a-protocol.org");
+            }
         }
     }
 
     #[test]
-    fn non_a2a_errors_have_no_error_info() {
+    fn non_a2a_errors_map_to_standard_codes_without_error_info() {
+        let invalid = A2aError::InvalidRequest {
+            message: "x".into(),
+        };
+        assert_eq!(invalid.http_status(), 400);
+        assert_eq!(invalid.jsonrpc_code(), -32602);
+        assert_eq!(invalid.grpc_status(), "INVALID_ARGUMENT");
+        assert!(invalid.error_info().is_none());
         assert!(
-            A2aError::InvalidRequest {
-                message: "x".into()
-            }
-            .error_info()
-            .is_none()
+            invalid.to_http_error_body()["error"]
+                .get("details")
+                .is_none()
         );
-        assert!(A2aError::Internal("x".into()).error_info().is_none());
+
+        let internal = A2aError::Internal("x".into());
+        assert_eq!(internal.http_status(), 500);
+        assert_eq!(internal.jsonrpc_code(), -32603);
+        assert_eq!(internal.grpc_status(), "INTERNAL");
+        assert!(internal.error_info().is_none());
     }
 
     #[test]
-    fn http_error_body_follows_aip193() {
-        let err = A2aError::TaskNotFound {
+    fn http_error_body_matches_spec_example_shape() {
+        // Spec Section 11.6 example: code, status, message, details.
+        let body = A2aError::TaskNotFound {
             task_id: "t-123".into(),
-        };
-        let body = err.to_http_error_body();
-
-        assert_eq!(body["error"]["code"], 404);
+        }
+        .to_http_error_body();
+        let error = body["error"].as_object().unwrap();
+        let mut keys: Vec<&str> = error.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["code", "details", "message", "status"]);
+        assert_eq!(body["error"]["status"], "NOT_FOUND");
         assert!(body["error"]["message"].as_str().unwrap().contains("t-123"));
-        let details = body["error"]["details"].as_array().unwrap();
-        assert_eq!(details.len(), 1);
-        assert_eq!(details[0]["@type"], errors::ERROR_INFO_TYPE);
-        assert_eq!(details[0]["reason"], errors::REASON_TASK_NOT_FOUND);
-        assert_eq!(details[0]["domain"], errors::ERROR_DOMAIN);
     }
 
     #[test]
-    fn jsonrpc_error_follows_spec() {
-        let err = A2aError::TaskNotCancelable {
+    fn jsonrpc_error_envelope_carries_request_id() {
+        let resp = A2aError::TaskNotCancelable {
             task_id: "t-456".into(),
-        };
-        let id = json!(42);
-        let resp = err.to_jsonrpc_error(Some(&id));
-
+        }
+        .to_jsonrpc_error(Some(&json!(42)));
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 42);
-        assert_eq!(resp["error"]["code"], errors::JSONRPC_TASK_NOT_CANCELABLE);
-        let details = resp["error"]["data"]
-            .as_array()
-            .expect("JSON-RPC error data is an array of typed detail objects");
-        assert_eq!(details.len(), 1);
-        let data = &details[0];
-        assert_eq!(data["@type"], errors::ERROR_INFO_TYPE);
-        assert_eq!(data["reason"], errors::REASON_TASK_NOT_CANCELABLE);
-        assert_eq!(data["domain"], errors::ERROR_DOMAIN);
     }
 
     #[test]
     fn jsonrpc_error_null_id_when_none() {
-        let err = A2aError::Internal("oops".into());
-        let resp = err.to_jsonrpc_error(None);
+        let resp = A2aError::Internal("oops".into()).to_jsonrpc_error(None);
         assert!(resp["id"].is_null());
-        // Internal error has no ErrorInfo
         assert!(resp["error"].get("data").is_none());
     }
 
-    #[test]
-    fn all_nine_a2a_jsonrpc_codes_in_range() {
-        let a2a_errors: Vec<A2aError> = vec![
-            A2aError::TaskNotFound {
-                task_id: "t".into(),
-            },
-            A2aError::TaskNotCancelable {
-                task_id: "t".into(),
-            },
-            A2aError::PushNotificationNotSupported,
-            A2aError::UnsupportedOperation {
-                message: "x".into(),
-            },
-            A2aError::ContentTypeNotSupported {
-                content_type: "x".into(),
-            },
-            A2aError::InvalidAgentResponse {
-                message: "x".into(),
-            },
-            A2aError::ExtendedAgentCardNotConfigured,
-            A2aError::ExtensionSupportRequired {
-                extension: "x".into(),
-            },
-            A2aError::VersionNotSupported {
-                version: "x".into(),
-            },
-        ];
+    // =========================================================
+    // Storage error mapping — every arm
+    // =========================================================
 
-        let codes: Vec<i32> = a2a_errors.iter().map(|e| e.jsonrpc_code()).collect();
-        assert_eq!(codes.len(), 9);
-        for code in &codes {
-            assert!(
-                (-32099..=-32001).contains(code),
-                "JSON-RPC code {code} out of A2A range"
-            );
+    fn not_cancelable_id(err: A2aError) -> String {
+        match err {
+            A2aError::TaskNotCancelable { task_id } => task_id,
+            other => panic!("expected TaskNotCancelable, got {other:?}"),
         }
-        // All unique
-        let unique: std::collections::HashSet<_> = codes.iter().collect();
-        assert_eq!(unique.len(), 9, "All 9 A2A error codes must be unique");
+    }
+
+    #[test]
+    fn storage_task_not_found_maps_to_task_not_found() {
+        let err = A2aError::from(A2aStorageError::TaskNotFound("t-1".into()));
+        assert!(matches!(err, A2aError::TaskNotFound { ref task_id } if task_id == "t-1"));
+    }
+
+    #[test]
+    fn storage_terminal_state_maps_to_not_cancelable_with_task_id() {
+        let err = A2aError::from(A2aStorageError::TerminalState {
+            task_id: "t-2".into(),
+            state: TaskState::Completed,
+        });
+        assert_eq!(not_cancelable_id(err), "t-2");
+    }
+
+    #[test]
+    fn storage_terminal_cas_loser_maps_to_not_cancelable_with_task_id() {
+        let err = A2aError::from(A2aStorageError::TerminalStateAlreadySet {
+            task_id: "t-3".into(),
+            current_state: "TASK_STATE_CANCELED".into(),
+        });
+        assert_eq!(not_cancelable_id(err), "t-3");
+    }
+
+    #[test]
+    fn storage_invalid_transition_maps_to_not_cancelable_with_task_id() {
+        let err = A2aError::from(A2aStorageError::InvalidTransition {
+            task_id: "t-4".into(),
+            current: TaskState::Submitted,
+            requested: TaskState::InputRequired,
+        });
+        assert_eq!(not_cancelable_id(err), "t-4");
+    }
+
+    #[test]
+    fn other_storage_errors_map_to_internal() {
+        for storage_err in [
+            A2aStorageError::OwnerMismatch {
+                task_id: "t".into(),
+            },
+            A2aStorageError::TenantMismatch {
+                task_id: "t".into(),
+            },
+            A2aStorageError::ConcurrentModification("c".into()),
+            A2aStorageError::PushConfigNotFound("p".into()),
+            A2aStorageError::DatabaseError("d".into()),
+            A2aStorageError::SerializationError("s".into()),
+            A2aStorageError::Generic("g".into()),
+        ] {
+            let text = storage_err.to_string();
+            match A2aError::from(storage_err) {
+                A2aError::Internal(msg) => assert_eq!(msg, text),
+                other => panic!("expected Internal for {text}, got {other:?}"),
+            }
+        }
     }
 }

@@ -12,7 +12,7 @@ rust-version.workspace = true
 readme = "README.md"
 
 [features]
-# gRPC transport (ADR-014). Off by default — HTTP+JSON adopters pay
+# gRPC transport. Off by default — HTTP+JSON adopters pay
 # zero tonic weight. Enabling transitively activates
 # turul-a2a-proto/grpc and exposes an `A2aGrpcClient` in the grpc
 # submodule.

@@ -418,29 +418,38 @@ mod tests {
     }
 
     // =========================================================
-    // AnyOfMiddleware — panics with empty children
-    // =========================================================
-
-    // =========================================================
     // AnyOfMiddleware — challenge selection (no concat).
     // WWW-Authenticate is built at the transport boundary from the
     // selected error's kind, not by merging child challenge strings.
     // =========================================================
 
     #[tokio::test]
-    async fn anyof_multiple_http_challenges_selects_first_by_precedence() {
-        let any = AnyOfMiddleware::new(vec![
-            Arc::new(FailHttpChallenge::new(AuthFailureKind::InvalidToken)),
-            Arc::new(FailHttpChallenge::new(AuthFailureKind::InvalidToken)),
-        ]);
-        let mut ctx = RequestContext::new();
-        let err = any.before_request(&mut ctx).await.unwrap_err();
+    async fn anyof_multiple_http_challenges_selects_one_not_merged() {
+        // Two different challenges of equal precedence: exactly one is
+        // surfaced — the first registered — whichever order they come in.
+        for (first, second) in [
+            (
+                AuthFailureKind::MissingCredential,
+                AuthFailureKind::InvalidToken,
+            ),
+            (
+                AuthFailureKind::InvalidToken,
+                AuthFailureKind::MissingCredential,
+            ),
+        ] {
+            let any = AnyOfMiddleware::new(vec![
+                Arc::new(FailHttpChallenge::new(first)),
+                Arc::new(FailHttpChallenge::new(second)),
+            ]);
+            let mut ctx = RequestContext::new();
+            let err = any.before_request(&mut ctx).await.unwrap_err();
 
-        match err {
-            MiddlewareError::HttpChallenge(kind) => {
-                assert_eq!(kind, AuthFailureKind::InvalidToken);
+            match err {
+                MiddlewareError::HttpChallenge(kind) => {
+                    assert_eq!(kind, first, "first-registered challenge wins");
+                }
+                other => panic!("Expected HttpChallenge, got: {other:?}"),
             }
-            other => panic!("Expected HttpChallenge, got: {other:?}"),
         }
     }
 
