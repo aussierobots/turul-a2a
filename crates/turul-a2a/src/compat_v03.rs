@@ -16,8 +16,14 @@
 //!
 //! Detection signals:
 //! - `A2A-Version: 1.0` header present → V10 (strict)
-//! - JSONRPC method uses slash form (`message/send`) → V03
-//! - Method is PascalCase + no version header → V10 (canonical default)
+//! - `A2A-Version: 0.3` header present → V03
+//! - no version header, JSONRPC method uses slash form (`message/send`) → V03
+//! - no version header, method is PascalCase → V10 (canonical default)
+//!
+//! Version acceptance itself is the transport-compliance layer's: with
+//! this feature an absent, empty or explicit `0.3` is accepted on the
+//! HTTP transports (spec Section 3.6.2 reads absent or empty as 0.3), and
+//! any other unsupported version is refused before detection runs.
 //!
 //! ## What activates conditionally (only in V03 mode)
 //!
@@ -54,20 +60,29 @@ pub enum CompatMode {
 
 /// Detect compat mode from the JSONRPC method name and HTTP headers.
 ///
-/// Called once per JSONRPC request at the transport boundary.
+/// Called once per JSONRPC request at the transport boundary, after the
+/// transport-compliance layer has accepted the requested version. The
+/// version policy is the one that layer applies: with `compat-v03` an
+/// absent, empty or explicit `0.3` `A2A-Version` is accepted.
 ///
 /// Detection logic:
-/// 1. If `A2A-Version: 1.0` header is present → V10 (strict, no compat)
-/// 2. If method name is slash-separated (contains `/`) → V03
-/// 3. Otherwise → V10 (canonical default; ambiguous prefers v1.0)
+/// 1. `A2A-Version` names the supported version (`1.0`) → V10, even for
+///    a slash-form method.
+/// 2. `A2A-Version` names `0.3` → V03, whatever the method shape.
+/// 3. No usable header: a slash-separated method (`message/send`) → V03.
+/// 4. Otherwise → V10 (canonical default; a PascalCase method is the
+///    v1.0 wire even when the header is absent).
 pub fn detect_compat_mode(method: &str, headers: &http::HeaderMap) -> CompatMode {
-    // Explicit v1.0 header takes priority — never enter compat mode
     if let Some(version) = headers
         .get(turul_a2a_types::wire::protocol::VERSION_PARAM)
         .and_then(|v| v.to_str().ok())
-        && crate::middleware::transport::version_supported(version)
     {
-        return CompatMode::V10;
+        if crate::middleware::transport::version_supported(version) {
+            return CompatMode::V10;
+        }
+        if crate::middleware::transport::is_legacy_version(version) {
+            return CompatMode::V03;
+        }
     }
 
     // Slash in method name is positive v0.3 identification
@@ -77,14 +92,6 @@ pub fn detect_compat_mode(method: &str, headers: &http::HeaderMap) -> CompatMode
 
     // Default: canonical v1.0
     CompatMode::V10
-}
-
-/// Route-based implicit detection: `POST /` is only reachable by v0.3 clients.
-///
-/// v1.0 clients POST to `/message:send`, `/message:stream`, etc.
-/// Arriving at the root path IS the detection signal.
-pub const fn root_post_compat_mode() -> CompatMode {
-    CompatMode::V03
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +362,24 @@ mod tests {
             CompatMode::V10,
             "Explicit A2A-Version: 1.0 forces V10 even with slash method"
         );
+    }
+
+    /// An explicit `A2A-Version: 0.3` is accepted by the version check
+    /// when compat is on, so it selects the 0.3 wire whatever the method
+    /// shape — the same version policy at both checks.
+    #[test]
+    fn v03_compat_detect_v03_with_explicit_legacy_header() {
+        for version in ["0.3", "0.3.0", " 0.3 "] {
+            let mut headers = HeaderMap::new();
+            headers.insert("a2a-version", version.parse().unwrap());
+            for method in ["SendMessage", "message/send"] {
+                assert_eq!(
+                    detect_compat_mode(method, &headers),
+                    CompatMode::V03,
+                    "A2A-Version: {version:?}, method {method}"
+                );
+            }
+        }
     }
 
     #[test]
