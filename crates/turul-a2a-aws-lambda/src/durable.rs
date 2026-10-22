@@ -253,21 +253,12 @@ async fn drive_sqs_record(state: &AppState, record: SqsMessage) -> Result<(), St
         in_flight: state.in_flight.clone(),
         push_dispatcher: state.push_dispatcher.clone(),
     };
-    let scope = SpawnScope {
-        tenant: job.tenant.clone(),
-        owner: job.owner.clone(),
-        task_id: job.task_id.clone(),
-        context_id: job.context_id.clone(),
-        message: match Message::try_from(job.message.clone()) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::error!(item = %identifier, error = %e, "invalid message in SQS job");
-                return Err(identifier);
-            }
-        },
-        claims: job.claims.clone(),
-        accepted_output_modes: job.accepted_output_modes.clone(),
-        request_metadata: job.request_metadata.clone(),
+    let scope = match SpawnScope::from_queued_job(&job) {
+        Ok(scope) => scope,
+        Err(e) => {
+            tracing::error!(item = %identifier, error = %e, "invalid message in SQS job");
+            return Err(identifier);
+        }
     };
     run_queued_executor_job(deps, scope).await;
     Ok(())
