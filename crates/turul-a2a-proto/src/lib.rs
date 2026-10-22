@@ -582,10 +582,15 @@ mod tests {
             timestamp: None,
         };
         let json = serde_json::to_value(&unspecified_status).unwrap();
-        // If present, it should be the correct string; if absent, that's valid proto3 JSON
-        if let Some(state_val) = json.get("state") {
-            assert_eq!(state_val, "TASK_STATE_UNSPECIFIED");
-        }
+        // The proto3 JSON mapping omits a field holding its default value,
+        // and UNSPECIFIED (0) is the enum default.
+        assert_eq!(json, serde_json::json!({}), "UNSPECIFIED state is omitted");
+        // Parsing accepts both the omitted form and the explicit name.
+        let omitted: TaskStatus = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(omitted.state, TaskState::Unspecified as i32);
+        let named: TaskStatus =
+            serde_json::from_value(serde_json::json!({"state": "TASK_STATE_UNSPECIFIED"})).unwrap();
+        assert_eq!(named.state, TaskState::Unspecified as i32);
     }
 
     #[test]

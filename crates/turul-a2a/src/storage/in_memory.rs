@@ -23,7 +23,8 @@ struct StoredTask {
     tenant: String,
     owner: String,
     task: Task,
-    /// Last update timestamp (spec §3.1.4: ListTasks sorted by last update time DESC).
+    /// Last write of any kind; the age basis for TTL cleanup. ListTasks
+    /// orders by the task's status timestamp instead.
     updated_at: String,
     /// cancel-requested marker. Storage-internal; never on wire.
     cancel_requested: bool,
@@ -259,8 +260,9 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         &self,
         tenant: &str,
         owner: &str,
-        task: Task,
+        mut task: Task,
     ) -> Result<Task, A2aStorageError> {
+        super::status_time::stamp_status(&mut task, &mut []);
         let key = (tenant.to_string(), task.id().to_string());
         let stored = StoredTask {
             tenant: tenant.to_string(),
@@ -296,8 +298,9 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         &self,
         tenant: &str,
         owner: &str,
-        task: Task,
+        mut task: Task,
     ) -> Result<(), A2aStorageError> {
+        super::status_time::stamp_status(&mut task, &mut []);
         let key = (tenant.to_string(), task.id().to_string());
         let mut tasks = self.tasks.write().await;
         match tasks.get(&key) {
@@ -345,10 +348,16 @@ impl A2aTaskStorage for InMemoryA2aStorage {
     }
 
     async fn list_tasks(&self, filter: TaskFilter) -> Result<TaskListPage, A2aStorageError> {
+        let page_size = filter.resolved_page_size()?;
+        let cursor = filter
+            .page_token
+            .as_deref()
+            .map(super::status_time::decode_cursor)
+            .transpose()?;
         let tasks = self.tasks.read().await;
 
         // Filter
-        let mut filtered: Vec<&StoredTask> = tasks
+        let mut filtered: Vec<(String, &StoredTask)> = tasks
             .values()
             .filter(|s| {
                 if let Some(ref t) = filter.tenant
@@ -373,55 +382,40 @@ impl A2aTaskStorage for InMemoryA2aStorage {
                 {
                     return false;
                 }
-                true
+                filter.admits_status_time(&s.task)
             })
+            .map(|s| (super::status_time::sort_key(&s.task), s))
             .collect();
 
-        // Sort by last update time descending (spec §3.1.4 MUST).
-        // Tiebreak by task_id descending for determinism.
-        filtered.sort_by(|a, b| {
-            b.updated_at
-                .cmp(&a.updated_at)
-                .then_with(|| b.task.id().cmp(a.task.id()))
+        // Status timestamp descending, task_id descending as tiebreak.
+        filtered.sort_by(|(a_key, a), (b_key, b)| {
+            b_key.cmp(a_key).then_with(|| b.task.id().cmp(a.task.id()))
         });
 
         let total_size = filtered.len() as i32;
-        let page_size = filter.page_size.map(|ps| ps.clamp(1, 100)).unwrap_or(50);
 
-        // Cursor-based pagination: token is "updated_at|task_id" of last item.
-        // Next page starts after items that sort before this cursor.
-        let start_idx = if let Some(ref token) = filter.page_token {
-            if let Some((cursor_time, cursor_id)) = token.split_once('|') {
-                filtered
-                    .iter()
-                    .position(|s| (s.updated_at.as_str(), s.task.id()) < (cursor_time, cursor_id))
-                    .unwrap_or(filtered.len())
-            } else {
-                // Legacy token format (task_id only) — skip past it
-                filtered
-                    .iter()
-                    .position(|s| s.task.id() < token.as_str())
-                    .unwrap_or(filtered.len())
-            }
-        } else {
-            0
+        // The cursor is the (sort key, task_id) of the previous page's
+        // last task; this page starts at the first task sorting after it.
+        let start_idx = match cursor {
+            Some(cursor) => filtered
+                .iter()
+                .position(|(key, s)| (key.as_str(), s.task.id()) < cursor)
+                .unwrap_or(filtered.len()),
+            None => 0,
         };
 
         let end_idx = (start_idx + page_size as usize).min(filtered.len());
         let page_tasks: Vec<Task> = filtered[start_idx..end_idx]
             .iter()
-            .map(|s| {
+            .map(|(_, s)| {
                 let t = trim_history(&s.task, filter.history_length);
                 strip_artifacts(&t, filter.include_artifacts.unwrap_or(false))
             })
             .collect();
 
-        // Encode cursor as "updated_at|task_id"
         let next_page_token = if end_idx < filtered.len() {
-            filtered
-                .get(end_idx - 1)
-                .map(|s| format!("{}|{}", s.updated_at, s.task.id()))
-                .unwrap_or_default()
+            let (key, last) = &filtered[end_idx - 1];
+            super::status_time::encode_cursor(key, last.task.id())
         } else {
             String::new()
         };
@@ -484,7 +478,8 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         // Update status on proto
         let mut proto = stored.task.as_proto().clone();
         proto.status = Some(new_status.into_proto());
-        let updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+        let mut updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+        super::status_time::stamp_status(&mut updated_task, &mut []);
 
         // Preserve cancel_requested (monotonic) and latest_event_sequence
         // (monotonic, maintained by atomic commits only).
@@ -558,8 +553,8 @@ impl A2aTaskStorage for InMemoryA2aStorage {
                 .find(|a| a.artifact_id == artifact.as_proto().artifact_id)
             {
                 existing.parts.extend(artifact.into_proto().parts);
-                // An artifact mutation is a task update: bump updated_at
-                // so ListTasks `updated_at DESC` reflects it.
+                // A write keeps the task alive for TTL cleanup; it does
+                // not change the status, so the listing order holds.
                 stored.updated_at = now_iso();
                 return Ok(());
             }
@@ -790,7 +785,7 @@ impl A2aPushNotificationStorage for InMemoryA2aStorage {
         // Deterministic order by config id
         matching.sort_by(|a, b| a.id.cmp(&b.id));
 
-        let page_size = page_size.map(|ps| ps.clamp(1, 100)).unwrap_or(50) as usize;
+        let page_size = super::filter::push_config_page_size(page_size) as usize;
 
         let start_idx = if let Some(token) = page_token {
             matching
@@ -855,7 +850,7 @@ impl A2aPushNotificationStorage for InMemoryA2aStorage {
 
         matching.sort_by(|a, b| a.id.cmp(&b.id));
 
-        let page_size = page_size.map(|ps| ps.clamp(1, 100)).unwrap_or(50) as usize;
+        let page_size = super::filter::push_config_page_size(page_size) as usize;
         let start_idx = if let Some(token) = page_token {
             matching
                 .iter()
@@ -1050,9 +1045,10 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         &self,
         tenant: &str,
         owner: &str,
-        task: Task,
-        events: Vec<StreamEvent>,
+        mut task: Task,
+        mut events: Vec<StreamEvent>,
     ) -> Result<(Task, Vec<u64>), A2aStorageError> {
+        super::status_time::stamp_status(&mut task, &mut events);
         // Acquire all locks in consistent order: tasks → event_counters → events
         let mut tasks = self.tasks.write().await;
         let mut counters = self.event_counters.write().await;
@@ -1100,7 +1096,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         task_id: &str,
         owner: &str,
         new_status: TaskStatus,
-        events: Vec<StreamEvent>,
+        mut events: Vec<StreamEvent>,
     ) -> Result<(Task, Vec<u64>), A2aStorageError> {
         // Acquire all locks in consistent order:
         // tasks → event_counters → events → pending_dispatches.
@@ -1173,8 +1169,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
                 turul_a2a_types::A2aTypeError::TerminalState(s) => {
                     A2aStorageError::TerminalStateAlreadySet {
                         task_id: task_id.to_string(),
-                        current_state: crate::storage::terminal_cas::task_state_wire_name(s)
-                            .to_string(),
+                        current_state: s.wire_name().to_string(),
                     }
                 }
                 other => A2aStorageError::TypeError(other),
@@ -1184,7 +1179,8 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         // Update task status
         let mut proto = stored.task.as_proto().clone();
         proto.status = Some(new_status.into_proto());
-        let updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+        let mut updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+        super::status_time::stamp_status(&mut updated_task, &mut events);
 
         // Preserve cancel_requested (monotonic) and snapshot previous
         // latest_event_sequence; the final value is max(prev, new_seqs).
@@ -1262,9 +1258,10 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         &self,
         tenant: &str,
         owner: &str,
-        task: Task,
-        events: Vec<StreamEvent>,
+        mut task: Task,
+        mut events: Vec<StreamEvent>,
     ) -> Result<Vec<u64>, A2aStorageError> {
+        super::status_time::stamp_status(&mut task, &mut events);
         // Acquire all locks in consistent order: tasks → event_counters → events
         let mut tasks = self.tasks.write().await;
         let mut counters = self.event_counters.write().await;
@@ -1297,8 +1294,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         {
             return Err(A2aStorageError::TerminalStateAlreadySet {
                 task_id: task.id().to_string(),
-                current_state: crate::storage::terminal_cas::task_state_wire_name(state)
-                    .to_string(),
+                current_state: state.wire_name().to_string(),
             });
         }
 
@@ -1778,6 +1774,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_pagination_exact_multiple() {
+        parity_tests::test_list_pagination_exact_multiple(&storage()).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_page_size_bounds() {
+        parity_tests::test_list_page_size_bounds(&storage()).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_status_timestamp_after() {
+        parity_tests::test_list_status_timestamp_after(&storage()).await;
+    }
+
+    #[tokio::test]
     async fn test_list_filter_by_status() {
         parity_tests::test_list_filter_by_status(&storage()).await;
     }
@@ -1810,6 +1821,11 @@ mod tests {
     #[tokio::test]
     async fn test_push_config_list_pagination() {
         parity_tests::test_push_config_list_pagination(&storage()).await;
+    }
+
+    #[tokio::test]
+    async fn test_push_config_list_pagination_exact_multiple() {
+        parity_tests::test_push_config_list_pagination_exact_multiple(&storage()).await;
     }
 
     #[tokio::test]
@@ -1850,8 +1866,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_artifact_mutation_bumps_list_order() {
-        parity_tests::test_artifact_mutation_bumps_list_order(&storage()).await;
+    async fn test_list_orders_by_status_timestamp() {
+        parity_tests::test_list_orders_by_status_timestamp(&storage()).await;
     }
 
     #[tokio::test]

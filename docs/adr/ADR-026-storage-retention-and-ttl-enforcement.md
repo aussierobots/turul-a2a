@@ -37,7 +37,7 @@ This matches DynamoDB's engine-native TTL, which reaps on the `ttl` attribute wi
 
 Per-backend implementation:
 
-- **PostgreSQL / SQLite:** real `DELETE ... WHERE <timestamp column> < (now - ttl)` against `a2a_task_events` (by `created_at`) and `a2a_tasks` (by its retention timestamp column). When a TTL is `0`, that class is skipped entirely (no DELETE issued).
+- **PostgreSQL / SQLite:** real `DELETE ... WHERE <timestamp column> < (now - ttl)` against `a2a_task_events` (by `created_at`) and `a2a_tasks` (by its retention timestamp column, `updated_at`: the time of the task's last write of any kind). The retention timestamp is deliberately not the ListTasks sort key: listing orders by the status timestamp (ADR-003), so an artifact write keeps a task alive without moving it in the listing. When a TTL is `0`, that class is skipped entirely (no DELETE issued).
 - **In-memory:** a timestamp sweep over the task and event maps, deleting entries older than their respective TTL.
 - **DynamoDB:** stays `Ok(0)`. DynamoDB reaps via its engine-native TTL on the `ttl` attribute; the application MUST NOT issue scans-and-deletes to duplicate that work. This divergence is intentional and documented: on DynamoDB, retention is the engine's job, and `cleanup_expired()` is a deliberate no-op. Operators who want app-driven reaping do not get it on DynamoDB; they configure the table's TTL attribute instead.
 
@@ -86,3 +86,4 @@ This is a **patch** bump. At its core this corrects a defect — `cleanup_expire
 ## Revision log
 
 - 2026-06-02 — Initial acceptance. Defines age-based, state-agnostic retention for events and tasks across all four backends; introduces a backend-agnostic `RetentionConfig` (TTLs + batch size) for the app-driven backends while leaving `DynamoDbConfig` unchanged; `cleanup_expired()` becomes the single idempotent maintenance entry point (batched, committed DELETE on SQL, lock-releasing sweep in-memory, intentional no-op on DynamoDB); dual trigger model (opt-in self-hosted background loop vs Lambda EventBridge discrete handler); patch bump (fixes the never-implemented ADR-009 cleanup claim, no breaking change).
+- 2026-10-22 — Retention basis named explicitly as `updated_at` (last write of any kind), distinct from the ListTasks status timestamp. A DynamoDB live test (`test_native_ttl_attributes_on_tasks_and_events`) pins the engine-native contract: task and event items carry a numeric `ttl` of now + the configured TTL, and the task's `ttl` survives a status rewrite.

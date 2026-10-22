@@ -195,22 +195,7 @@ impl pb::grpc::A2aService for GrpcService {
         let req = request.get_ref();
         let tenant = tenant_from(&request, &req.tenant);
 
-        // Translate the proto status enum into the string the shared core
-        // query struct parses. None when unspecified (0 is the proto3
-        // default-absent sentinel).
-        let status = pb::TaskState::try_from(req.status)
-            .ok()
-            .filter(|s| *s != pb::TaskState::Unspecified)
-            .map(|s| s.as_str_name().to_string());
-
-        let query = ListTasksQuery {
-            context_id: Some(req.context_id.clone()).filter(|s| !s.is_empty()),
-            status,
-            page_size: req.page_size,
-            page_token: Some(req.page_token.clone()).filter(|s| !s.is_empty()),
-            history_length: req.history_length,
-            include_artifacts: None,
-        };
+        let query = ListTasksQuery::from_proto(req).map_err(a2a_to_status)?;
 
         let value = router::core_list_tasks(self.state.clone(), &tenant, &owner, &query)
             .await

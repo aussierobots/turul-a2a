@@ -92,25 +92,22 @@ pub trait A2aAtomicStore: Send + Sync {
     ///   boundary.
     /// - **SQLite / PostgreSQL**: a conditional `UPDATE` whose `WHERE`
     ///   clause excludes terminal states. The `status_state` column
-    ///   stores Rust `Debug` forms of [`turul_a2a_types::TaskState`], so
-    ///   the conditional is `WHERE status_state NOT IN ('Completed',
-    ///   'Failed', 'Canceled', 'Rejected')`. Affected-rows equal to zero
-    ///   ⇒ terminal was already set and no task/event writes commit (the
-    ///   surrounding transaction is rolled back).
+    ///   stores the proto wire name ([`turul_a2a_types::TaskState::wire_name`]),
+    ///   so the conditional is `WHERE status_state NOT IN
+    ///   ('TASK_STATE_COMPLETED', 'TASK_STATE_FAILED', 'TASK_STATE_CANCELED',
+    ///   'TASK_STATE_REJECTED')`, built from
+    ///   [`turul_a2a_types::state_machine::TERMINAL_STATES`]. Affected-rows
+    ///   equal to zero ⇒ terminal was already set and no task/event writes
+    ///   commit (the surrounding transaction is rolled back).
     /// - **DynamoDB**: a `TransactWriteItems` with a `ConditionExpression`
     ///   on the task item's `statusState` attribute asserting it is not
-    ///   one of the same four Debug-format values (`Completed`, `Failed`,
-    ///   `Canceled`, `Rejected`). A `TransactionCanceledException`
+    ///   one of the same four wire names. A `TransactionCanceledException`
     ///   referencing the task-item's condition-check failure ⇒ terminal
     ///   was already set; the transaction as a whole aborts so no events
     ///   commit.
     ///
-    /// Storage column values (`"Completed"`, etc.) are distinct from the
-    /// proto wire names (`"TASK_STATE_COMPLETED"`, etc.). Error reporting
-    /// on [`A2aStorageError::TerminalStateAlreadySet`] converts to the
-    /// wire name so log and telemetry consumers see spec-compliant
-    /// identifiers. See [`crate::storage::terminal_cas`] for the helper
-    /// functions.
+    /// [`A2aStorageError::TerminalStateAlreadySet`] reports the persisted
+    /// state by the same wire name.
     ///
     /// `TerminalStateAlreadySet` is **distinct** from
     /// [`A2aStorageError::InvalidTransition`]. The latter is the
@@ -160,12 +157,12 @@ pub trait A2aAtomicStore: Send + Sync {
     ///   status before overwriting; if terminal, return the error.
     /// - **SQLite / PostgreSQL**: the conditional `UPDATE`'s `WHERE`
     ///   clause excludes terminal `status_state` values (same set as
-    ///   [`crate::storage::terminal_cas::DEBUG_TERMINAL_STATES`]).
+    ///   [`turul_a2a_types::state_machine::TERMINAL_STATES`], by wire name).
     ///   Affected-rows = 0 on an existing task ⇒ terminal already set;
     ///   the surrounding transaction rolls back so no events commit.
     /// - **DynamoDB**: the task-item's `Update` carries a
-    ///   `ConditionExpression` asserting `statusState NOT IN
-    ///   (:completed, :failed, :canceled, :rejected)`. A
+    ///   `ConditionExpression` asserting `NOT statusState IN (...)` over
+    ///   the same terminal set, by wire name. A
     ///   `TransactionCanceledException` citing the condition-check
     ///   failure ⇒ terminal already set; the transaction as a whole
     ///   aborts so no events commit.

@@ -147,12 +147,13 @@ This trait is backend-neutral. Implementations for DynamoDB, PostgreSQL, SQLite,
 - Query: `pk = :pk AND eventSequence > :seq` with `ScanIndexForward = true`
 - Per-task sequence allocation: counter item at `pk = {tenant}#{taskId}`, `sk = 0` (or `#counter`). `UpdateItem` with `ADD nextSequence :one` atomically increments and returns the new value.
 - **Atomic task+event commit:** `TransactWriteItems` combining: (1) counter increment, (2) event PutItem, (3) task update — all in one DynamoDB transaction. This satisfies `A2aAtomicStore`'s consistency requirement.
+- **Open defect (2026-10-22):** the shipped DynamoDB backend does not implement the counter item. It allocates `max(sk) + 1` from a query and writes the event with `attribute_not_exists(pk) AND attribute_not_exists(sk)`, with no retry, so concurrent appenders to one task fail with `ConditionalCheckFailed` instead of receiving distinct sequences. `test_atomic_concurrent_sequence_integrity` (now run on every backend) fails on DynamoDB. Pending decision: implement the counter item specified above, or amend this section to a bounded optimistic retry on the conditional put.
 
 **PostgreSQL:**
 - Table: `a2a_task_events`
 - Columns: `tenant TEXT, task_id TEXT, event_sequence BIGINT, event_type TEXT, event_data JSONB, created_at TIMESTAMPTZ DEFAULT NOW()`
 - Primary key: `(tenant, task_id, event_sequence)`
-- **Per-task sequence allocation:** `SELECT COALESCE(MAX(event_sequence), 0) + 1 FROM a2a_task_events WHERE tenant = $1 AND task_id = $2 FOR UPDATE` within the same transaction that inserts the event and updates the task. The `FOR UPDATE` on the MAX query provides row-level locking against concurrent writers to the same `(tenant, task_id)`. No separate counter table needed — the events table itself is the sequence source.
+- **Per-task sequence allocation:** `SELECT COALESCE(MAX(event_sequence), 0) + 1 FROM a2a_task_events WHERE tenant = $1 AND task_id = $2` within the same transaction that inserts the event and updates the task, after that transaction has locked the task row (the conditional `UPDATE a2a_tasks` of an atomic write, or `SELECT 1 FROM a2a_tasks ... FOR UPDATE` in a standalone `append_event`). PostgreSQL rejects `FOR UPDATE` on an aggregate, and MAX+1 without a lock lets two READ COMMITTED writers read the same MAX and collide on the primary key; the task-row lock serializes every writer to one `(tenant, task_id)`. No separate counter table needed — the events table itself is the sequence source.
 - Query: `WHERE tenant = $1 AND task_id = $2 AND event_sequence > $3 ORDER BY event_sequence`
 - The sequence is a real persisted value on each event row, not a derived view. Stable across retention/deletion — deleting old events does not renumber remaining events.
 - **Why not BIGSERIAL / ROW_NUMBER():** A global BIGSERIAL is not per-task monotonic. ROW_NUMBER() is query-time derivation, not a persisted sequence — it changes when events are deleted and cannot serve as a stable `Last-Event-ID` cursor.
@@ -397,3 +398,5 @@ If finer-grained executor events are wanted later, that gets a **separate ADR** 
 
 - 2026-04-17 — §12 amended by ADR-010.
 - 2026-10-22 — §2/§3: `Last-Event-ID` replay and SSE event ids removed (superseded by ADR-014 §2.3 item 3).
+- 2026-10-22 — §6/§9: the concurrent-sequence parity test runs on in-memory, SQLite, PostgreSQL and DynamoDB; the DynamoDB sequence allocator's drift from the counter-item design is recorded as an open defect in §6.
+- 2026-10-22 — §6 PostgreSQL: allocation serializes on the task-row lock (the previously documented `MAX(...) ... FOR UPDATE` is not valid PostgreSQL, and standalone `append_event` took no lock, so concurrent appenders collided on the primary key).

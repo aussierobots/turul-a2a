@@ -353,13 +353,98 @@ pub async fn test_history_length(storage: &dyn A2aTaskStorage) {
     // Should be the LAST 2 messages
     assert_eq!(task.history()[0].message_id, "m-3");
     assert_eq!(task.history()[1].message_id, "m-4");
+
+    // history_length larger than the history -> all of it, in order
+    // (A2A v1.0.1 §3.2.4: "at most this many recent messages").
+    let task = storage
+        .get_task("default", "hl-1", "owner", Some(10))
+        .await
+        .unwrap()
+        .unwrap();
+    let ids: Vec<&str> = task
+        .history()
+        .iter()
+        .map(|m| m.message_id.as_str())
+        .collect();
+    assert_eq!(ids, ["m-0", "m-1", "m-2", "m-3", "m-4"]);
+
+    // ListTasks applies the same semantics per task (A2A v1.0.1 §3.1.4 input
+    // historyLength, §3.2.4).
+    let list_history = |history_length: Option<i32>| TaskFilter {
+        tenant: Some("default".to_string()),
+        owner: Some("owner".to_string()),
+        history_length,
+        ..Default::default()
+    };
+    for (history_length, expected) in [
+        (None, vec!["m-0", "m-1", "m-2", "m-3", "m-4"]),
+        (Some(0), vec![]),
+        (Some(2), vec!["m-3", "m-4"]),
+        (Some(10), vec!["m-0", "m-1", "m-2", "m-3", "m-4"]),
+    ] {
+        let page = storage
+            .list_tasks(list_history(history_length))
+            .await
+            .unwrap();
+        assert_eq!(page.tasks.len(), 1);
+        let ids: Vec<&str> = page.tasks[0]
+            .history()
+            .iter()
+            .map(|m| m.message_id.as_str())
+            .collect();
+        assert_eq!(ids, expected, "ListTasks historyLength={history_length:?}");
+    }
+}
+
+/// Walk every page of a listing; returns the task ids page by page and
+/// asserts the invariants every page must hold.
+async fn collect_task_pages(
+    storage: &dyn A2aTaskStorage,
+    filter: TaskFilter,
+    expected_total: i32,
+) -> Vec<Vec<String>> {
+    let page_size = filter
+        .page_size
+        .expect("collect_task_pages needs a page size");
+    let mut pages = Vec::new();
+    let mut page_token = None;
+    loop {
+        let page = storage
+            .list_tasks(TaskFilter {
+                page_token: page_token.clone(),
+                ..filter.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total_size, expected_total, "total_size on every page");
+        assert_eq!(page.page_size, page_size, "page_size echoes the request");
+        assert!(page.tasks.len() as i32 <= page_size);
+        pages.push(page.tasks.iter().map(|t| t.id().to_string()).collect());
+        if page.next_page_token.is_empty() {
+            break;
+        }
+        assert_eq!(
+            page.tasks.len() as i32,
+            page_size,
+            "only the final page may be short"
+        );
+        page_token = Some(page.next_page_token);
+        assert!(pages.len() <= 10, "pagination does not terminate");
+    }
+    pages
+}
+
+fn pages_of(ids: &[&str], page_size: usize) -> Vec<Vec<String>> {
+    ids.chunks(page_size)
+        .map(|c| c.iter().map(|s| s.to_string()).collect())
+        .collect()
 }
 
 // =========================================================
 // P2-009: List pagination
 // =========================================================
 pub async fn test_list_pagination(storage: &dyn A2aTaskStorage) {
-    // Create 7 tasks
+    // Created in order, so pg-6 has the latest status timestamp.
     for i in 0..7 {
         storage
             .create_task("default", "owner", make_task(&format!("pg-{i}"), "ctx-pg"))
@@ -367,36 +452,107 @@ pub async fn test_list_pagination(storage: &dyn A2aTaskStorage) {
             .unwrap();
     }
 
-    let mut all_ids = Vec::new();
-    let mut page_token = None;
+    let pages = collect_task_pages(
+        storage,
+        TaskFilter {
+            tenant: Some("default".to_string()),
+            owner: Some("owner".to_string()),
+            context_id: Some("ctx-pg".to_string()),
+            page_size: Some(3),
+            ..Default::default()
+        },
+        7,
+    )
+    .await;
+    assert_eq!(
+        pages,
+        pages_of(&["pg-6", "pg-5", "pg-4", "pg-3", "pg-2", "pg-1", "pg-0"], 3),
+        "status timestamp DESC across pages, nothing skipped or repeated"
+    );
+}
 
-    loop {
-        let page = storage
-            .list_tasks(TaskFilter {
-                tenant: Some("default".to_string()),
-                owner: Some("owner".to_string()),
-                context_id: Some("ctx-pg".to_string()),
-                page_size: Some(3),
-                page_token: page_token.clone(),
-                ..Default::default()
-            })
+/// A2A v1.0.1 §3.1.4: the final page MUST carry an empty
+/// `nextPageToken`, including when the total is an exact multiple of the
+/// page size.
+pub async fn test_list_pagination_exact_multiple(storage: &dyn A2aTaskStorage) {
+    for i in 0..6 {
+        storage
+            .create_task("default", "owner", make_task(&format!("em-{i}"), "ctx-em"))
             .await
             .unwrap();
+    }
+    let pages = collect_task_pages(
+        storage,
+        TaskFilter {
+            tenant: Some("default".to_string()),
+            owner: Some("owner".to_string()),
+            context_id: Some("ctx-em".to_string()),
+            page_size: Some(3),
+            ..Default::default()
+        },
+        6,
+    )
+    .await;
+    assert_eq!(
+        pages,
+        pages_of(&["em-5", "em-4", "em-3", "em-2", "em-1", "em-0"], 3),
+        "two full pages; the second is final and has an empty token"
+    );
+}
 
-        assert_eq!(page.total_size, 7, "total_size should be 7 on every page");
-        assert!(page.tasks.len() <= 3, "page should have at most 3 tasks");
-        all_ids.extend(page.tasks.iter().map(|t| t.id().to_string()));
+/// `ListTasksRequest.page_size`: unset means 50; 1 and 100 are the
+/// bounds; anything outside them is rejected rather than clamped.
+pub async fn test_list_page_size_bounds(storage: &dyn A2aTaskStorage) {
+    for i in 0..2 {
+        storage
+            .create_task(
+                "default",
+                "owner-ps",
+                make_task(&format!("ps-{i}"), "ctx-ps"),
+            )
+            .await
+            .unwrap();
+    }
+    let filter = |page_size: Option<i32>| TaskFilter {
+        tenant: Some("default".to_string()),
+        owner: Some("owner-ps".to_string()),
+        page_size,
+        ..Default::default()
+    };
 
-        if page.next_page_token.is_empty() {
-            break;
+    let page = storage.list_tasks(filter(None)).await.unwrap();
+    assert_eq!(page.page_size, 50);
+    assert_eq!(page.tasks.len(), 2);
+
+    let page = storage.list_tasks(filter(Some(1))).await.unwrap();
+    assert_eq!(page.page_size, 1);
+    assert_eq!(page.tasks.len(), 1);
+    assert!(!page.next_page_token.is_empty());
+
+    let page = storage.list_tasks(filter(Some(100))).await.unwrap();
+    assert_eq!(page.page_size, 100);
+    assert_eq!(page.tasks.len(), 2);
+    assert!(page.next_page_token.is_empty());
+
+    for bad in [0, -1, 101] {
+        match storage.list_tasks(filter(Some(bad))).await {
+            Err(super::A2aStorageError::InvalidListRequest(msg)) => {
+                assert!(msg.contains("pageSize"), "{msg}")
+            }
+            other => panic!("pageSize={bad} must be rejected, got {other:?}"),
         }
-        page_token = Some(page.next_page_token);
     }
 
-    assert_eq!(all_ids.len(), 7, "should collect all 7 tasks across pages");
-    // No duplicates
-    let unique: std::collections::HashSet<_> = all_ids.iter().collect();
-    assert_eq!(unique.len(), 7);
+    match storage
+        .list_tasks(TaskFilter {
+            page_token: Some("not-a-cursor".into()),
+            ..filter(None)
+        })
+        .await
+    {
+        Err(super::A2aStorageError::InvalidListRequest(_)) => {}
+        other => panic!("a foreign pageToken must be rejected, got {other:?}"),
+    }
 }
 
 // =========================================================
@@ -439,6 +595,28 @@ pub async fn test_list_filter_by_status(storage: &dyn A2aTaskStorage) {
         .await
         .unwrap();
     assert_eq!(page.total_size, 2);
+    let ids: Vec<&str> = page.tasks.iter().map(|t| t.id()).collect();
+    assert_eq!(
+        ids,
+        ["fs-2", "fs-0"],
+        "only Working tasks, latest status first"
+    );
+    for task in &page.tasks {
+        assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Working);
+    }
+
+    let page = storage
+        .list_tasks(TaskFilter {
+            tenant: Some("default".to_string()),
+            owner: Some("owner".to_string()),
+            status: Some(TaskState::Submitted),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let ids: Vec<&str> = page.tasks.iter().map(|t| t.id()).collect();
+    assert_eq!(ids, ["fs-1"]);
+    assert_eq!(page.total_size, 1);
 }
 
 // =========================================================
@@ -468,6 +646,8 @@ pub async fn test_list_filter_by_context_id(storage: &dyn A2aTaskStorage) {
         .await
         .unwrap();
     assert_eq!(page.total_size, 2);
+    let ids: Vec<&str> = page.tasks.iter().map(|t| t.id()).collect();
+    assert_eq!(ids, ["fc-3", "fc-1"], "only ctx-alpha tasks, latest first");
 }
 
 // =========================================================
@@ -817,6 +997,48 @@ pub async fn test_push_config_list_pagination(storage: &dyn A2aPushNotificationS
     assert_eq!(unique.len(), 5, "no duplicate configs");
 }
 
+/// The final push-config page carries an empty `nextPageToken` even when
+/// the total is an exact multiple of the page size.
+pub async fn test_push_config_list_pagination_exact_multiple(
+    storage: &dyn A2aPushNotificationStorage,
+) {
+    let mut created = std::collections::HashSet::new();
+    for i in 0..4 {
+        let config = turul_a2a_proto::TaskPushNotificationConfig {
+            tenant: String::new(),
+            id: String::new(),
+            task_id: "task-em".to_string(),
+            url: format!("https://example.com/hook-{i}"),
+            token: String::new(),
+            authentication: None,
+        };
+        created.insert(storage.create_config("default", config).await.unwrap().id);
+    }
+
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let page = storage
+            .list_configs("default", "task-em", page_token.as_deref(), Some(2))
+            .await
+            .unwrap();
+        pages.push(page.configs.iter().map(|c| c.id.clone()).collect());
+        if page.next_page_token.is_empty() {
+            break;
+        }
+        page_token = Some(page.next_page_token);
+        assert!(pages.len() <= 5, "pagination does not terminate");
+    }
+
+    assert_eq!(
+        pages.iter().map(Vec::len).collect::<Vec<_>>(),
+        [2, 2],
+        "two full pages and no trailing empty page"
+    );
+    let listed: std::collections::HashSet<String> = pages.into_iter().flatten().collect();
+    assert_eq!(listed, created);
+}
+
 // =========================================================
 // P2-018: Push config tenant isolation
 // =========================================================
@@ -1060,6 +1282,7 @@ pub async fn test_atomic_create_task_with_events(
         .unwrap()
         .expect("Task should exist after atomic create");
     assert_eq!(fetched.id(), "at-create-1");
+    assert_eq!(status_time(&created), status_time(&fetched));
 
     // Events are readable via event store
     let stored_events = events
@@ -1068,6 +1291,20 @@ pub async fn test_atomic_create_task_with_events(
         .unwrap();
     assert_eq!(stored_events.len(), 1);
     assert_eq!(stored_events[0].0, 1);
+    assert_event_status_time_matches(&stored_events[0].1, &fetched);
+}
+
+/// The status-update event committed with a status write carries the
+/// same timestamp the write recorded on the task.
+fn assert_event_status_time_matches(event: &StreamEvent, task: &Task) {
+    let StreamEvent::StatusUpdate { status_update } = event else {
+        panic!("expected a status update, got {event:?}");
+    };
+    let task_ts = task.as_proto().status.as_ref().unwrap().timestamp.as_ref();
+    assert_eq!(
+        status_update.status["timestamp"],
+        serde_json::to_value(task_ts.expect("status write records a timestamp")).unwrap()
+    );
 }
 
 /// AT-002: update_task_status_with_events updates status and appends events atomically.
@@ -1113,12 +1350,14 @@ pub async fn test_atomic_update_status_with_events(
         fetched.status().unwrap().state().unwrap(),
         TaskState::Working
     );
+    assert_eq!(status_time(&updated), status_time(&fetched));
 
     let stored_events = events
         .get_events_after("default", "at-status-1", 0)
         .await
         .unwrap();
     assert_eq!(stored_events.len(), 1);
+    assert_event_status_time_matches(&stored_events[0].1, &fetched);
 }
 
 /// AT-003: update_task_status_with_events rejects invalid transitions
@@ -1752,11 +1991,7 @@ pub async fn test_terminal_cas_single_winner_on_concurrent_terminals(
     for (i, terminal) in terminals.into_iter().enumerate() {
         let atomic = Arc::clone(&atomic);
         let barrier = Arc::clone(&barrier);
-        let evt = make_status_event_for(
-            "cas-1",
-            "ctx-cas",
-            crate::storage::terminal_cas::task_state_wire_name(terminal),
-        );
+        let evt = make_status_event_for("cas-1", "ctx-cas", terminal.wire_name());
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
             let result = atomic
@@ -1882,11 +2117,7 @@ pub async fn test_terminal_cas_single_winner_from_submitted_includes_rejected(
     for (i, terminal) in terminals.into_iter().enumerate() {
         let atomic = Arc::clone(&atomic);
         let barrier = Arc::clone(&barrier);
-        let evt = make_status_event_for(
-            "cas-sub-1",
-            "ctx-cas-sub",
-            crate::storage::terminal_cas::task_state_wire_name(terminal),
-        );
+        let evt = make_status_event_for("cas-sub-1", "ctx-cas-sub", terminal.wire_name());
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
             let result = atomic
@@ -4609,48 +4840,174 @@ pub async fn test_artifact_removal_via_full_task_write(storage: &dyn A2aTaskStor
     assert_eq!(task.artifacts()[0].artifact_id, "art-1");
 }
 
-/// An artifact mutation is a task update: it must bump the task's
-/// `updated_at` so ListTasks `updated_at DESC` ordering reflects it.
-/// The sleep clears second-resolution timestamp columns.
-pub async fn test_artifact_mutation_bumps_list_order(storage: &dyn A2aTaskStorage) {
-    storage
-        .create_task("default", "owner-lo", make_task("lo-old", "ctx-lo"))
-        .await
-        .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    storage
-        .create_task("default", "owner-lo", make_task("lo-new", "ctx-lo"))
-        .await
-        .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+fn status_time(task: &Task) -> chrono::DateTime<chrono::Utc> {
+    let ts = task
+        .as_proto()
+        .status
+        .as_ref()
+        .and_then(|s| s.timestamp.as_ref())
+        .unwrap_or_else(|| panic!("task {} has no status timestamp", task.id()));
+    chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32).unwrap()
+}
 
+/// A submitted task whose status already carries a timestamp
+/// `offset_secs` after a fixed past instant. Storage keeps an existing
+/// status timestamp, so ordering tests fix the order themselves instead of
+/// relying on wall-clock gaps between writes (which can tie).
+fn make_task_at(task_id: &str, context_id: &str, offset_secs: i64) -> Task {
+    let mut task = make_task(task_id, context_id);
+    task.as_proto_mut().status.as_mut().unwrap().timestamp =
+        Some(turul_a2a_proto::pbjson_types::Timestamp {
+            seconds: 1_600_000_000 + offset_secs,
+            nanos: 0,
+        });
+    task
+}
+
+async fn listed_ids(storage: &dyn A2aTaskStorage, filter: TaskFilter) -> Vec<String> {
+    storage
+        .list_tasks(filter)
+        .await
+        .unwrap()
+        .tasks
+        .iter()
+        .map(|t| t.id().to_string())
+        .collect()
+}
+
+/// A2A v1.0.1 §3.1.4: ListTasks is sorted by status timestamp, most
+/// recent first. Every status write records a timestamp; artifact and
+/// history writes leave it — and the task's position — unchanged.
+///
+/// The older task has the lexically greater id, so an id tie-break
+/// cannot produce the expected order by accident.
+pub async fn test_list_orders_by_status_timestamp(storage: &dyn A2aTaskStorage) {
+    let older = storage
+        .create_task("default", "owner-lo", make_task_at("lo-z", "ctx-lo", 0))
+        .await
+        .unwrap();
+    let newer = storage
+        .create_task("default", "owner-lo", make_task_at("lo-a", "ctx-lo", 1))
+        .await
+        .unwrap();
+    assert!(status_time(&older) < status_time(&newer));
+
+    let filter = TaskFilter {
+        tenant: Some("default".into()),
+        owner: Some("owner-lo".into()),
+        context_id: Some("ctx-lo".into()),
+        ..Default::default()
+    };
+    assert_eq!(listed_ids(storage, filter.clone()).await, ["lo-a", "lo-z"]);
+
+    // Artifact, history and full-task writes that keep the status do not
+    // reorder.
     storage
         .append_artifact(
             "default",
-            "lo-old",
+            "lo-z",
             "owner-lo",
-            make_artifact("art-1", "bump"),
+            make_artifact("art-1", "chunk"),
             false,
             false,
         )
         .await
         .unwrap();
-
-    let page = storage
-        .list_tasks(TaskFilter {
-            tenant: Some("default".into()),
-            owner: Some("owner-lo".into()),
-            context_id: Some("ctx-lo".into()),
-            ..Default::default()
-        })
+    storage
+        .append_message("default", "lo-z", "owner-lo", make_message("m-1", "hi"))
         .await
         .unwrap();
-    let ids: Vec<&str> = page.tasks.iter().map(|t| t.id()).collect();
+    let mut read_back = storage
+        .get_task("default", "lo-z", "owner-lo", None)
+        .await
+        .unwrap()
+        .unwrap();
+    read_back.append_artifact(make_artifact("art-2", "whole-task write"));
+    storage
+        .update_task("default", "owner-lo", read_back)
+        .await
+        .unwrap();
+    let unchanged = storage
+        .get_task("default", "lo-z", "owner-lo", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status_time(&unchanged), status_time(&older));
     assert_eq!(
-        ids,
-        vec!["lo-old", "lo-new"],
-        "artifact append must move lo-old to the top of updated_at DESC"
+        listed_ids(storage, filter.clone()).await,
+        ["lo-a", "lo-z"],
+        "artifact/history writes must not move a task"
     );
+
+    // A status write moves it to the top.
+    let moved = storage
+        .update_task_status(
+            "default",
+            "lo-z",
+            "owner-lo",
+            TaskStatus::new(TaskState::Working),
+        )
+        .await
+        .unwrap();
+    assert!(status_time(&moved) > status_time(&newer));
+    let page = storage.list_tasks(filter).await.unwrap();
+    let ids: Vec<&str> = page.tasks.iter().map(|t| t.id()).collect();
+    assert_eq!(ids, ["lo-z", "lo-a"]);
+    assert!(status_time(&page.tasks[0]) >= status_time(&page.tasks[1]));
+}
+
+/// `ListTasksRequest.status_timestamp_after`: only tasks whose status
+/// timestamp is greater than or equal to the bound.
+pub async fn test_list_status_timestamp_after(storage: &dyn A2aTaskStorage) {
+    storage
+        .create_task("default", "owner-sa", make_task_at("sa-1", "ctx-sa", 0))
+        .await
+        .unwrap();
+    let second = storage
+        .create_task("default", "owner-sa", make_task_at("sa-2", "ctx-sa", 1))
+        .await
+        .unwrap();
+    let bound = status_time(&second);
+    let first = storage
+        .get_task("default", "sa-1", "owner-sa", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status_time(&first) < bound);
+
+    let after = |at: chrono::DateTime<chrono::Utc>| TaskFilter {
+        tenant: Some("default".into()),
+        owner: Some("owner-sa".into()),
+        status_timestamp_after: Some(at),
+        page_size: Some(1),
+        ..Default::default()
+    };
+
+    let page = storage.list_tasks(after(bound)).await.unwrap();
+    let ids: Vec<&str> = page.tasks.iter().map(|t| t.id()).collect();
+    assert_eq!(ids, ["sa-2"], "the bound is inclusive");
+    assert_eq!(page.total_size, 1, "total_size counts only matching tasks");
+    assert!(page.next_page_token.is_empty());
+
+    storage
+        .update_task_status(
+            "default",
+            "sa-1",
+            "owner-sa",
+            TaskStatus::new(TaskState::Working),
+        )
+        .await
+        .unwrap();
+    let pages = collect_task_pages(storage, after(bound), 2).await;
+    assert_eq!(pages, pages_of(&["sa-1", "sa-2"], 1));
+
+    let page = storage
+        .list_tasks(after(chrono::Utc::now() + chrono::Duration::days(1)))
+        .await
+        .unwrap();
+    assert!(page.tasks.is_empty());
+    assert_eq!(page.total_size, 0);
+    assert!(page.next_page_token.is_empty());
 }
 
 /// Both branches of `TaskFilter.include_artifacts`: true rehydrates

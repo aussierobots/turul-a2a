@@ -106,6 +106,12 @@ pub enum A2aStorageError {
     )]
     CreateConfigCasTimeout { tenant: String, task_id: String },
 
+    /// A listing request the caller must correct: out-of-range page
+    /// size or a page token this backend did not issue. Maps to the
+    /// protocol's invalid-request error.
+    #[error("{0}")]
+    InvalidListRequest(String),
+
     #[error("Database error: {0}")]
     DatabaseError(String),
 

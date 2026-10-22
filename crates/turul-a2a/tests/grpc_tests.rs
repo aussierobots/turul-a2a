@@ -342,9 +342,8 @@ async fn grpc_list_tasks_returns_created_tasks() {
         .expect("list ok");
     let inner = resp.into_inner();
     assert_eq!(inner.tasks.len(), 3, "tasks returned: {:?}", inner.tasks);
-    // ListTasks orders by updated_at DESC (CLAUDE.md §"Spec-aligned
-    // behaviors"). Three completed sends produce three distinct tasks.
-    assert!(inner.total_size >= 3);
+    // Three completed sends produce three distinct tasks.
+    assert_eq!(inner.total_size, 3);
 }
 
 #[tokio::test]
