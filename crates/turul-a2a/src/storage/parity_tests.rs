@@ -3852,7 +3852,15 @@ pub async fn test_push_failed_delivery_diagnostics_roundtrip(store: &dyn A2aPush
         .claim_delivery(&tenant, &task_id, seq, &config_id, "w", "owner-x", long)
         .await
         .expect("claim");
-    let before = SystemTime::now();
+    // Backends store attempt times at micro- or millisecond precision, so
+    // a stored time can fall below a nanosecond `before` taken in the same
+    // millisecond. Floor the window's start to the millisecond.
+    let before = {
+        let since_epoch = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        SystemTime::UNIX_EPOCH + Duration::from_millis(since_epoch.as_millis() as u64)
+    };
     store
         .record_attempt_started(&tenant, &task_id, seq, &config_id, "w", claim.generation)
         .await
