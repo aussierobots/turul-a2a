@@ -320,6 +320,14 @@ Ordered by certainty:
    `Internal(String)` for server-side failures that map to A2A
    `Internal`. Adopters needing richer or application-specific error
    shapes wrap or extend in their own error type at the call site.
+   *Clarified 2026-10-22:* the mapping is adopter code (the patterns
+   crate cannot name `turul_a2a::A2aError`). When it runs inside an
+   `AgentExecutor`, after the task exists, the resulting
+   `A2aError` does not reach the client as a JSON-RPC / HTTP error:
+   the framework commits the task `FAILED` with the error text as its
+   status message (pinned by the `post-task-hook-agent` smoke test).
+   Only request-shape checks made before the task is created surface
+   as wire errors.
 
 6. **`TerminalHook` trait + `SkillOutcome` enum** (Q5-resolved
    additive surface). Best-effort post-execution observer fired by
@@ -1154,3 +1162,4 @@ Reports pass/fail. Does not modify source. Does not decide scope.
 ## Revision log
 
 - 2026-10-22 — §2.1 amended from "internal path-only, `publish = false`" to the shipped state (published since 0.1.26, versioned workspace dep, licence symlinks, publish order after `turul-a2a-types`); §3 non-goal struck; §4.1 records that the `turul-a2a` → patterns dependency and the `EventSink` bridge were not delivered. §2.2 item 3 contracts tightened to what the code now enforces: `SkillCard::parse` is the only constructor (the public `Deserialize` derive that bypassed the strict-keyword check is removed), uncompilable schemas are rejected at parse with `ManifestError::Schema`, and validation error locations are `#`-rooted instance pointers for every validate entry point. The §2.3 fixed variant sets (`ProgressState` non-terminal only, `SkillError`, `SinkError`) are now compile-time enforced by wildcard-free matches inside the crate.
+- 2026-10-22 — §2.2 item 5 clarified: the `SkillError` → `A2aError` mapping is adopter code, and inside an `AgentExecutor` it yields a `FAILED` task carrying the error text, not a wire error.
