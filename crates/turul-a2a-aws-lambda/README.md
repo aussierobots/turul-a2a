@@ -21,7 +21,7 @@ Enable the `dynamodb` feature to propagate DynamoDB support to the
 underlying `turul-a2a` crate:
 
 ```toml
-turul-a2a-aws-lambda = { version = "0.1", features = ["dynamodb"] }
+turul-a2a-aws-lambda = { version = "0.2", features = ["dynamodb"] }
 ```
 
 ## Quick start

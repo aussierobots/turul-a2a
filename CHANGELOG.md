@@ -4,9 +4,9 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.1.36] — 2026-10-22
+## [0.2.0] — 2026-10-23
 
-Brings the framework to **A2A v1.0.1** on all three transports (HTTP+JSON, JSON-RPC, gRPC) after a full audit of the code and its tests against the specification and the ADRs. Many of the changes alter what goes on the wire, so read **Compatibility** before upgrading. 0.1.33, 0.1.34 and 0.1.35 were never published; their changes are included here.
+A minor-version bump because this release breaks public APIs and the wire contract: Cargo treats 0.1 → 0.2 as incompatible, so dependents opt in explicitly. Brings the framework to **A2A v1.0.1** on all three transports (HTTP+JSON, JSON-RPC, gRPC) after a full audit of the code and its tests against the specification and the ADRs. Many of the changes alter what goes on the wire, so read **Compatibility** before upgrading. 0.1.33 to 0.1.36 were never published; their changes are included here.
 
 ### Compatibility (read first)
 

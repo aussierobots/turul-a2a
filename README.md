@@ -24,8 +24,8 @@ Proto-first: types are generated from the normative `proto/a2a.proto` (package `
 
 ```toml
 [dependencies]
-turul-a2a = "0.1"
-turul-a2a-client = "0.1"
+turul-a2a = "0.2"
+turul-a2a-client = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
