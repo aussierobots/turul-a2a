@@ -494,33 +494,11 @@ async fn dispatch_list_tasks(
     owner: &str,
     params: Value,
 ) -> Result<Value, A2aError> {
-    let query = crate::router::ListTasksQuery {
-        context_id: params
-            .get("contextId")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        status: params
-            .get("status")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        page_size: params
-            .get("pageSize")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32),
-        page_token: params
-            .get("pageToken")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        history_length: params
-            .get("historyLength")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32),
-        include_artifacts: params.get("includeArtifacts").and_then(|v| v.as_bool()),
-        status_timestamp_after: params
-            .get("statusTimestampAfter")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-    };
+    let request: turul_a2a_proto::ListTasksRequest =
+        serde_json::from_value(params).map_err(|e| A2aError::InvalidRequest {
+            message: format!("Invalid ListTasks params: {e}"),
+        })?;
+    let query = crate::router::ListTasksQuery::from_proto(&request)?;
 
     let Json(response) = crate::router::core_list_tasks(state, tenant, owner, &query).await?;
     Ok(response)

@@ -9,7 +9,7 @@
 //! Artifact and history writes do not change the status, so they do not
 //! move a task in the listing.
 
-use chrono::{DateTime, SubsecRound, Utc};
+use chrono::{DateTime, NaiveDateTime, SubsecRound, Utc};
 use turul_a2a_proto::pbjson_types::Timestamp;
 use turul_a2a_types::Task;
 
@@ -65,10 +65,17 @@ pub(crate) fn encode_cursor(sort_key: &str, task_id: &str) -> String {
 }
 
 /// Split a cursor produced by [`encode_cursor`] into `(sort_key, task_id)`.
+/// Any other token is an invalid request: the sort key must be empty or in
+/// the fixed-width sort-key format, and the task id non-empty.
 pub(crate) fn decode_cursor(token: &str) -> Result<(&str, &str), A2aStorageError> {
     token
         .split_once('|')
+        .filter(|(key, task_id)| !task_id.is_empty() && (key.is_empty() || is_sort_key(key)))
         .ok_or_else(|| A2aStorageError::InvalidListRequest(format!("invalid pageToken: {token}")))
+}
+
+fn is_sort_key(key: &str) -> bool {
+    NaiveDateTime::parse_from_str(key, SORT_KEY_FORMAT).is_ok_and(|at| key_of(&at.and_utc()) == key)
 }
 
 #[cfg(test)]
@@ -124,9 +131,21 @@ mod tests {
             decode_cursor(&token).unwrap(),
             ("2023-11-14T22:13:20.000005Z", "task|with|bars")
         );
-        assert!(matches!(
-            decode_cursor("no-separator"),
-            Err(A2aStorageError::InvalidListRequest(_))
-        ));
+        // A task with no status timestamp has the empty sort key.
+        assert_eq!(decode_cursor("|t").unwrap(), ("", "t"));
+        for garbage in [
+            "no-separator",
+            "x|y",
+            "2023-11-14T22:13:20Z|t",
+            "2023-11-14T22:13:20.000005Z|",
+        ] {
+            assert!(
+                matches!(
+                    decode_cursor(garbage),
+                    Err(A2aStorageError::InvalidListRequest(_))
+                ),
+                "{garbage}"
+            );
+        }
     }
 }

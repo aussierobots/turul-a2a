@@ -639,6 +639,48 @@ pub(crate) struct ListTasksQuery {
     pub(crate) status_timestamp_after: Option<String>,
 }
 
+impl ListTasksQuery {
+    /// The query a proto `ListTasksRequest` carries: the gRPC message, or
+    /// JSON-RPC params decoded with the proto3 JSON mapping. proto3 leaves an
+    /// unset string empty and an unset enum `TASK_STATE_UNSPECIFIED`; both
+    /// mean "no filter". A value no `TaskState` has, or a `Timestamp` whose
+    /// nanos fall outside `0..=999_999_999`, is an invalid request.
+    pub(crate) fn from_proto(req: &turul_a2a_proto::ListTasksRequest) -> Result<Self, A2aError> {
+        let status = match turul_a2a_proto::TaskState::try_from(req.status) {
+            Ok(turul_a2a_proto::TaskState::Unspecified) => None,
+            Ok(s) => Some(s.as_str_name().to_string()),
+            Err(_) => {
+                return Err(A2aError::InvalidRequest {
+                    message: format!("Invalid status value: {}", req.status),
+                });
+            }
+        };
+        let status_timestamp_after = req
+            .status_timestamp_after
+            .as_ref()
+            .map(|ts| {
+                u32::try_from(ts.nanos)
+                    .ok()
+                    .filter(|nanos| *nanos < 1_000_000_000)
+                    .and_then(|nanos| chrono::DateTime::from_timestamp(ts.seconds, nanos))
+                    .map(|at| at.to_rfc3339())
+                    .ok_or_else(|| A2aError::InvalidRequest {
+                        message: "statusTimestampAfter is out of range".into(),
+                    })
+            })
+            .transpose()?;
+        Ok(Self {
+            context_id: Some(req.context_id.clone()).filter(|s| !s.is_empty()),
+            status,
+            page_size: req.page_size,
+            page_token: Some(req.page_token.clone()).filter(|s| !s.is_empty()),
+            history_length: req.history_length,
+            include_artifacts: req.include_artifacts,
+            status_timestamp_after,
+        })
+    }
+}
+
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
 pub(crate) struct PushConfigQuery {

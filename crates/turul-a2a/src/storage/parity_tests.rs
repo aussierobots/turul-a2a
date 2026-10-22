@@ -368,7 +368,7 @@ pub async fn test_history_length(storage: &dyn A2aTaskStorage) {
         .collect();
     assert_eq!(ids, ["m-0", "m-1", "m-2", "m-3", "m-4"]);
 
-    // ListTasks applies the same semantics per task (§3.1.4 input
+    // ListTasks applies the same semantics per task (A2A v1.0.1 §3.1.4 input
     // historyLength, §3.2.4).
     let list_history = |history_length: Option<i32>| TaskFilter {
         tenant: Some("default".to_string()),
@@ -4845,6 +4845,20 @@ fn status_time(task: &Task) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32).unwrap()
 }
 
+/// A submitted task whose status already carries a timestamp
+/// `offset_secs` after a fixed past instant. Storage keeps an existing
+/// status timestamp, so ordering tests fix the order themselves instead of
+/// relying on wall-clock gaps between writes (which can tie).
+fn make_task_at(task_id: &str, context_id: &str, offset_secs: i64) -> Task {
+    let mut task = make_task(task_id, context_id);
+    task.as_proto_mut().status.as_mut().unwrap().timestamp =
+        Some(turul_a2a_proto::pbjson_types::Timestamp {
+            seconds: 1_600_000_000 + offset_secs,
+            nanos: 0,
+        });
+    task
+}
+
 async fn listed_ids(storage: &dyn A2aTaskStorage, filter: TaskFilter) -> Vec<String> {
     storage
         .list_tasks(filter)
@@ -4864,14 +4878,14 @@ async fn listed_ids(storage: &dyn A2aTaskStorage, filter: TaskFilter) -> Vec<Str
 /// cannot produce the expected order by accident.
 pub async fn test_list_orders_by_status_timestamp(storage: &dyn A2aTaskStorage) {
     let older = storage
-        .create_task("default", "owner-lo", make_task("lo-z", "ctx-lo"))
+        .create_task("default", "owner-lo", make_task_at("lo-z", "ctx-lo", 0))
         .await
         .unwrap();
     let newer = storage
-        .create_task("default", "owner-lo", make_task("lo-a", "ctx-lo"))
+        .create_task("default", "owner-lo", make_task_at("lo-a", "ctx-lo", 1))
         .await
         .unwrap();
-    assert!(status_time(&older) <= status_time(&newer));
+    assert!(status_time(&older) < status_time(&newer));
 
     let filter = TaskFilter {
         tenant: Some("default".into()),
@@ -4930,7 +4944,7 @@ pub async fn test_list_orders_by_status_timestamp(storage: &dyn A2aTaskStorage) 
         )
         .await
         .unwrap();
-    assert!(status_time(&moved) >= status_time(&newer));
+    assert!(status_time(&moved) > status_time(&newer));
     let page = storage.list_tasks(filter).await.unwrap();
     let ids: Vec<&str> = page.tasks.iter().map(|t| t.id()).collect();
     assert_eq!(ids, ["lo-z", "lo-a"]);
@@ -4941,14 +4955,20 @@ pub async fn test_list_orders_by_status_timestamp(storage: &dyn A2aTaskStorage) 
 /// timestamp is greater than or equal to the bound.
 pub async fn test_list_status_timestamp_after(storage: &dyn A2aTaskStorage) {
     storage
-        .create_task("default", "owner-sa", make_task("sa-1", "ctx-sa"))
+        .create_task("default", "owner-sa", make_task_at("sa-1", "ctx-sa", 0))
         .await
         .unwrap();
     let second = storage
-        .create_task("default", "owner-sa", make_task("sa-2", "ctx-sa"))
+        .create_task("default", "owner-sa", make_task_at("sa-2", "ctx-sa", 1))
         .await
         .unwrap();
     let bound = status_time(&second);
+    let first = storage
+        .get_task("default", "sa-1", "owner-sa", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status_time(&first) < bound);
 
     let after = |at: chrono::DateTime<chrono::Utc>| TaskFilter {
         tenant: Some("default".into()),
@@ -4977,7 +4997,7 @@ pub async fn test_list_status_timestamp_after(storage: &dyn A2aTaskStorage) {
     assert_eq!(pages, pages_of(&["sa-1", "sa-2"], 1));
 
     let page = storage
-        .list_tasks(after(bound + chrono::Duration::days(1)))
+        .list_tasks(after(chrono::Utc::now() + chrono::Duration::days(1)))
         .await
         .unwrap();
     assert!(page.tasks.is_empty());

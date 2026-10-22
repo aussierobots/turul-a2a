@@ -1196,7 +1196,17 @@ impl A2aEventStore for PostgresA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
-        // Allocate per-task sequence via MAX+1 within transaction
+        // MAX+1 alone races under READ COMMITTED: two appenders read the
+        // same MAX and collide on the primary key. Lock the task row first,
+        // the row every atomic task+event write also updates before it
+        // allocates, so all writers to one task allocate in turn.
+        sqlx::query("SELECT 1 FROM a2a_tasks WHERE tenant = $1 AND task_id = $2 FOR UPDATE")
+            .bind(tenant)
+            .bind(task_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+
         let seq: Option<i64> = sqlx::query_scalar(
             "SELECT COALESCE(MAX(event_sequence), 0) + 1 FROM a2a_task_events
              WHERE tenant = $1 AND task_id = $2",

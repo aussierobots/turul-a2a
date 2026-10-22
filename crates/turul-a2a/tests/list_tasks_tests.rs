@@ -253,6 +253,21 @@ async fn status_timestamp_after_http_and_jsonrpc() {
     assert_eq!(status, 400, "{body}");
 }
 
+#[tokio::test]
+async fn jsonrpc_rejects_mistyped_or_unknown_params() {
+    let router = router_on(InMemoryA2aStorage::new());
+    for params in [
+        serde_json::json!({"statusTimestampAfter": 5}),
+        serde_json::json!({"statusTimestampAfter": "yesterday"}),
+        serde_json::json!({"status": "TASK_STATE_BOGUS"}),
+        serde_json::json!({"pageSize": "many"}),
+        serde_json::json!({"includeArtifacts": "yes"}),
+    ] {
+        let resp = jsonrpc(router.clone(), params.clone()).await;
+        assert_eq!(resp["error"]["code"], -32602, "{params}: {resp}");
+    }
+}
+
 #[cfg(feature = "grpc")]
 mod grpc {
     use super::*;
@@ -342,6 +357,29 @@ mod grpc {
                 .await
                 .expect_err("out-of-range pageSize");
             assert_eq!(err.code(), tonic::Code::InvalidArgument, "pageSize={bad}");
+        }
+
+        let err = client
+            .list_tasks(tonic::Request::new(turul_a2a_proto::ListTasksRequest {
+                status: 99,
+                ..request()
+            }))
+            .await
+            .expect_err("unknown TaskState value");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        for nanos in [-1, 1_000_000_000] {
+            let err = client
+                .list_tasks(tonic::Request::new(turul_a2a_proto::ListTasksRequest {
+                    status_timestamp_after: Some(turul_a2a_proto::pbjson_types::Timestamp {
+                        seconds: 0,
+                        nanos,
+                    }),
+                    ..request()
+                }))
+                .await
+                .expect_err("Timestamp nanos outside 0..=999_999_999");
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "nanos={nanos}");
         }
 
         let bound = chrono::DateTime::parse_from_rfc3339(&status_timestamp(&second)).unwrap();

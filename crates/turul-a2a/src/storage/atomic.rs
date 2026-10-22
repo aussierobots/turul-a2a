@@ -161,8 +161,8 @@ pub trait A2aAtomicStore: Send + Sync {
     ///   Affected-rows = 0 on an existing task ⇒ terminal already set;
     ///   the surrounding transaction rolls back so no events commit.
     /// - **DynamoDB**: the task-item's `Update` carries a
-    ///   `ConditionExpression` asserting `statusState NOT IN
-    ///   (:completed, :failed, :canceled, :rejected)`. A
+    ///   `ConditionExpression` asserting `NOT statusState IN (...)` over
+    ///   the same terminal set, by wire name. A
     ///   `TransactionCanceledException` citing the condition-check
     ///   failure ⇒ terminal already set; the transaction as a whole
     ///   aborts so no events commit.

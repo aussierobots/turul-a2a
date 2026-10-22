@@ -14,6 +14,10 @@
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
+use turul_a2a_types::state_machine::TERMINAL_STATES;
 use turul_a2a_types::{Artifact, Message, Task, TaskState, TaskStatus};
 
 use super::atomic::A2aAtomicStore;
@@ -52,6 +56,37 @@ pub struct DynamoDbConfig {
 }
 
 /// 1 day in seconds.
+/// `NOT statusState IN (:terminal0, ...)` over
+/// [`TERMINAL_STATES`]: the condition that guards every write which must not
+/// land on a task already in a terminal state. The matching values come from
+/// [`terminal_condition_values`].
+static TERMINAL_STATE_CONDITION: LazyLock<String> = LazyLock::new(|| {
+    let placeholders = (0..TERMINAL_STATES.len())
+        .map(|i| format!(":terminal{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("NOT statusState IN ({placeholders})")
+});
+
+/// Expression values for [`TERMINAL_STATE_CONDITION`] (each terminal
+/// state's wire name), plus the caller's own values for the rest of the
+/// expression.
+fn terminal_condition_values<const N: usize>(
+    extra: [(&str, AttributeValue); N],
+) -> HashMap<String, AttributeValue> {
+    TERMINAL_STATES
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            (
+                format!(":terminal{i}"),
+                AttributeValue::S(s.wire_name().to_string()),
+            )
+        })
+        .chain(extra.into_iter().map(|(k, v)| (k.to_string(), v)))
+        .collect()
+}
+
 const DEFAULT_TASK_TTL: u64 = 24 * 3600;
 /// 24 hours in seconds.
 const DEFAULT_EVENT_TTL: u64 = 24 * 3600;
@@ -1155,30 +1190,17 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .table_name(&self.config.tasks_table)
             .key("pk", AttributeValue::S(pk.clone()))
             .update_expression("SET cancelRequested = :true")
-            .condition_expression(
+            .condition_expression(format!(
                 "attribute_exists(pk) AND #owner = :owner \
                  AND (attribute_not_exists(statusState) \
-                      OR NOT statusState IN (:completed, :failed, :canceled, :rejected))",
-            )
+                      OR {})",
+                *TERMINAL_STATE_CONDITION
+            ))
             .expression_attribute_names("#owner", "owner")
-            .expression_attribute_values(":true", AttributeValue::Bool(true))
-            .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()))
-            .expression_attribute_values(
-                ":completed",
-                AttributeValue::S(TaskState::Completed.wire_name().to_string()),
-            )
-            .expression_attribute_values(
-                ":failed",
-                AttributeValue::S(TaskState::Failed.wire_name().to_string()),
-            )
-            .expression_attribute_values(
-                ":canceled",
-                AttributeValue::S(TaskState::Canceled.wire_name().to_string()),
-            )
-            .expression_attribute_values(
-                ":rejected",
-                AttributeValue::S(TaskState::Rejected.wire_name().to_string()),
-            )
+            .set_expression_attribute_values(Some(terminal_condition_values([
+                (":true", AttributeValue::Bool(true)),
+                (":owner", AttributeValue::S(owner.to_string())),
+            ])))
             .send()
             .await;
 
@@ -2042,28 +2064,16 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                     aws_sdk_dynamodb::types::Put::builder()
                         .table_name(&self.config.tasks_table)
                         .set_item(Some(task_item))
-                        .condition_expression(
+                        .condition_expression(format!(
                             "#owner = :owner AND (attribute_not_exists(statusState) \
-                             OR NOT statusState IN (:completed, :failed, :canceled, :rejected))",
-                        )
+                             OR {})",
+                            *TERMINAL_STATE_CONDITION
+                        ))
                         .expression_attribute_names("#owner", "owner")
-                        .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()))
-                        .expression_attribute_values(
-                            ":completed",
-                            AttributeValue::S(TaskState::Completed.wire_name().to_string()),
-                        )
-                        .expression_attribute_values(
-                            ":failed",
-                            AttributeValue::S(TaskState::Failed.wire_name().to_string()),
-                        )
-                        .expression_attribute_values(
-                            ":canceled",
-                            AttributeValue::S(TaskState::Canceled.wire_name().to_string()),
-                        )
-                        .expression_attribute_values(
-                            ":rejected",
-                            AttributeValue::S(TaskState::Rejected.wire_name().to_string()),
-                        )
+                        .set_expression_attribute_values(Some(terminal_condition_values([(
+                            ":owner",
+                            AttributeValue::S(owner.to_string()),
+                        )])))
                         .build()
                         .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
                 )
@@ -2266,28 +2276,16 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let task_put = aws_sdk_dynamodb::types::Put::builder()
             .table_name(&self.config.tasks_table)
             .set_item(Some(task_item))
-            .condition_expression(
+            .condition_expression(format!(
                 "#owner = :owner AND (attribute_not_exists(statusState) \
-                 OR NOT statusState IN (:completed, :failed, :canceled, :rejected))",
-            )
+                 OR {})",
+                *TERMINAL_STATE_CONDITION
+            ))
             .expression_attribute_names("#owner", "owner")
-            .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()))
-            .expression_attribute_values(
-                ":completed",
-                AttributeValue::S(TaskState::Completed.wire_name().to_string()),
-            )
-            .expression_attribute_values(
-                ":failed",
-                AttributeValue::S(TaskState::Failed.wire_name().to_string()),
-            )
-            .expression_attribute_values(
-                ":canceled",
-                AttributeValue::S(TaskState::Canceled.wire_name().to_string()),
-            )
-            .expression_attribute_values(
-                ":rejected",
-                AttributeValue::S(TaskState::Rejected.wire_name().to_string()),
-            );
+            .set_expression_attribute_values(Some(terminal_condition_values([(
+                ":owner",
+                AttributeValue::S(owner.to_string()),
+            )])));
         let mut items = vec![
             aws_sdk_dynamodb::types::TransactWriteItem::builder()
                 .put(
