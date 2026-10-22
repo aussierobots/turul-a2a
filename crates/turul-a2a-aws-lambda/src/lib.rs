@@ -728,8 +728,9 @@ impl LambdaA2aHandler {
     /// content-type detection, and the response envelope rebuild.
     ///
     /// Body encoding: text for `text/*`, `application/json`,
-    /// `application/xml`, `application/javascript`, or anything with
-    /// `charset=`; base64 otherwise.
+    /// `application/xml`, `application/javascript`, any `+json` / `+xml`
+    /// structured-syntax suffix (RFC 6839, e.g. `application/a2a+json`),
+    /// or anything with `charset=`; base64 otherwise.
     ///
     /// Path-prefix stripping (see
     /// [`LambdaA2aServerBuilder::strip_path_prefix`]) is applied
@@ -785,10 +786,14 @@ impl LambdaA2aHandler {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/octet-stream")
             .to_ascii_lowercase();
-        let is_text = ct.starts_with("text/")
-            || ct.starts_with("application/json")
-            || ct.starts_with("application/xml")
-            || ct.starts_with("application/javascript")
+        let essence = ct.split(';').next().unwrap_or("").trim();
+        let is_text = essence.starts_with("text/")
+            || matches!(
+                essence,
+                "application/json" | "application/xml" | "application/javascript"
+            )
+            || essence.ends_with("+json")
+            || essence.ends_with("+xml")
             || ct.contains("charset=");
 
         let (body_str, is_base64) = if bytes.is_empty() {
