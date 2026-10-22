@@ -161,6 +161,11 @@ pub mod protocol {
     pub const VERSION_PARAM: &str = "A2A-Version";
     /// The `Major.Minor` protocol version this implementation speaks.
     pub const VERSION: &str = "1.0";
+    /// Name of the `A2A-Extensions` service parameter, in the lowercase
+    /// form gRPC metadata requires (HTTP header names are
+    /// case-insensitive). Carries activated extension URIs on requests and
+    /// the echo on responses.
+    pub const EXTENSIONS_PARAM: &str = "a2a-extensions";
     /// Registered A2A media type (spec Section 14.1).
     pub const MEDIA_TYPE_A2A_JSON: &str = "application/a2a+json";
     /// Plain JSON media type, accepted on every JSON binding.

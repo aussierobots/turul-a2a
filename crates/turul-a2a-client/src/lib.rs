@@ -134,7 +134,10 @@ impl A2aClient {
             }
         }
         if !self.extensions.is_empty() {
-            req = req.header("a2a-extensions", self.extensions.join(", "));
+            req = req.header(
+                turul_a2a_types::wire::protocol::EXTENSIONS_PARAM,
+                self.extensions.join(", "),
+            );
         }
         req
     }

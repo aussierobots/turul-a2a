@@ -78,7 +78,10 @@ impl A2aGrpcClient {
         let mut req = Request::new(value);
         // Spec Section 3.6.1: clients MUST send the protocol version.
         req.metadata_mut().insert(
-            "a2a-version",
+            tonic::metadata::MetadataKey::from_bytes(
+                turul_a2a_types::wire::protocol::VERSION_PARAM.as_bytes(),
+            )
+            .expect("A2A-Version is a valid metadata key"),
             MetadataValue::from_static(turul_a2a_types::wire::protocol::VERSION),
         );
         match &self.auth {

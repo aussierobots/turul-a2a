@@ -185,11 +185,9 @@ pub fn response_header_value(activated: &HashSet<String>) -> Option<String> {
     Some(sorted.join(", "))
 }
 
-/// HTTP header name used for both activation (request) and echo
-/// (response). HTTP is case-insensitive; gRPC metadata requires
-/// lowercase, so we store the canonical lowercase form here and let
-/// HTTP handlers compare case-insensitively.
-pub const A2A_EXTENSIONS_HEADER: &str = "a2a-extensions";
+/// Header / metadata name used for both activation (request) and echo
+/// (response), in the lowercase form gRPC metadata requires.
+pub use turul_a2a_types::wire::protocol::EXTENSIONS_PARAM as A2A_EXTENSIONS_HEADER;
 
 /// Convenience: extract the activated set from an axum `HeaderMap`.
 pub fn activated_from_headers(headers: &axum::http::HeaderMap) -> HashSet<String> {
