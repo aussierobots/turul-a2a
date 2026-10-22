@@ -3,6 +3,8 @@
 //! Tests the actual HTTP response shape from /message:stream and /tasks/{id}:subscribe.
 //! Reads the streamed body from tower::ServiceExt, not a full network client.
 
+mod common;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -114,30 +116,20 @@ fn send_message_body(id: &str, text: &str) -> String {
     .to_string()
 }
 
-/// Collect SSE events from a response body with a timeout.
-/// Returns the raw `data:` payloads as parsed JSON values.
-async fn collect_sse_events(body: Body, timeout: Duration) -> Vec<serde_json::Value> {
-    let collected = tokio::time::timeout(timeout, async {
-        let bytes = body.collect().await.unwrap().to_bytes();
-        let text = String::from_utf8_lossy(&bytes);
-        parse_sse_events(&text)
-    })
-    .await;
-
-    // `Err(_)` is a timeout — stream didn't close in time; return empty.
-    collected.unwrap_or_default()
-}
-
-/// Parse SSE text format into JSON `data:` payloads ("data: {json}\n\n" per event).
-fn parse_sse_events(text: &str) -> Vec<serde_json::Value> {
-    text.split("\n\n")
-        .filter_map(|chunk| {
-            chunk
-                .lines()
-                .find_map(|line| line.strip_prefix("data:"))
-                .and_then(|data| serde_json::from_str(data.trim()).ok())
-        })
-        .collect()
+/// Stream `body` to a closing state. The caller keeps its router (and
+/// so the server state) alive, so the end of the stream is the
+/// server's decision, not a dropped broker.
+async fn closed_stream(router: &axum::Router, body: &str) -> Vec<serde_json::Value> {
+    let req = Request::post("/message:stream")
+        .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    common::read_sse(resp.into_body(), Duration::from_secs(5))
+        .await
+        .closed()
 }
 
 // =========================================================
@@ -170,18 +162,8 @@ async fn message_stream_returns_text_event_stream() {
 
 #[tokio::test]
 async fn message_stream_first_event_is_task_snapshot() {
-    let state = test_state();
-    let router = build_router(state);
-    let req = Request::post("/message:stream")
-        .header("content-type", "application/json")
-        .header("a2a-version", "1.0")
-        .body(Body::from(send_message_body("sse-first", "start")))
-        .unwrap();
-
-    let resp = router.oneshot(req).await.unwrap();
-    let events = collect_sse_events(resp.into_body(), Duration::from_secs(2)).await;
-
-    assert!(!events.is_empty(), "Should receive at least one event");
+    let router = build_router(test_state());
+    let events = closed_stream(&router, &send_message_body("sse-first", "start")).await;
 
     // A2A §3.1.2: the stream MUST begin with the Task object.
     let first = &events[0];
@@ -192,21 +174,14 @@ async fn message_stream_first_event_is_task_snapshot() {
     let task = &first["task"];
     assert!(task.get("id").is_some());
     assert!(task.get("contextId").is_some());
-    assert!(task.get("status").is_some());
+    // The turn has started before the snapshot is taken.
+    assert_eq!(task["status"]["state"], "TASK_STATE_WORKING");
 }
 
 #[tokio::test]
 async fn message_stream_events_are_proto_correct_stream_response() {
-    let state = test_state();
-    let router = build_router(state);
-    let req = Request::post("/message:stream")
-        .header("content-type", "application/json")
-        .header("a2a-version", "1.0")
-        .body(Body::from(send_message_body("sse-shape", "check shape")))
-        .unwrap();
-
-    let resp = router.oneshot(req).await.unwrap();
-    let events = collect_sse_events(resp.into_body(), Duration::from_secs(2)).await;
+    let router = build_router(test_state());
+    let events = closed_stream(&router, &send_message_body("sse-shape", "check shape")).await;
 
     // Every event must be a valid StreamResponse variant: the Task
     // snapshot first, then status or artifact updates.
@@ -222,84 +197,17 @@ async fn message_stream_events_are_proto_correct_stream_response() {
 }
 
 #[tokio::test]
-async fn message_stream_events_in_order() {
-    let state = test_state();
-    let router = build_router(state);
-    let req = Request::post("/message:stream")
-        .header("content-type", "application/json")
-        .header("a2a-version", "1.0")
-        .body(Body::from(send_message_body("sse-order", "ordering")))
-        .unwrap();
+async fn message_stream_closes_after_the_terminal_event() {
+    let router = build_router(test_state());
+    let events = closed_stream(&router, &send_message_body("sse-term", "complete me")).await;
 
-    let resp = router.oneshot(req).await.unwrap();
-    let events = collect_sse_events(resp.into_body(), Duration::from_secs(2)).await;
-
-    // Collect status states in order
-    let states: Vec<&str> = events
-        .iter()
-        .filter_map(|e| e.get("statusUpdate"))
-        .filter_map(|su| su.get("status"))
-        .filter_map(|s| s.get("state"))
-        .filter_map(|s| s.as_str())
-        .collect();
-
-    // Should see progression: SUBMITTED -> WORKING -> COMPLETED (or subset)
-    // The first state should be early in the lifecycle
-    if states.len() >= 2 {
-        // Verify no regression: later states should not be "earlier" than previous
-        let state_order = |s: &str| -> i32 {
-            match s {
-                "TASK_STATE_SUBMITTED" => 0,
-                "TASK_STATE_WORKING" => 1,
-                "TASK_STATE_COMPLETED" => 2,
-                _ => 99,
-            }
-        };
-        for window in states.windows(2) {
-            assert!(
-                state_order(window[0]) <= state_order(window[1]),
-                "Events out of order: {} before {}",
-                window[0],
-                window[1]
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn message_stream_includes_terminal_event() {
-    let state = test_state();
-    let router = build_router(state);
-    let req = Request::post("/message:stream")
-        .header("content-type", "application/json")
-        .header("a2a-version", "1.0")
-        .body(Body::from(send_message_body("sse-term", "complete me")))
-        .unwrap();
-
-    let resp = router.oneshot(req).await.unwrap();
-    let events = collect_sse_events(resp.into_body(), Duration::from_secs(2)).await;
-
-    // Should have a terminal status event
-    let terminal_states: Vec<&str> = events
-        .iter()
-        .filter_map(|e| e.get("statusUpdate"))
-        .filter_map(|su| su.get("status"))
-        .filter_map(|s| s.get("state"))
-        .filter_map(|s| s.as_str())
-        .filter(|s| {
-            matches!(
-                *s,
-                "TASK_STATE_COMPLETED"
-                    | "TASK_STATE_FAILED"
-                    | "TASK_STATE_CANCELED"
-                    | "TASK_STATE_REJECTED"
-            )
-        })
-        .collect();
-
+    // SUBMITTED and WORKING are reflected in the snapshot and not
+    // replayed; COMPLETED is the only status update, it is the last
+    // event, and the stream has closed after it.
+    assert_eq!(common::status_states(&events), ["TASK_STATE_COMPLETED"]);
     assert!(
-        !terminal_states.is_empty(),
-        "Stream should include a terminal status event"
+        events.last().unwrap().get("statusUpdate").is_some(),
+        "the terminal status update is the last event, got {events:?}"
     );
 }
 
@@ -378,6 +286,13 @@ async fn subscribe_terminal_task_returns_error() {
         400,
         "Subscribe to terminal task should return 400 (UnsupportedOperationError)"
     );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["error"]["details"][0]["reason"],
+        "UNSUPPORTED_OPERATION"
+    );
+    assert_eq!(json["error"]["details"][0]["domain"], "a2a-protocol.org");
 }
 
 #[tokio::test]
@@ -460,14 +375,15 @@ async fn subscribe_non_terminal_task_returns_sse_opening_with_task_snapshot() {
         .await
         .unwrap();
 
-    // Subscribe — should return 200 + text/event-stream with replayed events
+    // Subscribe — should return 200 + text/event-stream opening with
+    // the snapshot. The router is kept alive so the server state is.
     let router = build_router(state);
     let req = Request::get("/tasks/sub-happy-1:subscribe")
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
 
-    let resp = router.oneshot(req).await.unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
         200,
@@ -485,8 +401,11 @@ async fn subscribe_non_terminal_task_returns_sse_opening_with_task_snapshot() {
     );
 
     // Task snapshot only (spec §3.1.6): it already reflects the stored
-    // SUBMITTED and WORKING events, so neither is replayed.
-    let events = collect_sse_events(resp.into_body(), Duration::from_secs(3)).await;
+    // SUBMITTED and WORKING events, so neither is replayed. The task
+    // stays WORKING, so the stream stays open.
+    let events = common::read_sse(resp.into_body(), Duration::from_secs(1))
+        .await
+        .still_open();
     assert_eq!(events.len(), 1, "snapshot only, got: {events:?}");
 
     // First event MUST be a Task object (spec §3.1.6)

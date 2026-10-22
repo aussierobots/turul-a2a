@@ -3,6 +3,8 @@
 //! Full lifecycle scenarios exercising HTTP + JSON-RPC + SSE together.
 //! Assertions are wire-level and spec-level, not implementation-shaped.
 
+mod common;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -197,40 +199,6 @@ async fn jrpc_call(router: axum::Router, body: &str) -> (u16, serde_json::Value)
     post_json(router, "/jsonrpc", body).await
 }
 
-fn parse_sse_events(text: &str) -> Vec<serde_json::Value> {
-    text.split("\n\n")
-        .filter_map(|chunk| {
-            chunk
-                .lines()
-                .find_map(|l| l.strip_prefix("data:").map(|d| d.trim().to_string()))
-        })
-        .filter_map(|d| serde_json::from_str(&d).ok())
-        .collect()
-}
-
-/// Collect SSE events by reading body frames with a timeout.
-/// Unlike body.collect(), this returns partial data when the stream is still open.
-async fn collect_sse(body: Body, timeout: Duration) -> Vec<serde_json::Value> {
-    use http_body_util::BodyExt;
-    let mut body = body;
-    let mut buf = Vec::new();
-
-    let result = tokio::time::timeout(timeout, async {
-        while let Some(frame) = body.frame().await {
-            if let Ok(frame) = frame
-                && let Some(data) = frame.data_ref()
-            {
-                buf.extend_from_slice(data);
-            }
-        }
-    })
-    .await;
-
-    // Timeout is fine — stream may still be open
-    let _ = result;
-    parse_sse_events(&String::from_utf8_lossy(&buf))
-}
-
 // =========================================================
 // E2E-01: Full SendMessage lifecycle
 // =========================================================
@@ -355,34 +323,27 @@ async fn e2e_streaming_event_sequence() {
         .body(Body::from(send_body("se1", "stream me")))
         .unwrap();
 
-    let resp = router.oneshot(req).await.unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
-    let events = collect_sse(resp.into_body(), Duration::from_secs(2)).await;
+    let events = common::read_sse(resp.into_body(), Duration::from_secs(5))
+        .await
+        .closed();
 
-    // Should have status events
-    let states: Vec<&str> = events
-        .iter()
-        .filter_map(|e| e.get("statusUpdate"))
-        .filter_map(|su| su["status"]["state"].as_str())
-        .collect();
-
-    assert!(!states.is_empty(), "Should have status events");
-    // Last status should be terminal
-    let last = states.last().unwrap();
-    assert!(
-        *last == "TASK_STATE_COMPLETED" || *last == "TASK_STATE_FAILED",
-        "Last status should be terminal, got: {last}"
+    // The Task snapshot (already WORKING) opens the stream; the only
+    // status update after it is the terminal COMPLETED.
+    assert_eq!(
+        events[0]["task"]["status"]["state"], "TASK_STATE_WORKING",
+        "first event is the Task snapshot, got {events:?}"
     );
+    assert_eq!(common::status_states(&events), ["TASK_STATE_COMPLETED"]);
 }
 
 // =========================================================
 // E2E-06: Subscribe on live non-terminal task
 //
-// D3 note: Subscribe reads from the durable event store. Non-streaming
-// /message:send does not write events to the store in D3 scope. This test
-// verifies that subscribe works with tasks that DO have stored events
-// (created via atomic store). A future iteration may wire non-streaming
-// paths through atomic store too.
+// The subscriber attaches to a WORKING task, then the task completes:
+// the stream carries the snapshot, then the live COMPLETED event, then
+// closes.
 // =========================================================
 
 #[tokio::test]
@@ -445,26 +406,37 @@ async fn e2e_subscribe_live_task() {
         .unwrap_or("");
     assert!(ct.contains("text/event-stream"));
 
-    let events = collect_sse(resp.into_body(), Duration::from_secs(3)).await;
+    // The response head means the snapshot is taken; the task now
+    // completes, as an executor would complete it.
+    let completed_event = turul_a2a::streaming::StreamEvent::StatusUpdate {
+        status_update: turul_a2a::streaming::StatusUpdatePayload {
+            task_id: "sub-e2e-1".to_string(),
+            context_id: "ctx-sub-e2e".to_string(),
+            status: serde_json::json!({"state": "TASK_STATE_COMPLETED"}),
+        },
+    };
+    st.atomic_store
+        .update_task_status_with_events(
+            "",
+            "sub-e2e-1",
+            "anonymous",
+            turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Completed),
+            vec![completed_event],
+        )
+        .await
+        .unwrap();
+    st.event_broker.notify("sub-e2e-1").await;
 
-    // The snapshot already reflects SUBMITTED and WORKING, so neither is
-    // replayed after it; the task is idle, so nothing else arrives.
-    assert_eq!(events.len(), 1, "snapshot only, got: {events:?}");
+    let events = common::read_sse(resp.into_body(), Duration::from_secs(5))
+        .await
+        .closed();
 
-    // First event should be Task object (spec §3.1.6)
-    assert!(
-        events[0].get("task").is_some(),
-        "First event should be Task object, got: {}",
-        events[0]
-    );
-
-    // Remaining events should be statusUpdate
-    for event in &events[1..] {
-        assert!(
-            event.get("statusUpdate").is_some(),
-            "Subscribe event should be statusUpdate, got: {event}"
-        );
-    }
+    // First event is the Task object (spec §3.1.6); it already reflects
+    // SUBMITTED and WORKING, so neither is replayed. The live event
+    // follows, and the stream closes after it.
+    assert_eq!(events.len(), 2, "snapshot + live event, got: {events:?}");
+    assert_eq!(events[0]["task"]["status"]["state"], "TASK_STATE_WORKING");
+    assert_eq!(common::status_states(&events), ["TASK_STATE_COMPLETED"]);
 }
 
 // =========================================================

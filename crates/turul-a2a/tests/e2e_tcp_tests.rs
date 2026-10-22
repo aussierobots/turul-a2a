@@ -4,7 +4,10 @@
 //! and use A2aClient making actual HTTP requests over the network.
 //! No tower mocks, no oneshot — real HTTP connections.
 
+mod common;
+
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use turul_a2a::card_builder::AgentCardBuilder;
@@ -101,10 +104,9 @@ async fn start_server(executor: impl AgentExecutor + 'static) -> String {
         axum::serve(listener, router).await.unwrap();
     });
 
-    // Small delay for server to be ready
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    format!("http://{addr}")
+    let url = format!("http://{addr}");
+    common::wait_http_ready(&url).await;
+    url
 }
 
 /// Start a server with API key auth.
@@ -153,8 +155,9 @@ async fn start_server_with_api_key(
         axum::serve(listener, router).await.unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    format!("http://{addr}")
+    let url = format!("http://{addr}");
+    common::wait_http_ready(&url).await;
+    url
 }
 
 fn send_request(id: &str, text: &str) -> turul_a2a_proto::SendMessageRequest {
@@ -460,10 +463,13 @@ async fn e2e_tcp_send_streaming_message() {
     let request = MessageBuilder::new().text("stream me").build();
     let mut stream = client.send_streaming_message(request).await.unwrap();
 
+    // The stream must end on its own after the terminal event.
     let mut events = Vec::new();
-    while let Some(result) = stream.next().await {
-        let event = result.unwrap();
-        events.push(event);
+    while let Some(result) = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("stream closes after the terminal event")
+    {
+        events.push(result.unwrap());
     }
 
     assert!(!events.is_empty(), "Should receive streaming events");
@@ -503,20 +509,26 @@ async fn e2e_tcp_subscribe_to_non_terminal_task() {
     let mut stream = client.subscribe_to_task(&task_id).await.unwrap();
 
     // Collect first event (Task snapshot)
-    let first = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next()).await;
+    let first = tokio::time::timeout(Duration::from_secs(3), stream.next()).await;
 
     match first {
-        Ok(Some(Ok(event))) => {
-            assert!(
-                matches!(event.event, StreamEvent::Task(_)),
-                "First event should be Task snapshot, got: {:?}",
-                event.event
-            );
-        }
+        Ok(Some(Ok(event))) => match event.event {
+            StreamEvent::Task(task) => assert_eq!(
+                task.status().and_then(|s| s.state().ok()),
+                Some(TaskState::InputRequired)
+            ),
+            other => panic!("First event should be Task snapshot, got: {other:?}"),
+        },
         Ok(Some(Err(e))) => panic!("Stream error: {e}"),
         Ok(None) => panic!("Stream ended without events"),
         Err(_) => panic!("Timeout waiting for first event"),
     }
+
+    // INPUT_REQUIRED ends the stream right after the snapshot.
+    let next = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("stream closes after the INPUT_REQUIRED snapshot");
+    assert!(next.is_none(), "nothing follows the snapshot, got {next:?}");
 }
 
 #[tokio::test]
@@ -529,7 +541,7 @@ async fn e2e_tcp_subscribe_terminal_task_returns_error() {
     let resp = client.send_message(request).await.unwrap();
     let task_id = resp.task().expect("Expected Task").id().to_string();
 
-    // Subscribe to terminal task — should error
+    // Subscribe to terminal task — UnsupportedOperationError
     match client.subscribe_to_task(&task_id).await {
         Err(err) => {
             assert_eq!(
@@ -537,6 +549,7 @@ async fn e2e_tcp_subscribe_terminal_task_returns_error() {
                 Some(400),
                 "Terminal subscribe should return 400"
             );
+            assert_eq!(err.reason(), Some("UNSUPPORTED_OPERATION"));
         }
         Ok(_) => panic!("Subscribe to terminal task should return error"),
     }
