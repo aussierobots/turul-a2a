@@ -444,10 +444,14 @@ fn pages_of(ids: &[&str], page_size: usize) -> Vec<Vec<String>> {
 // P2-009: List pagination
 // =========================================================
 pub async fn test_list_pagination(storage: &dyn A2aTaskStorage) {
-    // Created in order, so pg-6 has the latest status timestamp.
+    // pg-6 has the latest status timestamp.
     for i in 0..7 {
         storage
-            .create_task("default", "owner", make_task(&format!("pg-{i}"), "ctx-pg"))
+            .create_task(
+                "default",
+                "owner",
+                make_task_at(&format!("pg-{i}"), "ctx-pg", i),
+            )
             .await
             .unwrap();
     }
@@ -477,7 +481,11 @@ pub async fn test_list_pagination(storage: &dyn A2aTaskStorage) {
 pub async fn test_list_pagination_exact_multiple(storage: &dyn A2aTaskStorage) {
     for i in 0..6 {
         storage
-            .create_task("default", "owner", make_task(&format!("em-{i}"), "ctx-em"))
+            .create_task(
+                "default",
+                "owner",
+                make_task_at(&format!("em-{i}"), "ctx-em", i),
+            )
             .await
             .unwrap();
     }
@@ -623,18 +631,19 @@ pub async fn test_list_filter_by_status(storage: &dyn A2aTaskStorage) {
 // P2-008: List filter by context_id
 // =========================================================
 pub async fn test_list_filter_by_context_id(storage: &dyn A2aTaskStorage) {
-    storage
-        .create_task("default", "owner", make_task("fc-1", "ctx-alpha"))
-        .await
-        .unwrap();
-    storage
-        .create_task("default", "owner", make_task("fc-2", "ctx-beta"))
-        .await
-        .unwrap();
-    storage
-        .create_task("default", "owner", make_task("fc-3", "ctx-alpha"))
-        .await
-        .unwrap();
+    for (offset, (id, ctx)) in [
+        ("fc-1", "ctx-alpha"),
+        ("fc-2", "ctx-beta"),
+        ("fc-3", "ctx-alpha"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        storage
+            .create_task("default", "owner", make_task_at(id, ctx, offset as i64))
+            .await
+            .unwrap();
+    }
 
     let page = storage
         .list_tasks(TaskFilter {
@@ -4952,7 +4961,7 @@ pub async fn test_list_orders_by_status_timestamp(storage: &dyn A2aTaskStorage) 
     let page = storage.list_tasks(filter).await.unwrap();
     let ids: Vec<&str> = page.tasks.iter().map(|t| t.id()).collect();
     assert_eq!(ids, ["lo-z", "lo-a"]);
-    assert!(status_time(&page.tasks[0]) >= status_time(&page.tasks[1]));
+    assert!(status_time(&page.tasks[0]) > status_time(&page.tasks[1]));
 }
 
 /// `ListTasksRequest.status_timestamp_after`: only tasks whose status

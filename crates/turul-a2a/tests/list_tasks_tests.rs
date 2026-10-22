@@ -151,6 +151,29 @@ fn status_timestamp(task: &serde_json::Value) -> String {
         .to_string()
 }
 
+fn status_time(task: &serde_json::Value) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(&status_timestamp(task))
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
+/// Send once the clock, at the microsecond precision storage stamps
+/// status writes with, has moved past `prev`'s status time, so the new
+/// task's status time is strictly later. Two back-to-back sends can
+/// otherwise share a timestamp.
+async fn send_after(
+    router: axum::Router,
+    message_id: &str,
+    prev: &serde_json::Value,
+) -> serde_json::Value {
+    use chrono::SubsecRound;
+    let prev_at = status_time(prev);
+    while chrono::Utc::now().trunc_subsecs(6) <= prev_at {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    send(router, message_id).await
+}
+
 #[tokio::test]
 async fn include_artifacts_http_and_jsonrpc() {
     let router = router_on(InMemoryA2aStorage::new());
@@ -212,9 +235,9 @@ async fn page_size_out_of_range_is_rejected_http_and_jsonrpc() {
 async fn status_timestamp_after_http_and_jsonrpc() {
     let router = router_on(InMemoryA2aStorage::new());
     let first = send(router.clone(), "m-st-1").await;
-    let second = send(router.clone(), "m-st-2").await;
+    let second = send_after(router.clone(), "m-st-2", &first).await;
     let bound = status_timestamp(&second);
-    assert!(status_timestamp(&first) < bound);
+    assert!(status_time(&first) < status_time(&second));
 
     let (status, page) = http_call(
         router.clone(),
@@ -350,8 +373,8 @@ mod grpc {
     #[tokio::test]
     async fn grpc_page_size_and_status_timestamp_after() {
         let (router, mut client, _guard) = dual().await;
-        send(router.clone(), "m-grpc-1").await;
-        let second = send(router, "m-grpc-2").await;
+        let first = send(router.clone(), "m-grpc-1").await;
+        let second = send_after(router, "m-grpc-2", &first).await;
 
         for bad in [0, 101] {
             let err = client
@@ -384,13 +407,9 @@ mod grpc {
             assert_eq!(err.code(), tonic::Code::InvalidArgument, "nanos={nanos}");
         }
 
-        let bound = chrono::DateTime::parse_from_rfc3339(&status_timestamp(&second)).unwrap();
         let page = client
             .list_tasks(tonic::Request::new(turul_a2a_proto::ListTasksRequest {
-                status_timestamp_after: Some(turul_a2a_proto::Timestamp {
-                    seconds: bound.timestamp(),
-                    nanos: bound.timestamp_subsec_nanos() as i32,
-                }),
+                status_timestamp_after: Some(status_time(&second).into()),
                 ..request()
             }))
             .await
