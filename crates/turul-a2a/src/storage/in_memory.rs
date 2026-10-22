@@ -945,7 +945,7 @@ impl A2aEventStore for InMemoryA2aStorage {
         let mut removed: u64 = {
             let mut claims = self.push_delivery_claims.write().await;
             let before = claims.len();
-            claims.retain(|_, row| !(row.status == ClaimStatus::GaveUp && row.expires_at <= now));
+            claims.retain(|_, row| !(row.status == ClaimStatus::GaveUp && row.expires_at < now));
             (before - claims.len()) as u64
         };
 

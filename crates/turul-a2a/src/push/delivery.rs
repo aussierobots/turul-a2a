@@ -61,6 +61,13 @@ use crate::storage::{A2aPushNotificationStorage, A2aStorageError, A2aTaskStorage
 /// (A2A v1.0.1 §4.3.3).
 pub const PUSH_CONTENT_TYPE: &str = "application/a2a+json";
 
+/// Longest failed-delivery retention honoured; a longer one (such as
+/// `Duration::MAX` meaning "keep") is clamped to it. 1000 years keeps
+/// the give-up time plus the retention representable as a `SystemTime`
+/// on every platform and as microseconds since the epoch in an `i64`,
+/// the storage backends' column type.
+pub const MAX_FAILED_DELIVERY_RETENTION: Duration = Duration::from_secs(1000 * 365 * 24 * 60 * 60);
+
 /// Runtime-configurable delivery parameters.
 ///
 /// Defaults: 8 attempts (the first immediate), waits doubling from a
@@ -84,11 +91,14 @@ pub struct PushDeliveryConfig {
     pub max_payload_bytes: usize,
     pub allow_insecure_urls: bool,
     /// How long a push config confirmed present by the pre-attempt
-    /// check is trusted without re-reading storage. `ZERO` re-reads
-    /// before every attempt.
+    /// check is trusted without re-reading storage. Default `ZERO`:
+    /// re-read before every attempt, so a deletion made anywhere stops
+    /// the delivery at its next attempt. A non-zero TTL lets a deletion
+    /// made outside this worker's server go unseen for up to the TTL.
     pub config_cache_ttl: Duration,
     /// How long a failed-delivery record is kept after the delivery
-    /// gives up; see [`DeliveryOutcome::GaveUp`].
+    /// gives up; see [`DeliveryOutcome::GaveUp`]. Values above
+    /// [`MAX_FAILED_DELIVERY_RETENTION`] are clamped to it.
     pub failed_delivery_retention: Duration,
 }
 
@@ -105,7 +115,7 @@ impl Default for PushDeliveryConfig {
             claim_expiry: Duration::from_secs(600),
             max_payload_bytes: 1024 * 1024,
             allow_insecure_urls: false,
-            config_cache_ttl: Duration::from_secs(5),
+            config_cache_ttl: Duration::ZERO,
             failed_delivery_retention: Duration::from_secs(7 * 24 * 60 * 60),
         }
     }
@@ -188,10 +198,10 @@ impl PushDnsResolver for TokioDnsResolver {
 /// deleted. A2A v1.0.1 §3.1.10: "No further notifications will be sent
 /// to the configured webhook after deletion."
 ///
-/// A config found present is trusted for
-/// [`PushDeliveryConfig::config_cache_ttl`] without re-reading. A
-/// deletion through the server that owns this worker drops the cached
-/// entries for that task at once (see
+/// With a non-zero [`PushDeliveryConfig::config_cache_ttl`] a config
+/// found present is trusted for the TTL without re-reading. A deletion
+/// through the server that owns this worker drops the cached entries
+/// for that task at once (see
 /// [`PushDeliveryWorker::invalidate_push_configs`]); a deletion made
 /// anywhere else is seen within the TTL.
 #[derive(Clone)]
@@ -211,13 +221,14 @@ impl DeliveryTargetLookup {
         ttl: Duration,
     ) -> Option<AbandonedReason> {
         if !cache.is_fresh(target, ttl) {
+            let generation = cache.generation();
             match self
                 .push_storage
                 .get_config(&target.tenant, &target.task_id, &target.config_id)
                 .await
             {
                 Ok(None) => return Some(AbandonedReason::ConfigDeleted),
-                Ok(Some(_)) => cache.record_present(target, ttl),
+                Ok(Some(_)) => cache.record_present(target, ttl, generation),
                 Err(_) => {}
             }
         }
@@ -238,37 +249,66 @@ impl DeliveryTargetLookup {
 /// so a config create can never make an entry stale; only a delete can.
 #[derive(Default)]
 struct PushConfigCache {
-    by_task: Mutex<HashMap<(String, String), HashMap<String, Instant>>>,
+    state: Mutex<PushConfigCacheState>,
+}
+
+#[derive(Default)]
+struct PushConfigCacheState {
+    /// Bumped by every invalidation. A storage read that started
+    /// before an invalidation may have seen the config before it was
+    /// deleted, so its result is not cached.
+    generation: u64,
+    by_task: HashMap<(String, String), HashMap<String, Instant>>,
 }
 
 impl PushConfigCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PushConfigCacheState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn is_fresh(&self, target: &PushTarget, ttl: Duration) -> bool {
-        let by_task = self.by_task.lock().unwrap_or_else(|e| e.into_inner());
-        by_task
+        self.lock()
+            .by_task
             .get(&(target.tenant.clone(), target.task_id.clone()))
             .and_then(|configs| configs.get(&target.config_id))
             .is_some_and(|confirmed| confirmed.elapsed() < ttl)
     }
 
-    fn record_present(&self, target: &PushTarget, ttl: Duration) {
+    /// Read before the storage read whose result is passed to
+    /// [`Self::record_present`].
+    fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+
+    /// Cache that `target`'s config was found present by a read that
+    /// started at `read_generation`, unless an invalidation has run
+    /// since.
+    fn record_present(&self, target: &PushTarget, ttl: Duration, read_generation: u64) {
         if ttl.is_zero() {
             return;
         }
-        let mut by_task = self.by_task.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.lock();
+        if state.generation != read_generation {
+            return;
+        }
         // Drop expired entries so the map holds only live deliveries.
-        by_task.retain(|_, configs| {
+        state.by_task.retain(|_, configs| {
             configs.retain(|_, confirmed| confirmed.elapsed() < ttl);
             !configs.is_empty()
         });
-        by_task
+        state
+            .by_task
             .entry((target.tenant.clone(), target.task_id.clone()))
             .or_default()
             .insert(target.config_id.clone(), Instant::now());
     }
 
     fn invalidate(&self, tenant: &str, task_id: &str) {
-        let mut by_task = self.by_task.lock().unwrap_or_else(|e| e.into_inner());
-        by_task.remove(&(tenant.to_string(), task_id.to_string()));
+        let mut state = self.lock();
+        state.generation = state.generation.wrapping_add(1);
+        state
+            .by_task
+            .remove(&(tenant.to_string(), task_id.to_string()));
     }
 }
 
@@ -604,7 +644,11 @@ impl PushDeliveryWorker {
             reason,
             last_error_class,
             last_http_status,
-            retained_until: SystemTime::now() + self.config.failed_delivery_retention,
+            retained_until: SystemTime::now()
+                + self
+                    .config
+                    .failed_delivery_retention
+                    .min(MAX_FAILED_DELIVERY_RETENTION),
         }
     }
 
@@ -962,12 +1006,14 @@ mod tests {
     /// worker's delivery config.
     #[test]
     fn runtime_config_maps_onto_delivery_config() {
-        let mut runtime = crate::server::RuntimeConfig::default();
-        runtime.push_max_attempts = 3;
-        runtime.push_read_timeout = Duration::from_millis(250);
-        runtime.push_config_cache_ttl = Duration::from_secs(9);
-        runtime.push_failed_delivery_retention = Duration::from_secs(60);
-        runtime.allow_insecure_push_urls = true;
+        let runtime = crate::server::RuntimeConfig {
+            push_max_attempts: 3,
+            push_read_timeout: Duration::from_millis(250),
+            push_config_cache_ttl: Duration::from_secs(9),
+            push_failed_delivery_retention: Duration::from_secs(60),
+            allow_insecure_push_urls: true,
+            ..Default::default()
+        };
         let cfg = PushDeliveryConfig::from_runtime_config(&runtime);
         assert_eq!(cfg.max_attempts, 3);
         assert_eq!(cfg.read_timeout, Duration::from_millis(250));
@@ -1029,5 +1075,63 @@ mod tests {
         assert!(failed.is_empty(), "abandoned is not a failed delivery");
         // The row is terminal: the delivery cannot be claimed again.
         assert!(matches!(w.claim(&t).await, Err(ClaimFailure::AlreadyHeld)));
+    }
+
+    /// A2A v1.0.1 §3.1.10: "No further notifications will be sent to the
+    /// configured webhook after deletion." The default re-reads the
+    /// config before every attempt, so a deletion made anywhere is seen.
+    #[test]
+    fn default_config_cache_is_off() {
+        assert_eq!(
+            PushDeliveryConfig::default().config_cache_ttl,
+            Duration::ZERO
+        );
+    }
+
+    /// A read that started before an invalidation may have seen the
+    /// config before it was deleted; its result must not be cached, or
+    /// the deleted config would be trusted for a whole TTL.
+    #[test]
+    fn presence_read_before_invalidation_is_not_cached() {
+        let cache = PushConfigCache::default();
+        let t = target("https://example.com/hook");
+        let ttl = Duration::from_secs(3600);
+
+        let read_generation = cache.generation();
+        cache.invalidate(&t.tenant, &t.task_id);
+        cache.record_present(&t, ttl, read_generation);
+        assert!(!cache.is_fresh(&t, ttl), "stale read was cached");
+
+        let read_generation = cache.generation();
+        cache.record_present(&t, ttl, read_generation);
+        assert!(cache.is_fresh(&t, ttl), "current read is cached");
+        cache.invalidate(&t.tenant, &t.task_id);
+        assert!(!cache.is_fresh(&t, ttl), "invalidation drops the entry");
+    }
+
+    /// A retention meaning "keep" (`Duration::MAX`) is clamped rather
+    /// than overflowing, and the result still fits the backends'
+    /// microsecond `i64` columns.
+    #[test]
+    fn huge_failed_delivery_retention_is_clamped() {
+        let cfg = PushDeliveryConfig {
+            failed_delivery_retention: Duration::MAX,
+            ..Default::default()
+        };
+        let w = worker_with_store(Arc::new(InMemoryA2aStorage::new()), cfg);
+        let before = SystemTime::now();
+        let DeliveryOutcome::GaveUp { retained_until, .. } = w.gave_up(
+            GaveUpReason::MaxAttemptsExhausted,
+            DeliveryErrorClass::Timeout,
+            None,
+        ) else {
+            panic!("gave_up returns GaveUp");
+        };
+        assert!(retained_until >= before + MAX_FAILED_DELIVERY_RETENTION);
+        let micros = retained_until
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        assert!(micros <= i64::MAX as u128, "fits an i64 microsecond column");
     }
 }

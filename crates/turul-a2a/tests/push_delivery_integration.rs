@@ -1800,20 +1800,22 @@ async fn seed_task_and_config(
 
 /// Worker with a target lookup on `store`, 500 ms between attempts so
 /// the test can delete something after the first POST. The config cache
-/// is off unless `config_cache_ttl` says otherwise, so a deletion made
-/// straight in storage is seen at the next attempt.
+/// keeps its default, so these tests pin that a deletion made straight
+/// in storage is seen at the next attempt without any invalidation.
 fn live_worker(store: &Arc<InMemoryA2aStorage>) -> Arc<PushDeliveryWorker> {
-    live_worker_with_cache(store, Duration::ZERO)
+    live_worker_with_cache(store, None)
 }
 
 fn live_worker_with_cache(
     store: &Arc<InMemoryA2aStorage>,
-    config_cache_ttl: Duration,
+    config_cache_ttl: Option<Duration>,
 ) -> Arc<PushDeliveryWorker> {
     let cfg = test_config(5, |c| {
         c.backoff_base = Duration::from_millis(500);
         c.backoff_cap = Duration::from_millis(500);
-        c.config_cache_ttl = config_cache_ttl;
+        if let Some(ttl) = config_cache_ttl {
+            c.config_cache_ttl = ttl;
+        }
     });
     Arc::new(
         PushDeliveryWorker::new(store.clone(), cfg, None, "instance-live".into())
@@ -1936,7 +1938,7 @@ async fn cached_config_is_trusted_until_invalidated() {
 
     let store = Arc::new(InMemoryA2aStorage::new());
     let cfg = seed_task_and_config(&store, &format!("{}/webhook", server.uri())).await;
-    let worker = live_worker_with_cache(&store, Duration::from_secs(3600));
+    let worker = live_worker_with_cache(&store, Some(Duration::from_secs(3600)));
     let target =
         PushTarget::from_config(LIVE_TENANT, LIVE_OWNER, &cfg.task_id, 1, &cfg).expect("target");
 

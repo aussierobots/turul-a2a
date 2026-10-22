@@ -291,23 +291,36 @@ impl A2aServerBuilder {
     /// exists without re-reading storage. Before each POST attempt the
     /// worker checks that the config and task still exist and abandons
     /// the delivery if either is gone; a config found present is
-    /// trusted for this long. Deleting a push config through this
-    /// server drops the cached entries for its task at once, so the
-    /// next attempt sees the deletion; a deletion made through another
-    /// instance is seen within the TTL. `Duration::ZERO` re-reads
-    /// before every attempt. Default 5s.
+    /// trusted for this long. Default `Duration::ZERO`: re-read before
+    /// every attempt, so a deletion made anywhere stops delivery at the
+    /// next attempt.
+    ///
+    /// With a non-zero TTL, deleting a push config through this server
+    /// drops the cached entries for its task at once, but a deletion
+    /// made through another instance (or another Lambda function) can
+    /// be followed by POSTs for up to the TTL, which A2A v1.0.1 §3.1.10
+    /// ("No further notifications will be sent to the configured
+    /// webhook after deletion") does not allow. Only set it for a
+    /// single-instance deployment.
     pub fn push_config_cache_ttl(mut self, d: Duration) -> Self {
         self.runtime_config.push_config_cache_ttl = d;
         self
     }
 
-    /// How long a failed push delivery stays listed by
-    /// `list_failed_deliveries` after it gives up. Past that, the
-    /// storage cleanup entry point (`cleanup_expired`, run by
-    /// [`Self::maintenance`] or a scheduled handler) removes it from
-    /// the SQL and in-memory backends; on DynamoDB the record's `ttl`
-    /// attribute is set to the end of the retention and the engine
-    /// expires it. Default 7 days.
+    /// The minimum time a failed push delivery stays listed by
+    /// `list_failed_deliveries` after it gives up. Default 7 days;
+    /// values above
+    /// [`MAX_FAILED_DELIVERY_RETENTION`](crate::push::delivery::MAX_FAILED_DELIVERY_RETENTION)
+    /// (1000 years) are
+    /// clamped to it.
+    ///
+    /// On the SQL and in-memory backends the record is removed only
+    /// when the storage cleanup entry point (`cleanup_expired`, run by
+    /// [`Self::maintenance`] or a scheduled handler) runs after the
+    /// retention has passed; without it the record is kept. On DynamoDB
+    /// `cleanup_expired` does not remove it: the record's `ttl`
+    /// attribute is set to the end of the retention and the table's TTL
+    /// expires it.
     pub fn push_failed_delivery_retention(mut self, d: Duration) -> Self {
         self.runtime_config.push_failed_delivery_retention = d;
         self
