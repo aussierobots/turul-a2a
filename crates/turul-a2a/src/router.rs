@@ -382,8 +382,9 @@ async fn agent_card_handler(State(state): State<AppState>) -> impl IntoResponse 
 
 async fn extended_agent_card_handler(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
 ) -> Result<impl IntoResponse, A2aError> {
-    match state.executor.extended_agent_card(None) {
+    match state.executor.extended_agent_card(ctx.identity.claims()) {
         Some(extended) => {
             let card = serde_json::to_value(extended).unwrap_or_default();
             #[cfg(feature = "compat-v03")]

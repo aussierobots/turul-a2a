@@ -369,7 +369,9 @@ async fn dispatch(
         methods::GET_TASK => dispatch_get_task(state, tenant, owner, params).await,
         methods::LIST_TASKS => dispatch_list_tasks(state, tenant, owner, params).await,
         methods::CANCEL_TASK => dispatch_cancel_task(state, tenant, owner, params).await,
-        methods::GET_EXTENDED_AGENT_CARD => dispatch_get_extended_agent_card(state).await,
+        methods::GET_EXTENDED_AGENT_CARD => {
+            dispatch_get_extended_agent_card(state, claims.as_ref()).await
+        }
         methods::CREATE_TASK_PUSH_NOTIFICATION_CONFIG => {
             dispatch_create_push_config(state, tenant, owner, params).await
         }
@@ -545,8 +547,11 @@ async fn dispatch_cancel_task(
     Ok(response)
 }
 
-async fn dispatch_get_extended_agent_card(state: AppState) -> Result<Value, A2aError> {
-    match state.executor.extended_agent_card(None) {
+async fn dispatch_get_extended_agent_card(
+    state: AppState,
+    claims: Option<&serde_json::Value>,
+) -> Result<Value, A2aError> {
+    match state.executor.extended_agent_card(claims) {
         Some(card) => Ok(serde_json::to_value(card).unwrap_or_default()),
         None => Err(A2aError::ExtendedAgentCardNotConfigured),
     }

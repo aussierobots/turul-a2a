@@ -74,13 +74,18 @@ impl AgentExecutor for TestExecutor {
         }
     }
 
+    /// The description reports the claims the card was built for, so
+    /// tests can see what the transport handed over.
     fn extended_agent_card(
         &self,
-        _claims: Option<&serde_json::Value>,
+        claims: Option<&serde_json::Value>,
     ) -> Option<turul_a2a_proto::AgentCard> {
         Some(turul_a2a_proto::AgentCard {
             name: "Auth Test Agent (Extended)".into(),
-            description: "Extended card with more details".into(),
+            description: format!(
+                "claims: {}",
+                claims.map_or("none".to_string(), |c| c.to_string())
+            ),
             supported_interfaces: vec![],
             provider: None,
             version: "1.0.0".into(),
@@ -352,6 +357,7 @@ async fn extended_agent_card_served_to_claims_less_api_key_identity() {
     let (status, body) = json_response(router, req).await;
     assert_eq!(status, 200, "claims-less authenticated caller: {body}");
     assert_eq!(body["name"], "Auth Test Agent (Extended)");
+    assert_eq!(body["description"], "claims: none");
 
     let router = build_router(state);
     let req = Request::get("/extendedAgentCard")
@@ -361,6 +367,33 @@ async fn extended_agent_card_served_to_claims_less_api_key_identity() {
     let (status, _, body) = response_with_headers(router, req).await;
     assert_eq!(status, 401);
     assert_eq!(body, serde_json::json!({"error": "missing_credential"}));
+}
+
+/// The executor builds the extended card for the authenticated caller:
+/// it receives the claims the auth middleware established, on HTTP and
+/// JSON-RPC alike.
+#[tokio::test]
+async fn extended_agent_card_receives_caller_claims_http_and_jsonrpc() {
+    let expected = format!("claims: {}", serde_json::json!({"test": true}));
+
+    let req = Request::get("/extendedAgentCard")
+        .header("x-test-auth", "user-1")
+        .header("a2a-version", "1.0")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = json_response(build_router(state_with_auth()), req).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["description"], expected, "HTTP: {body}");
+
+    let req = Request::post("/jsonrpc")
+        .header("x-test-auth", "user-1")
+        .header("a2a-version", "1.0")
+        .header("content-type", "application/json")
+        .body(Body::from(jrpc_body("GetExtendedAgentCard", 9)))
+        .unwrap();
+    let (status, body) = json_response(build_router(state_with_auth()), req).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["description"], expected, "JSON-RPC: {body}");
 }
 
 #[tokio::test]

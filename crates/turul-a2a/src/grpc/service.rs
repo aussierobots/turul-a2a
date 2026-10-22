@@ -327,13 +327,15 @@ impl pb::grpc::A2aService for GrpcService {
 
     async fn get_extended_agent_card(
         &self,
-        _request: Request<pb::GetExtendedAgentCardRequest>,
+        request: Request<pb::GetExtendedAgentCardRequest>,
     ) -> Result<Response<pb::AgentCard>, Status> {
-        // No core_* helper — the HTTP handler calls the executor directly.
-        // Mirror that path verbatim: claims are `None` for now (the HTTP
-        // GET endpoint passes `None` too; passing JWT claims through is
-        // future work).
-        match self.state.executor.extended_agent_card(None) {
+        // No core_* helper — like the HTTP handler, call the executor
+        // with the caller's claims from the auth layer's RequestContext.
+        let claims = request
+            .extensions()
+            .get::<RequestContext>()
+            .and_then(|ctx| ctx.identity.claims());
+        match self.state.executor.extended_agent_card(claims) {
             Some(card) => Ok(Response::new(card)),
             None => Err(a2a_to_status(
                 crate::error::A2aError::ExtendedAgentCardNotConfigured,
