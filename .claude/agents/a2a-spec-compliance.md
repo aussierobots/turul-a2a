@@ -33,13 +33,12 @@ Every A2A error response MUST include `google.rpc.ErrorInfo` with:
 - `domain = "a2a-protocol.org"`
 - `metadata`: optional structured context
 
-HTTP / JSON-RPC code mapping — any drift is a compliance violation:
-- `TaskNotFound` → HTTP 404, JSON-RPC −32001
-- `TaskNotCancelable` → HTTP 409, JSON-RPC −32002
-- `UnsupportedOperation` → HTTP 400, JSON-RPC −32004
-- `ContentTypeNotSupported` → HTTP 415, JSON-RPC −32005
-- `PushNotificationNotSupported` → HTTP 400
-- `VersionNotSupported` → HTTP 400
+HTTP / JSON-RPC / gRPC code mapping (A2A v1.0.1 §5.4) — any drift is a compliance violation:
+- `TaskNotFound` → HTTP 404, JSON-RPC −32001, gRPC NOT_FOUND
+- `ContentTypeNotSupported` → HTTP 400, JSON-RPC −32005, gRPC INVALID_ARGUMENT
+- `InvalidAgentResponse` → HTTP 500, JSON-RPC −32006, gRPC INTERNAL
+- `TaskNotCancelable` (−32002), `PushNotificationNotSupported` (−32003), `UnsupportedOperation` (−32004), `ExtendedAgentCardNotConfigured` (−32007), `ExtensionSupportRequired` (−32008), `VersionNotSupported` (−32009) → HTTP 400, gRPC FAILED_PRECONDITION
+- Error details are an array of `@type`-tagged objects: HTTP `error.details[]`, JSON-RPC `error.data[]`
 
 ## 3. Spec-specific behaviors
 

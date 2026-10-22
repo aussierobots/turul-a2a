@@ -4,17 +4,11 @@
 //! "a2a-protocol.org" }` in `Status.details` (non-A2A errors —
 //! `InvalidRequest`, `Internal` — carry no `ErrorInfo`).
 //!
-//! Mapping rationale:
-//!
-//! - `FAILED_PRECONDITION` covers state-based rejections where the
-//!   operation exists and is implemented but the resource's current
-//!   state makes it inapplicable (`TaskNotCancelable`,
-//!   `UnsupportedOperation`, `ExtensionSupportRequired`,
-//!   `VersionNotSupported`).
-//! - `UNIMPLEMENTED` covers capability absence — the deployment has
-//!   not wired the feature at all (`PushNotificationNotSupported`,
-//!   `ExtendedAgentCardNotConfigured`). Using `UNIMPLEMENTED` for
-//!   state rejections would be semantically wrong.
+//! Status codes follow the A2A error-mapping table (spec Section 5.4):
+//! every A2A error except `TaskNotFound` (`NOT_FOUND`),
+//! `ContentTypeNotSupported` (`INVALID_ARGUMENT`) and
+//! `InvalidAgentResponse` (`INTERNAL`) is `FAILED_PRECONDITION`, so
+//! clients distinguish them by the `ErrorInfo.reason`.
 //! - Transport auth failures are produced by the auth layer before
 //!   dispatch and surface as `UNAUTHENTICATED` / `PERMISSION_DENIED`
 //!   without `ErrorInfo`.
@@ -38,7 +32,7 @@ pub fn a2a_to_status(err: A2aError) -> Status {
             Some(errors::REASON_TASK_NOT_CANCELABLE),
         ),
         A2aError::PushNotificationNotSupported => (
-            Code::Unimplemented,
+            Code::FailedPrecondition,
             Some(errors::REASON_PUSH_NOTIFICATION_NOT_SUPPORTED),
         ),
         A2aError::UnsupportedOperation { .. } => (
@@ -53,7 +47,7 @@ pub fn a2a_to_status(err: A2aError) -> Status {
             (Code::Internal, Some(errors::REASON_INVALID_AGENT_RESPONSE))
         }
         A2aError::ExtendedAgentCardNotConfigured => (
-            Code::Unimplemented,
+            Code::FailedPrecondition,
             Some(errors::REASON_EXTENDED_AGENT_CARD_NOT_CONFIGURED),
         ),
         A2aError::ExtensionSupportRequired { .. } => (
@@ -111,10 +105,9 @@ mod tests {
     }
 
     #[test]
-    fn push_not_supported_is_unimplemented_not_failed_precondition() {
-        // Capability-absence, NOT state-based rejection.
+    fn push_not_supported_is_failed_precondition() {
         let s = a2a_to_status(A2aError::PushNotificationNotSupported);
-        assert_eq!(s.code(), Code::Unimplemented);
+        assert_eq!(s.code(), Code::FailedPrecondition);
         assert_eq!(
             reason_of(&s).as_deref(),
             Some("PUSH_NOTIFICATION_NOT_SUPPORTED")
@@ -122,8 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_operation_is_failed_precondition_not_unimplemented() {
-        // State-based rejection (terminal SubscribeToTask).
+    fn unsupported_operation_is_failed_precondition() {
         let s = a2a_to_status(A2aError::UnsupportedOperation {
             message: "terminal".into(),
         });
@@ -150,10 +142,9 @@ mod tests {
     }
 
     #[test]
-    fn extended_card_not_configured_is_unimplemented() {
-        // Also capability-absence, not state-based.
+    fn extended_card_not_configured_is_failed_precondition() {
         let s = a2a_to_status(A2aError::ExtendedAgentCardNotConfigured);
-        assert_eq!(s.code(), Code::Unimplemented);
+        assert_eq!(s.code(), Code::FailedPrecondition);
         assert_eq!(
             reason_of(&s).as_deref(),
             Some("EXTENDED_AGENT_CARD_NOT_CONFIGURED")

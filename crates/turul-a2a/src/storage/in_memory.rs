@@ -590,7 +590,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
             return Err(A2aStorageError::TaskNotFound(task_id.to_string()));
         }
         // Terminal → reject contract. Uses TerminalState
-        // (the state-machine-style signal); router maps to 409 at wire.
+        // (the state-machine-style signal); router maps it to TaskNotCancelable.
         let state = stored
             .task
             .status()

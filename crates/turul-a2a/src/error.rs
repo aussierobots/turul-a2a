@@ -145,7 +145,7 @@ impl A2aError {
         });
 
         if let Some(info) = self.error_info() {
-            error["data"] = info;
+            error["data"] = json!([info]);
         }
 
         json!({
@@ -164,7 +164,7 @@ impl turul_rpc::r#async::ToJsonRpcError for A2aError {
         turul_rpc::error::JsonRpcErrorObject {
             code: self.jsonrpc_code() as i64,
             message: self.to_string(),
-            data: self.error_info(),
+            data: self.error_info().map(|info| json!([info])),
         }
     }
 }
@@ -178,8 +178,8 @@ impl From<crate::storage::A2aStorageError> for A2aError {
                 task_id: String::new(),
             },
             // CAS loser from atomic-store terminal-CAS:
-            // maps to the same wire error as TerminalState — HTTP 409 /
-            // JSON-RPC -32002. Carry the task_id through for better
+            // maps to the same wire error as TerminalState —
+            // TaskNotCancelable. Carry the task_id through for better
             // diagnostics at the wire layer.
             A2aStorageError::TerminalStateAlreadySet { task_id, .. } => {
                 A2aError::TaskNotCancelable { task_id }
@@ -211,29 +211,29 @@ mod tests {
     }
 
     #[test]
-    fn task_not_cancelable_maps_to_409() {
+    fn task_not_cancelable_maps_to_400() {
         let err = A2aError::TaskNotCancelable {
             task_id: "t-1".into(),
         };
-        assert_eq!(err.http_status(), 409);
+        assert_eq!(err.http_status(), 400);
         assert_eq!(err.jsonrpc_code(), errors::JSONRPC_TASK_NOT_CANCELABLE);
         assert_eq!(err.error_reason(), Some(errors::REASON_TASK_NOT_CANCELABLE));
     }
 
     #[test]
-    fn content_type_not_supported_maps_to_415() {
+    fn content_type_not_supported_maps_to_400() {
         let err = A2aError::ContentTypeNotSupported {
             content_type: "text/xml".into(),
         };
-        assert_eq!(err.http_status(), 415);
+        assert_eq!(err.http_status(), 400);
     }
 
     #[test]
-    fn invalid_agent_response_maps_to_502() {
+    fn invalid_agent_response_maps_to_500() {
         let err = A2aError::InvalidAgentResponse {
             message: "bad".into(),
         };
-        assert_eq!(err.http_status(), 502);
+        assert_eq!(err.http_status(), 500);
     }
 
     #[test]
@@ -334,8 +334,11 @@ mod tests {
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 42);
         assert_eq!(resp["error"]["code"], errors::JSONRPC_TASK_NOT_CANCELABLE);
-        let data = &resp["error"]["data"];
-        assert!(data.is_object(), "JSON-RPC error data should be an object");
+        let details = resp["error"]["data"]
+            .as_array()
+            .expect("JSON-RPC error data is an array of typed detail objects");
+        assert_eq!(details.len(), 1);
+        let data = &details[0];
         assert_eq!(data["@type"], errors::ERROR_INFO_TYPE);
         assert_eq!(data["reason"], errors::REASON_TASK_NOT_CANCELABLE);
         assert_eq!(data["domain"], errors::ERROR_DOMAIN);

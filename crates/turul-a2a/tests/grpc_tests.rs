@@ -456,7 +456,7 @@ async fn grpc_extended_agent_card_success() {
 #[tokio::test]
 async fn grpc_extended_agent_card_not_configured() {
     // CompletingExecutor does not override extended_agent_card, so
-    // the default trait impl returns None → UNIMPLEMENTED.
+    // the default trait impl returns None → FAILED_PRECONDITION.
     let h = Harness::start_with(CompletingExecutor).await;
     let mut client = h.client().await;
 
@@ -466,7 +466,7 @@ async fn grpc_extended_agent_card_not_configured() {
         }))
         .await
         .expect_err("not configured");
-    assert_eq!(err.code(), tonic::Code::Unimplemented);
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     let (reason, _) = error_info(&err);
     assert_eq!(reason, "EXTENDED_AGENT_CARD_NOT_CONFIGURED");
 }

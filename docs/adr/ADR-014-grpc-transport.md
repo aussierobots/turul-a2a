@@ -203,11 +203,7 @@ Concretely:
   ADR-010 §4.3). The gRPC adapter MUST NOT perform its own
   terminal-state check and MUST NOT invent a transport-specific
   error. The canonical mapping in §2.5 maps this variant to
-  `FAILED_PRECONDITION` (state-based rejection — the operation
-  exists and is implemented, but the task's state makes it
-  inapplicable). Using `UNIMPLEMENTED` here would be semantically
-  wrong: the service **does** implement `SubscribeToTask` — it is
-  refusing this specific request on state grounds.
+  `FAILED_PRECONDITION`, per the A2A v1.0.1 error-mapping table.
 - `Last-Event-ID`-equivalent resume for gRPC: the client sends
   `a2a-last-event-id` ASCII metadata (value = UTF-8
   `"{task_id}:{sequence}"` matching the SSE convention in ADR-009
@@ -298,17 +294,17 @@ The mapping table is normative and is the single source of truth for
 the gRPC column. Every row was verified against
 `crates/turul-a2a-types/src/wire.rs` (HTTP / JSON-RPC constants and
 REASON strings) and `crates/turul-a2a/src/error.rs` (`A2aError`
-variants) on 2026-04-21.
+variants) on 2026-10-22 against the A2A v1.0.1 §5.4 table.
 
 | A2A variant / source                        | HTTP | JSON-RPC | gRPC `Status.code`   | `ErrorInfo.reason`                      |
 |---------------------------------------------|------|----------|----------------------|-----------------------------------------|
 | `A2aError::TaskNotFound`                    | 404  | -32001   | `NOT_FOUND`          | `TASK_NOT_FOUND`                        |
-| `A2aError::TaskNotCancelable`               | 409  | -32002   | `FAILED_PRECONDITION`| `TASK_NOT_CANCELABLE`                   |
-| `A2aError::PushNotificationNotSupported`    | 400  | -32003   | `UNIMPLEMENTED`      | `PUSH_NOTIFICATION_NOT_SUPPORTED`       |
+| `A2aError::TaskNotCancelable`               | 400  | -32002   | `FAILED_PRECONDITION`| `TASK_NOT_CANCELABLE`                   |
+| `A2aError::PushNotificationNotSupported`    | 400  | -32003   | `FAILED_PRECONDITION`| `PUSH_NOTIFICATION_NOT_SUPPORTED`       |
 | `A2aError::UnsupportedOperation` (state)    | 400  | -32004   | `FAILED_PRECONDITION`| `UNSUPPORTED_OPERATION`                 |
-| `A2aError::ContentTypeNotSupported`         | 415  | -32005   | `INVALID_ARGUMENT`   | `CONTENT_TYPE_NOT_SUPPORTED`            |
-| `A2aError::InvalidAgentResponse`            | 502  | -32006   | `INTERNAL`           | `INVALID_AGENT_RESPONSE`                |
-| `A2aError::ExtendedAgentCardNotConfigured`  | 404  | -32007   | `UNIMPLEMENTED`      | `EXTENDED_AGENT_CARD_NOT_CONFIGURED`    |
+| `A2aError::ContentTypeNotSupported`         | 400  | -32005   | `INVALID_ARGUMENT`   | `CONTENT_TYPE_NOT_SUPPORTED`            |
+| `A2aError::InvalidAgentResponse`            | 500  | -32006   | `INTERNAL`           | `INVALID_AGENT_RESPONSE`                |
+| `A2aError::ExtendedAgentCardNotConfigured`  | 400  | -32007   | `FAILED_PRECONDITION`| `EXTENDED_AGENT_CARD_NOT_CONFIGURED`    |
 | `A2aError::ExtensionSupportRequired`        | 400  | -32008   | `FAILED_PRECONDITION`| `EXTENSION_SUPPORT_REQUIRED`            |
 | `A2aError::VersionNotSupported`             | 400  | -32009   | `FAILED_PRECONDITION`| `VERSION_NOT_SUPPORTED`                 |
 | `A2aError::InvalidRequest` / deser failure  | 400  | -32602   | `INVALID_ARGUMENT`   | *(no ErrorInfo — non-A2A, per ADR-004)* |
@@ -316,23 +312,10 @@ variants) on 2026-04-21.
 | Auth failure (`MiddlewareError`, 401)       | 401  | —        | `UNAUTHENTICATED`    | *(transport auth; not A2aError — ADR-007)* |
 | Authz failure (`MiddlewareError`, 403)      | 403  | —        | `PERMISSION_DENIED`  | *(transport auth; not A2aError — ADR-007)* |
 
-Notes on the two state-based `FAILED_PRECONDITION` rows:
-
-- `UnsupportedOperation` is returned when the service implements the
-  RPC but the current resource state makes it inapplicable (most
-  notably: `SubscribeToTask` against a terminal task, per CLAUDE.md
-  §"Spec-aligned behaviors"). `FAILED_PRECONDITION` — not
-  `UNIMPLEMENTED` — is the canonical gRPC code for
-  "implemented-but-refused-due-to-state".
-- `PushNotificationNotSupported` maps to `UNIMPLEMENTED` because
-  the error is structurally a *capability* absence (the deployment
-  has not wired a push-notification backend, per ADR-011), not a
-  state-based refusal. This is the one A2A variant where
-  `UNIMPLEMENTED` is correct.
-
-`AuthenticatedExtendedCardNotConfigured` (-32007) likewise reports
-absent capability (the extended-card endpoint has no configured
-override), mapping to `UNIMPLEMENTED`.
+Every A2A error except `TaskNotFound`, `ContentTypeNotSupported` and
+`InvalidAgentResponse` maps to `FAILED_PRECONDITION`, as the A2A
+v1.0.1 table specifies. No A2A error maps to `UNIMPLEMENTED`; clients
+distinguish the `FAILED_PRECONDITION` errors by `ErrorInfo.reason`.
 
 Non-A2A errors (`InvalidRequest`, `Internal`) carry no `ErrorInfo`
 — this matches ADR-004's decision that framework-level errors are
@@ -746,3 +729,7 @@ theirs. Opt-in is the correct posture for both.
   future refactoring options; if any of them later becomes
   desirable, this ADR must be amended before implementation.
 
+## Revision log
+
+- 2026-04-21 — Initial acceptance against A2A v1.0.0.
+- 2026-10-22 — Error-mapping table aligned to A2A v1.0.1 §5.4: `PushNotificationNotSupported` and `ExtendedAgentCardNotConfigured` UNIMPLEMENTED→FAILED_PRECONDITION; HTTP column TaskNotCancelable 409→400, ContentTypeNotSupported 415→400, InvalidAgentResponse 502→500, ExtendedAgentCardNotConfigured 404→400 (the 404 row never matched `wire.rs`). The "capability absence → UNIMPLEMENTED" rationale is withdrawn because the spec no longer makes that split.

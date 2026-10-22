@@ -145,17 +145,17 @@ async fn get_task_not_found_returns_a2a_error() {
 }
 
 // =========================================================
-// CancelTask — 409 error parsing
+// CancelTask — TaskNotCancelable error parsing
 // =========================================================
 
 #[tokio::test]
-async fn cancel_terminal_task_returns_409_error() {
+async fn cancel_terminal_task_returns_task_not_cancelable_error() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/tasks/completed-task:cancel"))
-        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
             "error": {
-                "code": 409,
+                "code": 400,
                 "message": "Task not cancelable",
                 "details": [{
                     "@type": "type.googleapis.com/google.rpc.ErrorInfo",
@@ -169,7 +169,7 @@ async fn cancel_terminal_task_returns_409_error() {
 
     let client = A2aClient::new(server.uri());
     let err = client.cancel_task("completed-task").await.unwrap_err();
-    assert_eq!(err.status(), Some(409));
+    assert_eq!(err.status(), Some(400));
     assert_eq!(err.reason(), Some("TASK_NOT_CANCELABLE"));
 }
 

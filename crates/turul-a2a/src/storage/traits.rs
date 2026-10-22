@@ -130,7 +130,7 @@ pub trait A2aTaskStorage: Send + Sync {
     /// [`A2aCancellationSupervisor`]): wrong owner or missing task returns
     /// `TaskNotFound` (anti-enumeration, same pattern as other
     /// owner-scoped methods). A terminal task returns `TerminalState` —
-    /// callers map to HTTP 409 `TaskNotCancelable` at the wire layer.
+    /// callers map it to `TaskNotCancelable` at the wire layer.
     ///
     /// The marker is idempotent: setting it on a task where it is already
     /// `true` is a successful no-op. Storage-internal only; the marker

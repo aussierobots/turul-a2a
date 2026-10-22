@@ -355,11 +355,11 @@ async fn cancel_vs_cancel_idempotency() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 5: cancel on terminal task returns 409.
+// Test 5: cancel on terminal task returns TaskNotCancelable.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn cancel_on_terminal_returns_409() {
+async fn cancel_on_terminal_returns_task_not_cancelable() {
     let (state, storage) = make_state();
     seed_task(&storage, "default", "owner-t", "t-term").await;
     advance_to_working(&storage, "default", "owner-t", "t-term").await;

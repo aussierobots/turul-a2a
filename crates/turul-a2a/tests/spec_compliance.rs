@@ -203,36 +203,26 @@ async fn jsonrpc_call(
 /// A2A spec §5.4: every A2A error response carries a
 /// `google.rpc.ErrorInfo` record with `reason` + `domain`.
 ///
-/// The exact slot differs by transport:
+/// The slot name differs by transport, but both carry an array of
+/// `@type`-tagged detail objects:
 /// - HTTP (AIP-193): `error.details: [{"@type": "...ErrorInfo", ...}]`
-/// - JSON-RPC 2.0: `error.data: {"@type": "...ErrorInfo", ...}`
-///
-/// Both are normative under A2A v1.0 — one per transport — so the
-/// compliance check accepts either shape.
+/// - JSON-RPC 2.0: `error.data: [{"@type": "...ErrorInfo", ...}]`
 fn assert_has_error_info(json: &serde_json::Value, expected_reason: &str) {
     let error = json.get("error").expect("error envelope present");
-    let info: &serde_json::Value = if let Some(details) =
-        error.get("details").and_then(|d| d.as_array())
-    {
-        details
-            .iter()
-            .find(|entry| {
-                entry.get("@type").and_then(|t| t.as_str())
-                    == Some("type.googleapis.com/google.rpc.ErrorInfo")
-            })
-            .expect("google.rpc.ErrorInfo in error.details (HTTP)")
-    } else if let Some(data) = error.get("data") {
-        assert_eq!(
-            data.get("@type").and_then(|t| t.as_str()),
-            Some("type.googleapis.com/google.rpc.ErrorInfo"),
-            "JSON-RPC error.data must be a google.rpc.ErrorInfo"
-        );
-        data
-    } else {
-        panic!(
-            "error must carry ErrorInfo via either `details` (HTTP) or `data` (JSON-RPC); got {json}"
-        )
-    };
+    let details = error
+        .get("details")
+        .or_else(|| error.get("data"))
+        .and_then(|d| d.as_array())
+        .unwrap_or_else(|| {
+            panic!("error must carry a `details` (HTTP) or `data` (JSON-RPC) array; got {json}")
+        });
+    let info = details
+        .iter()
+        .find(|entry| {
+            entry.get("@type").and_then(|t| t.as_str())
+                == Some("type.googleapis.com/google.rpc.ErrorInfo")
+        })
+        .unwrap_or_else(|| panic!("google.rpc.ErrorInfo in error details; got {json}"));
     assert_eq!(
         info.get("reason").and_then(|v| v.as_str()),
         Some(expected_reason),
@@ -449,7 +439,7 @@ async fn list_tasks_http_carries_required_pagination_fields() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn cancel_terminal_task_returns_409_and_task_not_cancelable_error() {
+async fn cancel_terminal_task_returns_400_and_task_not_cancelable_error() {
     let router = compliance_router();
     // ComplianceAgent drives tasks to COMPLETED synchronously, so
     // any task we create is immediately terminal — perfect for
@@ -476,7 +466,7 @@ async fn cancel_terminal_task_returns_409_and_task_not_cancelable_error() {
         None,
     )
     .await;
-    assert_eq!(status, 409, "TaskNotCancelableError HTTP status");
+    assert_eq!(status, 400, "TaskNotCancelableError HTTP status");
     assert_has_error_info(&http_err, "TASK_NOT_CANCELABLE");
 
     // JSON-RPC.

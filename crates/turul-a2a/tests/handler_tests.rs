@@ -253,11 +253,11 @@ async fn get_task_history_length_zero_omits_history() {
 }
 
 // =========================================================
-// CancelTask — 409 on terminal, 200 on cancelable
+// CancelTask — TaskNotCancelable (400) on terminal, 200 on cancelable
 // =========================================================
 
 #[tokio::test]
-async fn cancel_completed_task_returns_409_with_error_info() {
+async fn cancel_completed_task_returns_task_not_cancelable_with_error_info() {
     let state = test_state();
 
     // Create and complete a task
@@ -277,7 +277,7 @@ async fn cancel_completed_task_returns_409_with_error_info() {
         .body(Body::empty())
         .unwrap();
     let (status, body) = json_response(router, req).await;
-    assert_eq!(status, 409);
+    assert_eq!(status, 400);
 
     let details = body["error"]["details"].as_array().unwrap();
     assert_eq!(details[0]["reason"], "TASK_NOT_CANCELABLE");

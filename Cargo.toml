@@ -37,7 +37,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.33"
+version = "0.1.34"
 edition = "2024"
 authors = ["Nick Hortovanyi <nick@aussierobots.com.au>"]
 license = "MIT OR Apache-2.0"
@@ -125,17 +125,17 @@ bytes = "1"
 serde_yaml = "0.9"
 jsonschema = "0.59"
 
-turul-a2a = { version = "0.1.33", path = "crates/turul-a2a" }
-turul-a2a-proto = { version = "0.1.33", path = "crates/turul-a2a-proto" }
-turul-a2a-types = { version = "0.1.33", path = "crates/turul-a2a-types" }
-turul-a2a-aws-lambda = { version = "0.1.33", path = "crates/turul-a2a-aws-lambda" }
+turul-a2a = { version = "0.1.34", path = "crates/turul-a2a" }
+turul-a2a-proto = { version = "0.1.34", path = "crates/turul-a2a-proto" }
+turul-a2a-types = { version = "0.1.34", path = "crates/turul-a2a-types" }
+turul-a2a-aws-lambda = { version = "0.1.34", path = "crates/turul-a2a-aws-lambda" }
 # Path-only: turul-a2a dev-depends on the client and auth crates, and both
 # depend on turul-a2a. A versioned dev-dep would make `cargo publish` of
 # turul-a2a wait on a release that cannot exist yet; cargo strips path-only
 # dev-deps at package time.
 turul-a2a-client = { path = "crates/turul-a2a-client" }
 turul-a2a-auth = { path = "crates/turul-a2a-auth" }
-turul-a2a-patterns = { version = "0.1.33", path = "crates/turul-a2a-patterns" }
+turul-a2a-patterns = { version = "0.1.34", path = "crates/turul-a2a-patterns" }
 turul-jwt-validator = "0.3"
 
 # Sibling repo turul-llm — provider-neutral LLM client abstraction +

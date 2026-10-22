@@ -267,7 +267,7 @@ async fn e2e_tcp_cancel_completed_task() {
     let task_id = resp.task().expect("Expected Task").id().to_string();
 
     let err = client.cancel_task(&task_id).await.unwrap_err();
-    assert_eq!(err.status(), Some(409));
+    assert_eq!(err.status(), Some(400));
     assert_eq!(err.reason(), Some("TASK_NOT_CANCELABLE"));
 }
 

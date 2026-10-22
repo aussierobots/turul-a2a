@@ -235,22 +235,22 @@ Tests are written from the A2A proto/spec FIRST, then implementation follows. If
 - Discovery: `GET /.well-known/agent-card.json`
 - JSON-RPC: `POST /jsonrpc` (all 11 methods, PascalCase)
 - TaskState: `TASK_STATE_SUBMITTED`, `TASK_STATE_WORKING`, etc.
-- Error: TaskNotFoundError → 404/-32001, TaskNotCancelableError → 409/-32002, UnsupportedOperationError → 400/-32004, ContentTypeNotSupportedError → 415/-32005
-- All A2A errors MUST include `google.rpc.ErrorInfo` with reason + domain
+- Error (A2A v1.0.1 §5.4): TaskNotFoundError → 404/-32001, InvalidAgentResponseError → 500/-32006, every other A2A error → 400 (-32002..-32009); gRPC: NOT_FOUND / INVALID_ARGUMENT (ContentType) / INTERNAL (InvalidAgentResponse) / FAILED_PRECONDITION for the rest. `ErrorInfo.reason` is the discriminator
+- All A2A errors MUST include `google.rpc.ErrorInfo` with reason + domain — HTTP in `error.details[]`, JSON-RPC in the `error.data[]` array
 
 ### Proto and Spec Compliance
 
-Our vendored `proto/a2a.proto` is byte-identical to upstream `a2aproject/A2A/specification/a2a.proto`. Per spec §1.4, the proto is "the single authoritative normative definition" for data objects and messages.
+Our vendored `proto/a2a.proto` is byte-identical to upstream `a2aproject/A2A:main/specification/a2a.proto` (SHA256 `945df6e3…2d1`, re-vendored 2026-10-22; semantically identical to the v1.0.1 tag). Per spec §1.4, the proto is "the single authoritative normative definition" for data objects and messages.
 
 **HTTP route patterns follow the proto's `google.api.http` annotations** (`/message:send`, `/tasks/{id=*}`, etc.).
 
 **Spec-aligned behaviors:**
 - SubscribeToTask: first event is Task object (spec §3.1.6), terminal tasks return UnsupportedOperationError
-- Error codes: TaskNotCancelable=409, UnsupportedOperation=400, PushNotificationNotSupported=400
+- Error codes: see the A2A v1.0.1 §5.4 table above (409/415/502 from v1.0.0 are gone)
 - Query params: camelCase (historyLength, pageSize, pageToken, contextId)
 - contextId/taskId mismatch rejection on continuation (spec §3.4.3)
 
-**Release scope.** turul-a2a is tested against the current upstream A2A v1.0 proto (`proto/a2a.proto`) and implements the core HTTP+JSON and JSON-RPC server surfaces covered by that vendored contract. Within those covered surfaces there are no known compliance gaps: ListTasks sorts by `updated_at DESC` across all four backends; pagination cursor encodes `updated_at|task_id` for stable iteration; the spec-compliance suite (`crates/turul-a2a/tests/spec_compliance.rs`) walks every core RPC on both transports.
+**Release scope.** turul-a2a is tested against the current upstream A2A v1.0 proto (`proto/a2a.proto`) and implements the core HTTP+JSON and JSON-RPC server surfaces covered by that vendored contract. Known open gaps against A2A v1.0.1: streaming send ignores `message.taskId` and does not open with a `Task`; the push webhook body is a bare `Task` rather than a `StreamResponse`; `AgentCard.capabilities` flags are not enforced; `ListTasks.statusTimestampAfter` is ignored. Otherwise: ListTasks sorts by `updated_at DESC` across all four backends; pagination cursor encodes `updated_at|task_id` for stable iteration; the spec-compliance suite (`crates/turul-a2a/tests/spec_compliance.rs`) walks every core RPC on both transports.
 
 **Out of scope for the framework release:**
 - gRPC transport on AWS Lambda (ADR-014 §2.6: Lambda lacks persistent HTTP/2). The feature itself is fully wired for self-hosted targets (ECS / Fargate / AppRunner / Kubernetes / bare VMs) — see [ADR-014](docs/adr/ADR-014-grpc-transport.md) and `examples/grpc-agent`.

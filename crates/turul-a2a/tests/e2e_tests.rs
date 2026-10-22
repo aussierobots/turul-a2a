@@ -560,7 +560,7 @@ async fn e2e_error_mapping_404() {
 }
 
 #[tokio::test]
-async fn e2e_error_mapping_409() {
+async fn e2e_error_mapping_task_not_cancelable() {
     let st = state_with(CompletingExecutor);
     let (_, send) = post_json(
         build_router(st.clone()),
@@ -571,7 +571,7 @@ async fn e2e_error_mapping_409() {
     let tid = send["task"]["id"].as_str().unwrap();
 
     let (status, body) = post_json(build_router(st), &format!("/tasks/{tid}:cancel"), "").await;
-    assert_eq!(status, 409);
+    assert_eq!(status, 400);
     let d = &body["error"]["details"].as_array().unwrap()[0];
     assert_eq!(d["reason"], "TASK_NOT_CANCELABLE");
 }
@@ -660,7 +660,7 @@ async fn e2e_jsonrpc_parity() {
     )
     .await;
     assert_eq!(body["error"]["code"], -32002);
-    let d = &body["error"]["data"];
+    let d = &body["error"]["data"][0];
     assert_eq!(d["reason"], "TASK_NOT_CANCELABLE");
     assert_eq!(d["domain"], "a2a-protocol.org");
 
@@ -671,5 +671,5 @@ async fn e2e_jsonrpc_parity() {
     )
     .await;
     assert_eq!(body["error"]["code"], -32001);
-    assert_eq!(body["error"]["data"]["reason"], "TASK_NOT_FOUND");
+    assert_eq!(body["error"]["data"][0]["reason"], "TASK_NOT_FOUND");
 }

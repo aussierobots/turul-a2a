@@ -4,6 +4,29 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.34] — 2026-10-22
+
+Aligns the error model with A2A v1.0.1 (§5.4 error-mapping table). See ADR-004 and ADR-014.
+
+### Changed
+
+- HTTP status for three A2A errors: `TaskNotCancelableError` 409 → **400**, `ContentTypeNotSupportedError` 415 → **400**, `InvalidAgentResponseError` 502 → **500**. The `turul_a2a_types::wire::errors::HTTP_*` constants change accordingly.
+- gRPC status for two A2A errors: `PushNotificationNotSupportedError` and `ExtendedAgentCardNotConfiguredError` `UNIMPLEMENTED` → **`FAILED_PRECONDITION`**.
+- Vendored `a2a.proto` re-synced with upstream. The changes are comment-only, so generated types are unchanged. The `tenant` field docs now define it as an opaque routing value that must match the selected `AgentInterface.tenant`. `AgentInterface.url` now documents a gRPC address as `hostname:port` rather than an HTTPS URL, which matters if you advertise a gRPC interface.
+
+### Fixed
+
+- JSON-RPC error responses now carry `error.data` as an **array** of `@type`-tagged detail objects (`[{"@type": "type.googleapis.com/google.rpc.ErrorInfo", ...}]`), as the spec requires. It was previously a bare ErrorInfo object.
+
+### Compatibility
+
+- Clients that branch on HTTP 409/415/502 or gRPC `UNIMPLEMENTED` to recognise these errors must match on `ErrorInfo.reason` instead. Seven of the nine A2A errors now share HTTP 400, and most share gRPC `FAILED_PRECONDITION`. `turul-a2a-client` already exposes `A2aClientError::reason()`.
+- JSON-RPC clients that read `error.data.reason` must read `error.data[0].reason` (or find the entry whose `@type` is ErrorInfo).
+
+### Verification
+
+Workspace tests with and without the `grpc` feature, the HTTP/JSON-RPC/gRPC spec-compliance and parity suites, and SQLite storage parity tests passed.
+
 ## [0.1.33] — 2026-10-22
 
 ### Changed

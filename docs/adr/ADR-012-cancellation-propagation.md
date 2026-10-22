@@ -42,8 +42,8 @@ This refines ADR-010 §5. The `CancelTask` handler **waits** up to a configurabl
 
 **Sequence**:
 
-1. **Validation**: `get_task(tenant, task_id, owner)` — enforces existence + owner + tenant. Missing → 404 `TaskNotFound`. Wrong owner → also 404 (consistent with existing auth-isolation pattern). Terminal → 409 `TaskNotCancelable` (existing spec-compliant rule, unchanged).
-2. **Marker write**: `A2aTaskStorage::set_cancel_requested(tenant, task_id, owner)` — conditional on task being non-terminal. If a concurrent commit pushed the task to terminal between step 1 and step 2, this returns `TaskNotCancelable` and the handler returns 409.
+1. **Validation**: `get_task(tenant, task_id, owner)` — enforces existence + owner + tenant. Missing → 404 `TaskNotFound`. Wrong owner → also 404 (consistent with existing auth-isolation pattern). Terminal → 400 `TaskNotCancelable` (existing spec-compliant rule, unchanged).
+2. **Marker write**: `A2aTaskStorage::set_cancel_requested(tenant, task_id, owner)` — conditional on task being non-terminal. If a concurrent commit pushed the task to terminal between step 1 and step 2, this returns `TaskNotCancelable` and the handler returns 400.
 3. **Local wake-up** (same-instance fast path): if `AppState::in_flight[(tenant, task_id)]` exists, call `handle.cancellation.cancel()`. Executor's next check of `ctx.cancellation.is_cancelled()` returns true; executor emits `sink.cancelled(...)` or the framework commits `CANCELED` directly after grace (step 4).
 4. **Grace wait with polling**: handler loops with a small internal poll (`cancel_handler_poll_interval`, default 100ms), re-reading `get_task` on each tick. Wait ends on whichever comes first:
    - **Terminal observed**: task state is now terminal (any terminal — `CANCELED`, `COMPLETED`, `FAILED`, `REJECTED`). Handler returns that task snapshot. Note: *any* terminal is accepted as resolution; a task that completes naturally between marker-write and grace-expiry is a legitimate race resolution per ADR-010 §7.1.
@@ -151,9 +151,9 @@ Beyond the ADR-010 §7.1 single-terminal-writer contract:
 
 - **Cancel-vs-complete**: ADR-010 §7.1 covers this. Whoever commits the terminal first wins; the other emits `EventSink is closed: terminal already set`. Handler's race-aware fallback reads the persisted state.
 
-- **Cancel-on-terminal**: pre-existing rule, unchanged. 409 `TaskNotCancelable` with `google.rpc.ErrorInfo` per ADR-004.
+- **Cancel-on-terminal**: pre-existing rule, unchanged. 400 `TaskNotCancelable` with `google.rpc.ErrorInfo` per ADR-004.
 
-- **Cancel-on-transitioning-to-terminal** (narrow window): handler's step 1 reads non-terminal; by step 2's `set_cancel_requested`, the task has transitioned to terminal. The conditional-write in `set_cancel_requested` fails with a state-based error; handler converts to `TaskNotCancelable` (409). No marker is set on a terminal task.
+- **Cancel-on-transitioning-to-terminal** (narrow window): handler's step 1 reads non-terminal; by step 2's `set_cancel_requested`, the task has transitioned to terminal. The conditional-write in `set_cancel_requested` fails with a state-based error; handler converts to `TaskNotCancelable` (400). No marker is set on a terminal task.
 
 ### 7. Owner Enforcement
 
@@ -285,8 +285,8 @@ These gate ADR-012 acceptance and phase-1 completion.
 5. **Cancel-vs-cancel idempotency**
    Two simultaneous `CancelTask` handlers on the same task (possibly on different instances). Executor emits CANCELED naturally at T=100ms. Assert: both handlers return the same CANCELED task. No duplicate terminal events in the event store. Second marker write is a no-op.
 
-6. **Cancel on terminal task returns 409**
-   Pre-existing behavior preserved — task already COMPLETED, cancel request returns `TaskNotCancelable` (409 HTTP, −32002 JSON-RPC) with `google.rpc.ErrorInfo.reason = "TASK_NOT_CANCELABLE"`. Marker is not set. This test already exists (handler_tests); confirm it still passes.
+6. **Cancel on terminal task returns TaskNotCancelable**
+   Pre-existing behavior preserved — task already COMPLETED, cancel request returns `TaskNotCancelable` (400 HTTP, −32002 JSON-RPC) with `google.rpc.ErrorInfo.reason = "TASK_NOT_CANCELABLE"`. Marker is not set. This test already exists (handler_tests); confirm it still passes.
 
 7. **Cancel by wrong owner returns TaskNotFound**
    Owner A creates task. Owner B's `CancelTask` returns 404 `TaskNotFound` (not 403 — consistent with anti-enumeration auth pattern). Marker is not set.
@@ -399,3 +399,7 @@ Taken together: panicked supervisors do not leak registry entries, do not leave 
 - **Event-based cancellation** (write a "cancel_requested" event to the durable event store): rejected. Events are per-task-sequence; a cancel request is a task-level mutation, not a stream event. Also, events are subscribed-to; the executor wouldn't be subscribing to its own task's events.
 - **Non-blocking handler returning immediately with non-terminal snapshot** (ADR-010 §5's original proposal): rejected in favor of blocking-up-to-grace. Clients get better UX; 5s cap is bounded; race-aware fallback handles edge cases cleanly.
 - **Handler commits CANCELED immediately without waiting**: rejected. Would ignore `ctx.cancellation` entirely — executor never gets a chance to acknowledge. Also defeats the grace design in ADR-010 §4.1 (for blocking-send timeout). Consistency matters: cancel and timeout both use cooperative-then-forced pattern.
+
+## Revision log
+
+- 2026-10-22 — HTTP status for `TaskNotCancelable` updated 409 → 400 to follow the A2A v1.0.1 error-mapping table (see ADR-004). No behavioural change to the cancellation contract.

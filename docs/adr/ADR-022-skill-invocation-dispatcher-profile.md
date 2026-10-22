@@ -269,7 +269,7 @@ request does not include the activation header (§2.2), the server
 MUST return `UnsupportedOperationError`:
 
 - HTTP transport: `400 Bad Request`, JSON-RPC error code `-32004`.
-- gRPC transport: `UNIMPLEMENTED` status with A2A error detail
+- gRPC transport: `FAILED_PRECONDITION` status with A2A error detail
   (`google.rpc.ErrorInfo`, `reason = "UNSUPPORTED_OPERATION"`,
   `domain = "a2a-protocol.org"`).
 
@@ -578,3 +578,7 @@ must be reviewable alongside this ADR.
   requires concrete adopter demand and a schema-publication shape
   that does not conflict with `AgentExtension.params`'s current
   "reserved empty" status in `v1`.
+
+## Revision log
+
+- 2026-10-22 — gRPC status for the missing-activation-header rejection corrected `UNIMPLEMENTED` → `FAILED_PRECONDITION`. The code has always returned `FAILED_PRECONDITION`; this aligns the ADR with the code and with the A2A v1.0.1 error-mapping table.

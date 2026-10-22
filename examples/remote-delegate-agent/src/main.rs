@@ -37,6 +37,7 @@ use turul_a2a::executor::{AgentExecutor, ExecutionContext};
 use turul_a2a_client::response::SendResponse;
 use turul_a2a_client::{A2aClient, A2aClientError, ClientAuth};
 use turul_a2a_proto as pb;
+use turul_a2a_types::wire::errors;
 use turul_a2a_types::{Message, Task};
 
 const DEFAULT_BIND_PORT: u16 = 3016;
@@ -254,23 +255,23 @@ fn map_upstream_error(err: A2aClientError) -> A2aError {
             message,
             reason,
         } => match (reason.as_deref(), status) {
-            (Some("TaskNotFoundError"), _) | (_, 404) => A2aError::TaskNotFound {
+            // Several A2A errors share HTTP 400, so the ErrorInfo reason —
+            // not the status — identifies which one the upstream raised.
+            (Some(errors::REASON_TASK_NOT_FOUND), _) | (None, 404) => A2aError::TaskNotFound {
                 task_id: format!("upstream:{message}"),
             },
-            (Some("UnsupportedOperationError"), _) | (_, 400)
-                if reason.as_deref() == Some("UnsupportedOperationError") =>
-            {
+            (Some(errors::REASON_UNSUPPORTED_OPERATION), _) => {
                 A2aError::UnsupportedOperation { message }
             }
-            (Some("ContentTypeNotSupportedError"), _) | (_, 415) => {
+            (Some(errors::REASON_CONTENT_TYPE_NOT_SUPPORTED), _) => {
                 A2aError::ContentTypeNotSupported {
                     content_type: message,
                 }
             }
-            (Some("TaskNotCancelableError"), _) | (_, 409) => A2aError::TaskNotCancelable {
+            (Some(errors::REASON_TASK_NOT_CANCELABLE), _) => A2aError::TaskNotCancelable {
                 task_id: format!("upstream:{message}"),
             },
-            (_, 400) => A2aError::InvalidRequest { message },
+            (None, 400) => A2aError::InvalidRequest { message },
             _ => A2aError::Internal(format!(
                 "upstream error (status={status}, reason={}): {message}",
                 reason.as_deref().unwrap_or("<none>")
@@ -464,7 +465,7 @@ mod unit {
         let err = A2aClientError::A2aError {
             status: 404,
             message: "task xyz not found".into(),
-            reason: Some("TaskNotFoundError".into()),
+            reason: Some(errors::REASON_TASK_NOT_FOUND.into()),
         };
         assert!(matches!(
             map_upstream_error(err),
@@ -475,18 +476,18 @@ mod unit {
         let err = A2aClientError::A2aError {
             status: 400,
             message: "streaming not supported".into(),
-            reason: Some("UnsupportedOperationError".into()),
+            reason: Some(errors::REASON_UNSUPPORTED_OPERATION.into()),
         };
         assert!(matches!(
             map_upstream_error(err),
             A2aError::UnsupportedOperation { .. }
         ));
 
-        // ContentTypeNotSupported → 415.
+        // ContentTypeNotSupported → 400 with ErrorInfo reason.
         let err = A2aClientError::A2aError {
-            status: 415,
+            status: 400,
             message: "image/png".into(),
-            reason: Some("ContentTypeNotSupportedError".into()),
+            reason: Some(errors::REASON_CONTENT_TYPE_NOT_SUPPORTED.into()),
         };
         assert!(matches!(
             map_upstream_error(err),

@@ -164,15 +164,18 @@ async fn agent_card_does_not_require_version_header() {
 
 #[tokio::test]
 async fn post_with_wrong_content_type_is_rejected() {
-    // POST with a non-JSON Content-Type should return 415
     let router = build_router(test_state());
     let req = Request::post("/message:send")
         .header("a2a-version", "1.0")
         .header("content-type", "text/plain")
         .body(Body::from(send_body()))
         .unwrap();
-    let (status, _) = json_response(router, req).await;
-    assert_eq!(status, 415, "Non-JSON Content-Type should return 415");
+    let (status, body) = json_response(router, req).await;
+    assert_eq!(status, 400, "ContentTypeNotSupportedError is HTTP 400");
+    assert_eq!(
+        body["error"]["details"][0]["reason"],
+        "CONTENT_TYPE_NOT_SUPPORTED"
+    );
 }
 
 #[tokio::test]
@@ -184,23 +187,26 @@ async fn post_without_content_type_allowed_for_empty_body_actions() {
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(router, req).await;
-    // Should get 404 (task not found), not 415
-    assert_ne!(
-        status, 415,
-        "POST without Content-Type + empty body should not be 415"
+    assert_eq!(
+        status, 404,
+        "POST without Content-Type + empty body reaches the handler (TaskNotFound)"
     );
 }
 
 #[tokio::test]
-async fn post_with_wrong_content_type_returns_415() {
+async fn post_with_xml_content_type_is_content_type_not_supported() {
     let router = build_router(test_state());
     let req = Request::post("/message:send")
         .header("content-type", "text/xml")
         .header("a2a-version", "1.0")
         .body(Body::from("<xml/>"))
         .unwrap();
-    let (status, _) = json_response(router, req).await;
-    assert_eq!(status, 415, "Non-JSON Content-Type should return 415");
+    let (status, body) = json_response(router, req).await;
+    assert_eq!(status, 400, "ContentTypeNotSupportedError is HTTP 400");
+    assert_eq!(
+        body["error"]["details"][0]["reason"],
+        "CONTENT_TYPE_NOT_SUPPORTED"
+    );
 }
 
 #[tokio::test]

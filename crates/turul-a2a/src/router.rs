@@ -1458,7 +1458,7 @@ pub(crate) async fn core_get_task(
 ///
 /// Sequence:
 /// 1. Validate existence + ownership (via owner-scoped `get_task`).
-/// 2. Reject with 409 if task is already terminal.
+/// 2. Reject with `TaskNotCancelable` if task is already terminal.
 /// 3. Write the cancel marker (owner-scoped, idempotent).
 /// 4. Trip the local in-flight cancellation token if present.
 /// 5. Wait up to `cancel_handler_grace`, polling task state every
@@ -1491,7 +1491,7 @@ pub async fn core_cancel_task(
             task_id: task_id.to_string(),
         })?;
 
-    // Step 2: reject terminal tasks up-front with 409.
+    // Step 2: reject terminal tasks up-front with TaskNotCancelable.
     if let Some(status) = initial_task.status()
         && let Ok(s) = status.state()
         && turul_a2a_types::state_machine::is_terminal(s)

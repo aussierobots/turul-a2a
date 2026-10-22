@@ -272,7 +272,7 @@ async fn a2a_error_envelope_carries_google_rpc_errorinfo() {
     .to_string();
     let (_, _, body) = call(&body_str).await;
     assert_eq!(body["error"]["code"], -32001);
-    let data = &body["error"]["data"];
+    let data = &body["error"]["data"][0];
     assert_eq!(
         data["@type"], "type.googleapis.com/google.rpc.ErrorInfo",
         "ErrorInfo @type must be the canonical google.rpc.ErrorInfo URL"

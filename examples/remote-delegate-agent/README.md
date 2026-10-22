@@ -116,15 +116,17 @@ message:
 ### 4. Error mapping
 
 Every `A2aClientError` becomes a local `A2aError`. `google.rpc.ErrorInfo`
-reason drives classification; HTTP status is the secondary signal.
+reason drives classification. Most A2A errors share HTTP 400, so the
+status code is only a fallback when the upstream sent no ErrorInfo.
 
 | Upstream client error | Local `A2aError` |
 |---|---|
-| `A2aError { reason: "TaskNotFoundError" }` (or HTTP 404) | `TaskNotFound { task_id: "upstream:<msg>" }` |
-| `A2aError { reason: "UnsupportedOperationError" }` | `UnsupportedOperation { message }` |
-| `A2aError { reason: "ContentTypeNotSupportedError" }` (or HTTP 415) | `ContentTypeNotSupported { content_type }` |
-| `A2aError { reason: "TaskNotCancelableError" }` (or HTTP 409) | `TaskNotCancelable { task_id: "upstream:<msg>" }` |
-| `A2aError { status: 400, reason: <other> }` | `InvalidRequest { message }` |
+| `A2aError { reason: "TASK_NOT_FOUND" }` (or HTTP 404, no reason) | `TaskNotFound { task_id: "upstream:<msg>" }` |
+| `A2aError { reason: "UNSUPPORTED_OPERATION" }` | `UnsupportedOperation { message }` |
+| `A2aError { reason: "CONTENT_TYPE_NOT_SUPPORTED" }` | `ContentTypeNotSupported { content_type }` |
+| `A2aError { reason: "TASK_NOT_CANCELABLE" }` | `TaskNotCancelable { task_id: "upstream:<msg>" }` |
+| `A2aError { status: 400, no reason }` | `InvalidRequest { message }` |
+| `A2aError` with any other reason or status | `Internal("upstream error (status=…, reason=…): …")` |
 | `Http { status, message }` (non-A2A, no ErrorInfo) | `Internal("upstream non-A2A HTTP <s>: <m>")` |
 | `Request(e)` where `e.is_timeout()` | `Internal("upstream timed out (transport layer): …")` |
 | `Request(e)` (other transport) | `Internal("upstream unreachable: …")` |

@@ -238,9 +238,10 @@ async fn get_task_not_found_returns_a2a_error_with_error_info() {
     let (_, body) = jsonrpc_call(router, &jsonrpc_request("GetTask", params, 3)).await;
 
     assert_eq!(body["error"]["code"], -32001); // JSONRPC_TASK_NOT_FOUND
-    // Must have ErrorInfo in data
-    let data = &body["error"]["data"];
-    assert!(data.is_object(), "JSON-RPC error data should be an object");
+    // Must have ErrorInfo as the typed entry in the data array
+    let details = body["error"]["data"].as_array().expect("data is an array");
+    assert_eq!(details.len(), 1);
+    let data = &details[0];
     assert_eq!(data["@type"], "type.googleapis.com/google.rpc.ErrorInfo");
     assert_eq!(data["reason"], "TASK_NOT_FOUND");
     assert_eq!(data["domain"], "a2a-protocol.org");
@@ -265,7 +266,7 @@ async fn list_tasks_via_jsonrpc() {
 }
 
 // =========================================================
-// CancelTask via JSON-RPC — 409 maps to -32002
+// CancelTask via JSON-RPC — TaskNotCancelable maps to -32002
 // =========================================================
 
 #[tokio::test]
@@ -290,8 +291,7 @@ async fn cancel_completed_task_returns_not_cancelable_error() {
     let (_, body) = jsonrpc_call(router, &jsonrpc_request("CancelTask", params, 5)).await;
 
     assert_eq!(body["error"]["code"], -32002); // JSONRPC_TASK_NOT_CANCELABLE
-    let data = &body["error"]["data"];
-    assert!(data.is_object(), "JSON-RPC error data should be an object");
+    let data = &body["error"]["data"][0];
     assert_eq!(data["reason"], "TASK_NOT_CANCELABLE");
     assert_eq!(data["domain"], "a2a-protocol.org");
 }
@@ -307,8 +307,7 @@ async fn get_extended_agent_card_not_configured() {
     let (_, body) = jsonrpc_call(router, &jsonrpc_request("GetExtendedAgentCard", params, 6)).await;
 
     assert_eq!(body["error"]["code"], -32007); // EXTENDED_AGENT_CARD_NOT_CONFIGURED
-    let data = &body["error"]["data"];
-    assert!(data.is_object(), "JSON-RPC error data should be an object");
+    let data = &body["error"]["data"][0];
     assert_eq!(data["reason"], "EXTENDED_AGENT_CARD_NOT_CONFIGURED");
 }
 

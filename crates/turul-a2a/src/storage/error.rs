@@ -21,9 +21,9 @@ pub enum A2aStorageError {
     /// which is the raw state-machine signal: `TerminalStateAlreadySet`
     /// is specifically the "you lost the race" signal emitted by
     /// [`crate::storage::A2aAtomicStore::update_task_status_with_events`].
-    /// Callers typically translate this to HTTP 409 `TaskNotCancelable` /
-    /// JSON-RPC `-32002` on the wire, and to `EventSink::closed` semantics
-    /// when the caller is an executor sink.
+    /// Callers typically translate this to `TaskNotCancelable` on the
+    /// wire, and to `EventSink::closed` semantics when the caller is an
+    /// executor sink.
     ///
     /// The `current_state` field carries the wire enum name (e.g.
     /// `"TASK_STATE_COMPLETED"`) so log/telemetry consumers can see

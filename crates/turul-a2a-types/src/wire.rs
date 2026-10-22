@@ -119,13 +119,14 @@ pub mod errors {
     pub const JSONRPC_EXTENSION_SUPPORT_REQUIRED: i32 = -32008;
     pub const JSONRPC_VERSION_NOT_SUPPORTED: i32 = -32009;
 
-    /// HTTP status codes for A2A errors (spec Section 5.4).
+    /// HTTP status codes for A2A errors (spec Section 5.4). Most A2A errors
+    /// share 400; clients tell them apart by the `ErrorInfo.reason`.
     pub const HTTP_TASK_NOT_FOUND: u16 = 404;
-    pub const HTTP_TASK_NOT_CANCELABLE: u16 = 409;
+    pub const HTTP_TASK_NOT_CANCELABLE: u16 = 400;
     pub const HTTP_PUSH_NOTIFICATION_NOT_SUPPORTED: u16 = 400;
     pub const HTTP_UNSUPPORTED_OPERATION: u16 = 400;
-    pub const HTTP_CONTENT_TYPE_NOT_SUPPORTED: u16 = 415;
-    pub const HTTP_INVALID_AGENT_RESPONSE: u16 = 502;
+    pub const HTTP_CONTENT_TYPE_NOT_SUPPORTED: u16 = 400;
+    pub const HTTP_INVALID_AGENT_RESPONSE: u16 = 500;
     pub const HTTP_EXTENDED_AGENT_CARD_NOT_CONFIGURED: u16 = 400;
     pub const HTTP_EXTENSION_SUPPORT_REQUIRED: u16 = 400;
     pub const HTTP_VERSION_NOT_SUPPORTED: u16 = 400;
@@ -261,18 +262,18 @@ mod tests {
     }
 
     #[test]
-    fn task_not_cancelable_is_409() {
-        assert_eq!(errors::HTTP_TASK_NOT_CANCELABLE, 409);
+    fn task_not_cancelable_is_400() {
+        assert_eq!(errors::HTTP_TASK_NOT_CANCELABLE, 400);
     }
 
     #[test]
-    fn content_type_not_supported_is_415() {
-        assert_eq!(errors::HTTP_CONTENT_TYPE_NOT_SUPPORTED, 415);
+    fn content_type_not_supported_is_400() {
+        assert_eq!(errors::HTTP_CONTENT_TYPE_NOT_SUPPORTED, 400);
     }
 
     #[test]
-    fn invalid_agent_response_is_502() {
-        assert_eq!(errors::HTTP_INVALID_AGENT_RESPONSE, 502);
+    fn invalid_agent_response_is_500() {
+        assert_eq!(errors::HTTP_INVALID_AGENT_RESPONSE, 500);
     }
 
     #[test]

@@ -41,7 +41,7 @@ Lifecycle transitions are split between framework and executor:
 
 **Single-terminal-writer invariant — enforced as a storage contract** (§3 and §7.1): for a given `(tenant, task_id)`, `A2aAtomicStore::update_task_status_with_events` MUST reject any write attempting to set a terminal state when the task is already in a terminal state, returning `A2aStorageError::TerminalStateAlreadySet { current_state }`. The check and the write occur within the same transaction on each backend. This is not a prose invariant — it is an enforced trait contract with parity tests across all four backends. Concurrent terminal emits resolve to exactly one winner; losers surface an explicit error their caller can distinguish from illegal state-machine transitions.
 
-If the executor emits `COMPLETED` and the framework has already committed `CANCELED` from a cancel request, the executor's emit returns `A2aError::InvalidRequest { message: "EventSink is closed" }` (because the sink detects terminal-already-set via the storage error and closes itself). Conversely, if the executor's `COMPLETED` commits first, a concurrent `CancelTask` returns `TaskNotCancelable` (409). This extends the existing cancel-on-terminal rule to cover the live-execution window without changing wire semantics.
+If the executor emits `COMPLETED` and the framework has already committed `CANCELED` from a cancel request, the executor's emit returns `A2aError::InvalidRequest { message: "EventSink is closed" }` (because the sink detects terminal-already-set via the storage error and closes itself). Conversely, if the executor's `COMPLETED` commits first, a concurrent `CancelTask` returns `TaskNotCancelable` (400). This extends the existing cancel-on-terminal rule to cover the live-execution window without changing wire semantics.
 
 **Split rationale**: giving the executor full lifecycle control would leak framework responsibilities (initial persistence, auth/tenant scoping, request-timeout enforcement) into every executor. Giving the framework full control rules out executor-driven progress, which is the whole point of this ADR.
 
@@ -361,7 +361,7 @@ These tests gate ADR-010 acceptance and phase-2 completion. All must be green on
    Executor loops checking `ctx.cancellation.is_cancelled()`, with an explicit tick every 50ms. `:cancel` is called on the task. Assert: executor observes cancellation within 200ms, calls `sink.cancelled(Some("user cancelled"))`, and the task's terminal event is `CANCELED` with that reason in the message.
 
 6. **Cancel vs complete race is deterministic**
-   Executor that emits `COMPLETED` immediately on startup. Client sends send + :cancel back-to-back. Assert: exactly one terminal event persists, either `COMPLETED` or `CANCELED`. Wire response to `:cancel` is either 200 (if cancel wins) or 409 TaskNotCancelable (if complete wins). The observed terminal matches the winning side.
+   Executor that emits `COMPLETED` immediately on startup. Client sends send + :cancel back-to-back. Assert: exactly one terminal event persists, either `COMPLETED` or `CANCELED`. Wire response to `:cancel` is either 200 (if cancel wins) or 400 TaskNotCancelable (if complete wins). The observed terminal matches the winning side.
 
 7. **Multiple subscribers receive identical ordered events**
    Two SSE subscribers attach before executor starts. Executor emits 5 events. Assert: both subscribers receive identical event sequence (same sequence numbers, same payloads, same order).
@@ -466,3 +466,7 @@ These tests gate ADR-010 acceptance and phase-2 completion. All must be green on
 - **Separate trait `StreamingAgentExecutor`**: rejected. Two traits means two routing paths, two registries, two testing matrices. The additive-field approach keeps one trait with a clearly-optional capability.
 - **Sink as a return value** (`execute` returns `Stream<Item = Event>`): rejected. Forces executors to model their work as a stream even when they don't want to, and makes it awkward to mix "mutate `&mut task`" with "emit events." The channel-as-handle shape is more idiomatic Rust.
 - **Buffered sink with flush on execute() return**: rejected. Violates the durability guarantee of §3 and creates an awkward edge where an executor that crashes mid-execute loses emitted events.
+
+## Revision log
+
+- 2026-10-22 — HTTP status for `TaskNotCancelable` updated 409 → 400 to follow the A2A v1.0.1 error-mapping table (see ADR-004). No behavioural change to the cancellation contract.

@@ -177,13 +177,13 @@ async fn create_on_a_cancel_on_b() {
     let (_, body) = json_response(router_a, req).await;
     let task_id = body["task"]["id"].as_str().unwrap();
 
-    // Cancel on B — task is already completed, so this should return 409
+    // Cancel on B — task is already completed, so this should return TaskNotCancelable (400)
     let req = Request::post(format!("/tasks/{task_id}:cancel"))
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
     let (status, body) = json_response(router_b, req).await;
-    assert_eq!(status, 409, "Cancel on B should see A's completed task");
+    assert_eq!(status, 400, "Cancel on B should see A's completed task");
     assert_eq!(body["error"]["details"][0]["reason"], "TASK_NOT_CANCELABLE");
 }
 
