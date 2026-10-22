@@ -55,7 +55,10 @@ impl AgentExecutor for MyAgent {
     }
 
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
-        AgentCardBuilder::new("My Agent", "1.0.0").build().unwrap()
+        AgentCardBuilder::new("My Agent", "1.0.0")
+            .streaming(true)
+            .build()
+            .unwrap()
     }
 }
 
@@ -65,6 +68,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+The card's capability flags are enforced (A2A v1.0.1 §3.3.4): streaming,
+push-notification configs and the extended agent card are refused unless
+the card declares `streaming(true)`, `push_notifications(true)` or
+`extended_agent_card(true)`. `AgentCardBuilder` leaves all three unset.
 
 See [`crates/turul-a2a/README.md`](crates/turul-a2a/README.md) for storage wiring, durable streaming, and feature flags.
 

@@ -237,7 +237,8 @@ async fn tenant_send_message_handler(
     let claims = ctx.identity.claims().cloned();
     let echoed = negotiate_profile_extensions(&state, &headers)?;
     crate::profile_dispatch::check_skill_invocation_body(&echoed, &body)?;
-    let Json(value) = core_send_message(state, &tenant, ctx.identity.owner(), claims, body).await?;
+    let Json(value) =
+        core_send_message(state, &tenant, ctx.identity.owner(), claims, &echoed, body).await?;
     Ok(attach_extension_echo(Json(value).into_response(), &echoed))
 }
 
@@ -383,15 +384,27 @@ async fn agent_card_handler(State(state): State<AppState>) -> impl IntoResponse 
 async fn extended_agent_card_handler(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, A2aError> {
-    match state.executor.extended_agent_card(None) {
-        Some(extended) => {
-            let card = serde_json::to_value(extended).unwrap_or_default();
-            #[cfg(feature = "compat-v03")]
-            let card = crate::compat_v03::inject_agent_card_compat(card);
-            Ok(Json(card))
-        }
-        None => Err(A2aError::ExtendedAgentCardNotConfigured),
-    }
+    let card = serde_json::to_value(core_get_extended_agent_card(&state)?).unwrap_or_default();
+    #[cfg(feature = "compat-v03")]
+    let card = crate::compat_v03::inject_agent_card_compat(card);
+    Ok(Json(card))
+}
+
+/// `GetExtendedAgentCard` for every transport. `UnsupportedOperation`
+/// unless the public card declares `capabilities.extendedAgentCard`;
+/// `ExtendedAgentCardNotConfigured` when it is declared but the
+/// executor supplies no extended card (A2A v1.0.1 §3.3.4).
+pub(crate) fn core_get_extended_agent_card(
+    state: &AppState,
+) -> Result<turul_a2a_proto::AgentCard, A2aError> {
+    crate::capability::require(
+        state.executor.as_ref(),
+        crate::capability::Capability::ExtendedAgentCard,
+    )?;
+    state
+        .executor
+        .extended_agent_card(None)
+        .ok_or(A2aError::ExtendedAgentCardNotConfigured)
 }
 
 async fn send_streaming_message_handler(
@@ -403,9 +416,15 @@ async fn send_streaming_message_handler(
     let claims = ctx.identity.claims().cloned();
     let echoed = negotiate_profile_extensions(&state, &headers)?;
     crate::profile_dispatch::check_skill_invocation_body(&echoed, &body)?;
-    let response =
-        core_send_streaming_message(state, DEFAULT_TENANT, ctx.identity.owner(), claims, body)
-            .await?;
+    let response = core_send_streaming_message(
+        state,
+        DEFAULT_TENANT,
+        ctx.identity.owner(),
+        claims,
+        &echoed,
+        body,
+    )
+    .await?;
     Ok(attach_extension_echo(response, &echoed))
 }
 
@@ -420,7 +439,8 @@ async fn tenant_send_streaming_message_handler(
     let echoed = negotiate_profile_extensions(&state, &headers)?;
     crate::profile_dispatch::check_skill_invocation_body(&echoed, &body)?;
     let response =
-        core_send_streaming_message(state, &tenant, ctx.identity.owner(), claims, body).await?;
+        core_send_streaming_message(state, &tenant, ctx.identity.owner(), claims, &echoed, body)
+            .await?;
     Ok(attach_extension_echo(response, &echoed))
 }
 
@@ -435,13 +455,19 @@ pub(crate) async fn open_send_stream(
     tenant: &str,
     owner: &str,
     claims: Option<serde_json::Value>,
+    activated_extensions: &std::collections::HashSet<String>,
     body: String,
 ) -> Result<TaskEventStream, A2aError> {
+    crate::capability::require(
+        state.executor.as_ref(),
+        crate::capability::Capability::Streaming,
+    )?;
     let request: turul_a2a_proto::SendMessageRequest =
         serde_json::from_str(&body).map_err(|e| A2aError::InvalidRequest {
             message: format!("Invalid request body: {e}"),
         })?;
-    let (accepted_output_modes, request_metadata) = executor_request_inputs(&request);
+    let (accepted_output_modes, request_metadata, activated_extensions) =
+        executor_request_inputs(&request, activated_extensions);
     let history_length = request
         .configuration
         .as_ref()
@@ -452,7 +478,7 @@ pub(crate) async fn open_send_stream(
     let message = Message::try_from(proto_message).map_err(|e| A2aError::InvalidRequest {
         message: format!("Invalid message: {e}"),
     })?;
-    let inline_push_config = inline_push_config(request.configuration.as_ref())?;
+    let inline_push_config = inline_push_config(&state, request.configuration.as_ref())?;
 
     let target = resolve_send_target(&state, tenant, owner, &message).await?;
     start_task_turn(&state, tenant, owner, &target, &message).await?;
@@ -494,6 +520,7 @@ pub(crate) async fn open_send_stream(
         claims,
         accepted_output_modes,
         request_metadata,
+        activated_extensions,
     };
     let _spawn = crate::server::spawn::spawn_tracked_executor(spawn_deps, scope)?;
 
@@ -520,6 +547,10 @@ pub(crate) async fn open_subscribe_stream(
     owner: &str,
     task_id: &str,
 ) -> Result<TaskEventStream, A2aError> {
+    crate::capability::require(
+        state.executor.as_ref(),
+        crate::capability::Capability::Streaming,
+    )?;
     // Read the sequence before the snapshot: an event committed in
     // between may appear in both, but none can be missed.
     let sequence = state
@@ -561,9 +592,10 @@ pub(crate) async fn core_send_streaming_message(
     tenant: &str,
     owner: &str,
     claims: Option<serde_json::Value>,
+    activated_extensions: &std::collections::HashSet<String>,
     body: String,
 ) -> Result<axum::response::Response, A2aError> {
-    let stream = open_send_stream(state, tenant, owner, claims, body).await?;
+    let stream = open_send_stream(state, tenant, owner, claims, activated_extensions, body).await?;
     Ok(sse_response(stream, |item| item))
 }
 
@@ -619,8 +651,15 @@ async fn send_message_handler(
     let claims = ctx.identity.claims().cloned();
     let echoed = negotiate_profile_extensions(&state, &headers)?;
     crate::profile_dispatch::check_skill_invocation_body(&echoed, &body)?;
-    let Json(value) =
-        core_send_message(state, DEFAULT_TENANT, ctx.identity.owner(), claims, body).await?;
+    let Json(value) = core_send_message(
+        state,
+        DEFAULT_TENANT,
+        ctx.identity.owner(),
+        claims,
+        &echoed,
+        body,
+    )
+    .await?;
     Ok(attach_extension_echo(Json(value).into_response(), &echoed))
 }
 
@@ -872,16 +911,24 @@ pub(crate) async fn start_task_turn(
 }
 
 /// `SendMessageConfiguration.taskPushNotificationConfig`, checked
-/// before anything is written: a missing or malformed URL is an
-/// `InvalidRequest` and no task is persisted. Push configs operate
-/// independently of execution mode (A2A v1.0.1 §3.2.2), so blocking,
-/// non-blocking and streaming sends all register it.
+/// before anything is written: on an agent that does not declare
+/// `capabilities.pushNotifications` it is a
+/// `PushNotificationNotSupported` (A2A v1.0.1 §3.3.4), and a missing or
+/// malformed URL is an `InvalidRequest`; either way no task is
+/// persisted. Push configs operate independently of execution mode
+/// (A2A v1.0.1 §3.2.2), so blocking, non-blocking and streaming sends
+/// all register it.
 fn inline_push_config(
+    state: &AppState,
     configuration: Option<&turul_a2a_proto::SendMessageConfiguration>,
 ) -> Result<Option<turul_a2a_proto::TaskPushNotificationConfig>, A2aError> {
     let Some(cfg) = configuration.and_then(|c| c.task_push_notification_config.clone()) else {
         return Ok(None);
     };
+    crate::capability::require(
+        state.executor.as_ref(),
+        crate::capability::Capability::PushNotifications,
+    )?;
     if cfg.url.is_empty() {
         return Err(A2aError::InvalidRequest {
             message: "inline push config url is required".into(),
@@ -967,13 +1014,15 @@ async fn fail_unstarted_task(
     state.event_broker.notify(&target.task_id).await;
 }
 
-/// Request-level executor inputs carried by a `SendMessageRequest`:
-/// `configuration.accepted_output_modes` and `metadata` (as a JSON
-/// object). The single extraction point for the blocking, streaming and
-/// durable-queue send paths.
+/// Request-level executor inputs: `configuration.accepted_output_modes`
+/// and `metadata` (as a JSON object) from the `SendMessageRequest`, and
+/// the negotiated extension URIs (activated by the client and
+/// advertised by the agent) in sorted order. The single extraction
+/// point for the blocking, streaming and durable-queue send paths.
 fn executor_request_inputs(
     request: &turul_a2a_proto::SendMessageRequest,
-) -> (Vec<String>, Option<serde_json::Value>) {
+    activated_extensions: &std::collections::HashSet<String>,
+) -> (Vec<String>, Option<serde_json::Value>, Vec<String>) {
     let accepted_output_modes = request
         .configuration
         .as_ref()
@@ -983,21 +1032,33 @@ fn executor_request_inputs(
         .metadata
         .as_ref()
         .and_then(|m| serde_json::to_value(m).ok());
-    (accepted_output_modes, request_metadata)
+    let mut activated_extensions: Vec<String> = activated_extensions.iter().cloned().collect();
+    activated_extensions.sort_unstable();
+    (
+        accepted_output_modes,
+        request_metadata,
+        activated_extensions,
+    )
 }
 
+/// `SendMessage` for every transport. `activated_extensions` is the
+/// negotiated extension set (URIs the client activated that the agent
+/// advertises); it reaches the executor as
+/// [`crate::executor::ExecutionContext::activated_extensions`].
 pub async fn core_send_message(
     state: AppState,
     tenant: &str,
     owner: &str,
     claims: Option<serde_json::Value>,
+    activated_extensions: &std::collections::HashSet<String>,
     body: String,
 ) -> Result<Json<serde_json::Value>, A2aError> {
     let request: turul_a2a_proto::SendMessageRequest =
         serde_json::from_str(&body).map_err(|e| A2aError::InvalidRequest {
             message: format!("Invalid request body: {e}"),
         })?;
-    let (accepted_output_modes, request_metadata) = executor_request_inputs(&request);
+    let (accepted_output_modes, request_metadata, activated_extensions) =
+        executor_request_inputs(&request, activated_extensions);
 
     let proto_message = request.message.ok_or(A2aError::InvalidRequest {
         message: "message field is required".into(),
@@ -1045,7 +1106,7 @@ pub async fn core_send_message(
         .as_ref()
         .and_then(|c| c.history_length);
 
-    let inline_push_config = inline_push_config(request.configuration.as_ref())?;
+    let inline_push_config = inline_push_config(&state, request.configuration.as_ref())?;
 
     let target = resolve_send_target(&state, tenant, owner, &message).await?;
     let task_id = target.task_id.clone();
@@ -1076,6 +1137,7 @@ pub async fn core_send_message(
                 claims: claims.clone(),
                 accepted_output_modes: accepted_output_modes.clone(),
                 request_metadata: request_metadata.clone(),
+                activated_extensions: activated_extensions.clone(),
                 enqueued_at_micros: now_micros,
             };
             if let Err(e) = queue.check_payload_size(&job) {
@@ -1151,6 +1213,7 @@ pub async fn core_send_message(
         claims: claims.clone(),
         accepted_output_modes,
         request_metadata,
+        activated_extensions,
     };
     let spawn = crate::server::spawn::spawn_tracked_executor(spawn_deps, scope)?;
 
@@ -1643,6 +1706,10 @@ pub(crate) async fn core_create_push_config(
     task_id: &str,
     body: String,
 ) -> Result<Json<serde_json::Value>, A2aError> {
+    crate::capability::require(
+        state.executor.as_ref(),
+        crate::capability::Capability::PushNotifications,
+    )?;
     verify_task_ownership(&state, tenant, owner, task_id).await?;
 
     let mut config: turul_a2a_proto::TaskPushNotificationConfig = serde_json::from_str(&body)
@@ -1683,6 +1750,10 @@ pub(crate) async fn core_list_push_configs(
     task_id: &str,
     query: &PushConfigQuery,
 ) -> Result<Json<serde_json::Value>, A2aError> {
+    crate::capability::require(
+        state.executor.as_ref(),
+        crate::capability::Capability::PushNotifications,
+    )?;
     verify_task_ownership(&state, tenant, owner, task_id).await?;
 
     let page = state
@@ -1715,6 +1786,10 @@ pub(crate) async fn core_get_push_config(
     task_id: &str,
     config_id: &str,
 ) -> Result<Json<serde_json::Value>, A2aError> {
+    crate::capability::require(
+        state.executor.as_ref(),
+        crate::capability::Capability::PushNotifications,
+    )?;
     verify_task_ownership(&state, tenant, owner, task_id).await?;
 
     let config = state
@@ -1736,6 +1811,10 @@ pub(crate) async fn core_delete_push_config(
     task_id: &str,
     config_id: &str,
 ) -> Result<Json<serde_json::Value>, A2aError> {
+    crate::capability::require(
+        state.executor.as_ref(),
+        crate::capability::Capability::PushNotifications,
+    )?;
     verify_task_ownership(&state, tenant, owner, task_id).await?;
 
     state
@@ -1753,8 +1832,8 @@ pub(crate) async fn core_delete_push_config(
 
 /// Parse the inbound `A2A-Extensions` header, validate against the
 /// agent card's advertised extensions, and return the negotiated set
-/// for echo on the response. Returns `UnsupportedOperationError` when
-/// the server advertises a `required = true` extension the client
+/// for echo on the response. Returns `ExtensionSupportRequiredError`
+/// when the server advertises a `required = true` extension the client
 /// did not activate.
 pub(crate) fn negotiate_profile_extensions(
     state: &AppState,

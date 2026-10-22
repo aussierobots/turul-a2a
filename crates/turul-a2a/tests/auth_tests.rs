@@ -60,7 +60,7 @@ impl AgentExecutor for TestExecutor {
             documentation_url: None,
             capabilities: Some(turul_a2a_proto::AgentCapabilities {
                 streaming: Some(false),
-                push_notifications: Some(false),
+                push_notifications: Some(true),
                 extensions: vec![],
                 extended_agent_card: Some(true),
             }),

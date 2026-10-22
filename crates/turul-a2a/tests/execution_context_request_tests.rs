@@ -1,11 +1,16 @@
-//! `SendMessageConfiguration.accepted_output_modes` and
-//! `SendMessageRequest.metadata` reach the executor.
+//! `SendMessageConfiguration.accepted_output_modes`,
+//! `SendMessageRequest.metadata` and the negotiated extensions reach the
+//! executor.
 //!
 //! a2a.proto `SendMessageConfiguration.accepted_output_modes`: "A list of
 //! media types the client is prepared to accept for response parts.
 //! Agents SHOULD use this to tailor their output." — so the agent must be
 //! able to see it. `SendMessageRequest.metadata` is "a flexible key-value
 //! map for passing additional context or parameters" to the agent.
+//! Extensions the client activates (A2A v1.0.1 §3.3.4 / the
+//! `A2A-Extensions` service parameter) that the agent advertises are
+//! reported as `ExecutionContext::activated_extensions`, so an executor
+//! applies extension behaviour only when the client asked for it.
 //!
 //! Covered paths: blocking send (HTTP + JSON-RPC), streaming send, and
 //! the durable-queue envelope (the consumer side is covered in the
@@ -13,6 +18,7 @@
 
 mod common;
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,8 +39,18 @@ use turul_a2a::storage::InMemoryA2aStorage;
 use turul_a2a::streaming::TaskEventBroker;
 use turul_a2a_types::{Message, Task};
 
-/// `(accepted_output_modes, request_metadata)` per execution.
-type Observed = Arc<Mutex<Vec<(Vec<String>, Option<serde_json::Value>)>>>;
+/// `(accepted_output_modes, request_metadata, activated_extensions)` per
+/// execution.
+type Inputs = (Vec<String>, Option<serde_json::Value>, Vec<String>);
+type Observed = Arc<Mutex<Vec<Inputs>>>;
+
+/// Extensions the observer advertises (neither required).
+const EXT_A: &str = "https://example.test/ext/a";
+const EXT_B: &str = "https://example.test/ext/b";
+/// Activation header value for requests "with inputs": both advertised
+/// extensions, out of order, plus one the agent does not advertise.
+const ACTIVATION: &str =
+    "https://example.test/ext/b, https://unknown.test/x, https://example.test/ext/a";
 
 struct ObservingExecutor {
     observed: Observed,
@@ -51,6 +67,7 @@ impl AgentExecutor for ObservingExecutor {
         self.observed.lock().unwrap().push((
             ctx.accepted_output_modes.clone(),
             ctx.request_metadata.clone(),
+            ctx.activated_extensions.clone(),
         ));
         ctx.events.complete(None).await?;
         Ok(())
@@ -63,8 +80,17 @@ impl AgentExecutor for ObservingExecutor {
             .streaming(true)
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain", "application/json"])
+            .extension(advertised(EXT_A))
+            .extension(advertised(EXT_B))
             .build()
             .unwrap()
+    }
+}
+
+fn advertised(uri: &str) -> turul_a2a_proto::AgentExtension {
+    turul_a2a_proto::AgentExtension {
+        uri: uri.into(),
+        ..Default::default()
     }
 }
 
@@ -98,14 +124,31 @@ fn send_request(with_inputs: bool, return_immediately: bool) -> serde_json::Valu
     req
 }
 
-fn expected_inputs() -> (Vec<String>, Option<serde_json::Value>) {
+/// Negotiated set: the advertised extensions the client activated,
+/// sorted; the unadvertised URI is dropped.
+fn expected_extensions() -> Vec<String> {
+    vec![EXT_A.to_string(), EXT_B.to_string()]
+}
+
+fn expected_inputs() -> Inputs {
     (
         vec!["application/json".to_string(), "text/plain".to_string()],
         Some(serde_json::json!({"traceId": "trace-77", "flags": {"debug": true}})),
+        expected_extensions(),
     )
 }
 
+/// A request "with inputs" also activates [`ACTIVATION`].
 fn post(uri: &str, body: String) -> Request<Body> {
+    Request::post(uri)
+        .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
+        .header("a2a-extensions", ACTIVATION)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn post_without_activation(uri: &str, body: String) -> Request<Body> {
     Request::post(uri)
         .header("content-type", "application/json")
         .header("a2a-version", "1.0")
@@ -128,14 +171,14 @@ async fn blocking_send_delivers_accepted_output_modes_and_request_metadata() {
 async fn blocking_send_without_inputs_yields_empty_modes_and_no_metadata() {
     let (router, observed) = router();
     let resp = router
-        .oneshot(post(
+        .oneshot(post_without_activation(
             "/message:send",
             send_request(false, false).to_string(),
         ))
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
-    assert_eq!(*observed.lock().unwrap(), vec![(vec![], None)]);
+    assert_eq!(*observed.lock().unwrap(), vec![(vec![], None, vec![])]);
 }
 
 #[tokio::test]
@@ -210,8 +253,31 @@ mod grpc {
             serde_json::from_value(send_request(true, false)).unwrap();
         let mut client: A2aServiceClient<common::VersionedChannel> =
             A2aServiceClient::with_interceptor(channel, common::with_a2a_version as _);
-        client.send_message(request).await.expect("grpc send");
+        let mut send = tonic::Request::new(request.clone());
+        send.metadata_mut()
+            .insert("a2a-extensions", ACTIVATION.parse().unwrap());
+        client.send_message(send).await.expect("grpc send");
         assert_eq!(*observed.lock().unwrap(), vec![expected_inputs()]);
+
+        let mut stream = tonic::Request::new(request);
+        stream
+            .metadata_mut()
+            .insert("a2a-extensions", ACTIVATION.parse().unwrap());
+        let mut frames = client
+            .send_streaming_message(stream)
+            .await
+            .expect("grpc stream")
+            .into_inner();
+        while tokio::time::timeout(Duration::from_secs(10), frames.message())
+            .await
+            .expect("stream closes after terminal")
+            .expect("stream frame")
+            .is_some()
+        {}
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![expected_inputs(), expected_inputs()]
+        );
     }
 }
 
@@ -264,11 +330,13 @@ async fn durable_queue_envelope_carries_accepted_output_modes_and_request_metada
         durable_executor_queue: Some(Arc::new(CapturingQueue { jobs: jobs.clone() })),
     };
 
+    let negotiated: HashSet<String> = expected_extensions().into_iter().collect();
     let response = turul_a2a::router::core_send_message(
         state,
         "",
         "anonymous",
         None,
+        &negotiated,
         send_request(true, true).to_string(),
     )
     .await
@@ -281,9 +349,10 @@ async fn durable_queue_envelope_carries_accepted_output_modes_and_request_metada
 
     let jobs = jobs.lock().await;
     assert_eq!(jobs.len(), 1);
-    let (modes, metadata) = expected_inputs();
+    let (modes, metadata, extensions) = expected_inputs();
     assert_eq!(jobs[0].accepted_output_modes, modes);
     assert_eq!(jobs[0].request_metadata, metadata);
+    assert_eq!(jobs[0].activated_extensions, extensions);
     assert!(
         observed.lock().unwrap().is_empty(),
         "the executor runs on the consumer side, not at enqueue"
@@ -294,4 +363,5 @@ async fn durable_queue_envelope_carries_accepted_output_modes_and_request_metada
         serde_json::from_str(&serde_json::to_string(&jobs[0]).unwrap()).unwrap();
     assert_eq!(decoded.accepted_output_modes, modes);
     assert_eq!(decoded.request_metadata, metadata);
+    assert_eq!(decoded.activated_extensions, extensions);
 }

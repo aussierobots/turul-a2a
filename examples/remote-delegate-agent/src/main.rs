@@ -34,7 +34,7 @@ use turul_a2a::A2aServer;
 use turul_a2a::card_builder::AgentCardBuilder;
 use turul_a2a::error::A2aError;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
-use turul_a2a::profiles::{SKILL_ID_METADATA_KEY, SKILL_INVOCATION_PROFILE_V1};
+use turul_a2a::profiles::SKILL_INVOCATION_PROFILE_V1;
 use turul_a2a_client::response::SendResponse;
 use turul_a2a_client::{A2aClient, A2aClientError, ClientAuth};
 use turul_a2a_proto as pb;
@@ -56,31 +56,28 @@ struct RemoteDelegateExecutor {
     timeout: Duration,
 }
 
-/// Extension URIs to activate on the upstream call for this message.
+/// Extensions the delegate advertises: those it knows how to carry to
+/// the upstream *and* the upstream advertises, copied from the
+/// upstream's card (so a `required` upstream extension is required here
+/// too). The skill-invocation profile is the only one: its routing
+/// metadata (`a2a.skillId` / `a2a.skillParams`) is forwarded intact.
 ///
-/// Activation is the `A2A-Extensions` request header, not
-/// `Message.extensions` (that field only attributes extensions present
-/// in the message). The delegate is the upstream's client, so it
-/// activates the skill-invocation profile itself whenever the message
-/// it forwards carries `a2a.skillId` routing metadata and the upstream
-/// advertises the profile. The header is what makes the upstream
-/// framework apply the profile (echo, request-shape check, and any
-/// required-extension rejection); whether the upstream executor also
-/// routes without it is that agent's choice.
-fn upstream_activations(message: &Message, upstream_card: &pb::AgentCard) -> Vec<String> {
-    let targets_skill = message
-        .metadata()
-        .is_some_and(|m| m.fields.contains_key(SKILL_ID_METADATA_KEY));
-    let upstream_advertises = upstream_card.capabilities.as_ref().is_some_and(|c| {
-        c.extensions
-            .iter()
-            .any(|e| e.uri == SKILL_INVOCATION_PROFILE_V1)
-    });
-    if targets_skill && upstream_advertises {
-        vec![SKILL_INVOCATION_PROFILE_V1.to_string()]
-    } else {
-        Vec::new()
-    }
+/// Because the delegate advertises nothing the upstream lacks, the
+/// negotiated set the framework hands the executor
+/// (`ExecutionContext::activated_extensions`) is exactly the set to
+/// activate upstream via the `A2A-Extensions` header.
+fn forwardable_extensions(upstream_card: &pb::AgentCard) -> Vec<pb::AgentExtension> {
+    upstream_card
+        .capabilities
+        .as_ref()
+        .map(|c| {
+            c.extensions
+                .iter()
+                .filter(|e| e.uri == SKILL_INVOCATION_PROFILE_V1)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl RemoteDelegateExecutor {
@@ -104,7 +101,7 @@ impl RemoteDelegateExecutor {
             )
         })?;
 
-        let local_card = AgentCardBuilder::new("Remote Delegate Agent", "0.1.0")
+        let mut local_card = AgentCardBuilder::new("Remote Delegate Agent", "0.1.0")
             .description(
                 "A2A agent that forwards every inbound message to a configured remote \
                  A2A agent and re-emits its artifacts. Pattern: gateway / proxy / fan-out precursor.",
@@ -131,8 +128,11 @@ impl RemoteDelegateExecutor {
                 input_modes: vec!["text/plain".into(), "application/json".into()],
                 output_modes: vec!["application/json".into(), "text/plain".into()],
                 security_requirements: vec![],
-            })
-            .build()?;
+            });
+        for extension in forwardable_extensions(&upstream_card) {
+            local_card = local_card.extension(extension);
+        }
+        let local_card = local_card.build()?;
 
         Ok(Self {
             client: Arc::new(client),
@@ -152,13 +152,17 @@ impl AgentExecutor for RemoteDelegateExecutor {
         ctx: &ExecutionContext,
     ) -> Result<(), A2aError> {
         let outbound = build_outbound_request(message);
-        let activations = upstream_activations(message, &self.upstream_card);
-        // `A2aClient` is cheap to clone (the HTTP pool is shared); the
-        // per-call clone carries this message's extension activations.
-        let client = if activations.is_empty() {
+        // Forward the extensions the caller activated that this delegate
+        // advertises (see `forwardable_extensions`). `A2aClient` is cheap
+        // to clone (the HTTP pool is shared); the per-call clone carries
+        // this request's activations.
+        let client = if ctx.activated_extensions.is_empty() {
             self.client.as_ref().clone()
         } else {
-            self.client.as_ref().clone().with_extensions(activations)
+            self.client
+                .as_ref()
+                .clone()
+                .with_extensions(ctx.activated_extensions.clone())
         };
 
         // The A2aClient already carries an internal HTTP timeout, but we
@@ -249,7 +253,8 @@ impl AgentExecutor for RemoteDelegateExecutor {
 //   - metadata is forwarded intact, so skill-dispatch routing keys
 //     (`a2a.skillId` / `a2a.skillParams`) reach the upstream.
 //   - extensions (attribution only) are forwarded intact. Activation is
-//     the A2A-Extensions header, set per call by `upstream_activations`.
+//     the A2A-Extensions header: the caller's negotiated extensions,
+//     set per call in `execute`.
 //   - role and parts are copied verbatim.
 // ---------------------------------------------------------------------------
 
@@ -390,7 +395,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         upstream_name, config.remote_url
     );
     println!("Auth forwarding: NEVER. Inbound caller credentials are not propagated.");
-    println!("Streaming passthrough: NO. /message:stream falls back to buffered.");
+    println!(
+        "Streaming: NO. The card does not declare streaming; /message:stream is refused (UnsupportedOperationError)."
+    );
     println!("Agent card: http://localhost:{port}/.well-known/agent-card.json");
     println!();
     println!("Send a message and watch it round-trip through the upstream:");
@@ -409,6 +416,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod unit {
     use super::*;
     use serde_json::json;
+    use turul_a2a::profiles::SKILL_ID_METADATA_KEY;
     use turul_a2a_types::Part;
 
     #[test]
@@ -482,26 +490,20 @@ mod unit {
         );
     }
 
-    /// A skill-targeted message to an upstream advertising the profile
-    /// activates it via the A2A-Extensions header.
+    /// The delegate advertises the skill-invocation profile only when the
+    /// upstream does, and never an upstream extension it cannot carry.
     #[test]
-    fn skill_targeted_message_activates_profile_upstream() {
-        assert_eq!(
-            upstream_activations(
-                &skill_targeted_message(),
-                &upstream_card(&[SKILL_INVOCATION_PROFILE_V1])
-            ),
-            vec![SKILL_INVOCATION_PROFILE_V1.to_string()]
-        );
-    }
-
-    #[test]
-    fn no_activation_without_routing_metadata_or_upstream_support() {
-        let plain = Message::new("in-2", turul_a2a_types::Role::User, vec![Part::text("hi")]);
-        assert!(
-            upstream_activations(&plain, &upstream_card(&[SKILL_INVOCATION_PROFILE_V1])).is_empty()
-        );
-        assert!(upstream_activations(&skill_targeted_message(), &upstream_card(&[])).is_empty());
+    fn advertises_only_forwardable_upstream_extensions() {
+        let advertised: Vec<String> = forwardable_extensions(&upstream_card(&[
+            SKILL_INVOCATION_PROFILE_V1,
+            "https://example.test/other/v1",
+        ]))
+        .into_iter()
+        .map(|e| e.uri)
+        .collect();
+        assert_eq!(advertised, vec![SKILL_INVOCATION_PROFILE_V1.to_string()]);
+        assert!(forwardable_extensions(&upstream_card(&[])).is_empty());
+        assert!(forwardable_extensions(&pb::AgentCard::default()).is_empty());
     }
 
     #[test]

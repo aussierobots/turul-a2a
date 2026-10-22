@@ -151,10 +151,16 @@ impl AgentExecutor for SinkDrivenCompleter {
 async fn blocking_send_long_running_sink_driven_completes() {
     let state = make_state(Arc::new(SinkDrivenCompleter { delay_ms: 50 }));
     let start = tokio::time::Instant::now();
-    let axum::Json(v) =
-        core_send_message(state.clone(), "", "owner-1", None, send_request_body("hi"))
-            .await
-            .expect("blocking send completes");
+    let axum::Json(v) = core_send_message(
+        state.clone(),
+        "",
+        "owner-1",
+        None,
+        &Default::default(),
+        send_request_body("hi"),
+    )
+    .await
+    .expect("blocking send completes");
     let elapsed = start.elapsed();
     let task = task_from_response(v);
     assert!(
@@ -234,10 +240,16 @@ impl AgentExecutor for DirectMutationChunkExtender {
 #[tokio::test]
 async fn blocking_send_direct_task_mutation_extended_artifact_is_persisted() {
     let state = make_state(Arc::new(DirectMutationChunkExtender));
-    let axum::Json(v) =
-        core_send_message(state.clone(), "", "owner-ext", None, send_request_body("x"))
-            .await
-            .expect("blocking send on direct-mutation chunk extender");
+    let axum::Json(v) = core_send_message(
+        state.clone(),
+        "",
+        "owner-ext",
+        None,
+        &Default::default(),
+        send_request_body("x"),
+    )
+    .await
+    .expect("blocking send on direct-mutation chunk extender");
     let task = task_from_response(v);
     assert_eq!(
         task.status().unwrap().state().unwrap(),
@@ -267,6 +279,7 @@ async fn blocking_send_direct_task_mutation_still_terminates_via_cas() {
         "",
         "owner-legacy",
         None,
+        &Default::default(),
         send_request_body("x"),
     )
     .await
@@ -308,10 +321,16 @@ impl AgentExecutor for ErrReturner {
 #[tokio::test]
 async fn blocking_send_executor_err_commits_failed() {
     let state = make_state(Arc::new(ErrReturner));
-    let axum::Json(v) =
-        core_send_message(state.clone(), "", "owner-err", None, send_request_body("x"))
-            .await
-            .expect("blocking send returns the FAILED task, not an Err");
+    let axum::Json(v) = core_send_message(
+        state.clone(),
+        "",
+        "owner-err",
+        None,
+        &Default::default(),
+        send_request_body("x"),
+    )
+    .await
+    .expect("blocking send returns the FAILED task, not an Err");
     let task = task_from_response(v);
     assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Failed);
     // The framework's agent-authored failure message carries the
@@ -365,10 +384,16 @@ impl AgentExecutor for PolicyRejecter {
 #[tokio::test]
 async fn blocking_send_executor_rejects_via_sink_reject() {
     let state = make_state(Arc::new(PolicyRejecter));
-    let axum::Json(v) =
-        core_send_message(state.clone(), "", "owner-r", None, send_request_body("x"))
-            .await
-            .expect("blocking send returns the REJECTED task");
+    let axum::Json(v) = core_send_message(
+        state.clone(),
+        "",
+        "owner-r",
+        None,
+        &Default::default(),
+        send_request_body("x"),
+    )
+    .await
+    .expect("blocking send returns the REJECTED task");
     let task = task_from_response(v);
     let state_val = task.status().unwrap().state().unwrap();
     assert_eq!(
@@ -424,9 +449,16 @@ async fn blocking_send_two_deadline_cooperative_returns_canceled() {
     let grace = Duration::from_millis(500);
     let state = fast_timeout_state(Arc::new(CooperativeCancelLoop), soft, grace);
     let start = tokio::time::Instant::now();
-    let axum::Json(v) = core_send_message(state, "", "owner-coop", None, send_request_body("x"))
-        .await
-        .expect("blocking send returns within grace window");
+    let axum::Json(v) = core_send_message(
+        state,
+        "",
+        "owner-coop",
+        None,
+        &Default::default(),
+        send_request_body("x"),
+    )
+    .await
+    .expect("blocking send returns within grace window");
     let elapsed = start.elapsed();
     let task = task_from_response(v);
     assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Canceled);
@@ -500,9 +532,16 @@ async fn blocking_send_two_deadline_abort_fallback_returns_failed() {
     let grace = Duration::from_millis(200);
     let state = fast_timeout_state(Arc::new(IgnoresCancellation), soft, grace);
     let start = tokio::time::Instant::now();
-    let axum::Json(v) = core_send_message(state, "", "owner-abort", None, send_request_body("x"))
-        .await
-        .expect("blocking send force-commits FAILED");
+    let axum::Json(v) = core_send_message(
+        state,
+        "",
+        "owner-abort",
+        None,
+        &Default::default(),
+        send_request_body("x"),
+    )
+    .await
+    .expect("blocking send force-commits FAILED");
     let elapsed = start.elapsed();
     let task = task_from_response(v);
     assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Failed);
@@ -554,10 +593,16 @@ async fn blocking_send_hard_timeout_actually_aborts_executor() {
         Duration::from_millis(150),
     );
 
-    let axum::Json(_v) =
-        core_send_message(state, "", "owner-abort-probe", None, send_request_body("x"))
-            .await
-            .expect("blocking send force-commits FAILED");
+    let axum::Json(_v) = core_send_message(
+        state,
+        "",
+        "owner-abort-probe",
+        None,
+        &Default::default(),
+        send_request_body("x"),
+    )
+    .await
+    .expect("blocking send force-commits FAILED");
 
     // The Sender lives inside the executor future. When the future
     // drops (via abort), the Sender drops, and `rx` resolves —
@@ -638,13 +683,17 @@ async fn blocking_send_hard_deadline_loses_cas_to_concurrent_cancel_returns_canc
     state_b.runtime_config.cancel_handler_poll_interval = grace / 8;
 
     let start = tokio::time::Instant::now();
-    let send = tokio::spawn(core_send_message(
-        state_a,
-        "",
-        "owner-race",
-        None,
-        send_request_body("x"),
-    ));
+    let send = tokio::spawn(async move {
+        core_send_message(
+            state_a,
+            "",
+            "owner-race",
+            None,
+            &Default::default(),
+            send_request_body("x"),
+        )
+        .await
+    });
 
     let task_id = observed_rx.await.expect("soft deadline trips the token");
     let axum::Json(cancelled) =
@@ -729,6 +778,7 @@ async fn non_blocking_send_return_immediately_returns_before_terminal() {
         "",
         "owner-ni",
         None,
+        &Default::default(),
         send_request_body_return_immediately("x"),
     )
     .await

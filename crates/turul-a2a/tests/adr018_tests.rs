@@ -251,6 +251,7 @@ fn queued_executor_job_envelope_roundtrip_preserves_claims() {
         claims: Some(claims.clone()),
         accepted_output_modes: vec![],
         request_metadata: None,
+        activated_extensions: vec![],
         enqueued_at_micros: 123_456_789,
     };
     let encoded = serde_json::to_string(&job).unwrap();
@@ -421,6 +422,7 @@ async fn blocking_send_delivers_claims_to_executor() {
         "",
         "alice",
         claims_in.clone(),
+        &Default::default(),
         serde_json::json!({
             "message": {
                 "messageId": uuid::Uuid::now_v7().to_string(),
@@ -576,9 +578,16 @@ async fn durable_path_preserves_text_task_id_and_context_id_across_enqueue_deque
         "configuration": {"returnImmediately": true},
     })
     .to_string();
-    let response = turul_a2a::router::core_send_message(state.clone(), "", "anonymous", None, body)
-        .await
-        .expect("send");
+    let response = turul_a2a::router::core_send_message(
+        state.clone(),
+        "",
+        "anonymous",
+        None,
+        &Default::default(),
+        body,
+    )
+    .await
+    .expect("send");
     let response_json = response.0;
     let task_id_from_http = response_json
         .pointer("/task/id")
@@ -639,6 +648,7 @@ async fn durable_path_preserves_text_task_id_and_context_id_across_enqueue_deque
         claims: job.claims.clone(),
         accepted_output_modes: job.accepted_output_modes.clone(),
         request_metadata: job.request_metadata.clone(),
+        activated_extensions: job.activated_extensions.clone(),
     };
     run_queued_executor_job(deps, scope).await;
 

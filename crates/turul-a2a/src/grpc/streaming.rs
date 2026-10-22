@@ -21,10 +21,11 @@ pub async fn handle_send_streaming_message(
     state: AppState,
     tenant: String,
     owner: String,
+    activated_extensions: &std::collections::HashSet<String>,
     body: String,
 ) -> Result<BoxedStreamResponseStream, Status> {
     // gRPC auth claims are not yet wired. Pass None for now.
-    let stream = router::open_send_stream(state, &tenant, &owner, None, body)
+    let stream = router::open_send_stream(state, &tenant, &owner, None, activated_extensions, body)
         .await
         .map_err(a2a_to_status)?;
     Ok(grpc_stream(stream))

@@ -7,8 +7,9 @@
 //!      (comma-separated URI list, whitespace tolerant) on every send
 //!      transport: HTTP blocking + streaming, JSON-RPC, gRPC.
 //!   3. Echo of the negotiated URIs on the response.
-//!   4. Rejection with `UnsupportedOperationError` when an advertised
-//!      `required = true` extension is not activated.
+//!   4. Rejection with `ExtensionSupportRequiredError` (JSON-RPC -32008,
+//!      HTTP 400, gRPC FAILED_PRECONDITION; A2A v1.0.1 §3.3.4) when an
+//!      advertised `required = true` extension is not activated.
 //!   5. Request shape: once the profile is negotiated,
 //!      `Message.metadata["a2a.skillId"]` must be a string, otherwise
 //!      InvalidParams (HTTP 400 / JSON-RPC -32602 / gRPC
@@ -40,6 +41,7 @@ use turul_a2a::profile_dispatch::{
 use turul_a2a::server::A2aServer;
 use turul_a2a::storage::InMemoryA2aStorage;
 use turul_a2a_types::pbjson::value_to_json;
+use turul_a2a_types::wire::errors;
 use turul_a2a_types::{Message, Task};
 
 const RESPONSE_HEADER: &str = "a2a-extensions";
@@ -95,8 +97,9 @@ fn validate_activation_required_but_not_activated_is_err() {
     let err = validate_activation(&HashSet::new(), &advertised)
         .expect_err("required extension not activated must error");
     assert!(
-        matches!(err, A2aError::UnsupportedOperation { .. }),
-        "expected UnsupportedOperationError, got {err:?}"
+        matches!(&err, A2aError::ExtensionSupportRequired { extension }
+            if extension == SKILL_INVOCATION_PROFILE_V1),
+        "expected ExtensionSupportRequiredError naming the URI, got {err:?}"
     );
 }
 
@@ -106,7 +109,7 @@ fn validate_activation_required_other_uri_does_not_satisfy() {
     let activated = HashSet::from(["https://other.example/ext/v1".to_string()]);
     let err = validate_activation(&activated, &advertised)
         .expect_err("activating a different URI does not satisfy a required ext");
-    assert!(matches!(err, A2aError::UnsupportedOperation { .. }));
+    assert!(matches!(err, A2aError::ExtensionSupportRequired { .. }));
 }
 
 #[test]
@@ -294,27 +297,89 @@ async fn profile_header_on_agent_without_profile_is_ignored() {
     assert_eq!(seen.skill_ids(), vec![None]);
 }
 
+/// A required extension the client did not activate:
+/// `ExtensionSupportRequiredError` (HTTP 400, `FAILED_PRECONDITION`) on
+/// blocking and streaming sends, default and tenant routes, before the
+/// executor runs.
 #[tokio::test]
-async fn http_send_required_extension_missing_returns_unsupported_operation() {
-    let (router, seen) = http_router(true);
-    let resp = router
+async fn http_send_required_extension_missing_returns_extension_support_required() {
+    for path in ["/message:send", "/message:stream", "/acme/message:send"] {
+        let (router, seen) =
+            router_with_card(base_card(vec![skill_invocation_extension(true)], true));
+        let resp = router
+            .oneshot(http_post(path, &send_body(None), &[]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status().as_u16(),
+            errors::HTTP_EXTENSION_SUPPORT_REQUIRED,
+            "{path}"
+        );
+        let body = json_body(resp).await;
+        assert_eq!(
+            body.pointer("/error/details/0/reason")
+                .and_then(|v| v.as_str()),
+            Some(errors::REASON_EXTENSION_SUPPORT_REQUIRED),
+            "{path}: {body}"
+        );
+        assert_eq!(
+            body["error"]["status"], "FAILED_PRECONDITION",
+            "{path}: {body}"
+        );
+        assert!(seen.skill_ids().is_empty(), "{path}: executor must not run");
+    }
+}
+
+#[tokio::test]
+async fn jsonrpc_send_required_extension_missing_returns_extension_support_required() {
+    for method in ["SendMessage", "SendStreamingMessage"] {
+        let (router, seen) =
+            router_with_card(base_card(vec![skill_invocation_extension(true)], true));
+        let resp = router
+            .oneshot(http_post("/jsonrpc", &jsonrpc_call(method, None), &[]))
+            .await
+            .unwrap();
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["error"]["code"],
+            errors::JSONRPC_EXTENSION_SUPPORT_REQUIRED,
+            "{method}: {body}"
+        );
+        assert_eq!(
+            body["error"]["data"][0]["reason"],
+            errors::REASON_EXTENSION_SUPPORT_REQUIRED,
+            "{method}: {body}"
+        );
+        assert!(
+            seen.skill_ids().is_empty(),
+            "{method}: executor must not run"
+        );
+    }
+}
+
+/// The negotiated set reaches the executor: the profile URI when the
+/// client activated it, nothing otherwise.
+#[tokio::test]
+async fn executor_sees_activated_extensions() {
+    let (router, seen) = http_router(false);
+    router
+        .clone()
+        .oneshot(http_post(
+            "/message:send",
+            &send_body(Some(serde_json::json!("demo"))),
+            &[("A2A-Extensions", SKILL_INVOCATION_PROFILE_V1)],
+        ))
+        .await
+        .unwrap();
+    router
         .oneshot(http_post("/message:send", &send_body(None), &[]))
         .await
         .unwrap();
-
     assert_eq!(
-        resp.status().as_u16(),
-        400,
-        "UnsupportedOperationError maps to HTTP 400 per A2A error model"
+        seen.activated(),
+        vec![vec![SKILL_INVOCATION_PROFILE_V1.to_string()], vec![]]
     );
-    let body = json_body(resp).await;
-    assert_eq!(
-        body.pointer("/error/details/0/reason")
-            .and_then(|v| v.as_str()),
-        Some("UNSUPPORTED_OPERATION"),
-        "error body must report UNSUPPORTED_OPERATION reason; got {body}"
-    );
-    assert!(seen.skill_ids().is_empty(), "executor must not run");
 }
 
 #[tokio::test]
@@ -485,11 +550,18 @@ mod grpc {
     use turul_a2a_proto::grpc::A2aServiceClient;
 
     async fn client(seen: Seen) -> A2aServiceClient<common::VersionedChannel> {
+        client_requiring(false, seen).await
+    }
+
+    async fn client_requiring(
+        required: bool,
+        seen: Seen,
+    ) -> A2aServiceClient<common::VersionedChannel> {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let router = A2aServer::builder()
             .executor(ProfileTestExecutor {
-                card: base_card(vec![skill_invocation_extension(false)], true),
+                card: base_card(vec![skill_invocation_extension(required)], true),
                 seen,
             })
             .storage(InMemoryA2aStorage::new())
@@ -562,6 +634,46 @@ mod grpc {
     }
 
     #[tokio::test]
+    async fn grpc_send_required_extension_missing_is_extension_support_required() {
+        use tonic_types::StatusExt;
+        let seen = Seen::default();
+        let mut client = client_requiring(true, seen.clone()).await;
+        let request = || {
+            let body: turul_a2a_proto::SendMessageRequest =
+                serde_json::from_str(&send_body(None)).unwrap();
+            tonic::Request::new(body)
+        };
+        let unary = client
+            .send_message(request())
+            .await
+            .expect_err("required extension not activated");
+        let streaming = client
+            .send_streaming_message(request())
+            .await
+            .expect_err("required extension not activated");
+        for status in [unary, streaming] {
+            assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+            let info = status.get_details_error_info().expect("ErrorInfo");
+            assert_eq!(info.reason, errors::REASON_EXTENSION_SUPPORT_REQUIRED);
+        }
+        assert!(seen.skill_ids().is_empty(), "executor must not run");
+    }
+
+    #[tokio::test]
+    async fn grpc_executor_sees_activated_extensions() {
+        let seen = Seen::default();
+        let mut client = client(seen.clone()).await;
+        client
+            .send_message(activated_request(Some(serde_json::json!("demo"))))
+            .await
+            .expect("send");
+        assert_eq!(
+            seen.activated(),
+            vec![vec![SKILL_INVOCATION_PROFILE_V1.to_string()]]
+        );
+    }
+
+    #[tokio::test]
     async fn grpc_streaming_send_missing_skill_id_is_invalid_argument() {
         let seen = Seen::default();
         let mut client = client(seen.clone()).await;
@@ -620,13 +732,31 @@ fn base_card(
 }
 
 /// What the executor saw: one entry per execution, holding the
-/// `a2a.skillId` metadata value if present.
+/// `a2a.skillId` metadata value if present and
+/// `ExecutionContext::activated_extensions`.
 #[derive(Clone, Default)]
-struct Seen(Arc<Mutex<Vec<Option<String>>>>);
+struct Seen(Arc<Mutex<Vec<Execution>>>);
+
+/// `(a2a.skillId, activated_extensions)` for one execution.
+type Execution = (Option<String>, Vec<String>);
 
 impl Seen {
     fn skill_ids(&self) -> Vec<Option<String>> {
-        self.0.lock().unwrap().clone()
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    fn activated(&self) -> Vec<Vec<String>> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, activated)| activated.clone())
+            .collect()
     }
 }
 
@@ -647,7 +777,11 @@ impl AgentExecutor for ProfileTestExecutor {
             .metadata()
             .and_then(|m| m.fields.get(SKILL_ID_METADATA_KEY))
             .and_then(|v| value_to_json(v.clone()).as_str().map(str::to_string));
-        self.seen.0.lock().unwrap().push(skill_id);
+        self.seen
+            .0
+            .lock()
+            .unwrap()
+            .push((skill_id, ctx.activated_extensions.clone()));
         ctx.events.complete(None).await?;
         Ok(())
     }

@@ -44,6 +44,7 @@ impl AgentExecutor for CompletingExecutor {
             .url("http://localhost", "JSONRPC", "1.0")
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
+            .streaming(true)
             .build()
             .unwrap()
     }
@@ -76,6 +77,7 @@ impl AgentExecutor for PausingExecutor {
             .url("http://localhost", "JSONRPC", "1.0")
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
+            .streaming(true)
             .build()
             .unwrap()
     }

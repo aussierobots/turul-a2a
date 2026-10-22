@@ -268,6 +268,7 @@ async fn drive_sqs_record(state: &AppState, record: SqsMessage) -> Result<(), St
         claims: job.claims.clone(),
         accepted_output_modes: job.accepted_output_modes.clone(),
         request_metadata: job.request_metadata.clone(),
+        activated_extensions: job.activated_extensions.clone(),
     };
     run_queued_executor_job(deps, scope).await;
     Ok(())

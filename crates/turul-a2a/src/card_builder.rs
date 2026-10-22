@@ -165,16 +165,28 @@ impl AgentCardBuilder {
         self
     }
 
+    /// Declare `capabilities.streaming`. Left unset by default; unless it
+    /// is `true` the server refuses `SendStreamingMessage` and
+    /// `SubscribeToTask` with `UnsupportedOperationError` (A2A v1.0.1
+    /// §3.3.4).
     pub fn streaming(mut self, enabled: bool) -> Self {
         self.streaming = Some(enabled);
         self
     }
 
+    /// Declare `capabilities.pushNotifications`. Left unset by default;
+    /// unless it is `true` the server refuses push-config Create / Get /
+    /// List / Delete and an inline `taskPushNotificationConfig` on send
+    /// with `PushNotificationNotSupportedError` (A2A v1.0.1 §3.3.4).
     pub fn push_notifications(mut self, enabled: bool) -> Self {
         self.push_notifications = Some(enabled);
         self
     }
 
+    /// Declare `capabilities.extendedAgentCard`. Left unset by default;
+    /// unless it is `true` the server refuses `GetExtendedAgentCard` with
+    /// `UnsupportedOperationError`, even when the executor supplies an
+    /// extended card (A2A v1.0.1 §3.3.4).
     pub fn extended_agent_card(mut self, enabled: bool) -> Self {
         self.extended_agent_card = Some(enabled);
         self

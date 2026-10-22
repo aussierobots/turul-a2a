@@ -124,7 +124,7 @@ fn make_agent_card(push: bool) -> turul_a2a_proto::AgentCard {
             streaming: Some(true),
             push_notifications: Some(push),
             extensions: vec![],
-            extended_agent_card: Some(false),
+            extended_agent_card: Some(true),
         }),
         security_schemes: HashMap::new(),
         security_requirements: vec![],

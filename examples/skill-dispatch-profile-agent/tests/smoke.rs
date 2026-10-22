@@ -284,11 +284,12 @@ async fn not_activated_fails_task_with_guidance() {
     );
 }
 
-/// `a2a.skillId` without the activation header: the executor cannot see
-/// the negotiated extension set, so it routes on metadata alone. The
-/// framework did not apply the profile, so nothing is echoed.
+/// `a2a.skillId` without the activation header: the profile was not
+/// activated, so the request is un-targeted. The executor sees no
+/// activated extension and takes the default path (no dispatch, the
+/// task fails with guidance); nothing is echoed.
 #[tokio::test]
-async fn skill_id_without_activation_header_still_dispatches() {
+async fn skill_id_without_activation_header_is_not_dispatched() {
     let agent = spawn_agent().await;
     let resp = send_message(
         &agent.base,
@@ -300,8 +301,13 @@ async fn skill_id_without_activation_header_still_dispatches() {
     assert!(resp.headers().get("a2a-extensions").is_none());
 
     let payload: Value = resp.json().await.expect("send json");
-    assert_eq!(task_state(&payload), "TASK_STATE_COMPLETED", "{payload:#}");
-    let artifact: Value =
-        serde_json::from_str(first_artifact_text(&payload)).expect("artifact is JSON");
-    assert_eq!(artifact, json!({ "reversed": "cba" }));
+    assert_eq!(task_state(&payload), "TASK_STATE_FAILED", "{payload:#}");
+    assert!(
+        status_text(&payload).contains("A2A-Extensions"),
+        "failure message should explain how to activate the profile: {payload:#}"
+    );
+    assert!(
+        payload.pointer("/task/artifacts/0").is_none(),
+        "no skill ran: {payload:#}"
+    );
 }

@@ -57,6 +57,11 @@ pub struct QueuedExecutorJob {
     /// none.
     #[serde(default)]
     pub request_metadata: Option<serde_json::Value>,
+    /// Extension URIs negotiated on the HTTP invocation. Mirrors
+    /// `ExecutionContext.activated_extensions`; empty when none were
+    /// activated.
+    #[serde(default)]
+    pub activated_extensions: Vec<String>,
     /// Epoch microseconds at which the HTTP invocation enqueued the
     /// job. Used by consumers for lag / DLQ diagnostics.
     pub enqueued_at_micros: i64,

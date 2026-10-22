@@ -93,11 +93,13 @@ message:
   the upstream.
 - `extensions` — forwarded intact. This list only *attributes*
   extensions present in the message; it does not activate anything.
-- Extension activation — the delegate sends its own `A2A-Extensions`
-  header on the upstream call: when the message carries `a2a.skillId`
-  and the upstream's card advertises the skill-invocation profile, the
-  delegate activates that profile (otherwise the upstream would treat
-  the message as un-targeted).
+- Extension activation — the delegate advertises the extensions it can
+  carry upstream (the skill-invocation profile, copied from the
+  upstream's card when the upstream advertises it) and forwards the
+  caller's activation: the URIs in `ExecutionContext::activated_extensions`
+  (activated by the caller, advertised by the delegate) go on the
+  upstream call's `A2A-Extensions` header. Routing metadata without
+  the caller's activation activates nothing upstream.
 - `referenceTaskIds` — forwarded intact.
 
 ### 3. Task / status / artifact mapping
@@ -161,21 +163,20 @@ status code is only a fallback when the upstream sent no ErrorInfo.
   "the delegate is caller X"). Adopters who consciously want
   passthrough auth must add it on top — this example does not
   provide a hook.
-- The caller's `A2A-Extensions` header is not visible to an
-  `AgentExecutor`, so it is not passed through verbatim. The delegate
-  activates the skill-invocation profile upstream itself when the
-  forwarded message targets a skill (§2); other caller-activated
-  extensions are not re-activated upstream.
+- The caller's `A2A-Extensions` header is not passed through
+  verbatim: the executor sees the negotiated set
+  (`ExecutionContext::activated_extensions`) and forwards only the
+  extensions the delegate advertises (§2); anything else the caller
+  activated is dropped.
 
 ### 7. Streaming
 
 **Buffered (`/message:send`) only in v1.** `/message:stream` is *not*
 implemented end-to-end:
 
-- The local agent card advertises `streaming: false`.
-- The framework's default behavior applies if a client calls
-  `/message:stream` on the delegate (single buffered emit-then-close
-  shape).
+- The local agent card advertises `streaming: false`, so a client
+  calling `/message:stream` (or `SubscribeToTask`) on the delegate gets
+  `UnsupportedOperationError`.
 - True SSE passthrough — subscribe to upstream SSE, fan out to local
   subscribers, propagate cancel — is non-trivial and deferred.
 - **Trigger to revisit**: an adopter case where the upstream emits
@@ -188,13 +189,13 @@ implemented end-to-end:
   end-to-end smoke that runs the built delegate binary on a free port
   against an in-process `wiremock` upstream, sends messages through
   the delegate, and asserts the upstream's artifact comes back in a
-  spec `SendMessageResponse` and that the profile is activated
-  upstream only for skill-targeted messages.
+  spec `SendMessageResponse`, that the delegate advertises the
+  upstream's skill-invocation profile, and that the profile is
+  activated upstream only when the caller activated it.
 - The unit tests in `src/main.rs` pin: outbound
   `messageId`/`contextId`/`taskId` handling, `metadata` + `extensions`
-  preservation, when the skill-invocation profile is activated
-  upstream, and the §4 error mapping table for all classification
-  rules.
+  preservation, which upstream extensions the delegate advertises, and
+  the §4 error mapping table for all classification rules.
 
 ## What this example is NOT
 

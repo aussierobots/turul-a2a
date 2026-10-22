@@ -37,7 +37,7 @@ Chosen over a Lambda-adapter pre-filter because `AppState.runtime_config` is alr
 
 The registration is inserted into `core_send_message` with this ordering, explicitly addressing the partial-persistence risk:
 
-1. **Parse and validate inline config up front** — before any storage write. If `request.configuration.task_push_notification_config` is `Some`, parse its `url` field via `url::Url::parse` (ADR-011 §R1). A malformed URL returns HTTP 400 / JSON-RPC -32602 / gRPC `INVALID_ARGUMENT` **before** `create_task_with_events` is called. No task row is persisted on this path.
+1. **Parse and validate inline config up front** — before any storage write. If `request.configuration.task_push_notification_config` is `Some`, parse its `url` field via `url::Url::parse` (ADR-011 §R1). A malformed URL returns HTTP 400 / JSON-RPC -32602 / gRPC `INVALID_ARGUMENT` **before** `create_task_with_events` is called. No task row is persisted on this path. *Amended 2026-10-22:* before the URL check, an agent whose card does not declare `capabilities.pushNotifications = true` refuses the inline config with `PushNotificationNotSupportedError` (HTTP 400 / JSON-RPC -32003 / gRPC `FAILED_PRECONDITION`; A2A v1.0.1 §3.3.4), also with nothing persisted.
 
 2. **Capability + `return_immediately` checks** — Bug 1 gate.
 
@@ -175,3 +175,4 @@ Adopters on Lambda:
 ## Revision log
 
 - 2026-10-22 — Bug 1: recorded the spec justification for refusing `return_immediately` on Lambda (A2A v1.0.1 §3.3.2 "a specific aspect of it is not supported") and that ADR-018's durable executor turns the capability back on. Bug 2: inline push config now also honoured on `SendStreamingMessage` (§3.2.2, "operates independently of execution mode") through helpers shared with `SendMessage`; the compensation returns the original storage error unchanged. Test obligations renamed to the tests that exist, the Lambda gate tested through `LambdaA2aServerBuilder::build`, `history_length` tests moved onto real continuations, gRPC inline-config tests added. Migration text corrected to the actual status-message wording.
+- 2026-10-22 — Step 1 gains the capability check: an inline push config on an agent whose card does not declare `capabilities.pushNotifications = true` is refused with `PushNotificationNotSupportedError` before any write, on blocking and streaming sends and every transport (A2A v1.0.1 §3.3.4). Test: `capability_tests::inline_push_config_requires_push_capability_and_persists_nothing` (plus its gRPC and Lambda variants).

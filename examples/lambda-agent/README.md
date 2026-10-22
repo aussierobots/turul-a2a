@@ -54,6 +54,10 @@ payloads.
   terminals. The request Lambda does NOT call the webhook — the two worker
   Lambdas do. See ADR-013 §4.4 for why `tokio::spawn` continuations are
   unsafe after the Lambda response returns.
+- **The card gates push.** Push-config CRUD and inline
+  `taskPushNotificationConfig` are refused with
+  `PushNotificationNotSupportedError` unless the agent card declares
+  `.push_notifications(true)`. This demo's card does not.
 
 ## Storage
 

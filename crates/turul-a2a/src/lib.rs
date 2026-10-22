@@ -50,6 +50,7 @@
 //! store. For horizontally scaled deployments, configure all
 //! instances against the same backend.
 
+mod capability;
 pub mod card_builder;
 #[cfg(feature = "compat-v03")]
 pub mod compat_v03;

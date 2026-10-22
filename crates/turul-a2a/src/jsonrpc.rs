@@ -36,7 +36,7 @@ pub(crate) fn is_jsonrpc_path(path: &str) -> bool {
 /// Wraps the inner dispatcher with profile-extension activation:
 /// the `A2A-Extensions` request header is parsed up front, a
 /// `required = true` advertised extension that the client did not
-/// activate trips an `UnsupportedOperationError` response without
+/// activate trips an `ExtensionSupportRequiredError` response without
 /// dispatching, and on success the activated URIs are echoed back in
 /// the same response header.
 pub async fn jsonrpc_dispatch_handler(
@@ -197,8 +197,17 @@ async fn jsonrpc_dispatch_inner(
             return axum::http::StatusCode::NO_CONTENT.into_response();
         }
 
-        return match dispatch_streaming(state, &method, &tenant, &owner, claims, params, id.clone())
-            .await
+        return match dispatch_streaming(
+            state,
+            &method,
+            &tenant,
+            &owner,
+            claims,
+            negotiated_extensions,
+            params,
+            id.clone(),
+        )
+        .await
         {
             Ok(response) => response,
             Err(e) => Json(e.to_jsonrpc_error(Some(&id))).into_response(),
@@ -209,7 +218,16 @@ async fn jsonrpc_dispatch_inner(
     //
     // Notifications run dispatch for side effects, then drop the response.
     if is_notification {
-        let _ = dispatch(state, &method, &tenant, &owner, claims, params).await;
+        let _ = dispatch(
+            state,
+            &method,
+            &tenant,
+            &owner,
+            claims,
+            negotiated_extensions,
+            params,
+        )
+        .await;
         return axum::http::StatusCode::NO_CONTENT.into_response();
     }
 
@@ -264,6 +282,10 @@ async fn jsonrpc_dispatch_inner(
         if let Some(c) = claims.clone() {
             session_ctx.extensions.insert("claims".to_string(), c);
         }
+        session_ctx.extensions.insert(
+            "activatedExtensions".to_string(),
+            json!(negotiated_extensions),
+        );
 
         let mut dispatcher = turul_rpc::JsonRpcDispatcher::<A2aError>::new();
         dispatcher.set_default_handler(A2aJsonRpcHandler {
@@ -285,7 +307,16 @@ async fn jsonrpc_dispatch_inner(
     }
 
     // Fallback: direct dispatch for unknown methods and non-i64 numeric ids.
-    let result = dispatch(state, &method, &tenant, &owner, claims, params).await;
+    let result = dispatch(
+        state,
+        &method,
+        &tenant,
+        &owner,
+        claims,
+        negotiated_extensions,
+        params,
+    )
+    .await;
 
     match result {
         Ok(value) => {
@@ -309,7 +340,7 @@ async fn jsonrpc_dispatch_inner(
 /// table. The outer handler (`jsonrpc_dispatch_handler`) guarantees by
 /// construction that `method` is a known non-streaming A2A method, that
 /// `params` is `RequestParams::Object`, and that `session_context` carries
-/// tenant/owner/claims under those keys.
+/// tenant/owner/claims/activatedExtensions under those keys.
 struct A2aJsonRpcHandler {
     state: AppState,
 }
@@ -338,6 +369,11 @@ impl turul_rpc::JsonRpcHandler for A2aJsonRpcHandler {
             .unwrap_or("")
             .to_string();
         let claims = ctx.extensions.get("claims").cloned();
+        let activated_extensions: std::collections::HashSet<String> = ctx
+            .extensions
+            .get("activatedExtensions")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
 
         let params_value = match params {
             Some(turul_rpc::RequestParams::Object(map)) => Value::Object(map.into_iter().collect()),
@@ -350,6 +386,7 @@ impl turul_rpc::JsonRpcHandler for A2aJsonRpcHandler {
             &tenant,
             &owner,
             claims,
+            &activated_extensions,
             params_value,
         )
         .await
@@ -362,10 +399,13 @@ async fn dispatch(
     tenant: &str,
     owner: &str,
     claims: Option<serde_json::Value>,
+    activated_extensions: &std::collections::HashSet<String>,
     params: Value,
 ) -> Result<Value, A2aError> {
     match method {
-        methods::SEND_MESSAGE => dispatch_send_message(state, tenant, owner, claims, params).await,
+        methods::SEND_MESSAGE => {
+            dispatch_send_message(state, tenant, owner, claims, activated_extensions, params).await
+        }
         methods::GET_TASK => dispatch_get_task(state, tenant, owner, params).await,
         methods::LIST_TASKS => dispatch_list_tasks(state, tenant, owner, params).await,
         methods::CANCEL_TASK => dispatch_cancel_task(state, tenant, owner, params).await,
@@ -401,12 +441,22 @@ async fn dispatch_streaming(
     tenant: &str,
     owner: &str,
     claims: Option<serde_json::Value>,
+    activated_extensions: &std::collections::HashSet<String>,
     params: Value,
     request_id: Value,
 ) -> Result<axum::response::Response, A2aError> {
     match method {
         methods::SEND_STREAMING_MESSAGE => {
-            dispatch_send_streaming_message(state, tenant, owner, claims, params, request_id).await
+            dispatch_send_streaming_message(
+                state,
+                tenant,
+                owner,
+                claims,
+                activated_extensions,
+                params,
+                request_id,
+            )
+            .await
         }
         methods::SUBSCRIBE_TO_TASK => {
             dispatch_subscribe_to_task(state, tenant, owner, params, request_id).await
@@ -420,11 +470,19 @@ async fn dispatch_send_streaming_message(
     tenant: &str,
     owner: &str,
     claims: Option<serde_json::Value>,
+    activated_extensions: &std::collections::HashSet<String>,
     params: Value,
     request_id: Value,
 ) -> Result<axum::response::Response, A2aError> {
-    let stream =
-        crate::router::open_send_stream(state, tenant, owner, claims, params.to_string()).await?;
+    let stream = crate::router::open_send_stream(
+        state,
+        tenant,
+        owner,
+        claims,
+        activated_extensions,
+        params.to_string(),
+    )
+    .await?;
     Ok(jsonrpc_sse_response(stream, request_id))
 }
 
@@ -476,6 +534,7 @@ async fn dispatch_send_message(
     tenant: &str,
     owner: &str,
     claims: Option<serde_json::Value>,
+    activated_extensions: &std::collections::HashSet<String>,
     params: Value,
 ) -> Result<Value, A2aError> {
     let body = serde_json::to_string(&params).map_err(|e| A2aError::InvalidRequest {
@@ -483,7 +542,8 @@ async fn dispatch_send_message(
     })?;
     // Reuse the core handler, which returns Json<Value> with SendMessageResponse shape
     let Json(response) =
-        crate::router::core_send_message(state, tenant, owner, claims, body).await?;
+        crate::router::core_send_message(state, tenant, owner, claims, activated_extensions, body)
+            .await?;
     Ok(response)
 }
 
@@ -546,10 +606,8 @@ async fn dispatch_cancel_task(
 }
 
 async fn dispatch_get_extended_agent_card(state: AppState) -> Result<Value, A2aError> {
-    match state.executor.extended_agent_card(None) {
-        Some(card) => Ok(serde_json::to_value(card).unwrap_or_default()),
-        None => Err(A2aError::ExtendedAgentCardNotConfigured),
-    }
+    let card = crate::router::core_get_extended_agent_card(&state)?;
+    Ok(serde_json::to_value(card).unwrap_or_default())
 }
 
 async fn dispatch_create_push_config(

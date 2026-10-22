@@ -44,7 +44,7 @@ impl AgentExecutor for DummyExecutor {
         Ok(())
     }
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
-        turul_a2a_proto::AgentCard::default()
+        push_and_streaming_card()
     }
 }
 
@@ -545,7 +545,7 @@ impl AgentExecutor for GatedExecutor {
             .map(|_| ())
     }
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
-        turul_a2a_proto::AgentCard::default()
+        push_and_streaming_card()
     }
 }
 
@@ -787,7 +787,7 @@ impl AgentExecutor for ArtifactsThenCompleteExecutor {
         ctx.events.complete(None).await.map(|_| ())
     }
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
-        turul_a2a_proto::AgentCard::default()
+        push_and_streaming_card()
     }
 }
 
@@ -865,4 +865,15 @@ async fn inline_push_config_on_blocking_send_delivers_one_terminal_post() {
 #[tokio::test]
 async fn inline_push_config_on_streaming_send_delivers_one_terminal_post() {
     inline_config_delivers_once("/message:stream").await;
+}
+
+fn push_and_streaming_card() -> turul_a2a_proto::AgentCard {
+    turul_a2a_proto::AgentCard {
+        capabilities: Some(turul_a2a_proto::AgentCapabilities {
+            streaming: Some(true),
+            push_notifications: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
