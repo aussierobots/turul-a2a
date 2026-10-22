@@ -1,18 +1,20 @@
-//! D3 durable streaming tests.
+//! Durable streaming tests.
 //!
-//! Verifies the core D3 guarantees under the upstream spec contract:
-//! - Subscribe first event is Task object (spec §3.1.6)
-//! - Terminal tasks return UnsupportedOperationError (spec §3.1.6)
-//! - Non-terminal subscribe replays stored events from durable store
-//! - Cross-instance subscriber/producer via shared store
-//! - No correctness dependence on same-instance broker delivery
+//! The durable event store, not the in-process broker, is the source of
+//! every streamed event:
+//! - subscribe opens with the Task snapshot (spec §3.1.6), and events
+//!   the snapshot already reflects are not sent again;
+//! - a subscriber on one instance receives events committed on another
+//!   through the shared store;
+//! - delivery does not depend on a same-instance broker wake-up.
+
+mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
 use http::Request;
-use http_body_util::BodyExt as _;
 use tower::ServiceExt;
 
 use turul_a2a::card_builder::AgentCardBuilder;
@@ -103,59 +105,9 @@ fn send_body(id: &str) -> String {
         .to_string()
 }
 
-/// Parse SSE events with IDs from raw text.
-fn parse_sse_events(text: &str) -> Vec<(Option<String>, serde_json::Value)> {
-    let mut events = Vec::new();
-    for chunk in text.split("\n\n") {
-        let chunk = chunk.trim();
-        if chunk.is_empty() {
-            continue;
-        }
-        let mut id = None;
-        let mut data = None;
-        for line in chunk.lines() {
-            if let Some(v) = line.strip_prefix("id:") {
-                id = Some(v.trim().to_string());
-            } else if let Some(v) = line.strip_prefix("data:")
-                && let Ok(j) = serde_json::from_str::<serde_json::Value>(v.trim())
-            {
-                data = Some(j);
-            }
-        }
-        if let Some(d) = data {
-            events.push((id, d));
-        }
-    }
-    events
-}
-
-async fn collect_sse(body: Body, timeout: Duration) -> Vec<(Option<String>, serde_json::Value)> {
-    let mut body = body;
-    let mut buf = String::new();
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-
-        match tokio::time::timeout(remaining, body.frame()).await {
-            Ok(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    buf.push_str(&String::from_utf8_lossy(data));
-                }
-            }
-            _ => break, // timeout, error, or stream ended
-        }
-    }
-
-    parse_sse_events(&buf)
-}
-
-/// Create a non-terminal task with stored events via atomic store.
-/// Returns (task_id, number_of_events_stored).
-async fn create_non_terminal_task(state: &AppState, task_id: &str) -> usize {
+/// Create a WORKING task with its SUBMITTED and WORKING events stored
+/// through the atomic store.
+async fn create_non_terminal_task(state: &AppState, task_id: &str) {
     let task = Task::new(task_id, TaskStatus::new(TaskState::Submitted))
         .with_context_id(format!("ctx-{task_id}"));
 
@@ -190,8 +142,6 @@ async fn create_non_terminal_task(state: &AppState, task_id: &str) -> usize {
         )
         .await
         .unwrap();
-
-    2 // SUBMITTED + WORKING
 }
 
 // =========================================================
@@ -203,81 +153,25 @@ async fn d3_subscribe_first_event_is_task_object() {
     let state = single_instance_state();
     create_non_terminal_task(&state, "d3-first-1").await;
 
+    // The router (and so the server state) stays alive for the
+    // stream's lifetime, as in a running server.
     let router = build_router(state);
     let req = Request::get("/tasks/d3-first-1:subscribe")
         .header("a2a-version", "1.0")
         .body(Body::empty())
         .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
 
-    let events = collect_sse(resp.into_body(), Duration::from_secs(3)).await;
-    assert!(!events.is_empty(), "Subscribe should emit events");
-
-    // First event MUST be a Task object (spec §3.1.6)
-    let (_, first) = &events[0];
-    assert!(
-        first.get("task").is_some(),
-        "First event MUST be Task object, got: {first}"
-    );
-    assert_eq!(first["task"]["id"], "d3-first-1");
-
-    // Subsequent events are stored StreamEvents from the durable store
-    if events.len() > 1 {
-        let (_, second) = &events[1];
-        assert!(
-            second.get("statusUpdate").is_some(),
-            "Events after Task snapshot should be stream events, got: {second}"
-        );
-    }
-}
-
-// =========================================================
-// D3-02: Terminal tasks return UnsupportedOperationError
-// =========================================================
-
-#[tokio::test]
-async fn d3_terminal_task_returns_error() {
-    let state = single_instance_state();
-
-    // Create and complete a task
-    create_non_terminal_task(&state, "d3-term-1").await;
-    let mut task = state
-        .task_storage
-        .get_task("", "d3-term-1", "anonymous", None)
+    // The snapshot already reflects the stored SUBMITTED and WORKING
+    // events, so it is the only item; the task stays WORKING, so the
+    // stream stays open.
+    let events = common::read_sse(resp.into_body(), Duration::from_secs(1))
         .await
-        .unwrap()
-        .unwrap();
-    task.complete();
-    state
-        .atomic_store
-        .update_task_with_events(
-            "",
-            "anonymous",
-            task,
-            vec![StreamEvent::StatusUpdate {
-                status_update: streaming::StatusUpdatePayload {
-                    task_id: "d3-term-1".to_string(),
-                    context_id: "ctx-d3-term-1".to_string(),
-                    status: serde_json::json!({"state": "TASK_STATE_COMPLETED"}),
-                },
-            }],
-        )
-        .await
-        .unwrap();
-
-    // Subscribe to terminal task → UnsupportedOperationError
-    let router = build_router(state);
-    let req = Request::get("/tasks/d3-term-1:subscribe")
-        .header("a2a-version", "1.0")
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "Terminal subscribe should return 400 (UnsupportedOperationError)"
-    );
+        .still_open();
+    assert_eq!(events.len(), 1, "snapshot only, got {events:?}");
+    assert_eq!(events[0]["task"]["id"], "d3-first-1");
+    assert_eq!(events[0]["task"]["status"]["state"], "TASK_STATE_WORKING");
 }
 
 /// After `delay`, commit INPUT_REQUIRED for `task_id` straight to the
@@ -332,11 +226,13 @@ async fn d3_cross_instance_subscriber_producer() {
     assert_eq!(resp.status(), 200);
     commit_input_required_later(&state_a, "d3-cross-1", Duration::from_millis(300));
 
-    let events = collect_sse(resp.into_body(), Duration::from_secs(5)).await;
+    let events = common::read_sse(resp.into_body(), Duration::from_secs(5))
+        .await
+        .closed();
     assert_eq!(events.len(), 2, "snapshot + A's event, got {events:?}");
-    assert_eq!(events[0].1["task"]["id"], "d3-cross-1");
+    assert_eq!(events[0]["task"]["id"], "d3-cross-1");
     assert_eq!(
-        events[1].1["statusUpdate"]["status"]["state"],
+        events[1]["statusUpdate"]["status"]["state"],
         "TASK_STATE_INPUT_REQUIRED"
     );
 }
@@ -361,10 +257,12 @@ async fn d3_no_broker_correctness_dependency() {
     // deliver it.
     commit_input_required_later(&state, "d3-nobroker-1", Duration::from_millis(300));
 
-    let events = collect_sse(resp.into_body(), Duration::from_secs(5)).await;
+    let events = common::read_sse(resp.into_body(), Duration::from_secs(5))
+        .await
+        .closed();
     assert_eq!(events.len(), 2, "snapshot + polled event, got {events:?}");
     assert_eq!(
-        events[1].1["statusUpdate"]["status"]["state"],
+        events[1]["statusUpdate"]["status"]["state"],
         "TASK_STATE_INPUT_REQUIRED"
     );
 }
@@ -383,27 +281,23 @@ async fn d3_streaming_send_reaches_terminal_through_the_store() {
         .header("a2a-version", "1.0")
         .body(Body::from(send_body("d3-stream-1")))
         .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
 
-    let events = collect_sse(resp.into_body(), Duration::from_secs(3)).await;
-    assert!(!events.is_empty(), "Streaming send should produce events");
-
+    let events = common::read_sse(resp.into_body(), Duration::from_secs(5))
+        .await
+        .closed();
     assert!(
-        events[0].1.get("task").is_some(),
-        "first item is the Task snapshot"
+        events[0].get("task").is_some(),
+        "first item is the Task snapshot, got {events:?}"
     );
-
-    // Should include terminal event
-    let has_terminal = events.iter().any(|(_, data)| {
-        data.get("statusUpdate")
-            .and_then(|su| su.get("status"))
-            .and_then(|s| s.get("state"))
-            .and_then(|s| s.as_str())
-            .is_some_and(|s| s == "TASK_STATE_COMPLETED")
-    });
-    assert!(
-        has_terminal,
-        "Stream should include terminal COMPLETED event"
+    let states: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e["statusUpdate"]["status"]["state"].as_str())
+        .collect();
+    assert_eq!(
+        states,
+        ["TASK_STATE_COMPLETED"],
+        "the stream ends with the terminal event"
     );
 }

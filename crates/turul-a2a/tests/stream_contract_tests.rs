@@ -15,6 +15,8 @@
 //!   contextId → inferred (§3.4.3), SUBMITTED / WORKING task →
 //!   InvalidRequest, and a follow-up while the previous turn's executor
 //!   is still running → UnsupportedOperation, with nothing written;
+//! - subscribing to a terminal task is UnsupportedOperation (§3.1.6),
+//!   to an unknown one TaskNotFound;
 //! - streams close on terminal states and INPUT_REQUIRED and stay open
 //!   across AUTH_REQUIRED;
 //! - artifact chunks keep `append` / `lastChunk` as stored.
@@ -816,6 +818,31 @@ async fn subscribe_to_an_input_required_task_yields_the_snapshot_and_closes() {
             snapshot(t, &items)["status"]["state"],
             "TASK_STATE_INPUT_REQUIRED",
             "{t:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn subscribe_to_a_terminal_or_unknown_task_is_refused() {
+    let h = harness().await;
+    for t in transports() {
+        let done = send(&h, t, message("m1", "hello", None, None))
+            .await
+            .unwrap();
+        let task_id = done["id"].as_str().unwrap();
+        let terminal = subscribe(&h, t, task_id, None).await.unwrap_err();
+        assert_failure(
+            t,
+            &terminal,
+            Expected::UnsupportedOperation,
+            "subscribe to a terminal task",
+        );
+        let unknown = subscribe(&h, t, "no-such-task", None).await.unwrap_err();
+        assert_failure(
+            t,
+            &unknown,
+            Expected::TaskNotFound,
+            "subscribe to an unknown task",
         );
     }
 }

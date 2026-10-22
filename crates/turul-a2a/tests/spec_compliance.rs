@@ -15,21 +15,22 @@
 //! | AgentCard (`/.well-known/...`)    |  ✅  |  n/a     |
 //! | GetExtendedAgentCard              |  ✅  |  ✅      |
 //! | SendMessage                       |  ✅  |  ✅      |
-//! | SendStreamingMessage              |  ✅  |  see SSE suite |
+//! | SendStreamingMessage              |  ✅  |  see stream contract suite |
 //! | GetTask                           |  ✅  |  ✅      |
 //! | ListTasks                         |  ✅  |  ✅      |
 //! | CancelTask                        |  ✅  |  ✅      |
-//! | SubscribeToTask (terminal-400)    |  ✅  |  see SSE suite |
+//! | SubscribeToTask (terminal-400)    |  ✅  |  see stream contract suite |
 //! | CreateTaskPushNotificationConfig  |  ✅  |  ✅      |
 //! | GetTaskPushNotificationConfig     |  ✅  |  ✅      |
 //! | ListTaskPushNotificationConfigs   |  ✅  |  ✅      |
 //! | DeleteTaskPushNotificationConfig  |  ✅  |  ✅      |
 //!
 //! AgentCard discovery is HTTP-only by spec — there is no JSON-RPC
-//! equivalent for the `.well-known` URL. Live-subscription sequencing
-//! for `SendStreamingMessage` + `SubscribeToTask` is exercised in the
-//! dedicated streaming suites (`sse_tests.rs`, `d3_streaming_tests.rs`);
-//! this file asserts only the "terminal-task subscribe returns
+//! equivalent for the `.well-known` URL. Stream sequencing for
+//! `SendStreamingMessage` + `SubscribeToTask` — first event is the Task,
+//! close policy, send-target rules — runs on HTTP, JSON-RPC and gRPC
+//! against one server in `stream_contract_tests.rs`; this file asserts
+//! the streaming response shape and the "terminal-task subscribe returns
 //! UnsupportedOperationError" contract (A2A spec §3.1.6).
 //!
 //! For each operation we assert:
@@ -47,6 +48,8 @@
 //! wiremock. Push-notification *delivery* wire mechanics are out of
 //! scope here and are covered by `push_dispatcher_server_tests.rs`;
 //! this file exercises the push *CRUD* surface.
+
+mod common;
 
 use std::collections::HashMap;
 
@@ -1030,7 +1033,9 @@ mod adr015_grpc_roundtrip {
     use tonic::Request;
     use turul_a2a_proto::grpc::A2aServiceClient;
 
-    async fn spawn_grpc() -> (SocketAddr, JoinHandle<()>) {
+    /// One server: the HTTP router, and gRPC served on the returned
+    /// address.
+    async fn spawn_grpc() -> (axum::Router, SocketAddr, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         let server = A2aServer::builder()
@@ -1038,22 +1043,22 @@ mod adr015_grpc_roundtrip {
             .storage(InMemoryA2aStorage::new())
             .bind(([127, 0, 0, 1], 0))
             .build()
-            .expect("grpc server build");
-        let router = server.into_tonic_router();
+            .expect("server build");
+        let (http_router, grpc_router) = server.into_routers();
         let handle = tokio::spawn(async move {
-            let _ = router
+            let _ = grpc_router
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await;
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        (addr, handle)
+        crate::common::wait_grpc_ready(addr).await;
+        (http_router, addr, handle)
     }
 
     /// gRPC `A2AService.GetExtendedAgentCard` arm of the extended-card
     /// skill-requirements round-trip parity check.
     #[tokio::test]
     async fn adr015_extended_card_skill_requirements_roundtrip_over_grpc() {
-        let (addr, _handle) = spawn_grpc().await;
+        let (http_router, addr, _handle) = spawn_grpc().await;
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
             .expect("endpoint")
             .connect()
@@ -1070,13 +1075,7 @@ mod adr015_grpc_roundtrip {
         let card_json = serde_json::to_value(&resp).expect("serialize proto card");
         let grpc_reqs = skill_requirements_of(&card_json);
 
-        // Fetch the public card via HTTP for parity.
-        let http_router = A2aServer::builder()
-            .executor(Adr015RoundtripExecutor)
-            .storage(InMemoryA2aStorage::new())
-            .build()
-            .expect("http server build")
-            .into_router();
+        // Fetch the public card via HTTP from the same server.
         let (status, _, public_card) = http_call(
             http_router,
             Method::GET,
@@ -1142,14 +1141,20 @@ async fn send_streaming_message_returns_text_event_stream() {
         ct.starts_with("text/event-stream"),
         "streaming response must use text/event-stream; got {ct}"
     );
-    // Drain a small prefix of the SSE body to prove we got a real
-    // event stream — full sequencing semantics are covered in
-    // `sse_tests.rs` and `d3_streaming_tests.rs`.
-    let body = resp.into_body().collect().await.unwrap().to_bytes();
-    let prefix = std::str::from_utf8(&body).unwrap_or("");
+    // The stream opens with the Task (spec §3.1.2) and ends after the
+    // terminal event; full sequencing semantics are covered in
+    // `stream_contract_tests.rs`.
+    let events = common::read_sse(resp.into_body(), std::time::Duration::from_secs(5))
+        .await
+        .closed();
     assert!(
-        prefix.contains("data:"),
-        "SSE body must contain at least one `data:` line, got: {prefix}"
+        events[0].get("task").is_some(),
+        "first event must be the Task, got {events:?}"
+    );
+    assert_eq!(
+        events.last().unwrap()["statusUpdate"]["status"]["state"],
+        "TASK_STATE_COMPLETED",
+        "the terminal event is last, got {events:?}"
     );
 }
 
@@ -1181,31 +1186,6 @@ mod grpc_parity {
     use tonic_types::StatusExt;
     use turul_a2a_proto::grpc::A2aServiceClient;
 
-    /// Stand up a tonic server that shares the given
-    /// `InMemoryA2aStorage` with the provided axum compliance router
-    /// (built from the SAME storage Arc-clone). Returns the bound
-    /// address and the server join handle — caller aborts on drop.
-    async fn spawn_grpc(storage: InMemoryA2aStorage) -> (SocketAddr, JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind ephemeral port");
-        let addr = listener.local_addr().expect("local_addr");
-        let server = A2aServer::builder()
-            .executor(ComplianceAgent)
-            .storage(storage)
-            .bind(([127, 0, 0, 1], 0))
-            .build()
-            .expect("grpc compliance server");
-        let router = server.into_tonic_router();
-        let handle = tokio::spawn(async move {
-            let _ = router
-                .serve_with_incoming(TcpListenerStream::new(listener))
-                .await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        (addr, handle)
-    }
-
     async fn grpc_client(addr: SocketAddr) -> A2aServiceClient<tonic::transport::Channel> {
         let ch = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
             .expect("endpoint")
@@ -1215,17 +1195,27 @@ mod grpc_parity {
         A2aServiceClient::new(ch)
     }
 
-    /// Build a fresh compliance axum router and a gRPC server against
-    /// the same `InMemoryA2aStorage`. Both transports share state.
+    /// One compliance `A2aServer` serving HTTP + JSON-RPC (the returned
+    /// router) and gRPC (on the returned address) over one shared
+    /// state. The caller holds the join handle for the test's lifetime.
     async fn dual_transport_harness() -> (axum::Router, SocketAddr, JoinHandle<()>) {
-        let shared = InMemoryA2aStorage::new();
-        let http_router = A2aServer::builder()
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let grpc_addr = listener.local_addr().expect("local_addr");
+        let server = A2aServer::builder()
             .executor(ComplianceAgent)
-            .storage(shared.clone())
+            .storage(InMemoryA2aStorage::new())
+            .bind(([127, 0, 0, 1], 0))
             .build()
-            .expect("http build")
-            .into_router();
-        let (grpc_addr, handle) = spawn_grpc(shared).await;
+            .expect("compliance server");
+        let (http_router, grpc_router) = server.into_routers();
+        let handle = tokio::spawn(async move {
+            let _ = grpc_router
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+        crate::common::wait_grpc_ready(grpc_addr).await;
         (http_router, grpc_addr, handle)
     }
 

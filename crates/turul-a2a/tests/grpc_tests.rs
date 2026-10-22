@@ -13,8 +13,9 @@
 //!     domain `"a2a-protocol.org"`.
 //!   * Both streaming RPCs open with the `Task` snapshot.
 //!   * Terminal-subscribe rejection as `FAILED_PRECONDITION`.
-//!   * `a2a-last-event-id` resume is covered with the other transports
-//!     in `stream_contract_tests.rs`.
+//!   * Reconnecting with `a2a-last-event-id` (ignored: the stream opens
+//!     with the snapshot) is covered with the other transports in
+//!     `stream_contract_tests.rs`.
 //!   * Tenant precedence (proto wins over metadata). Helper-level unit
 //!     tests already cover the rule; this suite adds one end-to-end
 //!     check that scoping lands in the right tenant.
@@ -22,6 +23,8 @@
 //!     `UNAUTHENTICATED`).
 
 #![cfg(feature = "grpc")]
+
+mod common;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -180,9 +183,7 @@ impl Harness {
                 .await;
         });
 
-        // Give tonic a tick to begin accepting. 50 ms is plenty on
-        // loopback; avoids flaky "connection refused" on the first RPC.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        common::wait_grpc_ready(addr).await;
 
         Self { addr, handle }
     }
@@ -492,12 +493,13 @@ async fn grpc_send_streaming_message_to_terminal() {
         .expect("ok")
         .into_inner();
 
-    let events: Vec<_> = stream
-        .take_while(|r| futures::future::ready(r.is_ok()))
-        .collect::<Vec<_>>()
+    // Every item must be Ok: a Status arriving mid-stream fails the
+    // test rather than silently ending the collection.
+    let events: Vec<_> = tokio::time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
         .await
+        .expect("stream closes after the terminal event")
         .into_iter()
-        .map(|r| r.unwrap())
+        .map(|r| r.expect("no mid-stream Status"))
         .collect();
 
     assert!(!events.is_empty(), "stream produced no events");

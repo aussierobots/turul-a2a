@@ -3,6 +3,8 @@
 //! Reuses the same core handler logic as HTTP routes.
 //! Tests verify exact method names, response envelopes, and error mappings.
 
+mod common;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -453,45 +455,11 @@ async fn null_params_treated_as_empty_object() {
 // JSON-RPC Streaming Tests
 // =========================================================
 
-/// Collect SSE events from a streaming response body with a timeout.
-async fn collect_jsonrpc_sse(body: Body, timeout: std::time::Duration) -> Vec<serde_json::Value> {
-    let mut body = body;
-    let mut buf = String::new();
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-
-        match tokio::time::timeout(remaining, http_body_util::BodyExt::frame(&mut body)).await {
-            Ok(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    buf.push_str(&String::from_utf8_lossy(data));
-                }
-            }
-            _ => break,
-        }
-    }
-
-    // Parse SSE data lines as JSON
-    let mut events = Vec::new();
-    for chunk in buf.split("\n\n") {
-        for line in chunk.lines() {
-            if let Some(data) = line.strip_prefix("data:")
-                && let Ok(json) = serde_json::from_str::<serde_json::Value>(data.trim())
-            {
-                events.push(json);
-            }
-        }
-    }
-    events
-}
-
 #[tokio::test]
 async fn jsonrpc_send_streaming_message_returns_sse_with_envelopes() {
     let state = test_state();
+    // Kept alive for the stream's lifetime, so its end is the server's
+    // decision.
     let router = build_router(state);
 
     let req_body = serde_json::json!({
@@ -515,7 +483,7 @@ async fn jsonrpc_send_streaming_message_returns_sse_with_envelopes() {
         .body(Body::from(req_body))
         .unwrap();
 
-    let resp = router.oneshot(req).await.unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
 
     let content_type = resp
@@ -528,8 +496,13 @@ async fn jsonrpc_send_streaming_message_returns_sse_with_envelopes() {
         "JSON-RPC streaming should return text/event-stream, got: {content_type}"
     );
 
-    let events = collect_jsonrpc_sse(resp.into_body(), std::time::Duration::from_secs(3)).await;
-    assert!(!events.is_empty(), "Should receive streaming events");
+    let events = common::read_sse(resp.into_body(), std::time::Duration::from_secs(5))
+        .await
+        .closed();
+    assert!(
+        events[0]["result"].get("task").is_some(),
+        "the first event is the Task snapshot, got {events:?}"
+    );
 
     // Every event should be a JSON-RPC envelope with the original request id
     for (i, event) in events.iter().enumerate() {
@@ -547,16 +520,12 @@ async fn jsonrpc_send_streaming_message_returns_sse_with_envelopes() {
         );
     }
 
-    // Should see terminal event (COMPLETED)
-    let has_completed = events.iter().any(|e| {
-        e["result"]
-            .get("statusUpdate")
-            .and_then(|su| su.get("status"))
-            .and_then(|s| s.get("state"))
-            .and_then(|s| s.as_str())
-            .is_some_and(|s| s == "TASK_STATE_COMPLETED")
-    });
-    assert!(has_completed, "Stream should include COMPLETED event");
+    // The stream ends with the terminal COMPLETED event.
+    let states: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e["result"]["statusUpdate"]["status"]["state"].as_str())
+        .collect();
+    assert_eq!(states, ["TASK_STATE_COMPLETED"]);
 }
 
 #[tokio::test]
@@ -604,7 +573,8 @@ async fn jsonrpc_subscribe_to_task_returns_task_snapshot_first() {
         .await
         .unwrap();
 
-    // Subscribe via JSON-RPC
+    // Subscribe via JSON-RPC; the router (and so the server state)
+    // stays alive for the stream's lifetime.
     let router = build_router(state);
     let req_body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -621,12 +591,15 @@ async fn jsonrpc_subscribe_to_task_returns_task_snapshot_first() {
         .body(Body::from(req_body))
         .unwrap();
 
-    let resp = router.oneshot(req).await.unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
 
-    let events = collect_jsonrpc_sse(resp.into_body(), std::time::Duration::from_secs(3)).await;
     // The snapshot already reflects the stored SUBMITTED and WORKING
-    // events, so neither is replayed after it.
+    // events, so neither is replayed after it; the task stays WORKING,
+    // so the stream stays open.
+    let events = common::read_sse(resp.into_body(), std::time::Duration::from_secs(1))
+        .await
+        .still_open();
     assert_eq!(events.len(), 1, "snapshot only, got {events:?}");
 
     // First event should be Task snapshot in JSON-RPC envelope
@@ -686,9 +659,10 @@ async fn jsonrpc_subscribe_terminal_task_returns_error() {
 
     let (_, body) = jsonrpc_call(router, &req_body).await;
 
-    // Should get JSON-RPC error (UnsupportedOperation), not an SSE stream
-    assert!(
-        body.get("error").is_some(),
-        "Terminal subscribe should return error: {body}"
-    );
+    // A JSON-RPC UnsupportedOperationError (spec §3.1.6, §5.4), not an
+    // SSE stream.
+    assert_eq!(body["id"], 88, "{body}");
+    assert_eq!(body["error"]["code"], -32004, "{body}");
+    assert_eq!(body["error"]["data"][0]["reason"], "UNSUPPORTED_OPERATION");
+    assert_eq!(body["error"]["data"][0]["domain"], "a2a-protocol.org");
 }
