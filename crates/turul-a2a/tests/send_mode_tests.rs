@@ -584,12 +584,15 @@ async fn blocking_send_hard_timeout_actually_aborts_executor() {
 // CancelTask on another instance (sharing the store) force-commits
 // CANCELED. That commit does not fire this instance's yielded signal,
 // so the blocking send reaches the hard deadline, its FAILED write gets
-// `TerminalStateAlreadySet`, and it returns the persisted CANCELED.
+// `TerminalStateAlreadySet`, and it returns the persisted CANCELED. The
+// executor overran the hard deadline either way, so it is aborted.
 // ---------------------------------------------------------------------------
 
 /// Reports when it observes the cancellation token, then ignores it.
+/// Holds `alive` inside its future so the test can see it dropped.
 struct ObservesThenIgnoresCancel {
     observed: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>,
+    alive: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 #[async_trait]
@@ -600,6 +603,7 @@ impl AgentExecutor for ObservesThenIgnoresCancel {
         _msg: &Message,
         ctx: &ExecutionContext,
     ) -> Result<(), A2aError> {
+        let _alive = self.alive.lock().expect("alive mutex").take();
         ctx.cancellation.cancelled().await;
         if let Some(tx) = self.observed.lock().expect("observed mutex").take() {
             let _ = tx.send(task.id().to_string());
@@ -618,8 +622,10 @@ async fn blocking_send_hard_deadline_loses_cas_to_concurrent_cancel_returns_canc
     let grace = Duration::from_millis(80);
     let storage = InMemoryA2aStorage::new();
     let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+    let (mut alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
     let executor = Arc::new(ObservesThenIgnoresCancel {
         observed: std::sync::Mutex::new(Some(observed_tx)),
+        alive: std::sync::Mutex::new(Some(alive_rx)),
     });
     let mut state_a = state_on(storage.clone(), executor);
     state_a.runtime_config.blocking_task_timeout = soft;
@@ -681,6 +687,12 @@ async fn blocking_send_hard_deadline_loses_cas_to_concurrent_cancel_returns_canc
         vec![TaskState::Canceled],
         "no FAILED ever persists"
     );
+
+    // The executor never returns on its own; only the hard-deadline abort
+    // drops its future. On the paused clock the timeout is a hang guard.
+    tokio::time::timeout(Duration::from_secs(2), alive_tx.closed())
+        .await
+        .expect("executor that overran the hard deadline must be aborted");
 }
 
 // ---------------------------------------------------------------------------
