@@ -83,4 +83,4 @@ pub mod server;
 pub mod storage;
 pub mod streaming;
 
-pub use server::A2aServer;
+pub use server::{A2aServer, BoundA2aServer};

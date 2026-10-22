@@ -1,12 +1,13 @@
 //! Offline smoke test for the planner-router example agent.
 //!
-//! Runs the already-built agent binary (`CARGO_BIN_EXE_*`) on a free
+//! Runs the already-built agent binary (`CARGO_BIN_EXE_*`) on an OS-assigned
 //! loopback port per test (parallel-safe, no nested `cargo run`) and
 //! verifies both planner routes plus the no-rule-matched fallback.
 //! No network egress — the agent has no external deps.
 
+use std::io::{BufRead, BufReader};
+use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -26,27 +27,32 @@ impl Drop for AgentGuard {
     }
 }
 
-/// A port the OS reports free right now, never handed out twice in this
-/// test binary (its tests run in parallel). The listener is dropped
-/// before the agent binds the port.
-fn free_port() -> u16 {
-    static ISSUED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
-    let mut issued = ISSUED.lock().expect("port registry");
-    loop {
-        let port = std::net::TcpListener::bind("0.0.0.0:0")
-            .and_then(|l| l.local_addr())
-            .expect("reserve free port")
-            .port();
-        if !issued.contains(&port) {
-            issued.push(port);
-            return port;
+/// Read the agent's stdout until it reports the address it bound
+/// (`... listening on http://<addr>`). The agent binds port 0, so the OS
+/// assigns a port no other process holds. The reader thread keeps draining
+/// stdout afterwards so the agent never blocks on a full pipe.
+async fn bound_port(child: &mut Child) -> u16 {
+    let stdout = child.stdout.take().expect("agent stdout is piped");
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut tx = Some(tx);
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some((_, addr)) = line.split_once(" listening on http://")
+                && let Ok(addr) = addr.parse::<SocketAddr>()
+                && let Some(tx) = tx.take()
+            {
+                let _ = tx.send(addr.port());
+            }
         }
-    }
+    });
+    tokio::time::timeout(Duration::from_secs(15), rx)
+        .await
+        .expect("agent reported its bound address within 15s")
+        .expect("agent exited before reporting its bound address")
 }
 
 /// Poll the agent card until this test's own child serves it. Fails fast
-/// if the child exits (for example because its port was taken in the
-/// meantime) and refuses a card served by a different listener.
+/// if the child exits and refuses a card served by a different listener.
 async fn wait_until_ready(guard: &mut AgentGuard) {
     let url = format!("{}/.well-known/agent-card.json", guard.base);
     for _ in 0..150 {
@@ -69,17 +75,18 @@ async fn wait_until_ready(guard: &mut AgentGuard) {
 }
 
 async fn spawn_agent() -> AgentGuard {
-    let port = free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_agent-role-planner-router-agent"))
-        .env("A2A_PORT", port.to_string())
-        .stdout(Stdio::null())
+        .env("A2A_PORT", "0")
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn agent");
     let mut guard = AgentGuard {
         child,
-        base: format!("http://127.0.0.1:{port}"),
+        base: String::new(),
     };
+    let port = bound_port(&mut guard.child).await;
+    guard.base = format!("http://127.0.0.1:{port}");
     wait_until_ready(&mut guard).await;
     guard
 }

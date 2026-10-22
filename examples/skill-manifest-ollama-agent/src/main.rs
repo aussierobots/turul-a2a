@@ -445,9 +445,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = A2aServer::builder()
         .executor(executor)
         .bind(([0, 0, 0, 0], port))
-        .build()?;
+        .build()?
+        .bind()
+        .await?;
 
-    println!("Skill Manifest Ollama Agent listening on http://0.0.0.0:{port}");
+    // The address actually bound: `A2A_PORT=0` lets the OS pick a free
+    // port, and the smoke tests read it from this line.
+    let port = server.local_addr().port();
+    println!(
+        "Skill Manifest Ollama Agent listening on http://{}",
+        server.local_addr()
+    );
     println!("Mode: {mode}");
     println!("Agent card: http://localhost:{port}/.well-known/agent-card.json");
     println!();
