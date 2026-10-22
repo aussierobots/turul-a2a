@@ -195,7 +195,7 @@ This is correct-by-design, not a bug. The alternative (exactly-once) requires ei
 When a delivery gives up after `push_max_attempts`, the claim record transitions to status `GaveUp` and is **retained for inspection**:
 
 - **Where**: the same `a2a_push_deliveries` table/region as active claims. No separate dead-letter table.
-- **Retention**: no backend prunes claim rows today. `push_failed_delivery_retention` (default 7 days) is accepted by the builder but nothing reads it (amended 2026-10-22).
+- **Retention**: the framework never prunes claim rows. DynamoDB expires them through its own item TTL (`DynamoDbConfig::push_delivery_ttl_seconds`, default 7 days); the SQL and in-memory backends keep them. `push_failed_delivery_retention` (default 7 days) is accepted by the builder but nothing reads it (amended 2026-10-22).
 - **Fields stored** (beyond the claim basics):
   - `first_attempted_at` — when the first POST was tried.
   - `last_attempted_at` — when the final POST failed.
@@ -473,7 +473,7 @@ Framework-enforced production protections:
 
 4. **Timeouts** (each configurable):
    - `push_connect_timeout`: 5 seconds default. Fails fast on unreachable hosts.
-   - `push_read_timeout`: 30 seconds default. Hard cap on receiving response.
+   - `push_read_timeout`: accepted, no effect (amended 2026-10-22). The read phase is bounded by `push_request_timeout`.
    - Total timeout (connect + TLS + write + read): enforced by `push_request_timeout` (already defined), 30s default.
 
 5. **Request body size cap**: `push_max_payload_bytes`, 1 MiB default. If the serialized Task exceeds this, the delivery records `PayloadTooLarge` (§5b error class) and is given up without POSTing. Prevents the framework from spraying multi-MB payloads at webhooks that can't handle them and from consuming excessive network bandwidth on chunk-heavy tasks.
@@ -533,3 +533,4 @@ Framework-enforced production protections:
 
 - 2026-10-22 — Proposed: §2 corrected to the terminal-only delivery the code has always had (it said all status updates). §3/§12/§13: body becomes the A2A v1.0.1 §4.3.3 `StreamResponse` envelope `{"task": <Task>}` with `Content-Type: application/a2a+json`, instead of a bare `Task`. `X-Turul-Push-Token` unchanged: the spec names no token header.
 - 2026-10-22 — Amended to what ships (maintainer decision), §2/§3 accepted and implemented. Removed promises with no code: §9 metrics and per-attempt logs (replaced by the tracing targets that exist), 429 `Retry-After` (§5), dispatcher panic sentinel/metric/respawn (§1, §6, R7), release-build WARN for `allow_insecure_push_urls` (R3.7), shared `reqwest::Client` (§6), config cache and claim retention (§5b, §11). Corrected: R5 payload-too-large is `GaveUp(PayloadTooLarge)`; R3.6 the allowlist hook runs before DNS and is not exposed by the server builders. Made true in code: §8 pre-attempt config/task re-read (spec §3.1.10), R3b non-https → `Abandoned(NonHttpsUrlInProduction)`, allowlist before DNS. §13 rewritten to the tests that pin shipped behaviour; #6, #15, #20, #22 dropped.
+- 2026-10-22 — R4 timeouts: `push_read_timeout` marked as accepted with no effect (the POST is bounded by `push_request_timeout`). Retention corrected: the framework never prunes claim rows, DynamoDB expires them by item TTL.

@@ -29,4 +29,4 @@ pub use claim::{
 };
 pub use dispatcher::PushDispatcher;
 pub use secret::{Secret, redact_in_str};
-pub use ssrf::{SsrfBlockReason, SsrfDecision, decide as ssrf_decide, is_blocked_ip};
+pub use ssrf::{SsrfBlockReason, SsrfDecision, is_blocked_ip};

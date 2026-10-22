@@ -948,7 +948,7 @@ pub async fn core_send_message(
         .map(|c| c.return_immediately)
         .unwrap_or(false);
 
-    // Bug 1: runtimes that cannot guarantee post-return
+    // Runtimes that cannot guarantee post-return
     // execution (e.g., AWS Lambda) refuse `return_immediately = true`
     // here — before any storage write — to avoid silently orphaning
     // the spawned executor. Mapped to HTTP 400 / JSON-RPC -32004 /
@@ -970,7 +970,7 @@ pub async fn core_send_message(
         });
     }
 
-    // Bug 3: extract SendMessageConfiguration.history_length
+    // Extract SendMessageConfiguration.history_length
     // preserving the proto tri-state — None=unbounded, Some(0)=empty,
     // Some(n>0)=last n (a2a.proto:150-154). Do NOT collapse Some(0) to
     // None; the storage layer's `trim_task` already differentiates
@@ -986,8 +986,8 @@ pub async fn core_send_message(
     let task_id = target.task_id.clone();
     let context_id = target.context_id.clone();
 
-    // §HTTP invocation step 3-4: if a durable executor queue
-    // is wired AND `return_immediately` is requested, build the
+    // If a durable executor queue is wired AND
+    // `return_immediately` is requested, build the
     // envelope and run `check_payload_size` BEFORE any storage write.
     // Oversize payloads return `A2aError::InvalidRequest` (HTTP 400 /
     // JSON-RPC -32602 / gRPC INVALID_ARGUMENT) with zero task
@@ -1027,15 +1027,15 @@ pub async fn core_send_message(
         register_inline_push_config(&state, tenant, owner, &target, cfg).await?;
     }
 
-    // §HTTP invocation step 7: if the durable executor path
-    // is active, enqueue the (already-built + size-checked) job and
-    // return the Working task. The executor is NOT spawned locally —
+    // If the durable executor path is active, enqueue the
+    // (already-built + size-checked) job and return the Working task.
+    // The executor is NOT spawned locally —
     // a separate invocation consumes the queue (SQS Lambda handler)
     // and runs the executor to terminal via
     // `run_executor_for_existing_task`.
     //
-    // Enqueue failure → FAILED compensation in the same shape as
-    // Bug 2 inline-push-config storage-failure compensation.
+    // Enqueue failure uses the same FAILED compensation as inline
+    // push-config registration failure (`fail_unstarted_task`).
     if let (Some(queue), Some(job)) = (durable_queue.as_ref(), durable_job) {
         match queue.enqueue(job).await {
             Ok(()) => {
@@ -1092,7 +1092,7 @@ pub async fn core_send_message(
         // background executor keeps running; the caller polls / streams
         // to observe completion.
         //
-        // Bug 3: `history_length` threaded through so the
+        // `history_length` is threaded through so the
         // storage-layer `trim_task` honours the proto tri-state
         // (a2a.proto:150-154).
         drop(spawn.yielded_rx);
@@ -1122,7 +1122,7 @@ pub async fn core_send_message(
     )
     .await?;
 
-    // Bug 3: if the caller supplied `history_length`, re-read
+    // If the caller supplied `history_length`, re-read
     // from storage so the same `trim_task` path that `GetTask` uses
     // applies to the send response. Skipping this when the field is
     // unset avoids an unnecessary storage round-trip on the default
@@ -1572,9 +1572,9 @@ pub(crate) async fn core_create_push_config(
         })?;
     config.task_id = task_id.to_string();
 
-    // §R1: URL must parse at CRUD time. The dispatcher used
-    // to silently skip unparseable URLs with no failed-delivery row,
-    // so an operator who mistyped the webhook had no feedback loop.
+    // The URL must parse at CRUD time: an unparseable URL can never be
+    // delivered, and rejecting it here gives the operator immediate
+    // feedback instead of a silent skip at delivery time.
     // Scheme (http/https) and SSRF checks still happen at delivery
     // time — those depend on runtime flags (`allow_insecure_push_urls`)
     // the CRUD call does not see.

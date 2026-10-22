@@ -682,8 +682,8 @@ fn turn_body(
     serde_json::json!({"message": message, "configuration": configuration}).to_string()
 }
 
-/// Run two INPUT_REQUIRED turns, then a third turn with `hl` and
-/// `return_immediately`. Returns the third response's history and
+/// Run three INPUT_REQUIRED turns, then a fourth turn with `hl` and
+/// `return_immediately`. Returns the fourth response's history and
 /// the task's full stored history afterwards.
 async fn continuation_history(
     hl: Option<i32>,
@@ -701,7 +701,7 @@ async fn continuation_history(
         .and_then(|v| v.as_str())
         .expect("task id")
         .to_string();
-    for text in ["two", "finish"] {
+    for text in ["two", "three", "finish"] {
         // A follow-up is accepted once the previous turn's executor
         // has returned.
         let start = std::time::Instant::now();
@@ -730,7 +730,11 @@ async fn continuation_history(
                 .iter()
                 .map(|m| serde_json::to_value(m).unwrap())
                 .collect::<Vec<_>>();
-            assert!(full.len() >= 3, "three user turns are in the history");
+            assert_eq!(
+                full.len(),
+                4,
+                "three prior user turns plus the current one are in the history"
+            );
             return (history, full);
         }
     }

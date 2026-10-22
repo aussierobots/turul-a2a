@@ -62,8 +62,7 @@ pub const PUSH_CONTENT_TYPE: &str = "application/a2a+json";
 
 /// Runtime-configurable delivery parameters.
 ///
-/// Defaults give a ~3-minute retry horizon (5 attempts with exponential
-/// backoff capped at 30s).
+/// Defaults: 8 attempts, exponential backoff from a 2s base capped at 60s.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct PushDeliveryConfig {
@@ -73,6 +72,8 @@ pub struct PushDeliveryConfig {
     pub backoff_jitter: f32,
     pub request_timeout: Duration,
     pub connect_timeout: Duration,
+    /// Accepted but currently unused: the read phase is bounded by
+    /// `request_timeout`.
     pub read_timeout: Duration,
     pub claim_expiry: Duration,
     pub max_payload_bytes: usize,
@@ -191,7 +192,8 @@ pub struct PushDeliveryWorker {
     pub instance_id: String,
     /// Pre-attempt existence checks. `None` skips them (a worker
     /// driven directly, without a dispatcher, has no stores to read).
-    pub target_lookup: Option<DeliveryTargetLookup>,
+    /// Set through [`Self::with_target_lookup`].
+    pub(crate) target_lookup: Option<DeliveryTargetLookup>,
 }
 
 impl PushDeliveryWorker {

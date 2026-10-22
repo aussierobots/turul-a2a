@@ -229,10 +229,11 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     ///   at `next_attempt_at`; the store does not dispatch retries.
     /// - `GaveUp { reason, last_error_class, last_http_status }` →
     ///   status transitions to `GaveUp`; the failure record is
-    ///   retained per `push_failed_delivery_retention`.
+    ///   retained until the backend expires it (DynamoDB item TTL)
+    ///   or the operator removes it; the framework never prunes it.
     ///   `list_failed_deliveries` surfaces it.
     /// - `Abandoned { reason }` → status transitions to `Abandoned`;
-    ///   the row is retained briefly for audit. `list_failed_deliveries`
+    ///   the row is retained for audit. `list_failed_deliveries`
     ///   does NOT surface `Abandoned` rows — nothing failed on the
     ///   delivery side, the surrounding context (config / task / URL
     ///   policy) caused the abandon.
@@ -285,13 +286,9 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     /// Returns the count of claim rows that currently satisfy the
     /// derivation above, so an adopter-run maintenance loop can
     /// alert on stuck-claim accumulation (the framework emits no
-    /// metric for it). Backends
-    /// MAY piggy-back retention cleanup of terminal claims past
-    /// `push_failed_delivery_retention` as a side effect of this
-    /// call, or handle retention via native mechanisms (e.g.,
-    /// DynamoDB TTL); the return value is the eligibility count
-    /// only, not a cleanup count. Terminal-status rows are never
-    /// counted regardless of age.
+    /// metric for it). The return value is the eligibility count
+    /// only; no first-party backend deletes terminal claims here.
+    /// Terminal-status rows are never counted regardless of age.
     async fn sweep_expired_claims(&self) -> Result<u64, A2aStorageError>;
 
     /// Enumerate expired-but-non-terminal claim rows so the server's
@@ -458,11 +455,10 @@ pub struct DeliveryClaim {
 /// - `GaveUp` — final failure after `push_max_attempts` OR a
 ///   pre-POST rejection that operators should see
 ///   (`SsrfBlocked`, `PayloadTooLarge`, `TlsRejected`). Row
-///   retained for operator inspection per
-///   `push_failed_delivery_retention`.
+///   retained for operator inspection.
 /// - `Abandoned` — terminal but not failed (config deleted, task
-///   deleted, non-HTTPS URL in production). Row retained briefly
-///   for audit; not surfaced by `list_failed_deliveries`.
+///   deleted, non-HTTPS URL in production). Row retained; not
+///   surfaced by `list_failed_deliveries`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ClaimStatus {

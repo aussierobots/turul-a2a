@@ -66,22 +66,28 @@ pub struct PushDispatcher {
 
 impl PushDispatcher {
     /// Every delivery this dispatcher runs re-reads its push config
-    /// and task from `push_storage` / `task_storage` before each POST
-    /// attempt and is abandoned once either is deleted.
+    /// and task before each POST attempt and is abandoned once either
+    /// is deleted. The reads go to `push_storage` / `task_storage`
+    /// unless the worker already carries its own
+    /// [`DeliveryTargetLookup`], which is kept.
     pub fn new(
         worker: Arc<PushDeliveryWorker>,
         push_storage: Arc<dyn A2aPushNotificationStorage>,
         task_storage: Arc<dyn A2aTaskStorage>,
     ) -> Self {
-        let worker = Arc::new(
+        let worker = if worker.target_lookup.is_some() {
             worker
-                .as_ref()
-                .clone()
-                .with_target_lookup(DeliveryTargetLookup {
-                    push_storage: push_storage.clone(),
-                    task_storage: task_storage.clone(),
-                }),
-        );
+        } else {
+            Arc::new(
+                worker
+                    .as_ref()
+                    .clone()
+                    .with_target_lookup(DeliveryTargetLookup {
+                        push_storage: push_storage.clone(),
+                        task_storage: task_storage.clone(),
+                    }),
+            )
+        };
         Self {
             worker,
             push_storage,
