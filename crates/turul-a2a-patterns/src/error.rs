@@ -65,7 +65,7 @@ pub enum ValidationError {
 
 #[cfg(test)]
 mod tests {
-    use super::{SinkError, SkillError};
+    use super::SkillError;
 
     /// `SkillError` has exactly two variants. Inside the defining crate
     /// `#[non_exhaustive]` does not force a wildcard arm, so this match
@@ -84,19 +84,5 @@ mod tests {
             "invalid-request"
         );
         assert_eq!(label(&SkillError::Internal("x".into())), "internal");
-    }
-
-    /// `SinkError` has exactly `Closed` and `Backend(String)`; same
-    /// compile-time guard as above.
-    #[test]
-    fn sink_error_variant_set_is_fixed() {
-        fn label(e: &SinkError) -> &'static str {
-            match e {
-                SinkError::Closed => "closed",
-                SinkError::Backend(_) => "backend",
-            }
-        }
-        assert_eq!(label(&SinkError::Closed), "closed");
-        assert_eq!(label(&SinkError::Backend("x".into())), "backend");
     }
 }

@@ -281,11 +281,12 @@ impl AgentExecutor for DispatcherExecutor {
         let (skill_id, params) = extract_dispatch_payload(message);
 
         let Some(skill_id) = skill_id else {
-            // Profile not activated (it is advertised as optional). When
-            // a client activates the profile without `a2a.skillId`, the
-            // framework rejects the request as InvalidParams before this
-            // executor runs, so this is the default, un-targeted path:
-            // fail the task with guidance.
+            // No `a2a.skillId`: the un-targeted path. The executor cannot
+            // see whether the client sent the activation header, so it
+            // routes on metadata alone. A client that did activate the
+            // profile without `a2a.skillId` never reaches here — the
+            // framework rejects that request as InvalidParams first.
+            // Fail the task with guidance.
             let metadata_keys = message.metadata_keys();
             task.fail(format!(
                 "Skill dispatch requires Message.metadata[\"{SKILL_ID_METADATA_KEY}\"] (string). \

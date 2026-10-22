@@ -63,8 +63,10 @@ struct RemoteDelegateExecutor {
 /// in the message). The delegate is the upstream's client, so it
 /// activates the skill-invocation profile itself whenever the message
 /// it forwards carries `a2a.skillId` routing metadata and the upstream
-/// advertises the profile. Without the header the upstream would treat
-/// the message as un-targeted and ignore the routing keys.
+/// advertises the profile. The header is what makes the upstream
+/// framework apply the profile (echo, request-shape check, and any
+/// required-extension rejection); whether the upstream executor also
+/// routes without it is that agent's choice.
 fn upstream_activations(message: &Message, upstream_card: &pb::AgentCard) -> Vec<String> {
     let targets_skill = message
         .metadata()
@@ -473,10 +475,7 @@ mod unit {
             .message
             .expect("outbound message present");
 
-        assert_eq!(
-            outbound.metadata.as_ref(),
-            inbound.as_proto().metadata.as_ref()
-        );
+        assert_eq!(outbound.metadata.as_ref(), inbound.metadata());
         assert_eq!(
             outbound.extensions,
             vec![SKILL_INVOCATION_PROFILE_V1.to_string()]

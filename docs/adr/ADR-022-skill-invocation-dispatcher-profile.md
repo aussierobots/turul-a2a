@@ -200,6 +200,18 @@ executor logic without skill dispatch. No error is returned for
 the absence of the header unless the extension was advertised as
 `required = true` (see §2.4).
 
+*Amended 2026-10-22.* What ships: the framework applies activation
+only at the router — echo, the §2.3 request-shape check, and (later)
+the §2.4 rejection. The negotiated extension set is **not** passed to
+the `AgentExecutor`; `ExecutionContext` carries no such field. An
+executor therefore cannot tell "header absent" from "header present"
+and routes on `Message.metadata` alone. The reference executor
+(`examples/skill-dispatch-profile-agent`) dispatches whenever
+`a2a.skillId` is present, header or not; "un-targeted" in practice
+means "no `a2a.skillId`". Making routing conditional on activation
+needs the negotiated set exposed on `ExecutionContext`, which is a
+separate decision (an additive public field) not taken here.
+
 **gRPC transport.** Per ADR-014, gRPC transport mirrors HTTP
 behaviour. The `A2A-Extensions` header is carried as a gRPC
 metadata key (lowercase) with the same comma-separated URI list.
@@ -620,3 +632,4 @@ a patterns-crate `SkillDispatchPayload` that was not built (§2.5).
 
 - 2026-10-22 — gRPC status for the missing-activation-header rejection corrected `UNIMPLEMENTED` → `FAILED_PRECONDITION`. The code has always returned `FAILED_PRECONDITION`; this aligns the ADR with the code and with the A2A v1.0.1 error-mapping table.
 - 2026-10-22 — Code and ADR reconciled on where the profile's rules live. The framework now enforces the §2.3 request shape on every send transport (HTTP blocking + streaming, JSON-RPC, gRPC): once the profile is negotiated, a missing or non-string `Message.metadata["a2a.skillId"]` is rejected as InvalidParams (`-32602` / HTTP 400 / gRPC `INVALID_ARGUMENT`) before any task is created. §2.5 point 5 ("passes to the registered dispatcher") amended: the framework owns no skill registry, so routing and unknown-id handling stay in the `AgentExecutor`. The reserved metadata keys are exported from `turul_a2a::profiles`. The acceptance-gates entry no longer claims `profile_dispatch_tests` pins routing; §7.2 maps each sketch case to its test and records cases 6-8 (patterns-crate `SkillDispatchPayload`) as not built.
+- 2026-10-22 — §2.2 no-header default amended to what ships: the negotiated extension set is not visible to the executor, so the reference executor routes on `a2a.skillId` whether or not the activation header was sent. Gating executor routing on activation requires exposing the negotiated set on `ExecutionContext` — an open decision.
