@@ -318,6 +318,12 @@ impl PushDispatcher {
         }
     }
 
+    /// Forget cached push-config presence for a task; see
+    /// [`PushDeliveryWorker::invalidate_push_configs`].
+    pub fn invalidate_push_configs(&self, tenant: &str, task_id: &str) {
+        self.worker.invalidate_push_configs(tenant, task_id);
+    }
+
     /// Handle back to the push-delivery store that the worker wraps.
     /// Exposed here so the fan-out path can write/delete the
     /// pending-dispatch marker without re-plumbing the trait object

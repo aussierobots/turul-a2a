@@ -1799,11 +1799,21 @@ async fn seed_task_and_config(
 }
 
 /// Worker with a target lookup on `store`, 500 ms between attempts so
-/// the test can delete something after the first POST.
+/// the test can delete something after the first POST. The config cache
+/// is off unless `config_cache_ttl` says otherwise, so a deletion made
+/// straight in storage is seen at the next attempt.
 fn live_worker(store: &Arc<InMemoryA2aStorage>) -> Arc<PushDeliveryWorker> {
+    live_worker_with_cache(store, Duration::ZERO)
+}
+
+fn live_worker_with_cache(
+    store: &Arc<InMemoryA2aStorage>,
+    config_cache_ttl: Duration,
+) -> Arc<PushDeliveryWorker> {
     let cfg = test_config(5, |c| {
         c.backoff_base = Duration::from_millis(500);
         c.backoff_cap = Duration::from_millis(500);
+        c.config_cache_ttl = config_cache_ttl;
     });
     Arc::new(
         PushDeliveryWorker::new(store.clone(), cfg, None, "instance-live".into())
@@ -1907,6 +1917,60 @@ async fn task_deleted_mid_retry_abandons_without_another_post() {
         DeliveryReport::Abandoned(AbandonedReason::TaskDeleted)
     );
     assert_eq!(posts, 1, "no POST after the task was deleted");
+}
+
+/// With the config cache on, a config confirmed present is not re-read
+/// within the TTL: a deletion made straight in storage (as another
+/// instance would) does not stop the next attempt. Invalidating the
+/// task's cached configs — what a deletion through this server does —
+/// makes the following attempt re-read, find the config gone and
+/// abandon.
+#[tokio::test]
+async fn cached_config_is_trusted_until_invalidated() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(InMemoryA2aStorage::new());
+    let cfg = seed_task_and_config(&store, &format!("{}/webhook", server.uri())).await;
+    let worker = live_worker_with_cache(&store, Duration::from_secs(3600));
+    let target =
+        PushTarget::from_config(LIVE_TENANT, LIVE_OWNER, &cfg.task_id, 1, &cfg).expect("target");
+
+    let delivery = {
+        let worker = worker.clone();
+        let target = target.clone();
+        tokio::spawn(async move { worker.deliver(&target, b"{}").await })
+    };
+    wait_until(Duration::from_secs(3), "the first POST", || async {
+        request_count(&server).await == 1
+    })
+    .await;
+    store
+        .delete_config(LIVE_TENANT, &cfg.task_id, &cfg.id)
+        .await
+        .expect("delete config");
+    wait_until(
+        Duration::from_secs(3),
+        "a POST from the cached config",
+        || async { request_count(&server).await == 2 },
+    )
+    .await;
+    worker.invalidate_push_configs(LIVE_TENANT, &cfg.task_id);
+
+    let report = delivery.await.expect("delivery task");
+    assert_eq!(
+        report,
+        DeliveryReport::Abandoned(AbandonedReason::ConfigDeleted)
+    );
+    assert_eq!(
+        request_count(&server).await,
+        2,
+        "no POST after invalidation"
+    );
 }
 
 // ---------------------------------------------------------------------------

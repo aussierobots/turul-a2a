@@ -991,3 +991,77 @@ async fn builder_outbound_url_validator_refuses_unlisted_webhooks() {
     assert_eq!(failed[0].last_error_class, DeliveryErrorClass::SSRFBlocked);
     assert_eq!(failed[0].delivery_attempt_count, 0, "never POSTed");
 }
+
+// ---------------------------------------------------------------------------
+// Push-config cache invalidation on delete through the server.
+// ---------------------------------------------------------------------------
+
+/// With a config cache TTL far longer than the test, deleting the push
+/// config through the server's HTTP surface still stops an in-flight
+/// delivery at its next attempt (A2A v1.0.1 §3.1.10): the delete drops
+/// the cached config, so the worker re-reads and abandons.
+#[tokio::test]
+async fn deleting_a_config_through_the_server_stops_a_cached_delivery() {
+    use turul_a2a::push::A2aPushDeliveryStore;
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock)
+        .await;
+
+    let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
+    let server = A2aServer::builder()
+        .executor(PushCapableExecutor)
+        .storage(storage.clone())
+        .push_delivery_store(storage.clone())
+        .allow_insecure_push_urls(true)
+        .cancel_handler_grace(Duration::from_millis(50))
+        .cancel_handler_poll_interval(Duration::from_millis(10))
+        .push_max_attempts(5)
+        .push_backoff_base(Duration::from_millis(500))
+        .push_backoff_cap(Duration::from_millis(500))
+        .push_backoff_jitter(0.0)
+        .push_claim_expiry(Duration::from_secs(30))
+        .push_config_cache_ttl(Duration::from_secs(3600))
+        .build()
+        .expect("server build");
+    let router = server.into_router();
+
+    let task_id = "task-server-push-cache";
+    seed_working_task(&storage, task_id).await;
+    create_push_config(
+        &router,
+        task_id,
+        "cfg-cached",
+        &format!("{}/hook", mock.uri()),
+    )
+    .await;
+    cancel_task(&router, task_id).await;
+    await_exactly_n_requests(&mock, 1, Duration::from_secs(3)).await;
+
+    let delete = Request::builder()
+        .method(Method::DELETE)
+        .uri(format!(
+            "/tasks/{task_id}/pushNotificationConfigs/cfg-cached"
+        ))
+        .header("A2A-Version", "1.0")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(delete).await.unwrap();
+    assert!(resp.status().is_success(), "delete: {}", resp.status());
+
+    // Two more backoff periods: an uninvalidated cache would POST again.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let posted = mock.received_requests().await.unwrap().len();
+    assert_eq!(posted, 1, "no POST after the config was deleted");
+    assert!(
+        storage
+            .list_failed_deliveries("", std::time::SystemTime::UNIX_EPOCH, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an abandoned delivery is not a failed delivery"
+    );
+}

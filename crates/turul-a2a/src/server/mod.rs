@@ -141,7 +141,7 @@ impl Default for RuntimeConfig {
             push_connect_timeout: push.connect_timeout,
             push_read_timeout: push.read_timeout,
             push_claim_expiry: push.claim_expiry,
-            push_config_cache_ttl: Duration::from_secs(5),
+            push_config_cache_ttl: push.config_cache_ttl,
             push_failed_delivery_retention: Duration::from_secs(7 * 24 * 60 * 60),
             push_max_payload_bytes: push.max_payload_bytes,
             allow_insecure_push_urls: push.allow_insecure_urls,
@@ -287,11 +287,15 @@ impl A2aServerBuilder {
         self
     }
 
-    /// Push-config cache TTL inside the delivery worker.
-    ///
-    /// Accepted but currently has no effect: the delivery path has no
-    /// config cache and lists configs from storage on every terminal
-    /// event.
+    /// How long the delivery worker trusts that a push config still
+    /// exists without re-reading storage. Before each POST attempt the
+    /// worker checks that the config and task still exist and abandons
+    /// the delivery if either is gone; a config found present is
+    /// trusted for this long. Deleting a push config through this
+    /// server drops the cached entries for its task at once, so the
+    /// next attempt sees the deletion; a deletion made through another
+    /// instance is seen within the TTL. `Duration::ZERO` re-reads
+    /// before every attempt. Default 5s.
     pub fn push_config_cache_ttl(mut self, d: Duration) -> Self {
         self.runtime_config.push_config_cache_ttl = d;
         self

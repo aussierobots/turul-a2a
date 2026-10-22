@@ -39,9 +39,10 @@
 //!   pinning the validated IP, so the TCP connect cannot be swapped
 //!   to a different host between validation and dial.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use rand::RngExt;
 use url::Url;
@@ -82,6 +83,10 @@ pub struct PushDeliveryConfig {
     pub claim_expiry: Duration,
     pub max_payload_bytes: usize,
     pub allow_insecure_urls: bool,
+    /// How long a push config confirmed present by the pre-attempt
+    /// check is trusted without re-reading storage. `ZERO` re-reads
+    /// before every attempt.
+    pub config_cache_ttl: Duration,
 }
 
 impl Default for PushDeliveryConfig {
@@ -97,6 +102,7 @@ impl Default for PushDeliveryConfig {
             claim_expiry: Duration::from_secs(600),
             max_payload_bytes: 1024 * 1024,
             allow_insecure_urls: false,
+            config_cache_ttl: Duration::from_secs(5),
         }
     }
 }
@@ -116,6 +122,7 @@ impl PushDeliveryConfig {
             claim_expiry: runtime.push_claim_expiry,
             max_payload_bytes: runtime.push_max_payload_bytes,
             allow_insecure_urls: runtime.allow_insecure_push_urls,
+            config_cache_ttl: runtime.push_config_cache_ttl,
         }
     }
 }
@@ -172,9 +179,16 @@ impl PushDnsResolver for TokioDnsResolver {
 }
 
 /// The config and task stores the worker re-reads before every POST
-/// attempt, so a delivery stops as soon as its push config or task is
+/// attempt, so a delivery stops once its push config or task is
 /// deleted. A2A v1.0.1 §3.1.10: "No further notifications will be sent
 /// to the configured webhook after deletion."
+///
+/// A config found present is trusted for
+/// [`PushDeliveryConfig::config_cache_ttl`] without re-reading. A
+/// deletion through the server that owns this worker drops the cached
+/// entries for that task at once (see
+/// [`PushDeliveryWorker::invalidate_push_configs`]); a deletion made
+/// anywhere else is seen within the TTL.
 #[derive(Clone)]
 pub struct DeliveryTargetLookup {
     pub push_storage: Arc<dyn A2aPushNotificationStorage>,
@@ -185,13 +199,22 @@ impl DeliveryTargetLookup {
     /// `Some(reason)` when the config or the task is gone. A read
     /// error is not evidence of deletion: the attempt proceeds and the
     /// next attempt checks again.
-    async fn gone(&self, target: &PushTarget) -> Option<AbandonedReason> {
-        if let Ok(None) = self
-            .push_storage
-            .get_config(&target.tenant, &target.task_id, &target.config_id)
-            .await
-        {
-            return Some(AbandonedReason::ConfigDeleted);
+    async fn gone(
+        &self,
+        target: &PushTarget,
+        cache: &PushConfigCache,
+        ttl: Duration,
+    ) -> Option<AbandonedReason> {
+        if !cache.is_fresh(target, ttl) {
+            match self
+                .push_storage
+                .get_config(&target.tenant, &target.task_id, &target.config_id)
+                .await
+            {
+                Ok(None) => return Some(AbandonedReason::ConfigDeleted),
+                Ok(Some(_)) => cache.record_present(target, ttl),
+                Err(_) => {}
+            }
         }
         if let Ok(None) = self
             .task_storage
@@ -201,6 +224,46 @@ impl DeliveryTargetLookup {
             return Some(AbandonedReason::TaskDeleted);
         }
         None
+    }
+}
+
+/// Push configs confirmed present, keyed by task then config id, with
+/// the time each was confirmed. Only presence is cached — a missing
+/// config abandons the delivery, so there is nothing to re-check — and
+/// so a config create can never make an entry stale; only a delete can.
+#[derive(Default)]
+struct PushConfigCache {
+    by_task: Mutex<HashMap<(String, String), HashMap<String, Instant>>>,
+}
+
+impl PushConfigCache {
+    fn is_fresh(&self, target: &PushTarget, ttl: Duration) -> bool {
+        let by_task = self.by_task.lock().unwrap_or_else(|e| e.into_inner());
+        by_task
+            .get(&(target.tenant.clone(), target.task_id.clone()))
+            .and_then(|configs| configs.get(&target.config_id))
+            .is_some_and(|confirmed| confirmed.elapsed() < ttl)
+    }
+
+    fn record_present(&self, target: &PushTarget, ttl: Duration) {
+        if ttl.is_zero() {
+            return;
+        }
+        let mut by_task = self.by_task.lock().unwrap_or_else(|e| e.into_inner());
+        // Drop expired entries so the map holds only live deliveries.
+        by_task.retain(|_, configs| {
+            configs.retain(|_, confirmed| confirmed.elapsed() < ttl);
+            !configs.is_empty()
+        });
+        by_task
+            .entry((target.tenant.clone(), target.task_id.clone()))
+            .or_default()
+            .insert(target.config_id.clone(), Instant::now());
+    }
+
+    fn invalidate(&self, tenant: &str, task_id: &str) {
+        let mut by_task = self.by_task.lock().unwrap_or_else(|e| e.into_inner());
+        by_task.remove(&(tenant.to_string(), task_id.to_string()));
     }
 }
 
@@ -217,6 +280,8 @@ pub struct PushDeliveryWorker {
     /// driven directly, without a dispatcher, has no stores to read).
     /// Set through [`Self::with_target_lookup`].
     pub(crate) target_lookup: Option<DeliveryTargetLookup>,
+    /// Shared by every clone of this worker.
+    config_cache: Arc<PushConfigCache>,
 }
 
 impl PushDeliveryWorker {
@@ -244,7 +309,15 @@ impl PushDeliveryWorker {
             outbound_validator,
             instance_id,
             target_lookup: None,
+            config_cache: Arc::default(),
         })
+    }
+
+    /// Forget the cached presence of every push config of a task, so
+    /// the next attempt of any delivery for it re-reads storage. Call
+    /// after deleting one of the task's push configs.
+    pub fn invalidate_push_configs(&self, tenant: &str, task_id: &str) {
+        self.config_cache.invalidate(tenant, task_id);
     }
 
     /// Re-read the push config and task before every POST attempt and
@@ -315,7 +388,9 @@ impl PushDeliveryWorker {
 
             // Config / task still exist.
             if let Some(lookup) = &self.target_lookup
-                && let Some(reason) = lookup.gone(target).await
+                && let Some(reason) = lookup
+                    .gone(target, &self.config_cache, self.config.config_cache_ttl)
+                    .await
             {
                 return self
                     .persist_terminal(target, &claim, DeliveryOutcome::Abandoned { reason })
