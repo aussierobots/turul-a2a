@@ -46,20 +46,8 @@ use turul_a2a::storage::InMemoryA2aStorage;
 use turul_a2a_proto::grpc::A2aServiceClient;
 use turul_a2a_types::{Artifact, Message, Part, Task};
 
-/// Raw tonic client channel that stamps every call with the `a2a-version`
-/// metadata a conforming client sends (spec Section 3.6.1).
-type VersionedChannel = tonic::service::interceptor::InterceptedService<
-    tonic::transport::Channel,
-    fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
->;
-
-fn with_a2a_version(mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-    req.metadata_mut().insert(
-        "a2a-version",
-        tonic::metadata::MetadataValue::from_static("1.0"),
-    );
-    Ok(req)
-}
+mod common;
+use common::{VersionedChannel, with_a2a_version};
 
 // =========================================================
 // Executors

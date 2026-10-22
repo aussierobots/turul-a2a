@@ -1047,22 +1047,10 @@ async fn agent_card_with_skill_level_security_roundtrips_via_all_card_paths() {
     );
 }
 
-/// Raw tonic client channel that stamps every call with the `a2a-version`
-/// metadata a conforming client sends (spec §3.6.1).
 #[cfg(feature = "grpc")]
-type VersionedChannel = tonic::service::interceptor::InterceptedService<
-    tonic::transport::Channel,
-    fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
->;
-
+mod common;
 #[cfg(feature = "grpc")]
-fn with_a2a_version(mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-    req.metadata_mut().insert(
-        "a2a-version",
-        tonic::metadata::MetadataValue::from_static("1.0"),
-    );
-    Ok(req)
-}
+use common::{VersionedChannel, with_a2a_version};
 
 #[cfg(feature = "grpc")]
 mod skill_security_grpc_roundtrip {

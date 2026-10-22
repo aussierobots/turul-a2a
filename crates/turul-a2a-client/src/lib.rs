@@ -87,7 +87,7 @@ impl A2aClient {
     /// Fetch the agent card from the well-known endpoint.
     pub async fn fetch_agent_card(&self) -> Result<pb::AgentCard, A2aClientError> {
         let url = format!("{}{}", self.base_url, wire::http::WELL_KNOWN_AGENT_CARD);
-        let resp = self.http.get(&url).send().await?;
+        let resp = self.request(reqwest::Method::GET, &url).send().await?;
         if !resp.status().is_success() {
             return Err(A2aClientError::Http {
                 status: resp.status().as_u16(),
@@ -264,9 +264,6 @@ impl A2aClient {
         }
         if let Some(include) = params.include_artifacts {
             req = req.query(&[("includeArtifacts", include.to_string())]);
-        }
-        if let Some(ref after) = params.status_timestamp_after {
-            req = req.query(&[("statusTimestampAfter", after.as_str())]);
         }
 
         let resp = req.send().await?;
@@ -537,7 +534,4 @@ pub struct ListTasksParams {
     pub history_length: Option<i32>,
     /// Whether returned tasks carry their artifacts.
     pub include_artifacts: Option<bool>,
-    /// Only tasks whose status changed after this ISO 8601 timestamp
-    /// (e.g. `2025-11-09T10:30:00Z`).
-    pub status_timestamp_after: Option<String>,
 }

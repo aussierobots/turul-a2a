@@ -1,6 +1,14 @@
-//! Tower layer that runs the shared `MiddlewareStack` against a tonic server.
+//! Tower layer that validates `a2a-version` metadata and runs the shared
+//! `MiddlewareStack` against a tonic server.
 //!
-//! This is a transport adapter only — the authentication *business logic*
+//! Before authentication, every `A2AService` call must carry an
+//! `a2a-version` the server speaks (spec Section 3.6.2); a missing, empty
+//! or unsupported value is rejected with `FAILED_PRECONDITION` carrying
+//! `VERSION_NOT_SUPPORTED`. Co-hosted services such as health and
+//! reflection are not checked. This is the gRPC counterpart of the HTTP
+//! transport-compliance layer.
+//!
+//! For authentication this is a transport adapter only — the *business logic*
 //! lives in `crate::middleware::stack::MiddlewareStack` and is shared
 //! verbatim with the HTTP path. The two transports differ only in:
 //!   * request body type (`tonic::body::Body` vs. `axum::body::Body`)
@@ -126,9 +134,10 @@ fn check_a2a_version<B>(req: &Request<B>) -> Result<(), crate::error::A2aError> 
     }
     let requested = req
         .headers()
-        .get("a2a-version")
+        .get(turul_a2a_types::wire::protocol::VERSION_PARAM)
         .map(|v| v.to_str().unwrap_or_default());
-    crate::middleware::transport::check_version(requested)
+    // gRPC never serves the 0.3 protocol, whatever features are enabled.
+    crate::middleware::transport::check_version(requested, false)
 }
 
 /// Map a `MiddlewareError` to a gRPC-formatted HTTP response.

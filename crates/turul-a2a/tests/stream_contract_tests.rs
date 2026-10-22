@@ -327,19 +327,9 @@ async fn jsonrpc_stream(h: &Harness, method: &str, params: Value, resume: Option
 }
 
 #[cfg(feature = "grpc")]
-type VersionedChannel = tonic::service::interceptor::InterceptedService<
-    tonic::transport::Channel,
-    fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
->;
-
+mod common;
 #[cfg(feature = "grpc")]
-fn with_a2a_version(mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-    req.metadata_mut().insert(
-        "a2a-version",
-        tonic::metadata::MetadataValue::from_static("1.0"),
-    );
-    Ok(req)
-}
+use common::{VersionedChannel, with_a2a_version};
 
 #[cfg(feature = "grpc")]
 async fn grpc_client(h: &Harness) -> turul_a2a_proto::grpc::A2aServiceClient<VersionedChannel> {

@@ -17,45 +17,50 @@ use turul_a2a_types::wire::protocol;
 
 use crate::error::A2aError;
 
-/// Whether `requested` names the protocol version this server speaks.
+/// Whether `requested` names `target`'s `Major.Minor`.
 ///
 /// Only `Major.Minor` is compared: spec Section 3.6 says patch numbers
 /// "MUST not be considered when clients and servers negotiate protocol
 /// versions", so `1.0.1` is treated as `1.0`.
-pub(crate) fn version_supported(requested: &str) -> bool {
-    let mut ours = protocol::VERSION.split('.');
+fn same_major_minor(requested: &str, target: &str) -> bool {
+    let mut ours = target.split('.');
     let mut theirs = requested.trim().split('.');
     ours.next() == theirs.next()
         && ours.next() == theirs.next()
         && theirs.all(|patch| !patch.is_empty() && patch.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Whether `requested` names the protocol version this server speaks.
+pub(crate) fn version_supported(requested: &str) -> bool {
+    same_major_minor(requested, protocol::VERSION)
+}
+
+/// The legacy protocol version served on the JSON-RPC endpoint by the
+/// `compat-v03` feature.
+const LEGACY_VERSION: &str = "0.3";
+
+/// Whether the HTTP transports serve the legacy 0.3 protocol.
+const HTTP_SERVES_V03: bool = cfg!(feature = "compat-v03");
+
 /// Validate the requested `A2A-Version` (header, gRPC metadata or query
 /// parameter value).
 ///
-/// Spec Section 3.6.2: an absent or empty value means version 0.3. Without
-/// the `compat-v03` feature 0.3 is not served, so it is rejected with
-/// `VersionNotSupportedError`; with the feature it is accepted.
-pub(crate) fn check_version(requested: Option<&str>) -> Result<(), A2aError> {
-    match requested.map(str::trim) {
-        Some(v) if !v.is_empty() => {
-            if version_supported(v) {
-                Ok(())
-            } else {
-                Err(A2aError::VersionNotSupported {
-                    version: v.to_string(),
-                })
-            }
-        }
-        _ => {
-            if cfg!(feature = "compat-v03") {
-                Ok(())
-            } else {
-                Err(A2aError::VersionNotSupported {
-                    version: "0.3 (A2A-Version absent or empty)".to_string(),
-                })
-            }
-        }
+/// Spec Section 3.6.2: an absent or empty value means version 0.3, and an
+/// agent MUST return `VersionNotSupportedError` for a version the
+/// interface does not support. `serves_v03` says whether this interface
+/// serves 0.3; when it does, an absent, empty or explicit `0.3` is
+/// accepted, otherwise all three are rejected.
+pub(crate) fn check_version(requested: Option<&str>, serves_v03: bool) -> Result<(), A2aError> {
+    match requested.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) if version_supported(v) => Ok(()),
+        Some(v) if serves_v03 && same_major_minor(v, LEGACY_VERSION) => Ok(()),
+        Some(v) => Err(A2aError::VersionNotSupported {
+            version: v.to_string(),
+        }),
+        None if serves_v03 => Ok(()),
+        None => Err(A2aError::VersionNotSupported {
+            version: "0.3 (A2A-Version absent or empty)".to_string(),
+        }),
     }
 }
 
@@ -135,7 +140,7 @@ where
 fn check_request<B>(req: &Request<B>) -> Result<(), A2aError> {
     // Discovery is public and version-independent.
     if !super::is_bypass_path(req.uri().path()) {
-        check_version(requested_version(req).as_deref())?;
+        check_version(requested_version(req).as_deref(), HTTP_SERVES_V03)?;
     }
 
     // A POST without a Content-Type is allowed (e.g. cancel with an empty
@@ -170,18 +175,29 @@ mod tests {
     }
 
     #[test]
-    fn absent_or_empty_version_is_0_3() {
-        for requested in [None, Some(""), Some("  ")] {
-            let result = check_version(requested);
-            if cfg!(feature = "compat-v03") {
-                assert!(result.is_ok(), "{requested:?}");
-            } else {
-                assert!(
-                    matches!(result, Err(A2aError::VersionNotSupported { .. })),
-                    "{requested:?}"
-                );
-            }
+    fn version_0_3_absent_empty_or_explicit_follows_serves_v03() {
+        for requested in [None, Some(""), Some("  "), Some("0.3"), Some("0.3.0")] {
+            assert!(check_version(requested, true).is_ok(), "{requested:?}");
+            assert!(
+                matches!(
+                    check_version(requested, false),
+                    Err(A2aError::VersionNotSupported { .. })
+                ),
+                "{requested:?}"
+            );
         }
+        for serves_v03 in [true, false] {
+            assert!(check_version(Some("1.0"), serves_v03).is_ok());
+            assert!(matches!(
+                check_version(Some("0.4"), serves_v03),
+                Err(A2aError::VersionNotSupported { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn http_serves_v03_only_with_compat_feature() {
+        assert_eq!(HTTP_SERVES_V03, cfg!(feature = "compat-v03"));
     }
 
     #[test]

@@ -549,8 +549,13 @@ async fn a2a_version_header_sent_on_every_request_kind() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"name": "x"})))
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/agent-card.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"name": "x"})))
+        .mount(&server)
+        .await;
 
-    let client = A2aClient::new(server.uri());
+    let client = A2aClient::discover(server.uri()).await.unwrap();
     client.send_message(hello()).await.unwrap();
     client.send_streaming_message_raw(hello()).await.unwrap();
     client.get_task("t-1", None).await.unwrap();
@@ -570,7 +575,11 @@ async fn a2a_version_header_sent_on_every_request_kind() {
     client.fetch_extended_agent_card().await.unwrap();
 
     let received = server.received_requests().await.unwrap();
-    assert_eq!(received.len(), 11, "one request per client call");
+    assert_eq!(
+        received.len(),
+        12,
+        "discovery plus one request per client call"
+    );
     for req in &received {
         assert_eq!(
             req.headers.get("a2a-version").and_then(|v| v.to_str().ok()),
@@ -601,7 +610,6 @@ async fn list_tasks_sends_every_param_as_camel_case_query() {
         page_token: Some("cursor-2".into()),
         history_length: Some(3),
         include_artifacts: Some(true),
-        status_timestamp_after: Some("2025-11-09T10:30:00Z".into()),
     };
     client.list_tasks(&params).await.unwrap();
 
@@ -614,7 +622,6 @@ async fn list_tasks_sends_every_param_as_camel_case_query() {
         ("pageToken", "cursor-2"),
         ("historyLength", "3"),
         ("includeArtifacts", "true"),
-        ("statusTimestampAfter", "2025-11-09T10:30:00Z"),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
