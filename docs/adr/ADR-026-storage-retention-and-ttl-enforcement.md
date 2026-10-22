@@ -80,10 +80,12 @@ This is a **patch** bump. At its core this corrects a defect — `cleanup_expire
 
 - **ADR-008** (Lambda adapter and streaming coordination): the Lambda maintenance handler follows the thin-wrapper, request/response-only philosophy established here; no persistent process, no core churn.
 - **ADR-009** (Durable event coordination): owns the event store, the `cleanup_expired()` trait method, and the original (unimplemented) event-TTL claim. This ADR corrects that claim and supplies the real reaping mechanics and trigger model. ADR-009 §8's TTL/Cleanup paragraph is amended to point here.
-- **ADR-013** (Lambda push-delivery parity): unaffected. Push-delivery retention (`push_delivery_ttl_seconds`) remains DynamoDB-engine-owned and is out of scope for this ADR's cross-backend `cleanup_expired()` work.
+- **ADR-013** (Lambda push-delivery parity): unaffected. DynamoDB push-delivery item expiry (`push_delivery_ttl_seconds`) remains engine-owned.
+- **ADR-011** (Push notification delivery): `cleanup_expired()` also deletes failed push-delivery records (`GaveUp` claim rows) past their `retained_until`, set from the server's `push_failed_delivery_retention` rather than `RetentionConfig`, and counts them in its return value. DynamoDB sets the record's `ttl` to the same instant.
 - **ADR-018** (Lambda durable executor via SQS): the EventBridge-Scheduler-invoked maintenance handler is the same discrete-event-handler shape ADR-018 uses for its SQS dequeue handler — a single Lambda function classifying and dispatching multiple event shapes.
 
 ## Revision log
 
 - 2026-06-02 — Initial acceptance. Defines age-based, state-agnostic retention for events and tasks across all four backends; introduces a backend-agnostic `RetentionConfig` (TTLs + batch size) for the app-driven backends while leaving `DynamoDbConfig` unchanged; `cleanup_expired()` becomes the single idempotent maintenance entry point (batched, committed DELETE on SQL, lock-releasing sweep in-memory, intentional no-op on DynamoDB); dual trigger model (opt-in self-hosted background loop vs Lambda EventBridge discrete handler); patch bump (fixes the never-implemented ADR-009 cleanup claim, no breaking change).
+- 2026-10-22 — `cleanup_expired()` additionally reaps failed push-delivery records past their retention on the SQL and in-memory backends (ADR-011); the returned count includes them.
 - 2026-10-22 — Retention basis named explicitly as `updated_at` (last write of any kind), distinct from the ListTasks status timestamp. A DynamoDB live test (`test_native_ttl_attributes_on_tasks_and_events`) pins the engine-native contract: task and event items carry a numeric `ttl` of now + the configured TTL, and the task's `ttl` survives a status rewrite.

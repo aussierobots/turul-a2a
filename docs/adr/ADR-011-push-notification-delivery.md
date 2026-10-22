@@ -154,7 +154,8 @@ Per-delivery retry schedule (default; deployment-configurable):
 - `push_backoff_base: Duration` — default 2s (first wait).
 - `push_backoff_cap: Duration` — default 60s (max single wait).
 - `push_backoff_jitter: f32` — default 0.25.
-- `push_request_timeout: Duration` — default 30s (single POST).
+- `push_request_timeout: Duration` — default 30s (single POST: connect, send and the full response).
+- `push_read_timeout: Duration` — default 30s. Longest the POST waits with nothing arriving from the receiver (status line and headers, then each body read); a receiver that accepts and stalls fails the attempt with class `Timeout`.
 - `push_claim_expiry: Duration` — default 10 minutes. **MUST exceed the retry horizon** so re-claim by another instance does not race live retries. The builder validates this constraint at construction time.
 
 Deployments that want near-message-queue reliability (covering longer outages) should extend `push_max_attempts` and `push_claim_expiry` together. Deployments that want fire-and-forget best-effort can shorten both. The framework refuses configurations where `push_claim_expiry < max_horizon`.
@@ -169,6 +170,7 @@ Deployments that want near-message-queue reliability (covering longer outages) s
 - 2xx response → success, stop.
 - 3xx → treated as success; do NOT follow redirects automatically (§R3b / SSRF).
 - 4xx other than 408/429 → permanent failure, no retry. The receiver explicitly rejected the delivery; retrying is wasteful.
+- TLS handshake failure (certificate rejected, receiver not speaking TLS on the port) → permanent failure on the first attempt: `GaveUp(TlsRejected)`, class `TlsRejected`. A certificate or protocol misconfiguration does not fix itself within the retry horizon (amended 2026-10-22).
 
 ### 5a. At-Least-Once Semantics (Explicit)
 
@@ -195,13 +197,13 @@ This is correct-by-design, not a bug. The alternative (exactly-once) requires ei
 When a delivery gives up after `push_max_attempts`, the claim record transitions to status `GaveUp` and is **retained for inspection**:
 
 - **Where**: the same `a2a_push_deliveries` table/region as active claims. No separate dead-letter table.
-- **Retention**: the framework never prunes claim rows. DynamoDB expires them through its own item TTL (`DynamoDbConfig::push_delivery_ttl_seconds`, default 7 days); the SQL and in-memory backends keep them. `push_failed_delivery_retention` (default 7 days) is accepted by the builder but nothing reads it (amended 2026-10-22).
+- **Retention**: `push_failed_delivery_retention` (default 7 days). The worker stamps each give-up with `retained_until` = give-up time + retention (`DeliveryOutcome::GaveUp`). On the SQL and in-memory backends the storage cleanup entry point, `A2aEventStore::cleanup_expired` (the server's `.maintenance(interval)` loop or the Lambda maintenance handler), deletes `GaveUp` rows past `retained_until` in committed batches, whatever the task and event TTLs. A terminal row is never re-claimed, so the row's claim-expiry column holds `retained_until` once it is `GaveUp`. DynamoDB sets the item's `ttl` attribute to `retained_until` on the give-up write and the engine expires it; other claim items keep the claim-time `ttl` from `DynamoDbConfig::push_delivery_ttl_seconds`. `Succeeded` and `Abandoned` rows are not pruned on the SQL and in-memory backends (amended 2026-10-22).
 - **Fields stored** (beyond the claim basics):
   - `first_attempted_at` — when the first POST was tried.
   - `last_attempted_at` — when the final POST failed.
   - `attempt_count` — final count (up to `push_max_attempts`).
   - `last_http_status: Option<u16>` — status of the last POST, if any.
-  - `last_error_class` — enum: `NetworkError`, `Timeout`, `HttpError(5xx)`, `HttpError(4xx)`, `HttpError(429)`, `SSRFBlocked`, `PayloadTooLarge`, `ConfigDeleted`, etc. **Not a free-text error string** — classifications only, to avoid leaking secrets or PII from errors (see §4a).
+  - `last_error_class` — enum: `NetworkError`, `Timeout`, `HttpError5xx`, `HttpError4xx`, `HttpError429`, `SSRFBlocked`, `PayloadTooLarge`, `TlsRejected`. Config or task deletion is not an error class: it ends the delivery `Abandoned` with `AbandonedReason::{ConfigDeleted, TaskDeleted}` (amended 2026-10-22). **Not a free-text error string** — classifications only, to avoid leaking secrets or PII from errors (see §4a).
   - `gave_up_at` — timestamp.
 - **What is NOT stored**: the request body (privacy), the `Authorization` header value (secret), the `X-Turul-Push-Token` value (secret), receiver response body. The config can be re-fetched from the config CRUD store if needed.
 
@@ -243,6 +245,7 @@ Atomic claim: `INSERT ... ON CONFLICT DO NOTHING` on SQL backends; `PutItem` wit
 
 - **Config deleted between event commit and delivery attempt**: worker reads the config from storage just before each POST attempt. If the config no longer exists, the delivery is abandoned cleanly. No error, no retry. This is how the framework honours A2A v1.0.1 §3.1.10: "No further notifications will be sent to the configured webhook after deletion." The dispatcher installs the pre-attempt lookup on its worker (`DeliveryTargetLookup`); a read error is not treated as deletion — the attempt proceeds and the next one checks again.
 - **Config deleted mid-retry chain**: next retry tick sees the config gone, abandons. Claim marked `abandoned`.
+- **Config cache** (`push_config_cache_ttl`, default 5s; amended 2026-10-22): a config the pre-attempt check found present is trusted for the TTL without re-reading storage. Deleting a push config through the server (`DeletePushNotificationConfig` on any transport) drops the worker's cached entries for that task, so the next attempt re-reads and abandons. A deletion made through another instance, or directly in storage, is seen within the TTL — up to one TTL of further attempts. `Duration::ZERO` re-reads before every attempt. Only presence is cached, so a config create cannot make an entry stale and needs no invalidation. The task-existence check is not cached.
 - **Config added after events exist (backfill)**: no backfill. Configs capture events commit-timestamped after registration. This avoids weird catch-up storms when a client registers many configs against long-running tasks.
 - **Task deleted while push pending**: same as config deletion — next check finds task missing (`get_task` returns None), delivery abandoned.
 - **Orphaned task with push configs** (task in WORKING but no executor; see ADR-012 §5): events only fire on state changes. An orphaned non-terminal task with configs attached produces no deliveries until something forces a terminal (cancel, TTL-cleanup, admin action). This is correct — the config fires on changes, not on "still running."
@@ -330,9 +333,7 @@ pub enum DeliveryErrorClass {
     HttpError429,
     SSRFBlocked,
     PayloadTooLarge,
-    ConfigDeleted,
-    TaskDeleted,
-    TlsRejected,
+    TlsRejected,   // ConfigDeleted / TaskDeleted removed 2026-10-22: deletion is an AbandonedReason
 }
 
 pub struct DeliveryClaim {
@@ -361,7 +362,7 @@ pub enum DeliveryOutcome {
 
 ### 11. Config Resolution — Matching Configs to Events
 
-For each terminal event on `(tenant, task_id)`, the dispatcher lists the configs eligible for that event (`list_configs_eligible_at_event`, ADR-013 §4.5), paginating to the end. There is no cache: `push_config_cache_ttl` is accepted by the builder but nothing reads it (amended 2026-10-22). Only terminal events are dispatched, so the listing runs once per terminal commit.
+For each terminal event on `(tenant, task_id)`, the dispatcher lists the configs eligible for that event (`list_configs_eligible_at_event`, ADR-013 §4.5), paginating to the end. This listing is not cached: eligibility depends on the event's sequence, and only terminal events are dispatched, so it runs once per terminal commit. `push_config_cache_ttl` governs the per-attempt config re-read instead (§8, amended 2026-10-22).
 
 If no configs are registered, the event is effectively dropped from the push perspective (SSE subscribers still receive it). This is normal and expected — most tasks don't have push configs.
 
@@ -408,7 +409,15 @@ If no configs are registered, the event is effectively dropped from the push per
 
 18. **DNS rebinding defense** — `push_delivery_integration::reqwest_connects_to_validated_ip_not_system_dns`: the POST connects to the validated IP for an unresolvable hostname, one resolution per attempt.
 
-19. **Outbound allowlist hook** — `push_delivery_integration::outbound_allowlist_refuses_before_dns`: refused host → `GaveUp(SsrfBlocked)`, never resolved, no POST.
+19. **Outbound allowlist hook** — `push_delivery_integration::outbound_allowlist_refuses_before_dns`: refused host → `GaveUp(SsrfBlocked)`, never resolved, no POST. Through the builders: `push_dispatcher_server_tests::builder_outbound_url_validator_refuses_unlisted_webhooks` and the Lambda `builder_tests::lambda_builder_outbound_url_validator_refuses_unlisted_webhooks` — the refused config is an SSRF-blocked failed delivery with no POST, the allowed config on the same task is delivered.
+
+25. **TLS failure is permanent** — `push_delivery_integration::tls_handshake_failure_gives_up_without_retry`: a receiver answering plaintext on an https URL → one connection, `GaveUp(TlsRejected)`, class `TlsRejected`. Certificate rejection classification: `push::delivery::tests::certificate_rejection_is_a_tls_failure`.
+
+26. **Read timeout** — `push_delivery_integration::read_timeout_bounds_a_silent_receiver`: a receiver that stalls past `read_timeout` fails the attempt with class `Timeout`, well inside `request_timeout`.
+
+27. **Config cache** — `push_delivery_integration::cached_config_is_trusted_until_invalidated` (a storage-level delete is not seen while cached; invalidation makes the next attempt abandon) and `push_dispatcher_server_tests::deleting_a_config_through_the_server_stops_a_cached_delivery` (an HTTP delete stops an in-flight delivery despite a one-hour TTL).
+
+28. **Failed-delivery retention** — `push_delivery_integration::failed_delivery_is_removed_by_cleanup_once_retention_ends` and the storage parity test `test_cleanup_reaps_failed_deliveries_past_retention` (in-memory, SQLite, PostgreSQL): a record past `retained_until` is deleted and counted, one within it survives, an expired non-terminal claim is untouched. DynamoDB: `test_gave_up_delivery_ttl_is_retention_end` (live-only) pins the `ttl` attribute.
 
 21. **At-least-once redelivery after claim-then-crash** — `push_delivery_integration::reclaim_sweep_redispatches_after_persistent_terminal_failure`: POST succeeded, terminal write lost; after expiry the reclaim path re-POSTs (2 POSTs total) and the row ends terminal.
 
@@ -418,7 +427,7 @@ If no configs are registered, the event is effectively dropped from the push per
 
 ### 14. What Changes in Existing Code
 
-> **Note 2026-10-22.** This section is the original plan. Where it differs from what ships, §1, §6, §9, §11 and §13 as amended are authoritative: per-attempt HTTP clients, no subscribing worker, no config cache, tests in `push_delivery_integration.rs` / `push_dispatcher_server_tests.rs`. `push_config_cache_ttl`, `push_failed_delivery_retention` and `push_read_timeout` are accepted by the builder and have no effect.
+> **Note 2026-10-22.** This section is the original plan. Where it differs from what ships, §1, §6, §9, §11 and §13 as amended are authoritative: per-attempt HTTP clients, no subscribing worker, a per-attempt config cache rather than a resolution cache (§8), tests in `push_delivery_integration.rs` / `push_dispatcher_server_tests.rs`. `push_config_cache_ttl`, `push_failed_delivery_retention` and `push_read_timeout` are implemented (§5, §5b, §8); `outbound_url_validator` is a setter on both `A2aServerBuilder` and `LambdaA2aServerBuilder`.
 
 **New**:
 - `crates/turul-a2a/src/push/delivery.rs`: `PushDeliveryWorker`, per-config delivery task, retry loop. Uses shared `reqwest::Client`.
@@ -445,7 +454,7 @@ If no configs are registered, the event is effectively dropped from the push per
 
 ### 15. Risks and Mitigations
 
-**R1 — Webhook receiver is slow / flaky, generates sustained retry load**. Bounded by `push_max_attempts` (8 default; ~3min total horizon). Each giveup leaves a failed-delivery record (§5b); there are no metrics (§9). Future ADR can add circuit-breaker. For 0.1.x, a consistently-failing webhook just produces up to 8 failed POSTs per event and gives up. Claim rows are not pruned (§5b).
+**R1 — Webhook receiver is slow / flaky, generates sustained retry load**. Bounded by `push_max_attempts` (8 default; ~3min total horizon). Each giveup leaves a failed-delivery record (§5b); there are no metrics (§9). Future ADR can add circuit-breaker. For 0.1.x, a consistently-failing webhook just produces up to 8 failed POSTs per event and gives up. Failed-delivery records are pruned after `push_failed_delivery_retention` (§5b).
 
 **R2 — Cross-instance claim race starves slow-winner**. Mitigated by claim expiry (§7): if the winner takes too long, another instance re-claims. Bounded by `push_claim_expiry` (default 10m). Tune in concert with `push_max_attempts` — the builder enforces `push_claim_expiry > retry_horizon`. Shorter claim expiry requires shorter retry horizon.
 
@@ -473,19 +482,19 @@ Framework-enforced production protections:
 
 4. **Timeouts** (each configurable):
    - `push_connect_timeout`: 5 seconds default. Fails fast on unreachable hosts.
-   - `push_read_timeout`: accepted, no effect (amended 2026-10-22). The read phase is bounded by `push_request_timeout`.
+   - `push_read_timeout`: 30 seconds default. Bounds each wait for the receiver's response (headers, then each body read), independent of the connect timeout (amended 2026-10-22).
    - Total timeout (connect + TLS + write + read): enforced by `push_request_timeout` (already defined), 30s default.
 
 5. **Request body size cap**: `push_max_payload_bytes`, 1 MiB default. If the serialized Task exceeds this, the delivery records `PayloadTooLarge` (§5b error class) and is given up without POSTing. Prevents the framework from spraying multi-MB payloads at webhooks that can't handle them and from consuming excessive network bandwidth on chunk-heavy tasks.
 
-6. **Outbound allowlist hook** (optional): `OutboundUrlValidator = Arc<dyn Fn(&url::Url) -> Result<(), String> + Send + Sync>`, the third argument of `PushDeliveryWorker::new`. Called before DNS resolution — a refused host is never resolved. Returning `Err` gives up the delivery with error class `SSRFBlocked`; the reason string is not recorded (the class is a fixed enum). As shipped, `A2aServerBuilder` and `LambdaA2aServerBuilder` construct their worker with no validator; only a directly constructed worker can use the hook (amended 2026-10-22).
+6. **Outbound allowlist hook** (optional): `OutboundUrlValidator = Arc<dyn Fn(&url::Url) -> Result<(), String> + Send + Sync>`, the third argument of `PushDeliveryWorker::new`. Called before DNS resolution — a refused host is never resolved. Returning `Err` gives up the delivery with error class `SSRFBlocked`; the reason string is not recorded (the class is a fixed enum). Installed on a server through `A2aServerBuilder::outbound_url_validator` or `LambdaA2aServerBuilder::outbound_url_validator`; it runs in addition to the scheme and private-address checks, including when `allow_insecure_push_urls` disables the latter (amended 2026-10-22).
 
 7. **`allow_insecure_push_urls`** remains the dev-only flag (default `false`, §R3b). When set `true`, ALSO disables the private-IP blocklist — otherwise `http://localhost:8080` tests would fail the new blocklist. The flag is documented as mutually-exclusive with production use. No startup warning is emitted when it is set (amended 2026-10-22; the release-build WARN was never built).
 
 **R3b — TLS requirement for delivery URLs**. A2A spec §7.1 mandates TLS 1.2+ for A2A transport. Push delivery is an outbound A2A-adjacent HTTP flow. Policy:
 - **Production**: the framework enforces `https://` at delivery time. A config registered with `http://` succeeds at CRUD (no validation at registration to keep CRUD simple and backend-portable) but the delivery worker refuses to POST, logs WARN (`turul_a2a::push_non_https_url`, by `config_id` — the URL may carry secrets), and records the claim as `Abandoned { reason: NonHttpsUrlInProduction }`. Abandoned rows are not failed deliveries, so `list_failed_deliveries` does not list it. Pinned by `push::delivery::tests::non_https_url_in_production_is_abandoned_without_post`.
 - **Development / test**: `allow_insecure_push_urls` (see R3 point 7) permits `http://` delivery for localhost testing. Must be set explicitly per-deployment.
-- No automatic cert pinning, no mTLS delivery in 0.1.x. The reqwest default (rustls + system roots) handles standard TLS.
+- No automatic cert pinning, no mTLS delivery in 0.1.x. The reqwest default (rustls + system roots) handles standard TLS. A handshake the client rejects is a permanent failure (§5).
 
 **R4 — Outbound redirects hit internal endpoints (open redirect into SSRF)**. Mitigated: delivery does NOT follow redirects (§5). Non-2xx/3xx are errors; 3xx treated as opaque success per §5. Webhooks that legitimately 301-redirect will receive a single POST and a logged "unexpected 3xx" info — this is intentional.
 
@@ -534,3 +543,4 @@ Framework-enforced production protections:
 - 2026-10-22 — Proposed: §2 corrected to the terminal-only delivery the code has always had (it said all status updates). §3/§12/§13: body becomes the A2A v1.0.1 §4.3.3 `StreamResponse` envelope `{"task": <Task>}` with `Content-Type: application/a2a+json`, instead of a bare `Task`. `X-Turul-Push-Token` unchanged: the spec names no token header.
 - 2026-10-22 — Amended to what ships (maintainer decision), §2/§3 accepted and implemented. Removed promises with no code: §9 metrics and per-attempt logs (replaced by the tracing targets that exist), 429 `Retry-After` (§5), dispatcher panic sentinel/metric/respawn (§1, §6, R7), release-build WARN for `allow_insecure_push_urls` (R3.7), shared `reqwest::Client` (§6), config cache and claim retention (§5b, §11). Corrected: R5 payload-too-large is `GaveUp(PayloadTooLarge)`; R3.6 the allowlist hook runs before DNS and is not exposed by the server builders. Made true in code: §8 pre-attempt config/task re-read (spec §3.1.10), R3b non-https → `Abandoned(NonHttpsUrlInProduction)`, allowlist before DNS. §13 rewritten to the tests that pin shipped behaviour; #6, #15, #20, #22 dropped.
 - 2026-10-22 — R4 timeouts: `push_read_timeout` marked as accepted with no effect (the POST is bounded by `push_request_timeout`). Retention corrected: the framework never prunes claim rows, DynamoDB expires them by item TTL.
+- 2026-10-22 — The three accepted-but-inert options implemented (maintainer decision): `push_read_timeout` bounds a silent receiver (§5, R3.4); `push_config_cache_ttl` caches confirmed config presence for the pre-attempt check, invalidated by a delete through the server (§8, §11); `push_failed_delivery_retention` stamps `retained_until` on `GaveUp`, reaped by `cleanup_expired` on SQL/in-memory and by item `ttl` on DynamoDB (§5b, R1). `outbound_url_validator` setters on `A2aServerBuilder` and `LambdaA2aServerBuilder` (R3.6). Error classes: a TLS handshake failure is a permanent `GaveUp(TlsRejected)`; `DeliveryErrorClass::{ConfigDeleted, TaskDeleted}` removed as never produced — deletion is `AbandonedReason` (§5, §5b, §10). Defaults documented once, on `PushDeliveryConfig`; the builders' `RuntimeConfig` takes them from it. §13 gains #25–#28.
