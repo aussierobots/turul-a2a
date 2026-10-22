@@ -1,59 +1,58 @@
 //! Offline smoke test for the critic example agent.
 //!
-//! Spins up the agent binary on an isolated port and verifies the four
-//! end-to-end critic paths produce the expected structured artifacts.
-//! No network egress — the agent has no external deps.
+//! Runs the already-built agent binary (`CARGO_BIN_EXE_*`) on a free
+//! loopback port (parallel-safe, no nested `cargo run`) and verifies the
+//! four end-to-end critic paths produce the expected structured
+//! artifacts. No network egress — the agent has no external deps.
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-const TEST_PORT: u16 = 38013;
-
-struct AgentGuard(Child);
+struct AgentGuard {
+    child: Child,
+    base: String,
+}
 
 impl Drop for AgentGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
-fn spawn_agent() -> AgentGuard {
-    // Explicitly set-to-empty rather than `env_remove`. The binary's
-    // dotenvy support (if any sibling example added it) treats empty
-    // strings as "no opt-in", which is what we want for hermetic smoke.
-    let child = Command::new(env!("CARGO"))
-        .args([
-            "run",
-            "--quiet",
-            "-p",
-            "agent-role-critic-agent",
-            "--bin",
-            "agent-role-critic-agent",
-        ])
-        .env("A2A_PORT", TEST_PORT.to_string())
-        .env("OLLAMA_BASE_URL", "")
-        .env("RUN_OLLAMA_SMOKE", "")
+/// A port the OS reports free right now. The listener is dropped before
+/// the agent binds it.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("0.0.0.0:0")
+        .and_then(|l| l.local_addr())
+        .expect("reserve free port")
+        .port()
+}
+
+async fn spawn_agent() -> AgentGuard {
+    let port = free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_agent-role-critic-agent"))
+        .env("A2A_PORT", port.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn agent");
-    AgentGuard(child)
-}
-
-async fn wait_for_card(client: &reqwest::Client, base: &str) {
-    let url = format!("{base}/.well-known/agent-card.json");
-    for _ in 0..240 {
-        if let Ok(r) = client.get(&url).send().await
+    let guard = AgentGuard {
+        child,
+        base: format!("http://127.0.0.1:{port}"),
+    };
+    let url = format!("{}/.well-known/agent-card.json", guard.base);
+    for _ in 0..150 {
+        if let Ok(r) = reqwest::get(&url).await
             && r.status().is_success()
         {
-            return;
+            return guard;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("agent did not become ready at {url} within 60s");
+    panic!("agent did not become ready at {url} within 15s");
 }
 
 async fn send_text(client: &reqwest::Client, base: &str, id: &str, text: &str) -> Value {
@@ -64,40 +63,37 @@ async fn send_text(client: &reqwest::Client, base: &str, id: &str, text: &str) -
             "parts": [ { "text": text } ]
         }
     });
-    client
+    let resp = client
         .post(format!("{base}/message:send"))
         .header("a2a-version", "1.0")
         .json(&body)
         .send()
         .await
-        .expect("send req")
-        .json::<Value>()
-        .await
-        .expect("send json")
+        .expect("send req");
+    assert_eq!(resp.status().as_u16(), 200);
+    resp.json::<Value>().await.expect("send json")
 }
 
+/// The JSON payload of the first artifact of a spec `SendMessageResponse`
+/// (`{"task": {...}}`) for a completed task.
 fn first_artifact_payload(resp: &Value) -> Value {
-    let artifacts = resp["artifacts"]
-        .as_array()
-        .or_else(|| resp["task"]["artifacts"].as_array())
-        .unwrap_or_else(|| panic!("no artifacts in response: {resp:#}"));
-    assert!(
-        !artifacts.is_empty(),
-        "artifacts must be non-empty: {resp:#}"
+    assert_eq!(
+        resp.pointer("/task/status/state").and_then(Value::as_str),
+        Some("TASK_STATE_COMPLETED"),
+        "{resp:#}"
     );
-    let text = artifacts[0]["parts"][0]["text"]
-        .as_str()
-        .unwrap_or_else(|| panic!("missing text part: {resp:#}"));
+    let text = resp
+        .pointer("/task/artifacts/0/parts/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("expected SendMessageResponse.task with an artifact: {resp:#}"));
     serde_json::from_str(text).expect("artifact payload is JSON")
 }
 
 #[tokio::test]
 async fn critic_smoke() {
-    let _guard = spawn_agent();
-    let base = format!("http://127.0.0.1:{TEST_PORT}");
+    let agent = spawn_agent().await;
+    let base = agent.base.clone();
     let client = reqwest::Client::new();
-
-    wait_for_card(&client, &base).await;
 
     // 0. AgentCard must advertise both registered skills.
     let card: Value = client

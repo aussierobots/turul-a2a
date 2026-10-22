@@ -263,8 +263,8 @@ auth dependency. The smoke test is hermetic.
 
 - `curl: (7) Failed to connect` — the agent has not started yet, or
   `A2A_PORT` is set to a different value than the one you're hitting.
-- `agent did not become ready` in the smoke test — increase the wait
-  budget or check that nothing else is bound to port 38013.
+- `agent did not become ready` in the smoke test — the built binary did
+  not start listening within 15s; run it by hand to see its startup error.
 - `Manifest parse: ...` startup error — the on-disk `SKILL.md` files
   must round-trip through `SkillCard::parse`. The build-time embedded
   manifests run a parse test (`cargo test -p agent-role-critic-agent`)
@@ -276,7 +276,7 @@ auth dependency. The smoke test is hermetic.
 cargo test -p agent-role-critic-agent --tests
 ```
 
-The smoke test spawns the binary on an isolated port (38013) and walks the
+The smoke test runs the built binary on a free port and walks the
 four critic paths end-to-end. Hermetic — no network access.
 
 ## References

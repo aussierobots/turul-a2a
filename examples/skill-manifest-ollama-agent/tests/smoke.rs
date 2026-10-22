@@ -1,7 +1,9 @@
-//! Offline smoke test. Boots the example agent on a free port, hits
+//! Offline smoke test. Runs the already-built agent binary
+//! (`CARGO_BIN_EXE_*`) on a free loopback port, hits
 //! `/.well-known/agent-card.json` to verify the manifest-derived skill is
 //! advertised, then sends a JSON-shaped greeting via `POST /message:send`
-//! and asserts the offline stub artifact comes back.
+//! and asserts the offline stub artifact comes back in a spec
+//! `SendMessageResponse`.
 //!
 //! Live-Ollama path is NOT exercised here — see README.md for the manual
 //! probe.
@@ -11,31 +13,31 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-const TEST_PORT: u16 = 38010;
-
-struct AgentGuard(Child);
+struct AgentGuard {
+    child: Child,
+    base: String,
+}
 
 impl Drop for AgentGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
-fn spawn_agent() -> AgentGuard {
-    // `cargo run -p skill-manifest-ollama-agent` reuses the workspace
-    // target dir; in CI the binary may already be built. Pass A2A_PORT so
-    // the test owns its own port and never collides with `cargo run`.
-    let child = Command::new(env!("CARGO"))
-        .args([
-            "run",
-            "--quiet",
-            "-p",
-            "skill-manifest-ollama-agent",
-            "--bin",
-            "skill-manifest-ollama-agent",
-        ])
-        .env("A2A_PORT", TEST_PORT.to_string())
+/// A port the OS reports free right now. The listener is dropped before
+/// the agent binds it.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("0.0.0.0:0")
+        .and_then(|l| l.local_addr())
+        .expect("reserve free port")
+        .port()
+}
+
+async fn spawn_agent() -> AgentGuard {
+    let port = free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_skill-manifest-ollama-agent"))
+        .env("A2A_PORT", port.to_string())
         // Explicitly set-to-empty rather than `env_remove`. The binary's
         // `dotenvy::dotenv()` autoload at startup honours already-set env
         // vars and does NOT override them; empty values are present-but-
@@ -49,33 +51,30 @@ fn spawn_agent() -> AgentGuard {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn agent");
-    AgentGuard(child)
-}
-
-async fn wait_for_card(client: &reqwest::Client, base: &str) {
-    let url = format!("{base}/.well-known/agent-card.json");
-    for _ in 0..120 {
-        if let Ok(r) = client.get(&url).send().await
+    let guard = AgentGuard {
+        child,
+        base: format!("http://127.0.0.1:{port}"),
+    };
+    let url = format!("{}/.well-known/agent-card.json", guard.base);
+    for _ in 0..150 {
+        if let Ok(r) = reqwest::get(&url).await
             && r.status().is_success()
         {
-            return;
+            return guard;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("agent did not become ready at {url} within 30s");
+    panic!("agent did not become ready at {url} within 15s");
 }
 
 #[tokio::test]
 async fn offline_smoke_end_to_end() {
-    let _guard = spawn_agent();
-    let base = format!("http://127.0.0.1:{TEST_PORT}");
+    let agent = spawn_agent().await;
     let client = reqwest::Client::new();
-
-    wait_for_card(&client, &base).await;
 
     // 1. AgentCard advertises the manifest-derived skill.
     let card: Value = client
-        .get(format!("{base}/.well-known/agent-card.json"))
+        .get(format!("{}/.well-known/agent-card.json", agent.base))
         .send()
         .await
         .expect("card req")
@@ -99,31 +98,25 @@ async fn offline_smoke_end_to_end() {
         }
     });
 
-    let resp: Value = client
-        .post(format!("{base}/message:send"))
+    let resp = client
+        .post(format!("{}/message:send", agent.base))
         .header("a2a-version", "1.0")
         .json(&send_body)
         .send()
         .await
-        .expect("send req")
-        .json()
-        .await
-        .expect("send json");
+        .expect("send req");
+    assert_eq!(resp.status().as_u16(), 200);
+    let resp: Value = resp.json().await.expect("send json");
 
-    // Response shape: a Task wrapper. Drill into artifacts[].parts[].text
-    // and parse it as the JSON greeting payload.
-    let artifacts = resp["artifacts"]
-        .as_array()
-        .or_else(|| resp["task"]["artifacts"].as_array())
-        .unwrap_or_else(|| panic!("no artifacts in response: {resp:#}"));
-    assert!(
-        !artifacts.is_empty(),
-        "artifacts must be non-empty: {resp:#}"
+    assert_eq!(
+        resp.pointer("/task/status/state").and_then(Value::as_str),
+        Some("TASK_STATE_COMPLETED"),
+        "{resp:#}"
     );
-
-    let part_text = artifacts[0]["parts"][0]["text"]
-        .as_str()
-        .unwrap_or_else(|| panic!("missing text part: {resp:#}"));
+    let part_text = resp
+        .pointer("/task/artifacts/0/parts/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("expected SendMessageResponse.task with an artifact: {resp:#}"));
     let greeting_payload: Value = serde_json::from_str(part_text).expect("artifact text is JSON");
     let greeting = greeting_payload["greeting"]
         .as_str()

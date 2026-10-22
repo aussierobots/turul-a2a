@@ -218,8 +218,8 @@ skill rather than a code block.
 cargo test -p agent-role-planner-router-agent --tests
 ```
 
-The smoke test spawns the binary on an isolated port and walks the two
-primary planner paths end-to-end. Hermetic — no network access.
+The smoke test runs the built binary on a free port per test and walks
+both planner routes and the no-match fallback. Hermetic — no network access.
 
 ## References
 

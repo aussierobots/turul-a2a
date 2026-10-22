@@ -241,9 +241,9 @@ Working end-to-end at
 | --- | --- |
 | Activation header missing and extension is `required = false` (default in this example) | Request reaches the executor; if `a2a.skillId` is absent the executor returns a `Failed` task. |
 | Activation header missing and extension is `required = true` | Transport returns `UnsupportedOperationError` (HTTP 400 / JSON-RPC `-32004`). |
-| Activation header set but `a2a.skillId` metadata absent | Executor returns a `Failed` task citing the missing key. |
-| `a2a.skillId` references an unregistered skill | Executor returns `InvalidParamsError`. |
-| `a2a.skillParams` violates the skill's `inputSchema` | `SkillHandler` returns `InvalidRequest` → `InvalidParamsError`. |
+| Activation header set but `a2a.skillId` metadata absent (or not a string) | The framework rejects the request with `InvalidParamsError` (HTTP 400 / JSON-RPC `-32602`) before the executor runs. |
+| `a2a.skillId` references an unregistered skill | The executor errors; the task ends `Failed` with a status message citing the unknown id. |
+| `a2a.skillParams` violates the skill's `inputSchema` | `SkillHandler` returns `SkillError::InvalidRequest`; the task ends `Failed` with the validation reason. |
 
 ## Layout
 
