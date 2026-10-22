@@ -24,7 +24,14 @@ Brings the framework to **A2A v1.0.1** on all three transports (HTTP+JSON, JSON-
   - `pageSize` outside 1..=100 returns InvalidRequest instead of being clamped;
   - a negative `historyLength` is rejected on every operation.
 - **Timestamps** are serialised RFC 3339 with `Z`, for example `2026-10-22T10:11:13.794556Z` (previously `+00:00`), and are now present on every status. Generated `google.protobuf.Timestamp` fields have the type `turul_a2a_proto::Timestamp`.
-- **Bearer/API-key:** a request with no credentials gets a bare `WWW-Authenticate` challenge with no `error` code (RFC 6750 §3.1).
+- **Auth failure bodies** (401/403) now carry a code and a human-readable message, as every A2A error must:
+  - HTTP is `{"error":{"code","status","message","details":[ErrorInfo]}}`;
+  - on `/jsonrpc` it is a JSON-RPC error with custom code -32040 (unauthenticated) or -32041 (forbidden);
+  - on gRPC the Status message is readable.
+
+  The stable kind moves from the bare `"error"` string to `ErrorInfo.reason` (upper snake case, for example `INVALID_TOKEN`) in the `turul-a2a` domain. A request with no credentials gets a bare `WWW-Authenticate` challenge with no `error` code (RFC 6750 §3.1).
+- **JSON responses are labelled `application/a2a+json`** (spec §11.1); v0.3 requests under `compat-v03` keep `application/json`.
+- **Message parts are checked against `AgentCard.defaultInputModes`:** a part whose `mediaType` is set and not accepted is refused with `ContentTypeNotSupportedError` before any task is created. `*/*` and `type/*` act as wildcards; untyped parts, and agents that declare no input modes, are unaffected. Agents that receive typed parts must list those types.
 - **Source-level API changes:**
   - `A2aStorageError::TerminalState` and `InvalidTransition` carry the task id;
   - `A2aStorageError` gains `InvalidListRequest`;

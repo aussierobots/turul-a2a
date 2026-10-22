@@ -492,6 +492,7 @@ pub(crate) async fn open_send_stream(
     let message = Message::try_from(proto_message).map_err(|e| A2aError::InvalidRequest {
         message: format!("Invalid message: {e}"),
     })?;
+    check_part_media_types(&state, &message)?;
     let inline_push_config = inline_push_config(&state, request.configuration.as_ref())?;
 
     let target = resolve_send_target(&state, tenant, owner, &message).await?;
@@ -767,6 +768,46 @@ pub(crate) struct PushConfigQuery {
 // =========================================================
 
 #[doc(hidden)]
+/// Reject a message part whose declared media type the agent does not
+/// accept (A2A v1.0.1 §3.1.1: `ContentTypeNotSupportedError`, "a Media
+/// Type provided in the request's message parts is not supported by the
+/// agent"). The accepted set is `AgentCard.defaultInputModes`; `*/*` and
+/// `type/*` entries are wildcards. Parts without a media type, and agents
+/// that declare no input modes, are not restricted. Runs before anything
+/// is written.
+fn check_part_media_types(state: &AppState, message: &Message) -> Result<(), A2aError> {
+    let card = state.executor.agent_card();
+    if card.default_input_modes.is_empty() {
+        return Ok(());
+    }
+    let essence = |m: &str| {
+        m.split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+    };
+    let accepts = |media_type: &str| {
+        let wanted = essence(media_type);
+        card.default_input_modes.iter().any(|mode| {
+            let mode = essence(mode);
+            mode == "*/*"
+                || mode == wanted
+                || mode
+                    .strip_suffix("/*")
+                    .is_some_and(|ty| wanted.split('/').next() == Some(ty))
+        })
+    };
+    for part in &message.as_proto().parts {
+        if !part.media_type.is_empty() && !accepts(&part.media_type) {
+            return Err(A2aError::ContentTypeNotSupported {
+                content_type: part.media_type.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The task a `SendMessage` / `SendStreamingMessage` targets.
 pub(crate) struct SendTarget {
     pub(crate) task_id: String,
@@ -1087,6 +1128,7 @@ pub async fn core_send_message(
     let message = Message::try_from(proto_message).map_err(|e| A2aError::InvalidRequest {
         message: format!("Invalid message: {e}"),
     })?;
+    check_part_media_types(&state, &message)?;
 
     let return_immediately = request
         .configuration
