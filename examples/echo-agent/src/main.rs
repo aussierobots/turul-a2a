@@ -50,14 +50,18 @@ impl AgentExecutor for EchoExecutor {
     }
 }
 
+fn server() -> Result<A2aServer, A2aError> {
+    A2aServer::builder()
+        .executor(EchoExecutor)
+        .bind(([0, 0, 0, 0], 3000))
+        .build()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let server = A2aServer::builder()
-        .executor(EchoExecutor)
-        .bind(([0, 0, 0, 0], 3000))
-        .build()?;
+    let server = server()?;
 
     println!("Echo Agent listening on http://0.0.0.0:3000");
     println!("Agent card: http://localhost:3000/.well-known/agent-card.json");
@@ -71,4 +75,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     server.run().await?;
     Ok(())
+}
+
+/// In-process tests: the same server `main` runs, driven through its
+/// router without binding a socket.
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    async fn call(req: axum::http::Request<Body>) -> (u16, Value) {
+        let resp = super::server()
+            .unwrap()
+            .into_router()
+            .oneshot(req)
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn send_echoes_text_as_artifact_and_completes() {
+        let body = json!({
+            "message": {"messageId": "m-1", "role": "ROLE_USER", "parts": [{"text": "hello"}]}
+        });
+        let (status, resp) = call(
+            axum::http::Request::post("/message:send")
+                .header("content-type", "application/json")
+                .header("a2a-version", "1.0")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(resp["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+        assert_eq!(
+            resp["task"]["artifacts"][0]["parts"][0]["text"],
+            "Echo: hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_card_advertises_echo_skill() {
+        let (status, card) = call(
+            axum::http::Request::get("/.well-known/agent-card.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(card["name"], "Echo Agent");
+        assert_eq!(card["skills"][0]["id"], "echo");
+    }
 }

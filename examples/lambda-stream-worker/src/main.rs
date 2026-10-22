@@ -74,9 +74,22 @@ async fn main() -> Result<(), Error> {
         .without_time()
         .init();
 
-    // One-time cold-start setup: build the dispatcher against the
-    // shared backend. The dispatcher is Clone so it can be shared
-    // between invocations.
+    let handler = build_handler()?;
+
+    lambda_runtime::run(service_fn(move |event: LambdaEvent<DynamoDbEvent>| {
+        let handler = handler.clone();
+        async move {
+            let response: DynamoDbEventResponse = handler.handle_stream_event(event.payload).await;
+            Ok::<_, Error>(response)
+        }
+    }))
+    .await
+}
+
+/// One-time cold-start setup: build the dispatcher against the shared
+/// backend. The handler is Clone so it can be shared between
+/// invocations.
+fn build_handler() -> Result<LambdaStreamRecoveryHandler, Error> {
     let storage = build_storage();
     let delivery: Arc<dyn A2aPushDeliveryStore> = storage.clone();
     let push_storage: Arc<dyn A2aPushNotificationStorage> = storage.clone();
@@ -95,16 +108,21 @@ async fn main() -> Result<(), Error> {
         .map_err(|e| Error::from(format!("worker build failed: {e}")))?,
     );
     let dispatcher = Arc::new(PushDispatcher::new(worker, push_storage, task_storage));
-    let handler = LambdaStreamRecoveryHandler::new(dispatcher);
+    Ok(LambdaStreamRecoveryHandler::new(dispatcher))
+}
 
-    lambda_runtime::run(service_fn(move |event: LambdaEvent<DynamoDbEvent>| {
-        let handler = handler.clone();
-        async move {
-            let response: DynamoDbEventResponse = handler.handle_stream_event(event.payload).await;
-            Ok::<_, Error>(response)
-        }
-    }))
-    .await
+#[cfg(test)]
+mod tests {
+    use aws_lambda_events::event::dynamodb::Event as DynamoDbEvent;
+
+    /// The handler `main` runs builds without AWS access, and an empty
+    /// stream batch reports no item failures.
+    #[tokio::test]
+    async fn handler_builds_and_an_empty_batch_has_no_failures() {
+        let handler = super::build_handler().expect("handler builds");
+        let response = handler.handle_stream_event(DynamoDbEvent::default()).await;
+        assert!(response.batch_item_failures.is_empty());
+    }
 }
 
 /// Local uuid helper — avoids taking a direct dep on `uuid` in this

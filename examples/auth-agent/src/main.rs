@@ -68,10 +68,7 @@ impl AgentExecutor for AuthEchoExecutor {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
-
+fn server() -> Result<A2aServer, A2aError> {
     // Configure API key auth with demo keys
     let mut keys = HashMap::new();
     keys.insert("demo-key-alice".to_string(), "alice".to_string());
@@ -79,11 +76,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let api_key_auth = ApiKeyMiddleware::new(Arc::new(StaticApiKeyLookup::new(keys)), "X-API-Key");
 
-    let server = A2aServer::builder()
+    A2aServer::builder()
         .executor(AuthEchoExecutor)
         .middleware(Arc::new(api_key_auth))
         .bind(([0, 0, 0, 0], 3001))
-        .build()?;
+        .build()
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+
+    let server = server()?;
 
     println!("Auth Echo Agent listening on http://0.0.0.0:3001");
     println!("Agent card: http://localhost:3001/.well-known/agent-card.json");
@@ -107,4 +111,88 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     server.run().await?;
     Ok(())
+}
+
+/// In-process tests: the same server `main` runs (API-key middleware
+/// included), driven through its router without binding a socket.
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    async fn call(req: Request<Body>) -> (u16, Value) {
+        let resp = super::server()
+            .unwrap()
+            .into_router()
+            .oneshot(req)
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    fn send(api_key: Option<&str>) -> Request<Body> {
+        let body = json!({
+            "message": {"messageId": "m-1", "role": "ROLE_USER", "parts": [{"text": "hello"}]}
+        });
+        let mut req = Request::post("/message:send")
+            .header("content-type", "application/json")
+            .header("a2a-version", "1.0");
+        if let Some(key) = api_key {
+            req = req.header("X-API-Key", key);
+        }
+        req.body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn send_without_api_key_is_unauthorized() {
+        let (status, _) = call(send(None)).await;
+        assert_eq!(status, 401);
+    }
+
+    #[tokio::test]
+    async fn send_with_unknown_api_key_is_unauthorized() {
+        let (status, _) = call(send(Some("not-a-demo-key"))).await;
+        assert_eq!(status, 401);
+    }
+
+    #[tokio::test]
+    async fn send_with_api_key_runs_as_the_key_owner() {
+        let (status, resp) = call(send(Some("demo-key-alice"))).await;
+        assert_eq!(status, 200);
+        assert_eq!(resp["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+        assert_eq!(
+            resp["task"]["artifacts"][0]["parts"][0]["text"],
+            "Authenticated as: alice (tenant: default)"
+        );
+    }
+
+    /// The public card is served without credentials and advertises the
+    /// middleware's API-key scheme.
+    #[tokio::test]
+    async fn agent_card_is_public_and_advertises_api_key_scheme() {
+        let (status, card) = call(
+            Request::get("/.well-known/agent-card.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let schemes = card["securitySchemes"]
+            .as_object()
+            .expect("securitySchemes object");
+        assert_eq!(schemes.len(), 1, "{card:#}");
+        let scheme = schemes.values().next().unwrap();
+        assert_eq!(
+            scheme["apiKeySecurityScheme"]["name"], "X-API-Key",
+            "{card:#}"
+        );
+    }
 }
