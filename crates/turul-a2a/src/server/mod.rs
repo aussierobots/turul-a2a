@@ -831,6 +831,24 @@ impl A2aServer {
         crate::grpc::make_grpc_router(state, middleware_stack)
     }
 
+    /// Build the HTTP router and the tonic gRPC router over one shared
+    /// server state, for serving both transports from one process.
+    ///
+    /// Both routers share storage, the event broker and the in-flight
+    /// executor registry, so a turn started on one transport is visible
+    /// to the other (a follow-up sent over gRPC while an HTTP-started
+    /// executor is still running is refused). Calling `into_router` and
+    /// `into_tonic_router` on two separately built servers would give
+    /// each transport its own registry and broker.
+    #[cfg(feature = "grpc")]
+    pub fn into_routers(self) -> (axum::Router, crate::grpc::LayeredGrpcRouter) {
+        let (state, _) = self.into_augmented_state();
+        let middleware_stack = state.middleware_stack.clone();
+        let http = build_router(state.clone());
+        let grpc = crate::grpc::make_grpc_router(state, middleware_stack);
+        (http, grpc)
+    }
+
     /// Produce the `AppState` that `into_router` would mount, plus a flag
     /// indicating whether security augmentation was applied. Exposed to
     /// tests so they can assert post-augmentation invariants (e.g., that

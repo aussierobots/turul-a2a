@@ -70,8 +70,9 @@ cargo run -p grpc-agent --bin grpc-client -- stream "hello"
 ```
 
 All 11 `lf.a2a.v1.A2AService` RPCs are served via
-`A2aServer::into_tonic_router()` — the single public entry point,
-which always layers the same Tower auth stack as the HTTP path.
+`A2aServer::into_tonic_router()`, or `A2aServer::into_routers()` to
+serve HTTP and gRPC from one process over one shared server state.
+Both always layer the same Tower auth stack as the HTTP path.
 Streaming consumes the same durable event store and stream contract
 as SSE. `grpc-reflection` and
 `grpc-health` are optional sub-features.
