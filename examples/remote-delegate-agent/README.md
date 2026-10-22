@@ -88,12 +88,16 @@ message:
   correlate the delegate's tasks across calls. A future revision
   could expose passthrough of these fields under a flag.
 - `role`, `parts` — copied verbatim.
-- `metadata` — forwarded intact, so the skill-dispatch profile
-  (`Message.metadata["a2a.skillId"]` and `["a2a.skillParams"]`) keeps
-  working through the delegate. Same for any other extension that
-  parks data on `Message.metadata`.
-- `extensions` — forwarded intact (the per-message extension URI
-  list).
+- `metadata` — forwarded intact, so skill-dispatch routing keys
+  (`Message.metadata["a2a.skillId"]` and `["a2a.skillParams"]`) reach
+  the upstream.
+- `extensions` — forwarded intact. This list only *attributes*
+  extensions present in the message; it does not activate anything.
+- Extension activation — the delegate sends its own `A2A-Extensions`
+  header on the upstream call: when the message carries `a2a.skillId`
+  and the upstream's card advertises the skill-invocation profile, the
+  delegate activates that profile (otherwise the upstream would treat
+  the message as un-targeted).
 - `referenceTaskIds` — forwarded intact.
 
 ### 3. Task / status / artifact mapping
@@ -157,10 +161,11 @@ status code is only a fallback when the upstream sent no ErrorInfo.
   "the delegate is caller X"). Adopters who consciously want
   passthrough auth must add it on top — this example does not
   provide a hook.
-- The `A2A-Extensions` header IS effectively forwarded — the
-  `Message.extensions` list and any extension metadata on
-  `Message.metadata` flow through under §2, so profile activation
-  works end-to-end.
+- The caller's `A2A-Extensions` header is not visible to an
+  `AgentExecutor`, so it is not passed through verbatim. The delegate
+  activates the skill-invocation profile upstream itself when the
+  forwarded message targets a skill (§2); other caller-activated
+  extensions are not re-activated upstream.
 
 ### 7. Streaming
 
@@ -179,17 +184,17 @@ implemented end-to-end:
 
 ## Tests
 
-- `cargo test -p remote-delegate-agent` — runs unit tests + a real
-  end-to-end smoke that spawns *both* `skill-manifest-ollama-agent`
-  (the upstream) and `remote-delegate-agent` on fixed test ports,
-  sends a message through the delegate, and asserts the upstream's
-  offline-stub marker appears in the returned artifact. The smoke
-  exercises every guarantee in §2 / §3 / §4 except the deferred
-  streaming behavior.
-- The four unit tests in `src/main.rs` pin: outbound
+- `cargo test -p remote-delegate-agent` — runs unit tests + an
+  end-to-end smoke that runs the built delegate binary on a free port
+  against an in-process `wiremock` upstream, sends messages through
+  the delegate, and asserts the upstream's artifact comes back in a
+  spec `SendMessageResponse` and that the profile is activated
+  upstream only for skill-targeted messages.
+- The unit tests in `src/main.rs` pin: outbound
   `messageId`/`contextId`/`taskId` handling, `metadata` + `extensions`
-  preservation for the skill-dispatch profile, and the §4 error
-  mapping table for all classification rules.
+  preservation, when the skill-invocation profile is activated
+  upstream, and the §4 error mapping table for all classification
+  rules.
 
 ## What this example is NOT
 
