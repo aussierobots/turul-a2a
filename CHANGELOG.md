@@ -31,7 +31,8 @@ Brings the framework to **A2A v1.0.1** on all three transports (HTTP+JSON, JSON-
   - `QueuedExecutorJob` and `SpawnScope` are `#[non_exhaustive]`; build them with `QueuedExecutorJob::new` / `SpawnScope::from_queued_job`;
   - `DeliveryOutcome::GaveUp` gains `retained_until`;
   - `DeliveryErrorClass::{ConfigDeleted, TaskDeleted}` are removed (deletion is `AbandonedReason`);
-  - `turul_a2a::streaming::replay`, `turul_a2a::storage::terminal_cas`, `push::ssrf::decide`, `compat_v03::root_post_compat_mode` and `in_flight::poll_once_for_tests` are removed;
+  - `turul_a2a::streaming::replay`, `turul_a2a::storage::terminal_cas`, `grpc::streaming::LAST_EVENT_ID_METADATA`, `push::ssrf_decide` / `push::ssrf::decide` (use `ssrf::check_url` + `ssrf::pick_destination`), `compat_v03::root_post_compat_mode` and `in_flight::poll_once_for_tests` are removed;
+  - `DeliveryTargetLookup` is `#[non_exhaustive]`; build it with `DeliveryTargetLookup::new`;
   - `turul-a2a-patterns` `SkillCard` no longer implements `Serialize`/`Deserialize`, and `SkillCard::parse` is the only constructor;
   - client `ListTasksParams` gained fields, so struct literals need `..Default::default()`.
 - **turul-a2a-client SSE** yields `Err(A2aClientError::Json)` for an event that is not JSON, where before it was silently skipped.
@@ -65,7 +66,7 @@ Brings the framework to **A2A v1.0.1** on all three transports (HTTP+JSON, JSON-
   - a terminal task → `UnsupportedOperationError`;
   - a mismatched `contextId` is rejected, and a missing one is taken from the task.
 
-  Blocking send to a terminal task also returns `UnsupportedOperationError`, where it used to return -32602.
+  Blocking send to a terminal task also returns `UnsupportedOperationError`, where it used to return -32602, and so does a follow-up to a task that is SUBMITTED or WORKING (accepting those is optional in the spec), where it used to return InvalidRequest.
 - A follow-up message while the previous turn's executor is still running is refused before anything is written. Previously the task was left stuck in WORKING.
 - An executor that calls `require_input` / `require_auth` and then returns `Ok` leaves the task interrupted; it used to be forced to FAILED.
 - `AgentExecutor::extended_agent_card` and the executor on gRPC sends now receive the caller's claims.

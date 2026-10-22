@@ -839,7 +839,11 @@ pub(crate) async fn resolve_send_target(
                 });
             }
             _ => {
-                return Err(A2aError::InvalidRequest {
+                // Accepting messages for a task that is still being
+                // processed is optional (A2A v1.0.1 §3.3.3: "MAY"); this
+                // implementation does not, which is an unsupported aspect
+                // of the operation rather than a malformed request.
+                return Err(A2aError::UnsupportedOperation {
                     message: format!(
                         "Task {msg_task_id} is in state {s:?}, only INPUT_REQUIRED or AUTH_REQUIRED tasks accept follow-up messages"
                     ),

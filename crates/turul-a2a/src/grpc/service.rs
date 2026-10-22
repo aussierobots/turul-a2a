@@ -7,9 +7,8 @@
 //!   3. deserialize core JSON response back to the proto response type
 //!   4. map `A2aError` via [`crate::grpc::error::a2a_to_status`]
 //!
-//! Streaming RPCs are stubbed out here (return `UNIMPLEMENTED`); the
-//! streaming module (next commit) replaces them with the replay-then-live
-//! loop backed by the durable event store.
+//! The two streaming RPCs encode the shared core stream in
+//! [`crate::grpc::streaming`].
 
 use std::pin::Pin;
 
@@ -254,7 +253,9 @@ impl pb::grpc::A2aService for GrpcService {
         let tenant = tenant_from(&request, &request.get_ref().tenant);
         let task_id = request.get_ref().task_id.clone();
         if task_id.is_empty() {
-            return Err(Status::invalid_argument("push config task_id is required"));
+            return Err(a2a_to_status(crate::error::A2aError::InvalidRequest {
+                message: "push config task_id is required".into(),
+            }));
         }
         let body = serde_json::to_string(request.get_ref()).map_err(internal_from_json)?;
 

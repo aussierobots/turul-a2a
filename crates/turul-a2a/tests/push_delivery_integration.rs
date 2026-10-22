@@ -1820,10 +1820,7 @@ fn live_worker_with_cache(
     Arc::new(
         PushDeliveryWorker::new(store.clone(), cfg, None, "instance-live".into())
             .expect("worker")
-            .with_target_lookup(DeliveryTargetLookup {
-                push_storage: store.clone(),
-                task_storage: store.clone(),
-            }),
+            .with_target_lookup(DeliveryTargetLookup::new(store.clone(), store.clone())),
     )
 }
 

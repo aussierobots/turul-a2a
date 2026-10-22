@@ -784,7 +784,7 @@ async fn blocking_continuation_infers_the_context_id() {
 }
 
 #[tokio::test]
-async fn send_to_a_submitted_or_working_task_is_invalid_request() {
+async fn send_to_a_submitted_or_working_task_is_unsupported_operation() {
     let h = harness().await;
     for t in transports() {
         let submitted = format!("submitted-{t:?}");
@@ -806,9 +806,19 @@ async fn send_to_a_submitted_or_working_task_is_invalid_request() {
         for task_id in [&submitted, &working] {
             let msg = message("m2", "more", Some(task_id), None);
             let blocking = send(&h, t, msg.clone()).await.unwrap_err();
-            assert_failure(t, &blocking, Expected::InvalidRequest, "blocking send");
+            assert_failure(
+                t,
+                &blocking,
+                Expected::UnsupportedOperation,
+                "blocking send",
+            );
             let streaming = stream_send(&h, t, msg).await.unwrap_err();
-            assert_failure(t, &streaming, Expected::InvalidRequest, "streaming send");
+            assert_failure(
+                t,
+                &streaming,
+                Expected::UnsupportedOperation,
+                "streaming send",
+            );
         }
         h.release();
         assert_eq!(

@@ -45,7 +45,7 @@ HTTP / JSON-RPC / gRPC code mapping (A2A v1.0.1 §5.4) — any drift is a compli
 - **SubscribeToTask**: first event on the stream is the Task object (spec §3.1.6). Subsequent events are `StreamingResponse` variants.
 - **SubscribeToTask on terminal task**: returns `UnsupportedOperationError`, not 200 + empty.
 - **contextId/taskId mismatch on continuation**: rejected (spec §3.4.3). Message with a `taskId` that references a task belonging to a different `contextId` must fail.
-- **ListTasks**: sorted by `updated_at DESC` across all backends. Pagination cursor encodes `updated_at|task_id` for stable iteration.
+- **ListTasks**: sorted by status timestamp DESC (task id tie-break) across all backends (spec §3.1.4). Pagination cursor encodes `<status timestamp>|<task_id>`; the final page has an empty `nextPageToken`; `pageSize` outside 1..=100 is rejected; `statusTimestampAfter` is honoured.
 - **Push notifications** (spec §9): delivery is HTTP POST with Task object payload; authorization per `config.authentication` object.
 
 ## 4. Test realism

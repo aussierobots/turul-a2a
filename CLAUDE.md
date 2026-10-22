@@ -135,7 +135,7 @@ These are separate by design. Only add types that are genuinely part of the comm
 
 `proto/a2a.proto` → `prost-build` (generates Rust structs) + `pbjson-build` (generates serde impls with camelCase JSON) → `turul-a2a-proto` crate → wrapped by `turul-a2a-types`
 
-Google well-known types (`google.protobuf.Struct`, `Value`, `Timestamp`) mapped to `pbjson_types` via `compile_well_known_types()` + `extern_path`.
+Google well-known types `google.protobuf.Struct` / `Value` map to `pbjson_types` via `compile_well_known_types()` + `extern_path`; `google.protobuf.Timestamp` maps to `turul_a2a_proto::Timestamp`, which serialises as Z-normalised RFC 3339 (proto3 JSON mapping).
 
 ### Known Exceptions
 

@@ -265,9 +265,11 @@ only.
     WORKING and then failed to spawn, leaving the task stuck;
   - the task is INPUT_REQUIRED or AUTH_REQUIRED → the message is
     appended and the task moves to WORKING;
-  - the task is SUBMITTED or WORKING → `InvalidRequest`, unchanged.
-    The spec leaves this case undefined, and turul executors only
-    accept follow-ups in an interrupted state.
+  - the task is SUBMITTED or WORKING → `UnsupportedOperation`. The spec
+    makes accepting such messages optional (§3.3.3 "MAY"), and turul
+    executors only accept follow-ups in an interrupted state, so the
+    refusal is an unsupported aspect of the operation — the same error
+    as a follow-up arriving while the previous turn's executor runs.
 - Terminal `SubscribeToTask` → `UnsupportedOperation` from the core
   (§3.1.6). Transports MUST NOT add their own terminal check; §2.5 maps
   the error to gRPC `FAILED_PRECONDITION`.
@@ -846,3 +848,4 @@ theirs. Opt-in is the correct posture for both.
 - 2026-10-22 — §2.2: `A2aServer::into_routers()` added as a second public gRPC entry point (HTTP and gRPC routers over one shared server state, gRPC side auth-layered exactly as `into_tonic_router()`); the "only public entry point" sentence now names both.
 - 2026-10-22 — §2.5: ownership of the gRPC column moved to `A2aError::grpc_status` (`wire::errors::GRPC_*`), per ADR-004; this ADR's table is a restatement, not a second source of truth. The claim that A2A publishes no gRPC table is withdrawn — v1.0.1 §5.4 does. §2.4: the gRPC layer now validates `a2a-version` metadata on `A2AService` calls before auth; missing, empty, `0.3` or unsupported values are rejected with FAILED_PRECONDITION / VERSION_NOT_SUPPORTED regardless of `compat-v03`; health and reflection are exempt.
 - 2026-10-22 — §2.3 item 6: a storage error after a stream opened ends it with one error item encoded per binding — HTTP+SSE an AIP-193 `{"error": …}` frame, JSON-RPC an error response with the request id, gRPC a `Status` — instead of closing the SSE streams silently.
+- 2026-10-22 — Send-target resolution: a follow-up to a SUBMITTED or WORKING task is `UnsupportedOperation` (was `InvalidRequest`), consistent with the in-flight-executor refusal; accepting such messages is optional in the spec.

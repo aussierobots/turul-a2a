@@ -57,10 +57,6 @@ use crate::push::ssrf::{
 };
 use crate::storage::{A2aPushNotificationStorage, A2aStorageError, A2aTaskStorage};
 
-/// `Content-Type` of every webhook POST: the A2A media type
-/// (A2A v1.0.1 §4.3.3).
-pub const PUSH_CONTENT_TYPE: &str = "application/a2a+json";
-
 /// Longest failed-delivery retention honoured; a longer one (such as
 /// `Duration::MAX` meaning "keep") is clamped to it. 1000 years keeps
 /// the give-up time plus the retention representable as a `SystemTime`
@@ -205,12 +201,25 @@ impl PushDnsResolver for TokioDnsResolver {
 /// [`PushDeliveryWorker::invalidate_push_configs`]); a deletion made
 /// anywhere else is seen within the TTL.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct DeliveryTargetLookup {
     pub push_storage: Arc<dyn A2aPushNotificationStorage>,
     pub task_storage: Arc<dyn A2aTaskStorage>,
 }
 
 impl DeliveryTargetLookup {
+    /// Look targets up in `push_storage` (configs) and `task_storage`
+    /// (tasks).
+    pub fn new(
+        push_storage: Arc<dyn A2aPushNotificationStorage>,
+        task_storage: Arc<dyn A2aTaskStorage>,
+    ) -> Self {
+        Self {
+            push_storage,
+            task_storage,
+        }
+    }
+
     /// `Some(reason)` when the config or the task is gone. A read
     /// error is not evidence of deletion: the attempt proceeds and the
     /// next attempt checks again.
@@ -824,7 +833,10 @@ impl PushDeliveryWorker {
 
         let mut req = client
             .post(target.url.clone())
-            .header("Content-Type", PUSH_CONTENT_TYPE)
+            .header(
+                "Content-Type",
+                turul_a2a_types::wire::protocol::MEDIA_TYPE_A2A_JSON,
+            )
             .header(
                 "User-Agent",
                 format!("turul-a2a/{}", env!("CARGO_PKG_VERSION")),

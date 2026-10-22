@@ -82,10 +82,10 @@ impl PushDispatcher {
                 worker
                     .as_ref()
                     .clone()
-                    .with_target_lookup(DeliveryTargetLookup {
-                        push_storage: push_storage.clone(),
-                        task_storage: task_storage.clone(),
-                    }),
+                    .with_target_lookup(DeliveryTargetLookup::new(
+                        push_storage.clone(),
+                        task_storage.clone(),
+                    )),
             )
         };
         Self {
