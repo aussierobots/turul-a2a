@@ -124,7 +124,7 @@ async fn run(mw: &BearerMiddleware, token: &str) -> Result<RequestContext, Middl
 }
 
 fn assert_kind(result: Result<RequestContext, MiddlewareError>, expected: MiddlewareError) {
-    let err = result.err().expect("request must be rejected");
+    let err = result.expect_err("request must be rejected");
     assert_eq!(format!("{err:?}"), format!("{expected:?}"));
 }
 
@@ -188,7 +188,7 @@ async fn every_validator_failure_is_invalid_token() {
         ),
     ];
     for (case, token) in cases {
-        let err = run(&mw, &token).await.err().expect(case);
+        let err = run(&mw, &token).await.expect_err(case);
         assert!(
             matches!(
                 err,

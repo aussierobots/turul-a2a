@@ -61,10 +61,10 @@ pub enum CompatMode {
 /// 3. Otherwise → V10 (canonical default; ambiguous prefers v1.0)
 pub fn detect_compat_mode(method: &str, headers: &http::HeaderMap) -> CompatMode {
     // Explicit v1.0 header takes priority — never enter compat mode
-    if let Some(version) = headers.get("a2a-version").and_then(|v| v.to_str().ok()) {
-        if crate::middleware::transport::version_supported(version) {
-            return CompatMode::V10;
-        }
+    if let Some(version) = headers.get("a2a-version").and_then(|v| v.to_str().ok())
+        && crate::middleware::transport::version_supported(version)
+    {
+        return CompatMode::V10;
     }
 
     // Slash in method name is positive v0.3 identification
@@ -154,15 +154,15 @@ pub fn maybe_normalize_params(params: &mut serde_json::Value, mode: CompatMode) 
 fn normalize_roles(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
-            if let Some(role) = map.get_mut("role") {
-                if let Some(s) = role.as_str() {
-                    let normalized = match s {
-                        "user" => "ROLE_USER",
-                        "agent" => "ROLE_AGENT",
-                        other => other,
-                    };
-                    *role = serde_json::Value::String(normalized.to_string());
-                }
+            if let Some(role) = map.get_mut("role")
+                && let Some(s) = role.as_str()
+            {
+                let normalized = match s {
+                    "user" => "ROLE_USER",
+                    "agent" => "ROLE_AGENT",
+                    other => other,
+                };
+                *role = serde_json::Value::String(normalized.to_string());
             }
             for (_, v) in map.iter_mut() {
                 normalize_roles(v);
@@ -210,15 +210,15 @@ pub fn maybe_normalize_response(response: &mut serde_json::Value, mode: CompatMo
 fn denormalize_roles(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
-            if let Some(role) = map.get_mut("role") {
-                if let Some(s) = role.as_str() {
-                    let denormalized = match s {
-                        "ROLE_USER" => "user",
-                        "ROLE_AGENT" => "agent",
-                        other => other,
-                    };
-                    *role = serde_json::Value::String(denormalized.to_string());
-                }
+            if let Some(role) = map.get_mut("role")
+                && let Some(s) = role.as_str()
+            {
+                let denormalized = match s {
+                    "ROLE_USER" => "user",
+                    "ROLE_AGENT" => "agent",
+                    other => other,
+                };
+                *role = serde_json::Value::String(denormalized.to_string());
             }
             for (_, v) in map.iter_mut() {
                 denormalize_roles(v);
@@ -237,21 +237,21 @@ fn denormalize_roles(value: &mut serde_json::Value) {
 fn normalize_task_state_enums(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
-            if let Some(state) = map.get_mut("state") {
-                if let Some(s) = state.as_str() {
-                    let normalized = match s {
-                        "TASK_STATE_SUBMITTED" => "submitted",
-                        "TASK_STATE_WORKING" => "working",
-                        "TASK_STATE_COMPLETED" => "completed",
-                        "TASK_STATE_CANCELED" => "canceled",
-                        "TASK_STATE_FAILED" => "failed",
-                        "TASK_STATE_INPUT_REQUIRED" => "input-required",
-                        "TASK_STATE_REJECTED" => "rejected",
-                        "TASK_STATE_AUTH_REQUIRED" => "auth-required",
-                        other => other,
-                    };
-                    *state = serde_json::Value::String(normalized.to_string());
-                }
+            if let Some(state) = map.get_mut("state")
+                && let Some(s) = state.as_str()
+            {
+                let normalized = match s {
+                    "TASK_STATE_SUBMITTED" => "submitted",
+                    "TASK_STATE_WORKING" => "working",
+                    "TASK_STATE_COMPLETED" => "completed",
+                    "TASK_STATE_CANCELED" => "canceled",
+                    "TASK_STATE_FAILED" => "failed",
+                    "TASK_STATE_INPUT_REQUIRED" => "input-required",
+                    "TASK_STATE_REJECTED" => "rejected",
+                    "TASK_STATE_AUTH_REQUIRED" => "auth-required",
+                    other => other,
+                };
+                *state = serde_json::Value::String(normalized.to_string());
             }
             for (_, v) in map.iter_mut() {
                 normalize_task_state_enums(v);
@@ -286,10 +286,10 @@ pub fn inject_agent_card_compat(mut card: serde_json::Value) -> serde_json::Valu
             .unwrap_or_default();
 
         if let Some(primary) = interfaces.first() {
-            if !obj.contains_key("url") {
-                if let Some(url) = primary.get("url") {
-                    obj.insert("url".to_string(), url.clone());
-                }
+            if !obj.contains_key("url")
+                && let Some(url) = primary.get("url")
+            {
+                obj.insert("url".to_string(), url.clone());
             }
 
             let additional: Vec<serde_json::Value> = interfaces

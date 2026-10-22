@@ -604,7 +604,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         if turul_a2a_types::state_machine::is_terminal(state) {
             return Err(A2aStorageError::TerminalState {
                 task_id: task_id.to_string(),
-                state: state,
+                state,
             });
         }
         // Idempotent: already true → no-op success.

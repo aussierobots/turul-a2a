@@ -898,7 +898,7 @@ impl A2aTaskStorage for SqliteA2aStorage {
                 };
                 Err(A2aStorageError::TerminalState {
                     task_id: task_id.to_string(),
-                    state: state,
+                    state,
                 })
             }
         }
