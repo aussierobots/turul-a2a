@@ -44,7 +44,7 @@ use turul_a2a_types::Task;
 use url::Url;
 
 use crate::push::claim::ReclaimableClaim;
-use crate::push::delivery::{DeliveryReport, PushDeliveryWorker, PushTarget};
+use crate::push::delivery::{DeliveryReport, DeliveryTargetLookup, PushDeliveryWorker, PushTarget};
 use crate::push::secret::Secret;
 use crate::storage::{A2aPushNotificationStorage, A2aTaskStorage};
 use crate::streaming::StreamEvent;
@@ -65,11 +65,23 @@ pub struct PushDispatcher {
 }
 
 impl PushDispatcher {
+    /// Every delivery this dispatcher runs re-reads its push config
+    /// and task from `push_storage` / `task_storage` before each POST
+    /// attempt and is abandoned once either is deleted.
     pub fn new(
         worker: Arc<PushDeliveryWorker>,
         push_storage: Arc<dyn A2aPushNotificationStorage>,
         task_storage: Arc<dyn A2aTaskStorage>,
     ) -> Self {
+        let worker = Arc::new(
+            worker
+                .as_ref()
+                .clone()
+                .with_target_lookup(DeliveryTargetLookup {
+                    push_storage: push_storage.clone(),
+                    task_storage: task_storage.clone(),
+                }),
+        );
         Self {
             worker,
             push_storage,
@@ -147,13 +159,13 @@ impl PushDispatcher {
         // it would be either redundant (fresh-dispatch) or already
         // handled by the caller (reclaim).
 
-        // Serialise the task payload once — every config receives
-        // the same JSON body.
-        let payload = match serde_json::to_vec(&task) {
+        // Serialise the payload once — every config receives the same
+        // body.
+        let payload = match push_payload(&task) {
             Ok(p) => p,
             Err(e) => {
                 return Err(crate::storage::A2aStorageError::SerializationError(
-                    format!("task payload serialise failed: {e}"),
+                    format!("push payload serialise failed: {e}"),
                 ));
             }
         };
@@ -544,7 +556,7 @@ impl PushDispatcher {
                     // outcome.
                     return;
                 };
-                let payload = match serde_json::to_vec(&task) {
+                let payload = match push_payload(&task) {
                     Ok(p) => p,
                     Err(_) => return,
                 };
@@ -598,6 +610,17 @@ impl PushDispatcher {
             }
         }
     }
+}
+
+/// The webhook body: a `StreamResponse` whose only member is `task`,
+/// the task snapshot (A2A v1.0.1 §4.3.3 — "The payload uses the same
+/// `StreamResponse` format as streaming operations").
+pub(crate) fn push_payload(task: &Task) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&turul_a2a_proto::StreamResponse {
+        payload: Some(turul_a2a_proto::stream_response::Payload::Task(
+            task.as_proto().clone(),
+        )),
+    })
 }
 
 /// Deliver only on terminal status events. Artifact events are out of
@@ -715,6 +738,26 @@ mod tests {
         // Debug of the Secret must not leak the raw bytes.
         assert!(!format!("{:?}", t.auth_credentials).contains("CRED-Y"));
         assert!(!format!("{:?}", t.token).contains("TOKEN-X"));
+    }
+
+    #[test]
+    fn push_payload_is_a_stream_response_with_only_the_task() {
+        let task = Task::new(
+            "task-1",
+            turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Completed),
+        )
+        .with_context_id("ctx-1");
+        let body: serde_json::Value =
+            serde_json::from_slice(&push_payload(&task).expect("serialise")).unwrap();
+        let members = body.as_object().expect("object");
+        assert_eq!(
+            members.keys().collect::<Vec<_>>(),
+            vec!["task"],
+            "exactly one top-level member"
+        );
+        assert_eq!(body["task"]["id"], "task-1");
+        assert_eq!(body["task"]["contextId"], "ctx-1");
+        assert_eq!(body["task"]["status"]["state"], "TASK_STATE_COMPLETED");
     }
 
     #[test]

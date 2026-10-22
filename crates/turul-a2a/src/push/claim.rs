@@ -74,10 +74,9 @@
 //!
 //! # Observability
 //!
-//! `claim_delivery` is called once per (event, config) pair. Callers
-//! are expected to emit `framework.push_claim_attempts` /
-//! `_conflicts` tracing events around the call. The store does not
-//! emit telemetry itself — it only provides the race-free primitive.
+//! `claim_delivery` is called once per (event, config) pair. The
+//! store emits no telemetry — it only provides the race-free
+//! primitive — and the framework emits no claim metrics either.
 //!
 //! # Expiry sweep
 //!
@@ -284,9 +283,9 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     /// stored status or a computed property.
     ///
     /// Returns the count of claim rows that currently satisfy the
-    /// derivation above. Intended for periodic metric emission
-    /// (`framework.push_claims_expired_gauge` and similar) so
-    /// operators can alert on stuck-claim accumulation. Backends
+    /// derivation above, so an adopter-run maintenance loop can
+    /// alert on stuck-claim accumulation (the framework emits no
+    /// metric for it). Backends
     /// MAY piggy-back retention cleanup of terminal claims past
     /// `push_failed_delivery_retention` as a side effect of this
     /// call, or handle retention via native mechanisms (e.g.,
@@ -595,7 +594,8 @@ pub enum DeliveryErrorClass {
     HttpError4xx { status: u16 },
     /// HTTP 5xx response. Transient; retried until the horizon.
     HttpError5xx { status: u16 },
-    /// HTTP 429 Too Many Requests. Retried, respecting `Retry-After`.
+    /// HTTP 429 Too Many Requests. Retried on the normal backoff
+    /// schedule; a `Retry-After` header is not consulted.
     HttpError429,
     /// Destination rejected by SSRF guard — private-range IP, DNS
     /// rebinding attempt, allowlist denial.

@@ -174,36 +174,46 @@ pub fn validate_scheme(url: &Url, allow_insecure: bool) -> Result<(), SsrfBlockR
     }
 }
 
+/// The checks that need no DNS answer: the URL has a host, its
+/// scheme is allowed, and the operator allowlist validator (if any)
+/// accepts it. The delivery worker runs these BEFORE resolving the
+/// hostname, so a URL the deployment refuses never causes a DNS
+/// query either.
+pub fn check_url(
+    url: &Url,
+    allow_insecure: bool,
+    outbound_validator: Option<&OutboundUrlValidator>,
+) -> Result<(), SsrfBlockReason> {
+    if url.host_str().is_none() {
+        return Err(SsrfBlockReason::InvalidUrl);
+    }
+    validate_scheme(url, allow_insecure)?;
+    if let Some(validator) = outbound_validator
+        && validator(url).is_err()
+    {
+        return Err(SsrfBlockReason::ValidatorDenied);
+    }
+    Ok(())
+}
+
 /// Apply the SSRF decision to a parsed URL with a pre-resolved list
-/// of destination IPs.
-///
-/// Callers: the delivery worker resolves the hostname (via a
-/// single `tokio::net::lookup_host` or an injected DNS resolver for
-/// testability), passes the resolved IPs here, and receives either
-/// `Allow { resolved_ip }` — which the worker then uses to open a
-/// connection directly to that IP — or `Block(reason)`.
-///
-/// The allowlist validator, if present, runs BEFORE DNS; it sees
-/// the URL pre-resolution so deployments can reject by hostname
-/// regardless of how it resolves.
+/// of destination IPs: [`check_url`], then [`pick_destination`].
 pub fn decide(
     url: &Url,
     resolved_ips: &[IpAddr],
     allow_insecure: bool,
     outbound_validator: Option<&OutboundUrlValidator>,
 ) -> SsrfDecision {
-    // URL shape: must have a host.
-    if url.host_str().is_none() {
-        return SsrfDecision::Block(SsrfBlockReason::InvalidUrl);
+    match check_url(url, allow_insecure, outbound_validator) {
+        Err(reason) => SsrfDecision::Block(reason),
+        Ok(()) => pick_destination(resolved_ips, allow_insecure),
     }
-    if let Err(reason) = validate_scheme(url, allow_insecure) {
-        return SsrfDecision::Block(reason);
-    }
-    if let Some(validator) = outbound_validator
-        && validator(url).is_err()
-    {
-        return SsrfDecision::Block(SsrfBlockReason::ValidatorDenied);
-    }
+}
+
+/// Choose the IP the worker connects to from one DNS answer: the
+/// first address outside the blocklist. The worker connects to that
+/// IP directly, so a later DNS answer cannot swap the destination.
+pub fn pick_destination(resolved_ips: &[IpAddr], allow_insecure: bool) -> SsrfDecision {
     // Pick the first IP that passes the blocklist. When
     // `allow_insecure` is true we also bypass the blocklist so
     // `http://127.0.0.1` works in local tests.

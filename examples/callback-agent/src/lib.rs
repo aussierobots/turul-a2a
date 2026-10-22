@@ -5,10 +5,11 @@
 //!
 //! 1. Caller registers a `TaskPushNotificationConfig` — webhook URL
 //!    plus a shared secret `token` — against a task id.
-//! 2. When the task reaches a terminal state, the framework POSTs
-//!    the terminal Task JSON to that URL with the `token` echoed in
-//!    the `X-Turul-Push-Token` header (note: framework header, not
-//!    the spec's `X-A2A-Notification-Token`).
+//! 2. When the task reaches a terminal state, the framework POSTs a
+//!    `StreamResponse` — `{"task": <terminal Task>}`, Content-Type
+//!    `application/a2a+json` — to that URL with the `token` echoed in
+//!    the `X-Turul-Push-Token` header. The A2A spec names no header
+//!    for the token, so this one is turul-specific.
 //! 3. The receiver validates the header matches the token it
 //!    registered. A mismatch means the call isn't ours — reject.
 //!
@@ -101,12 +102,13 @@ impl AgentExecutor for CallbackExecutor {
 }
 
 /// A single webhook call observed by the receiver. `body` is the raw
-/// JSON the framework POSTed (the proto-JSON form of the terminal
-/// `Task`).
+/// JSON the framework POSTed: a `StreamResponse` whose `task` member
+/// is the terminal `Task`.
 #[derive(Debug, Clone)]
 pub struct ReceivedWebhook {
     pub token_header: Option<String>,
     pub event_sequence_header: Option<String>,
+    pub content_type_header: Option<String>,
     pub body: serde_json::Value,
 }
 
@@ -129,6 +131,10 @@ async fn webhook_handler(
         .get(EVENT_SEQUENCE_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let content_type_header = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
 
     // Validate the shared-secret token. In production this is the
     // primary defence against forged webhooks from arbitrary
@@ -137,6 +143,7 @@ async fn webhook_handler(
         let _ = state.tx.send(ReceivedWebhook {
             token_header,
             event_sequence_header,
+            content_type_header,
             body: serde_json::json!({"_rejected_reason": "token mismatch"}),
         });
         return (StatusCode::UNAUTHORIZED, "invalid push token");
@@ -147,6 +154,7 @@ async fn webhook_handler(
     let _ = state.tx.send(ReceivedWebhook {
         token_header,
         event_sequence_header,
+        content_type_header,
         body: parsed,
     });
     (StatusCode::OK, "ok")

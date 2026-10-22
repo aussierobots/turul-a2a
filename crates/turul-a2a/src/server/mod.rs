@@ -1383,6 +1383,10 @@ mod tests {
             server.state.push_delivery_store.is_none(),
             ".storage() must NOT auto-wire push_delivery_store — push is opt-in via .push_delivery_store()"
         );
+        assert!(
+            server.state.push_dispatcher.is_none(),
+            "no delivery store, no dispatcher"
+        );
     }
 
     #[test]
@@ -1412,6 +1416,10 @@ mod tests {
             .build()
             .expect("build must succeed");
         assert!(server.state.push_delivery_store.is_some());
+        assert!(
+            server.state.push_dispatcher.is_some(),
+            "a wired delivery store gets a dispatcher, so terminal commits fan out"
+        );
     }
 
     // -----------------------------------------------------------------

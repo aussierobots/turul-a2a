@@ -1,12 +1,17 @@
-//! Wiremock integration tests for the push delivery worker
-//!.
+//! Wiremock integration tests for the push delivery worker.
 //!
-//! Covers a representative subset of the normative scenarios:
-//! - Basic delivery on terminal event (happy path)
-//! - Retry on 5xx with backoff
-//! - No retry on 4xx (non-408/429)
-//! - Giveup after max attempts
-//! - Secret redaction coverage
+//! Covers:
+//! - Basic delivery: exact `Authorization`, `X-Turul-Push-Token` and
+//!   `Content-Type` headers; Bearer, Basic and custom (`ApiKey`) schemes
+//! - Retry on 5xx and 429; no retry on other 4xx; giveup after max
+//!   attempts with a complete, secret-free failed-delivery record
+//! - Config or task deleted mid-retry → Abandoned, no further POST
+//! - Two instances sharing storage → exactly one POST
+//! - Claim expiry: a second instance resumes the cluster-wide budget
+//! - SSRF: private / loopback / metadata / unspecified destinations and
+//!   the operator allowlist are refused before any POST
+//! - Secret redaction across Debug output, failed-delivery records and
+//!   every tracing event emitted during delivery
 //!
 //! These tests drive `PushDeliveryWorker::deliver` directly against a
 //! wiremock `MockServer`. The dispatcher (event → configs fan-out) is
@@ -31,13 +36,14 @@ use turul_a2a::push::claim::{
     A2aPushDeliveryStore, DeliveryClaim, DeliveryOutcome, FailedDelivery,
 };
 use turul_a2a::push::delivery::{
-    DeliveryReport, PushDeliveryConfig, PushDeliveryWorker, PushDnsResolver, PushTarget,
+    DeliveryReport, DeliveryTargetLookup, PushDeliveryConfig, PushDeliveryWorker, PushDnsResolver,
+    PushTarget,
 };
 use turul_a2a::push::secret::Secret;
-use turul_a2a::push::{DeliveryErrorClass, GaveUpReason};
+use turul_a2a::push::{AbandonedReason, DeliveryErrorClass, GaveUpReason};
 use turul_a2a::storage::{A2aPushNotificationStorage, A2aStorageError, InMemoryA2aStorage};
 use url::Url;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ---------------------------------------------------------------------------
@@ -51,9 +57,13 @@ const SENTINEL_TOKEN: &str = "SECRET-TOKEN-DO-NOT-LEAK";
 // Fixtures.
 // ---------------------------------------------------------------------------
 
-/// Build a worker with a fast retry schedule suitable for integration
-/// tests. Jitter is zeroed so backoff is deterministic.
-fn fast_worker(store: Arc<InMemoryA2aStorage>, max_attempts: u32) -> PushDeliveryWorker {
+/// Fast, deterministic delivery config for tests (zero jitter,
+/// millisecond backoff, insecure URLs allowed because wiremock lives
+/// on 127.0.0.1); `tune` adjusts it per test.
+fn test_config(
+    max_attempts: u32,
+    tune: impl FnOnce(&mut PushDeliveryConfig),
+) -> PushDeliveryConfig {
     // `PushDeliveryConfig` is `#[non_exhaustive]` — can't be built via
     // struct literal from an external test crate, so mutate a default.
     let mut cfg = PushDeliveryConfig::default();
@@ -66,14 +76,42 @@ fn fast_worker(store: Arc<InMemoryA2aStorage>, max_attempts: u32) -> PushDeliver
     cfg.read_timeout = Duration::from_secs(2);
     cfg.claim_expiry = Duration::from_secs(60);
     cfg.max_payload_bytes = 64 * 1024;
-    cfg.allow_insecure_urls = true; // wiremock lives on 127.0.0.1
+    cfg.allow_insecure_urls = true;
+    tune(&mut cfg);
+    cfg
+}
+
+/// Build a worker with a fast retry schedule suitable for integration
+/// tests. Jitter is zeroed so backoff is deterministic.
+fn fast_worker(store: Arc<InMemoryA2aStorage>, max_attempts: u32) -> PushDeliveryWorker {
     PushDeliveryWorker::new(
         store,
-        cfg,
+        test_config(max_attempts, |_| {}),
         None,
         format!("instance-{}", uuid::Uuid::now_v7()),
     )
     .expect("worker build must succeed")
+}
+
+/// Poll `condition` until it holds or `deadline` passes.
+async fn wait_until<F, Fut>(deadline: Duration, what: &str, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let start = std::time::Instant::now();
+    while !condition().await {
+        assert!(start.elapsed() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn request_count(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("wiremock recording enabled")
+        .len()
 }
 
 fn sentinel_target(base_url: &str) -> PushTarget {
@@ -97,8 +135,17 @@ fn sentinel_target(base_url: &str) -> PushTarget {
 #[tokio::test]
 async fn happy_path_single_post_succeeds() {
     let server = MockServer::start().await;
+    // Exact header values: a matcher mismatch means no 200 and the
+    // `.expect(1)` fails on drop.
     Mock::given(method("POST"))
         .and(path("/webhook"))
+        .and(header(
+            "authorization",
+            format!("Bearer {SENTINEL_CREDENTIAL}").as_str(),
+        ))
+        .and(header("x-turul-push-token", SENTINEL_TOKEN))
+        .and(header("content-type", "application/a2a+json"))
+        .and(header("x-turul-event-sequence", "1"))
         .respond_with(ResponseTemplate::new(200))
         .expect(1) // wiremock asserts on drop
         .mount(&server)
@@ -108,8 +155,12 @@ async fn happy_path_single_post_succeeds() {
     let worker = fast_worker(store.clone(), 8);
     let target = sentinel_target(&server.uri());
 
-    let report = worker.deliver(&target, br#"{"status":"completed"}"#).await;
+    let payload = br#"{"task":{"id":"t"}}"#;
+    let report = worker.deliver(&target, payload).await;
     assert_eq!(report, DeliveryReport::Succeeded(200));
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].body, payload, "the payload is POSTed verbatim");
 
     // No failed-delivery record should be stored for a successful
     // delivery — only giveups/abandons are surfaced there.
@@ -247,6 +298,11 @@ async fn giveup_after_max_attempts_on_sustained_5xx() {
         .await
         .unwrap();
     assert_eq!(failed.len(), 1, "one failed-delivery record for giveup");
+    assert_eq!(failed[0].task_id, target.task_id);
+    assert_eq!(failed[0].config_id, target.config_id);
+    assert_eq!(failed[0].event_sequence, target.event_sequence);
+    assert!(failed[0].first_attempted_at <= failed[0].last_attempted_at);
+    assert!(failed[0].last_attempted_at <= failed[0].gave_up_at);
     assert_eq!(
         failed[0].delivery_attempt_count, max_attempts,
         "delivery_attempt_count must equal configured max"
@@ -279,16 +335,74 @@ async fn giveup_after_max_attempts_on_sustained_5xx() {
 // Secret redaction coverage.
 //
 // The worker must never surface the raw credential or push token in
-// any observable form (Debug, Display, stored failed-delivery
-// records). The worker does not currently emit tracing events on
-// failure — when that's added, this test should be extended to capture
-// log output too. For now it enforces the invariant at every surface
-// the worker does touch.
+// any observable form: Debug output, stored failed-delivery records,
+// or any tracing event or span field emitted while delivering, at any
+// level.
 // ---------------------------------------------------------------------------
+
+/// Records every tracing event and span field, at every level, as text.
+#[derive(Clone, Default)]
+struct TraceCapture {
+    lines: Arc<Mutex<Vec<String>>>,
+}
+
+struct TextVisitor<'a>(&'a mut String);
+
+impl tracing::field::Visit for TextVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!(" {}={value:?}", field.name()));
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TraceCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut line = event.metadata().target().to_string();
+        event.record(&mut TextVisitor(&mut line));
+        self.lines.lock().unwrap().push(line);
+    }
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        _id: &tracing::span::Id,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut line = attrs.metadata().name().to_string();
+        attrs.record(&mut TextVisitor(&mut line));
+        self.lines.lock().unwrap().push(line);
+    }
+}
 
 #[tokio::test]
 async fn secret_sentinel_never_leaks_on_giveup() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    // Current-thread runtime: the thread-local subscriber sees every
+    // event the delivery emits.
+    let capture = TraceCapture::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+    tracing::info!(target: "capture_probe", "probe");
+    assert_eq!(
+        capture.lines.lock().unwrap().len(),
+        1,
+        "the capture layer must be live for the assertions below to mean anything"
+    );
+
     let server = MockServer::start().await;
+    // Two retried 500s, then a non-retryable 400: the delivery walks
+    // the retry and the giveup paths.
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .expect(2)
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/webhook"))
         .respond_with(ResponseTemplate::new(400))
@@ -344,6 +458,15 @@ async fn secret_sentinel_never_leaks_on_giveup() {
         !rendered.contains(SENTINEL_TOKEN),
         "FailedDelivery leaked token: {rendered}"
     );
+
+    // 3) No tracing event or span field carries either secret.
+    let lines = capture.lines.lock().unwrap();
+    for line in lines.iter() {
+        assert!(
+            !line.contains(SENTINEL_CREDENTIAL) && !line.contains(SENTINEL_TOKEN),
+            "tracing output leaked a secret: {line}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -841,7 +964,18 @@ async fn reclaim_sweep_redispatches_after_persistent_terminal_failure() {
     // reclaim enumeration surfaces the row. Using delivery_store
     // directly; the wrapper delegates list_reclaimable_claims to
     // the inner store.
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    wait_until(
+        Duration::from_secs(2),
+        "the stuck claim to expire",
+        || async {
+            !delivery_store
+                .list_reclaimable_claims(16)
+                .await
+                .expect("list_reclaimable_claims")
+                .is_empty()
+        },
+    )
+    .await;
     let reclaimable = delivery_store
         .list_reclaimable_claims(16)
         .await
@@ -1275,7 +1409,18 @@ async fn redispatch_read_error_leaves_row_reclaimable() {
         )
         .await
         .expect("seed claim");
-    tokio::time::sleep(Duration::from_millis(70)).await;
+    wait_until(
+        Duration::from_secs(2),
+        "the seeded claim to expire",
+        || async {
+            !delivery_store
+                .list_reclaimable_claims(16)
+                .await
+                .expect("list_reclaimable_claims")
+                .is_empty()
+        },
+    )
+    .await;
 
     let reclaimable = delivery_store
         .list_reclaimable_claims(16)
@@ -1414,7 +1559,13 @@ async fn pending_dispatch_marker_recovers_persistent_list_configs_outage() {
         terminal_task,
         vec![(terminal_seq, completed)],
     );
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    // The fan-out gives up after its third list attempt.
+    wait_until(
+        Duration::from_secs(3),
+        "three failed config listings",
+        || async { *push_storage.list_configs_calls.lock().unwrap() == 3 },
+    )
+    .await;
 
     // Marker must be present. `list_stale_pending_dispatches` with
     // cutoff = now returns everything recorded before now.
@@ -1530,9 +1681,11 @@ async fn initial_dispatch_retries_list_configs_on_transient_failure() {
 
     dispatcher.dispatch(tenant.into(), owner.into(), task, vec![(1, completed)]);
 
-    // Wait for bounded retry (50+150+500 ms max) plus a small margin
-    // for the POST to reach wiremock and the terminal write to land.
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    // Bounded list retry (50+150+500 ms max), then the POST.
+    wait_until(Duration::from_secs(3), "the dispatched POST", || async {
+        request_count(&server).await == 1
+    })
+    .await;
 
     assert_eq!(
         *push_storage.list_configs_calls.lock().unwrap(),
@@ -1541,4 +1694,403 @@ async fn initial_dispatch_retries_list_configs_on_transient_failure() {
     );
 
     drop(server);
+}
+
+// ---------------------------------------------------------------------------
+// Authentication schemes: the header is `{scheme} {credentials}`
+// verbatim for any IANA or custom scheme.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn basic_and_custom_auth_schemes_are_sent_verbatim() {
+    for (scheme, credentials) in [("Basic", "dXNlcjpwYXNz"), ("ApiKey", "k-123")] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/webhook"))
+            .and(header(
+                "authorization",
+                format!("{scheme} {credentials}").as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = Arc::new(InMemoryA2aStorage::new());
+        let worker = fast_worker(store, 1);
+        let mut target = sentinel_target(&server.uri());
+        target.auth_scheme = scheme.into();
+        target.auth_credentials = Secret::new(credentials.into());
+
+        let report = worker.deliver(&target, b"{}").await;
+        assert_eq!(report, DeliveryReport::Succeeded(200), "scheme {scheme}");
+        drop(server);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 429 is retried.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn retry_on_429_then_success() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(429))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(InMemoryA2aStorage::new());
+    let worker = fast_worker(store, 3);
+    let report = worker.deliver(&sentinel_target(&server.uri()), b"{}").await;
+    assert_eq!(report, DeliveryReport::Succeeded(200));
+    drop(server);
+}
+
+// ---------------------------------------------------------------------------
+// Deletion mid-retry. The worker re-reads the config and the task
+// before every attempt; once either is gone the delivery is abandoned
+// and no further POST is sent (A2A v1.0.1 §3.1.10).
+// ---------------------------------------------------------------------------
+
+const LIVE_TENANT: &str = "tenant-live";
+const LIVE_OWNER: &str = "owner-live";
+
+/// Seed a WORKING task and one push config for it; return the config.
+async fn seed_task_and_config(
+    store: &Arc<InMemoryA2aStorage>,
+    url: &str,
+) -> turul_a2a_proto::TaskPushNotificationConfig {
+    use turul_a2a::storage::A2aTaskStorage;
+    let task_id = format!("task-{}", uuid::Uuid::now_v7());
+    let task = turul_a2a_types::Task::new(
+        &task_id,
+        turul_a2a_types::TaskStatus::new(turul_a2a_types::TaskState::Working),
+    )
+    .with_context_id("ctx-live");
+    store
+        .create_task(LIVE_TENANT, LIVE_OWNER, task)
+        .await
+        .expect("seed task");
+    store
+        .create_config(
+            LIVE_TENANT,
+            turul_a2a_proto::TaskPushNotificationConfig {
+                tenant: LIVE_TENANT.into(),
+                id: "cfg-live".into(),
+                task_id,
+                url: url.into(),
+                token: String::new(),
+                authentication: None,
+            },
+        )
+        .await
+        .expect("seed config")
+}
+
+/// Worker with a target lookup on `store`, 500 ms between attempts so
+/// the test can delete something after the first POST.
+fn live_worker(store: &Arc<InMemoryA2aStorage>) -> Arc<PushDeliveryWorker> {
+    let cfg = test_config(5, |c| {
+        c.backoff_base = Duration::from_millis(500);
+        c.backoff_cap = Duration::from_millis(500);
+    });
+    Arc::new(
+        PushDeliveryWorker::new(store.clone(), cfg, None, "instance-live".into())
+            .expect("worker")
+            .with_target_lookup(DeliveryTargetLookup {
+                push_storage: store.clone(),
+                task_storage: store.clone(),
+            }),
+    )
+}
+
+/// Run one delivery against a 500-forever receiver, apply `delete`
+/// after the first POST, and return the report and the POST count.
+async fn deliver_and_delete_after_first_post<F, Fut>(delete: F) -> (DeliveryReport, usize)
+where
+    F: FnOnce(Arc<InMemoryA2aStorage>, turul_a2a_proto::TaskPushNotificationConfig) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(InMemoryA2aStorage::new());
+    let cfg = seed_task_and_config(&store, &format!("{}/webhook", server.uri())).await;
+    let worker = live_worker(&store);
+    let target =
+        PushTarget::from_config(LIVE_TENANT, LIVE_OWNER, &cfg.task_id, 1, &cfg).expect("target");
+
+    let delivery = {
+        let worker = worker.clone();
+        let target = target.clone();
+        tokio::spawn(async move { worker.deliver(&target, b"{}").await })
+    };
+    wait_until(Duration::from_secs(3), "the first POST", || async {
+        request_count(&server).await == 1
+    })
+    .await;
+    delete(store.clone(), cfg.clone()).await;
+    let report = delivery.await.expect("delivery task");
+
+    // Abandoned is terminal and not a failure: not listed, not
+    // reclaimable, and the claim cannot be taken again.
+    assert!(
+        store
+            .list_failed_deliveries(LIVE_TENANT, SystemTime::UNIX_EPOCH, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(store.list_reclaimable_claims(16).await.unwrap().is_empty());
+    assert!(matches!(
+        store
+            .claim_delivery(
+                LIVE_TENANT,
+                &cfg.task_id,
+                1,
+                &cfg.id,
+                "instance-other",
+                LIVE_OWNER,
+                Duration::from_secs(60),
+            )
+            .await,
+        Err(A2aStorageError::ClaimAlreadyHeld { .. })
+    ));
+    (report, request_count(&server).await)
+}
+
+#[tokio::test]
+async fn config_deleted_mid_retry_abandons_without_another_post() {
+    let (report, posts) = deliver_and_delete_after_first_post(|store, cfg| async move {
+        store
+            .delete_config(LIVE_TENANT, &cfg.task_id, &cfg.id)
+            .await
+            .expect("delete config");
+    })
+    .await;
+    assert_eq!(
+        report,
+        DeliveryReport::Abandoned(AbandonedReason::ConfigDeleted)
+    );
+    assert_eq!(posts, 1, "no POST after the config was deleted");
+}
+
+#[tokio::test]
+async fn task_deleted_mid_retry_abandons_without_another_post() {
+    let (report, posts) = deliver_and_delete_after_first_post(|store, cfg| async move {
+        use turul_a2a::storage::A2aTaskStorage;
+        assert!(
+            store
+                .delete_task(LIVE_TENANT, &cfg.task_id, LIVE_OWNER)
+                .await
+                .expect("delete task")
+        );
+    })
+    .await;
+    assert_eq!(
+        report,
+        DeliveryReport::Abandoned(AbandonedReason::TaskDeleted)
+    );
+    assert_eq!(posts, 1, "no POST after the task was deleted");
+}
+
+// ---------------------------------------------------------------------------
+// Cross-instance coordination.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn two_instances_sharing_storage_post_exactly_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(InMemoryA2aStorage::new());
+    let a = fast_worker(store.clone(), 3);
+    let b = fast_worker(store.clone(), 3);
+    let target = sentinel_target(&server.uri());
+
+    let (ra, rb) = tokio::join!(a.deliver(&target, b"{}"), b.deliver(&target, b"{}"));
+    let mut reports = vec![ra, rb];
+    reports.sort_by_key(|r| format!("{r:?}"));
+    assert_eq!(
+        reports,
+        vec![
+            DeliveryReport::ClaimLostOrFinal,
+            DeliveryReport::Succeeded(200)
+        ],
+        "one instance delivers, the other loses the claim"
+    );
+    assert_eq!(request_count(&server).await, 1);
+    drop(server);
+}
+
+/// Instance A claims and starts one POST, then dies without recording
+/// an outcome. Once its claim expires, instance B re-claims and resumes
+/// the cluster-wide budget: with `max_attempts = 3` it makes exactly
+/// two more POSTs and records the giveup with all three counted.
+#[tokio::test]
+async fn expired_claim_is_resumed_by_another_instance_within_the_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(InMemoryA2aStorage::new());
+    let target = sentinel_target(&server.uri());
+
+    let claim_a = store
+        .claim_delivery(
+            &target.tenant,
+            &target.task_id,
+            target.event_sequence,
+            &target.config_id,
+            "instance-A",
+            &target.owner,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("A claims");
+    let count = store
+        .record_attempt_started(
+            &target.tenant,
+            &target.task_id,
+            target.event_sequence,
+            &target.config_id,
+            "instance-A",
+            claim_a.generation,
+        )
+        .await
+        .expect("A starts its POST");
+    assert_eq!(count, 1);
+
+    wait_until(Duration::from_secs(2), "A's claim to expire", || async {
+        store.list_reclaimable_claims(16).await.unwrap().len() == 1
+    })
+    .await;
+
+    let b = fast_worker(store.clone(), 3);
+    let report = b.deliver(&target, b"{}").await;
+    assert_eq!(
+        report,
+        DeliveryReport::GaveUp(GaveUpReason::MaxAttemptsExhausted)
+    );
+    assert_eq!(
+        request_count(&server).await,
+        2,
+        "B only spends what is left"
+    );
+
+    let failed = store
+        .list_failed_deliveries(&target.tenant, SystemTime::UNIX_EPOCH, 10)
+        .await
+        .unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].delivery_attempt_count, 3);
+    assert_eq!(failed[0].last_http_status, Some(500));
+    assert!(store.list_reclaimable_claims(16).await.unwrap().is_empty());
+    drop(server);
+}
+
+// ---------------------------------------------------------------------------
+// SSRF, end to end through `deliver`. Insecure URLs are disallowed, so
+// the URL is https and the injected resolver answers with the address
+// under test. A blocked destination is recorded as a failed delivery
+// with no attempt counted — the counter only advances immediately
+// before a POST.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ssrf_blocked_destinations_are_never_posted() {
+    for ip in ["127.0.0.1", "10.0.0.5", "169.254.169.254", "::1", "::"] {
+        let store = Arc::new(InMemoryA2aStorage::new());
+        let calls = Arc::new(Mutex::new(0u32));
+        let worker = PushDeliveryWorker::new(
+            store.clone(),
+            test_config(3, |c| c.allow_insecure_urls = false),
+            None,
+            "instance-ssrf".into(),
+        )
+        .expect("worker")
+        .with_dns_resolver(Arc::new(PinResolver {
+            ip: ip.parse().unwrap(),
+            call_count: calls.clone(),
+        }));
+        let mut target = sentinel_target("https://hook.example.test");
+        target.url = Url::parse("https://hook.example.test/webhook").unwrap();
+
+        let report = worker.deliver(&target, b"{}").await;
+        assert_eq!(
+            report,
+            DeliveryReport::GaveUp(GaveUpReason::SsrfBlocked),
+            "{ip}"
+        );
+        assert_eq!(*calls.lock().unwrap(), 1, "{ip}: resolved once");
+        let failed = store
+            .list_failed_deliveries(&target.tenant, SystemTime::UNIX_EPOCH, 10)
+            .await
+            .unwrap();
+        assert_eq!(failed.len(), 1, "{ip}");
+        assert_eq!(failed[0].last_error_class, DeliveryErrorClass::SSRFBlocked);
+        assert_eq!(failed[0].delivery_attempt_count, 0, "{ip}: no POST");
+        assert_eq!(failed[0].last_http_status, None, "{ip}");
+    }
+}
+
+/// The operator allowlist runs before DNS: a refused host is never
+/// resolved and never POSTed.
+#[tokio::test]
+async fn outbound_allowlist_refuses_before_dns() {
+    let store = Arc::new(InMemoryA2aStorage::new());
+    let calls = Arc::new(Mutex::new(0u32));
+    let validator: turul_a2a::push::ssrf::OutboundUrlValidator =
+        Arc::new(|url: &Url| match url.host_str() {
+            Some(h) if h.ends_with(".example.com") => Ok(()),
+            _ => Err("host is not on the allowlist".into()),
+        });
+    let worker = PushDeliveryWorker::new(
+        store.clone(),
+        test_config(3, |c| c.allow_insecure_urls = false),
+        Some(validator),
+        "instance-allowlist".into(),
+    )
+    .expect("worker")
+    .with_dns_resolver(Arc::new(PinResolver {
+        ip: "203.0.113.10".parse().unwrap(),
+        call_count: calls.clone(),
+    }));
+    let mut target = sentinel_target("https://evil.attacker.test");
+    target.url = Url::parse("https://evil.attacker.test/hook").unwrap();
+
+    let report = worker.deliver(&target, b"{}").await;
+    assert_eq!(report, DeliveryReport::GaveUp(GaveUpReason::SsrfBlocked));
+    assert_eq!(*calls.lock().unwrap(), 0, "a refused host is not resolved");
+    let failed = store
+        .list_failed_deliveries(&target.tenant, SystemTime::UNIX_EPOCH, 10)
+        .await
+        .unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].last_error_class, DeliveryErrorClass::SSRFBlocked);
+    assert_eq!(failed[0].delivery_attempt_count, 0);
 }

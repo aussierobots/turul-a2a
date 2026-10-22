@@ -8,7 +8,9 @@
 //!    caller.
 //! 3. The webhook receiver rejects (401) any call whose header
 //!    doesn't match — forged or stale callbacks don't get through.
-//! 4. The delivered body is a proto-JSON `Task` in terminal state.
+//! 4. The delivered body is a `StreamResponse` — exactly one member,
+//!    `task`, holding the terminal Task — sent as
+//!    `application/a2a+json` (A2A v1.0.1 §4.3.3).
 //!
 //! Both spawned servers (the A2A agent and the receiver) keep their
 //! JoinHandles and abort at test end — no leaked listening sockets.
@@ -113,19 +115,33 @@ async fn terminal_fires_webhook_and_token_is_validated() {
         "framework must include the event sequence header for replay/debug"
     );
 
-    // Body is the proto-JSON form of the terminal Task.
-    let status_state = received
+    assert_eq!(
+        received.content_type_header.as_deref(),
+        Some("application/a2a+json"),
+        "webhook Content-Type must be the A2A media type"
+    );
+
+    // Body is a StreamResponse whose only member is the terminal Task.
+    let members: Vec<&String> = received
         .body
-        .get("status")
-        .and_then(|s| s.get("state"))
-        .and_then(|v| v.as_str());
+        .as_object()
+        .expect("JSON object body")
+        .keys()
+        .collect();
+    assert_eq!(
+        members,
+        vec!["task"],
+        "delivered body must be a StreamResponse with exactly one member, `task`"
+    );
+    let posted_task = &received.body["task"];
+    let status_state = posted_task["status"]["state"].as_str();
     assert_eq!(
         status_state,
         Some("TASK_STATE_COMPLETED"),
-        "delivered body must be a terminal task; got: {}",
+        "delivered body must carry the terminal task; got: {}",
         serde_json::to_string(&received.body).unwrap_or_default()
     );
-    let body_task_id = received.body.get("id").and_then(|v| v.as_str());
+    let body_task_id = posted_task["id"].as_str();
     assert_eq!(
         body_task_id,
         Some(task_id.as_str()),

@@ -2,8 +2,9 @@
 
 Worked example of the A2A push-notification contract (ADR-011): register a
 webhook URL and a shared-secret token against a task; when the task
-terminates, the framework POSTs the terminal Task to that URL with the token
-echoed in the `X-Turul-Push-Token` header for receiver-side authentication.
+terminates, the framework POSTs a `StreamResponse` — `{"task": <terminal Task>}`,
+`Content-Type: application/a2a+json` (A2A v1.0.1 §4.3.3) — to that URL with the
+token echoed in the `X-Turul-Push-Token` header for receiver-side authentication.
 
 For demo friendliness, a single `cargo run` spawns **two servers in one
 process**:
@@ -40,7 +41,7 @@ curl -s http://localhost:3003/tasks/$TASK_ID/pushNotificationConfigs \
 
 # 3. Wait ~1.5 s — the agent's terminal log line "webhook called"
 #    appears in the cargo run terminal. The receiver prints the
-#    delivered Task JSON with the token header it observed.
+#    delivered StreamResponse JSON with the token header it observed.
 ```
 
 ## What it shows
@@ -49,7 +50,7 @@ curl -s http://localhost:3003/tasks/$TASK_ID/pushNotificationConfigs \
 - `.allow_insecure_push_urls(true)` — required to deliver to `http://127.0.0.1`. **Never enable in production.** Default is `false`; real deployments use `https://` only.
 - `TaskPushNotificationConfig.token` — shared secret echoed in the
   `X-Turul-Push-Token` header by the framework's `PushDeliveryWorker`
-  (`crates/turul-a2a/src/push/delivery.rs:591-593`).
+  (`crates/turul-a2a/src/push/delivery.rs`).
 - Receiver-side validation — the `/webhook` handler in `lib.rs` rejects
   calls whose token header doesn't match the one it registered with,
   returning `401`. Without this check, anyone who knows the receiver URL
@@ -57,11 +58,10 @@ curl -s http://localhost:3003/tasks/$TASK_ID/pushNotificationConfigs \
 
 ## Token header note
 
-The framework emits `X-Turul-Push-Token`, not the A2A spec's suggested
-`X-A2A-Notification-Token`. This is a framework implementation choice
-flagged in ADR-011 §4. If you integrate with a receiver that expects
-the spec header name, you'll need to either adapt the receiver or
-patch the worker — this example uses the framework's header verbatim.
+The A2A spec defines `TaskPushNotificationConfig.token` but names no
+header for conveying it, so the framework uses its own
+`X-Turul-Push-Token` (ADR-011 §4). Receivers that must work with other
+A2A server implementations cannot rely on this header name.
 
 ## Smoke test
 
@@ -75,7 +75,7 @@ register + wait flow through `turul-a2a-client`, and asserts:
 1. The webhook is called within 5 s of terminal.
 2. `X-Turul-Push-Token` header equals the registered token.
 3. `X-Turul-Event-Sequence` header is present.
-4. The delivered body is a proto-JSON Task with `state: TASK_STATE_COMPLETED` and the matching task id.
+4. The delivered body is a `StreamResponse` with exactly one member, `task`, whose state is `TASK_STATE_COMPLETED` and whose id matches; `Content-Type` is `application/a2a+json`.
 5. A direct POST with the **wrong** token gets `401` and is tagged as rejected — proves the validation path runs.
 
 Both server handles are kept and aborted at test end; no leaked

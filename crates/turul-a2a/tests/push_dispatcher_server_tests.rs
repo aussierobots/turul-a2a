@@ -48,15 +48,17 @@ impl AgentExecutor for DummyExecutor {
     }
 }
 
-/// Poll wiremock's recorded requests until `expected` POSTs have
-/// arrived, or `deadline` elapses. Returns the captured requests on
-/// success. Push deliveries are spawned tokio tasks, so callers need
-/// a short grace window after the triggering HTTP call returns.
-async fn await_n_requests(
+/// Wait until wiremock has recorded `expected` requests (polling up to
+/// `deadline`), then hold a quiet window and assert the count is still
+/// exactly `expected` — a duplicate POST arriving late fails the test.
+/// Push deliveries run on spawned tokio tasks, so callers need this
+/// grace window after the triggering HTTP call returns.
+async fn await_exactly_n_requests(
     server: &MockServer,
     expected: usize,
     deadline: Duration,
 ) -> Vec<wiremock::Request> {
+    const QUIET_WINDOW: Duration = Duration::from_millis(200);
     let start = Instant::now();
     loop {
         let reqs = server
@@ -64,7 +66,7 @@ async fn await_n_requests(
             .await
             .expect("wiremock must have recording enabled");
         if reqs.len() >= expected {
-            return reqs;
+            break;
         }
         if start.elapsed() >= deadline {
             panic!(
@@ -74,6 +76,36 @@ async fn await_n_requests(
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    tokio::time::sleep(QUIET_WINDOW).await;
+    let reqs = server
+        .received_requests()
+        .await
+        .expect("wiremock must have recording enabled");
+    assert_eq!(reqs.len(), expected, "unexpected extra webhook POSTs");
+    reqs
+}
+
+/// Header value as a string, or `None` when absent / non-ASCII.
+fn header<'a>(req: &'a wiremock::Request, name: &str) -> Option<&'a str> {
+    req.headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// Assert the webhook body is a `StreamResponse` carrying only `task`
+/// (A2A v1.0.1 §4.3.3) with the A2A media type, and return that task.
+fn posted_task(req: &wiremock::Request) -> serde_json::Value {
+    assert_eq!(
+        header(req, "content-type"),
+        Some("application/a2a+json"),
+        "webhook Content-Type must be the A2A media type"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&req.body).expect("JSON body");
+    let members: Vec<&String> = body.as_object().expect("object body").keys().collect();
+    assert_eq!(
+        members,
+        vec!["task"],
+        "push body must be a StreamResponse with exactly one member, `task`"
+    );
+    body["task"].clone()
 }
 
 /// Seed a task into shared storage in WORKING state, so the cancel
@@ -202,11 +234,9 @@ async fn framework_cancel_triggers_push_delivery_with_canceled_state() {
     );
 
     // --- Await the dispatched POST --------------------------------
-    let reqs = await_n_requests(&mock, 1, Duration::from_secs(3)).await;
-    assert_eq!(reqs.len(), 1);
+    let reqs = await_exactly_n_requests(&mock, 1, Duration::from_secs(3)).await;
 
-    // Payload is the full Task JSON with terminal state CANCELED.
-    let posted: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    let posted = posted_task(&reqs[0]);
     assert_eq!(
         posted["id"].as_str(),
         Some(task_id),
@@ -219,22 +249,14 @@ async fn framework_cancel_triggers_push_delivery_with_canceled_state() {
     );
 
     // Headers: Authorization + X-Turul-Push-Token populated from config.
-    let auth_header = reqs[0]
-        .headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    assert!(
-        auth_header.starts_with("Bearer srv-cred"),
-        "Authorization header must carry scheme + credentials, got {auth_header:?}"
-    );
-    let token_header = reqs[0]
-        .headers
-        .get("x-turul-push-token")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
     assert_eq!(
-        token_header, "srv-token",
+        header(&reqs[0], "authorization"),
+        Some("Bearer srv-cred"),
+        "Authorization header must be the config scheme and credentials"
+    );
+    assert_eq!(
+        header(&reqs[0], "x-turul-push-token"),
+        Some("srv-token"),
         "X-Turul-Push-Token header must carry the config token"
     );
 
@@ -339,10 +361,6 @@ async fn dispatcher_paginates_through_all_push_configs() {
         .await;
 
     let inner = Arc::new(InMemoryA2aStorage::new().with_push_dispatch_enabled(true));
-    let tiny_push: Arc<dyn turul_a2a::storage::A2aPushNotificationStorage> =
-        Arc::new(TinyPageStorage {
-            inner: inner.clone(),
-        });
 
     // Manually wire an AppState via the builder's `.storage()` for
     // task/event/atomic/supervisor, but override `.push_storage()`
@@ -401,9 +419,8 @@ async fn dispatcher_paginates_through_all_push_configs() {
     }
 
     // Drive framework-committed CANCELED through :cancel → dispatcher
-    // fans out to all configs. Confirmed unused — keeping for
-    // rustc-ignorable no-op side-effect purposes.
-    let _cancel_resp = router
+    // fans out to all configs.
+    let cancel_resp = router
         .clone()
         .oneshot(
             Request::builder()
@@ -415,14 +432,15 @@ async fn dispatcher_paginates_through_all_push_configs() {
         )
         .await
         .unwrap();
+    assert_eq!(cancel_resp.status(), StatusCode::OK, "cancel must succeed");
 
-    // Wait for ALL expected POSTs to arrive (spawned per-config tasks).
-    let reqs = await_n_requests(&mock, EXPECTED_CONFIGS, Duration::from_secs(3)).await;
-    assert!(reqs.len() >= EXPECTED_CONFIGS);
+    // Every config receives exactly one POST (spawned per-config tasks).
+    let reqs = await_exactly_n_requests(&mock, EXPECTED_CONFIGS, Duration::from_secs(3)).await;
+    for req in &reqs {
+        assert_eq!(posted_task(req)["id"].as_str(), Some(task_id));
+    }
 
     drop(mock);
-    // Suppress "used here" lint on the forced trait object.
-    let _ = &tiny_push;
 }
 
 // ---------------------------------------------------------------------------
@@ -639,9 +657,8 @@ async fn executor_completion_triggers_push_delivery_with_completed_state() {
     let _ = send_handle.await;
 
     // --- Await the dispatched POST --------------------------------
-    let reqs = await_n_requests(&mock, 1, Duration::from_secs(3)).await;
-    assert_eq!(reqs.len(), 1);
-    let posted: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    let reqs = await_exactly_n_requests(&mock, 1, Duration::from_secs(3)).await;
+    let posted = posted_task(&reqs[0]);
     assert_eq!(posted["id"].as_str(), Some(task_id.as_str()));
     assert_eq!(
         posted["status"]["state"].as_str(),
@@ -650,4 +667,202 @@ async fn executor_completion_triggers_push_delivery_with_completed_state() {
     );
 
     drop(mock);
+}
+
+// ---------------------------------------------------------------------------
+// Several configs on one task: each receives its own POST carrying its
+// own credentials.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn each_config_receives_its_own_post_with_its_own_auth() {
+    let mock = MockServer::start().await;
+    for name in ["a", "b", "c"] {
+        Mock::given(method("POST"))
+            .and(path(format!("/hook-{name}")))
+            .and(wiremock::matchers::header(
+                "authorization",
+                format!("Bearer cred-{name}").as_str(),
+            ))
+            .and(wiremock::matchers::header(
+                "x-turul-push-token",
+                format!("token-{name}").as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock)
+            .await;
+    }
+
+    let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
+    let server = A2aServer::builder()
+        .executor(DummyExecutor)
+        .storage(storage.clone())
+        .push_delivery_store(storage.clone())
+        .allow_insecure_push_urls(true)
+        .cancel_handler_grace(Duration::from_millis(50))
+        .cancel_handler_poll_interval(Duration::from_millis(10))
+        .push_max_attempts(1)
+        .push_backoff_cap(Duration::from_millis(10))
+        .push_claim_expiry(Duration::from_secs(5))
+        .build()
+        .expect("server build");
+    let router = server.into_router();
+
+    let task_id = "task-distinct-auth";
+    seed_working_task(&storage, task_id).await;
+    for name in ["a", "b", "c"] {
+        let body = serde_json::json!({
+            "id": format!("cfg-{name}"),
+            "taskId": task_id,
+            "url": format!("{}/hook-{name}", mock.uri()),
+            "token": format!("token-{name}"),
+            "authentication": {"scheme": "Bearer", "credentials": format!("cred-{name}")},
+        });
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/tasks/{task_id}/pushNotificationConfigs"))
+                    .header("content-type", "application/json")
+                    .header("A2A-Version", "1.0")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "cfg-{name} create");
+    }
+
+    let cancel_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/tasks/{task_id}:cancel"))
+                .header("A2A-Version", "1.0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancel_resp.status(), StatusCode::OK);
+
+    // A POST with the wrong credentials matches no mock (404), so three
+    // successful matches mean each config got exactly its own POST.
+    let reqs = await_exactly_n_requests(&mock, 3, Duration::from_secs(3)).await;
+    for req in &reqs {
+        let posted = posted_task(req);
+        assert_eq!(posted["status"]["state"], "TASK_STATE_CANCELED");
+    }
+    drop(mock);
+}
+
+// ---------------------------------------------------------------------------
+// Inline push config (`SendMessageConfiguration.taskPushNotificationConfig`)
+// delivered end to end, on blocking and streaming sends. The executor
+// emits three artifact chunks before completing: artifacts do not
+// trigger delivery, so exactly one POST — the terminal one — arrives,
+// carrying all three artifacts.
+// ---------------------------------------------------------------------------
+
+struct ArtifactsThenCompleteExecutor;
+
+#[async_trait]
+impl AgentExecutor for ArtifactsThenCompleteExecutor {
+    async fn execute(
+        &self,
+        _task: &mut Task,
+        _msg: &Message,
+        ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        for i in 0..3 {
+            let artifact = turul_a2a_types::Artifact::new(
+                format!("art-{i}"),
+                vec![turul_a2a_types::Part::text(format!("chunk {i}"))],
+            );
+            ctx.events.emit_artifact(artifact, false, true).await?;
+        }
+        ctx.events.complete(None).await.map(|_| ())
+    }
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        turul_a2a_proto::AgentCard::default()
+    }
+}
+
+async fn inline_config_delivers_once(send_path: &str) {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/inline-hook"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer inline-cred",
+        ))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
+    let server = A2aServer::builder()
+        .executor(ArtifactsThenCompleteExecutor)
+        .storage(storage.clone())
+        .push_delivery_store(storage.clone())
+        .allow_insecure_push_urls(true)
+        .push_max_attempts(1)
+        .push_backoff_cap(Duration::from_millis(10))
+        .push_claim_expiry(Duration::from_secs(5))
+        .build()
+        .expect("server build");
+    let router = server.into_router();
+
+    let send_body = serde_json::json!({
+        "message": {
+            "messageId": uuid::Uuid::now_v7().to_string(),
+            "role": "ROLE_USER",
+            "parts": [{"text": "go"}],
+        },
+        "configuration": {
+            "taskPushNotificationConfig": {
+                "url": format!("{}/inline-hook", mock.uri()),
+                "authentication": {"scheme": "Bearer", "credentials": "inline-cred"},
+            },
+        },
+    });
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(send_path)
+                .header("content-type", "application/json")
+                .header("A2A-Version", "1.0")
+                .body(Body::from(send_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "{send_path}");
+    let _ = resp.into_body().collect().await.unwrap();
+
+    let reqs = await_exactly_n_requests(&mock, 1, Duration::from_secs(3)).await;
+    let posted = posted_task(&reqs[0]);
+    assert_eq!(posted["status"]["state"], "TASK_STATE_COMPLETED");
+    assert_eq!(
+        posted["artifacts"].as_array().map(Vec::len),
+        Some(3),
+        "the terminal snapshot carries every artifact"
+    );
+    drop(mock);
+}
+
+#[tokio::test]
+async fn inline_push_config_on_blocking_send_delivers_one_terminal_post() {
+    inline_config_delivers_once("/message:send").await;
+}
+
+#[tokio::test]
+async fn inline_push_config_on_streaming_send_delivers_one_terminal_post() {
+    inline_config_delivers_once("/message:stream").await;
 }

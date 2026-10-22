@@ -12,11 +12,13 @@
 //!
 //! 1. `claim_delivery` — acquire the cross-instance lock.
 //! 2. For each retry iteration (up to `max_attempts`):
-//!    1. Pre-flight checks: config still exists, task still exists,
-//!       payload under size cap, SSRF guard allows the URL.
+//!    1. Pre-flight checks: config and task still exist (when the
+//!       worker has a [`DeliveryTargetLookup`]; the dispatcher always
+//!       installs one), SSRF guard allows the URL. The payload size
+//!       cap is checked once, before the claim's first attempt.
 //!    2. `record_attempt_started` — advance the counter + set
 //!       Attempting, fenced on identity + non-terminal status.
-//!    3. POST the Task body with `Authorization: {scheme}
+//!    3. POST the payload with `Authorization: {scheme}
 //!       {credentials}` (from `Secret`, exposed at the header
 //!       build call only) and `X-Turul-Push-Token: {token}`.
 //!    4. Classify the response into `DeliveryOutcome::{Succeeded,
@@ -30,7 +32,8 @@
 //! - Single-config, single-event delivery. The dispatcher chooses
 //!   which events trigger which configs; this worker doesn't
 //!   enumerate.
-//! - No redirect following (`Policy::none`), §R4.
+//! - No redirect following (`Policy::none`): a redirect target could
+//!   be an internal address the SSRF check never saw.
 //! - DNS resolved once per attempt via [`PushDnsResolver`]; the
 //!   reqwest client is rebuilt per attempt with a `resolve` override
 //!   pinning the validated IP, so the TCP connect cannot be swapped
@@ -49,9 +52,13 @@ use crate::push::claim::{
 };
 use crate::push::secret::Secret;
 use crate::push::ssrf::{
-    OutboundUrlValidator, SsrfBlockReason, SsrfDecision, decide as ssrf_decide,
+    OutboundUrlValidator, SsrfBlockReason, SsrfDecision, check_url, pick_destination,
 };
-use crate::storage::A2aStorageError;
+use crate::storage::{A2aPushNotificationStorage, A2aStorageError, A2aTaskStorage};
+
+/// `Content-Type` of every webhook POST: the A2A media type
+/// (A2A v1.0.1 §4.3.3).
+pub const PUSH_CONTENT_TYPE: &str = "application/a2a+json";
 
 /// Runtime-configurable delivery parameters.
 ///
@@ -140,6 +147,39 @@ impl PushDnsResolver for TokioDnsResolver {
     }
 }
 
+/// The config and task stores the worker re-reads before every POST
+/// attempt, so a delivery stops as soon as its push config or task is
+/// deleted. A2A v1.0.1 §3.1.10: "No further notifications will be sent
+/// to the configured webhook after deletion."
+#[derive(Clone)]
+pub struct DeliveryTargetLookup {
+    pub push_storage: Arc<dyn A2aPushNotificationStorage>,
+    pub task_storage: Arc<dyn A2aTaskStorage>,
+}
+
+impl DeliveryTargetLookup {
+    /// `Some(reason)` when the config or the task is gone. A read
+    /// error is not evidence of deletion: the attempt proceeds and the
+    /// next attempt checks again.
+    async fn gone(&self, target: &PushTarget) -> Option<AbandonedReason> {
+        if let Ok(None) = self
+            .push_storage
+            .get_config(&target.tenant, &target.task_id, &target.config_id)
+            .await
+        {
+            return Some(AbandonedReason::ConfigDeleted);
+        }
+        if let Ok(None) = self
+            .task_storage
+            .get_task(&target.tenant, &target.task_id, &target.owner, Some(0))
+            .await
+        {
+            return Some(AbandonedReason::TaskDeleted);
+        }
+        None
+    }
+}
+
 /// Worker handle, assembled once per instance and cloned into each
 /// per-delivery task.
 #[derive(Clone)]
@@ -149,6 +189,9 @@ pub struct PushDeliveryWorker {
     pub config: PushDeliveryConfig,
     pub outbound_validator: Option<OutboundUrlValidator>,
     pub instance_id: String,
+    /// Pre-attempt existence checks. `None` skips them (a worker
+    /// driven directly, without a dispatcher, has no stores to read).
+    pub target_lookup: Option<DeliveryTargetLookup>,
 }
 
 impl PushDeliveryWorker {
@@ -174,7 +217,15 @@ impl PushDeliveryWorker {
             config,
             outbound_validator,
             instance_id,
+            target_lookup: None,
         })
+    }
+
+    /// Re-read the push config and task before every POST attempt and
+    /// abandon the delivery once either is gone.
+    pub fn with_target_lookup(mut self, lookup: DeliveryTargetLookup) -> Self {
+        self.target_lookup = Some(lookup);
+        self
     }
 
     /// Override the default DNS resolver (tests).
@@ -236,28 +287,62 @@ impl PushDeliveryWorker {
                     .await;
             }
 
-            // SSRF / scheme pre-flight.
-            let ips = self
-                .resolve(&target.url)
-                .await
-                .unwrap_or_else(|_| Vec::new());
-            let decision = ssrf_decide(
+            // Config / task still exist.
+            if let Some(lookup) = &self.target_lookup
+                && let Some(reason) = lookup.gone(target).await
+            {
+                return self
+                    .persist_terminal(target, &claim, DeliveryOutcome::Abandoned { reason })
+                    .await;
+            }
+
+            // SSRF / scheme pre-flight. URL checks first, so a refused
+            // URL is never resolved; then one DNS answer per attempt.
+            let decision = match check_url(
                 &target.url,
-                &ips,
                 self.config.allow_insecure_urls,
                 self.outbound_validator.as_ref(),
-            );
+            ) {
+                Err(reason) => SsrfDecision::Block(reason),
+                Ok(()) => {
+                    let ips = self.resolve(&target.url).await.unwrap_or_default();
+                    pick_destination(&ips, self.config.allow_insecure_urls)
+                }
+            };
             let resolved_ip = match decision {
                 SsrfDecision::Allow { resolved_ip } => resolved_ip,
-                SsrfDecision::Block(reason) => {
-                    let (gu, ec) = ssrf_block_to_diagnostics(reason);
+                SsrfDecision::Block(SsrfBlockReason::InsecureScheme) => {
+                    // Not a failure of the receiver: the config can
+                    // never be delivered under this deployment's
+                    // policy. Logged (by config id — the URL may carry
+                    // secrets) and recorded as abandoned, not given up.
+                    tracing::warn!(
+                        target: "turul_a2a::push_non_https_url",
+                        tenant = %target.tenant,
+                        task_id = %target.task_id,
+                        config_id = %target.config_id,
+                        event_sequence = target.event_sequence,
+                        "push delivery abandoned: only https:// webhook URLs are \
+                         delivered unless allow_insecure_push_urls is set"
+                    );
+                    return self
+                        .persist_terminal(
+                            target,
+                            &claim,
+                            DeliveryOutcome::Abandoned {
+                                reason: AbandonedReason::NonHttpsUrlInProduction,
+                            },
+                        )
+                        .await;
+                }
+                SsrfDecision::Block(_) => {
                     return self
                         .persist_terminal(
                             target,
                             &claim,
                             DeliveryOutcome::GaveUp {
-                                reason: gu,
-                                last_error_class: ec,
+                                reason: GaveUpReason::SsrfBlocked,
+                                last_error_class: DeliveryErrorClass::SSRFBlocked,
                                 last_http_status: None,
                             },
                         )
@@ -565,7 +650,7 @@ impl PushDeliveryWorker {
 
         let mut req = client
             .post(target.url.clone())
-            .header("Content-Type", "application/json")
+            .header("Content-Type", PUSH_CONTENT_TYPE)
             .header(
                 "User-Agent",
                 format!("turul-a2a/{}", env!("CARGO_PKG_VERSION")),
@@ -634,9 +719,8 @@ enum ClaimFailure {
     Other(#[allow(dead_code)] String),
 }
 
-/// What `deliver` returns; used by the dispatcher to log / update
-/// metrics but is not required for correctness (the store already
-/// records the definitive outcome).
+/// What `deliver` returns; the dispatcher only logs it — the store
+/// already records the definitive outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryReport {
     Succeeded(u16),
@@ -653,20 +737,6 @@ pub enum DeliveryReport {
     /// any state. Worker stops; sweep or next-tick reconciliation
     /// will pick up.
     TransientStoreError,
-}
-
-fn ssrf_block_to_diagnostics(reason: SsrfBlockReason) -> (GaveUpReason, DeliveryErrorClass) {
-    match reason {
-        SsrfBlockReason::PrivateIp
-        | SsrfBlockReason::InvalidUrl
-        | SsrfBlockReason::DnsResolutionFailed
-        | SsrfBlockReason::ValidatorDenied => {
-            (GaveUpReason::SsrfBlocked, DeliveryErrorClass::SSRFBlocked)
-        }
-        SsrfBlockReason::InsecureScheme => {
-            (GaveUpReason::TlsRejected, DeliveryErrorClass::TlsRejected)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -744,26 +814,31 @@ mod tests {
         ));
     }
 
-    /// SSRF block for non-HTTPS URLs in production mode: the
-    /// worker never POSTs and records SSRFBlocked.
+    /// A plain `http://` URL with insecure URLs disallowed is never
+    /// POSTed: the delivery is abandoned as `NonHttpsUrlInProduction`
+    /// and, being abandoned rather than failed, is not listed as a
+    /// failed delivery. `webhook.invalid` cannot resolve, so a POST
+    /// attempt would surface as a network-error retry instead.
     #[tokio::test]
-    async fn non_https_in_production_records_gaveup_ssrf() {
+    async fn non_https_url_in_production_is_abandoned_without_post() {
         let store = Arc::new(InMemoryA2aStorage::new());
         let cfg = PushDeliveryConfig {
             allow_insecure_urls: false,
             ..Default::default()
         };
         let w = worker_with_store(store.clone(), cfg);
-        let t = target("http://webhook.example.com/");
+        let t = target("http://webhook.invalid/");
         let report = w.deliver(&t, b"{}").await;
-        // The SSRF-block path maps InsecureScheme to TlsRejected, but
-        // a plain-http production URL is the common case that
-        // operators want to see. Assert any GaveUp reason surfaces.
-        assert!(matches!(report, DeliveryReport::GaveUp(_)));
+        assert_eq!(
+            report,
+            DeliveryReport::Abandoned(AbandonedReason::NonHttpsUrlInProduction)
+        );
         let failed = store
             .list_failed_deliveries(&t.tenant, SystemTime::UNIX_EPOCH, 10)
             .await
             .unwrap();
-        assert_eq!(failed.len(), 1);
+        assert!(failed.is_empty(), "abandoned is not a failed delivery");
+        // The row is terminal: the delivery cannot be claimed again.
+        assert!(matches!(w.claim(&t).await, Err(ClaimFailure::AlreadyHeld)));
     }
 }
