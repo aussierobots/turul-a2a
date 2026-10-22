@@ -442,9 +442,13 @@ pub(crate) async fn open_send_stream(
     let message = Message::try_from(proto_message).map_err(|e| A2aError::InvalidRequest {
         message: format!("Invalid message: {e}"),
     })?;
+    let inline_push_config = inline_push_config(request.configuration.as_ref())?;
 
     let target = resolve_send_target(&state, tenant, owner, &message).await?;
     start_task_turn(&state, tenant, owner, &target, &message).await?;
+    if let Some(cfg) = inline_push_config {
+        register_inline_push_config(&state, tenant, owner, &target, cfg).await?;
+    }
 
     let sequence = state
         .event_store
@@ -822,6 +826,102 @@ pub(crate) async fn start_task_turn(
     Ok(())
 }
 
+/// `SendMessageConfiguration.taskPushNotificationConfig`, checked
+/// before anything is written: a missing or malformed URL is an
+/// `InvalidRequest` and no task is persisted. Push configs operate
+/// independently of execution mode (A2A v1.0.1 §3.2.2), so blocking,
+/// non-blocking and streaming sends all register it.
+fn inline_push_config(
+    configuration: Option<&turul_a2a_proto::SendMessageConfiguration>,
+) -> Result<Option<turul_a2a_proto::TaskPushNotificationConfig>, A2aError> {
+    let Some(cfg) = configuration.and_then(|c| c.task_push_notification_config.clone()) else {
+        return Ok(None);
+    };
+    if cfg.url.is_empty() {
+        return Err(A2aError::InvalidRequest {
+            message: "inline push config url is required".into(),
+        });
+    }
+    if let Err(e) = url::Url::parse(&cfg.url) {
+        return Err(A2aError::InvalidRequest {
+            message: format!("inline push config url is not a valid URL: {e}"),
+        });
+    }
+    Ok(Some(cfg))
+}
+
+/// Register an inline push config against the task whose turn has
+/// just started, before its executor is spawned, so no executor runs
+/// without its callback. If registration fails the task is moved to
+/// FAILED and the storage error is returned; the executor never runs.
+async fn register_inline_push_config(
+    state: &AppState,
+    tenant: &str,
+    owner: &str,
+    target: &SendTarget,
+    mut cfg: turul_a2a_proto::TaskPushNotificationConfig,
+) -> Result<(), A2aError> {
+    cfg.task_id = target.task_id.clone();
+    if let Err(e) = state.push_storage.create_config(tenant, cfg).await {
+        tracing::warn!(
+            tenant = tenant,
+            owner = owner,
+            task_id = %target.task_id,
+            "inline push config registration failed: transitioning task to FAILED"
+        );
+        let reason = format!("inline push notification config registration failed: {e}");
+        fail_unstarted_task(state, tenant, owner, target, &reason).await;
+        return Err(A2aError::from(e));
+    }
+    Ok(())
+}
+
+/// Move a task whose turn started but whose executor never ran to
+/// FAILED, with `reason` as the agent status message. Best effort: if
+/// the transition itself fails the caller still returns its original
+/// error, and the task stays WORKING until something else resolves it.
+async fn fail_unstarted_task(
+    state: &AppState,
+    tenant: &str,
+    owner: &str,
+    target: &SendTarget,
+    reason: &str,
+) {
+    let reason_msg = Message::new(
+        uuid::Uuid::now_v7().to_string(),
+        turul_a2a_types::Role::Agent,
+        vec![turul_a2a_types::Part::text(reason)],
+    );
+    let failed_status = TaskStatus::new(TaskState::Failed).with_message(reason_msg);
+    let failed_event = StreamEvent::StatusUpdate {
+        status_update: crate::streaming::StatusUpdatePayload {
+            task_id: target.task_id.clone(),
+            context_id: target.context_id.clone(),
+            status: serde_json::to_value(&failed_status).unwrap_or_default(),
+        },
+    };
+    if let Err(compensate_err) = state
+        .atomic_store
+        .update_task_status_with_events(
+            tenant,
+            &target.task_id,
+            owner,
+            failed_status,
+            vec![failed_event],
+        )
+        .await
+    {
+        tracing::error!(
+            tenant = tenant,
+            owner = owner,
+            task_id = %target.task_id,
+            error = %compensate_err,
+            "FAILED compensation itself failed: task may remain WORKING"
+        );
+    }
+    state.event_broker.notify(&target.task_id).await;
+}
+
 pub async fn core_send_message(
     state: AppState,
     tenant: &str,
@@ -880,25 +980,7 @@ pub async fn core_send_message(
         .as_ref()
         .and_then(|c| c.history_length);
 
-    // Validate inline push config URL BEFORE any storage write. A
-    // malformed URL returns HTTP 400 / -32602 / INVALID_ARGUMENT with
-    // zero task persistence. URL parse mirrors `core_create_push_config`.
-    let inline_push_config: Option<turul_a2a_proto::TaskPushNotificationConfig> = request
-        .configuration
-        .as_ref()
-        .and_then(|c| c.task_push_notification_config.clone());
-    if let Some(cfg) = inline_push_config.as_ref() {
-        if cfg.url.is_empty() {
-            return Err(A2aError::InvalidRequest {
-                message: "inline push config url is required".into(),
-            });
-        }
-        if let Err(e) = url::Url::parse(&cfg.url) {
-            return Err(A2aError::InvalidRequest {
-                message: format!("inline push config url is not a valid URL: {e}"),
-            });
-        }
-    }
+    let inline_push_config = inline_push_config(request.configuration.as_ref())?;
 
     let target = resolve_send_target(&state, tenant, owner, &message).await?;
     let task_id = target.task_id.clone();
@@ -941,71 +1023,8 @@ pub async fn core_send_message(
 
     start_task_turn(&state, tenant, owner, &target, &message).await?;
 
-    // Bug 2 steps 4-5: register any inline push config BEFORE
-    // spawning the executor so a pre-terminal failure cannot leave a
-    // live executor with no registered callback. URL was parsed up
-    // front (step 1), so the remaining failure mode is storage.
-    // Failure path: transition the just-created task to FAILED with an
-    // agent Message carrying the reason text (pattern matches the
-    // hard-timeout compensation at router.rs:1034-1054), then return
-    // the original storage error. The executor is never spawned.
-    if let Some(mut cfg) = inline_push_config {
-        cfg.task_id = task_id.clone();
-        match state.push_storage.create_config(tenant, cfg).await {
-            Ok(_) => {}
-            Err(e) => {
-                let reason = format!("inline push notification config registration failed: {e}");
-                tracing::warn!(
-                    tenant = tenant,
-                    owner = owner,
-                    task_id = %task_id,
-                    "ADR-017 Bug 2 compensation: transitioning task to FAILED \
-                     after inline push config registration failure"
-                );
-                let reason_msg = Message::new(
-                    uuid::Uuid::now_v7().to_string(),
-                    turul_a2a_types::Role::Agent,
-                    vec![turul_a2a_types::Part::text(reason)],
-                );
-                let failed_status = TaskStatus::new(TaskState::Failed).with_message(reason_msg);
-                let failed_event = StreamEvent::StatusUpdate {
-                    status_update: crate::streaming::StatusUpdatePayload {
-                        task_id: task_id.clone(),
-                        context_id: context_id.clone(),
-                        status: serde_json::to_value(&failed_status).unwrap_or_default(),
-                    },
-                };
-                // Best-effort compensation. If the FAILED transition
-                // itself fails (backend unavailable, CAS race with a
-                // concurrent writer), we still return the original
-                // push-storage error — double-failure is flagged to
-                // the caller via the original error, and the task
-                // will be observable as Working until a supervisor
-                // sweep or manual cleanup resolves it.
-                if let Err(compensate_err) = state
-                    .atomic_store
-                    .update_task_status_with_events(
-                        tenant,
-                        &task_id,
-                        owner,
-                        failed_status,
-                        vec![failed_event],
-                    )
-                    .await
-                {
-                    tracing::error!(
-                        tenant = tenant,
-                        owner = owner,
-                        task_id = %task_id,
-                        error = %compensate_err,
-                        "ADR-017 Bug 2 compensation failed: task may remain \
-                         in WORKING without a callback until supervisor sweep"
-                    );
-                }
-                state.event_broker.notify(&task_id).await;
-                return Err(A2aError::from(e));
-            }
-        }
+    if let Some(cfg) = inline_push_config {
+        register_inline_push_config(&state, tenant, owner, &target, cfg).await?;
     }
 
     // §HTTP invocation step 7: if the durable executor path
@@ -1039,42 +1058,9 @@ pub async fn core_send_message(
                     owner = owner,
                     task_id = %task_id,
                     queue_kind = queue.kind(),
-                    "ADR-018 enqueue failed: transitioning task to FAILED"
+                    "durable executor enqueue failed: transitioning task to FAILED"
                 );
-                let reason_msg = Message::new(
-                    uuid::Uuid::now_v7().to_string(),
-                    turul_a2a_types::Role::Agent,
-                    vec![turul_a2a_types::Part::text(reason.clone())],
-                );
-                let failed_status = TaskStatus::new(TaskState::Failed).with_message(reason_msg);
-                let failed_event = StreamEvent::StatusUpdate {
-                    status_update: crate::streaming::StatusUpdatePayload {
-                        task_id: task_id.clone(),
-                        context_id: context_id.clone(),
-                        status: serde_json::to_value(&failed_status).unwrap_or_default(),
-                    },
-                };
-                if let Err(compensate_err) = state
-                    .atomic_store
-                    .update_task_status_with_events(
-                        tenant,
-                        &task_id,
-                        owner,
-                        failed_status,
-                        vec![failed_event],
-                    )
-                    .await
-                {
-                    tracing::error!(
-                        tenant = tenant,
-                        owner = owner,
-                        task_id = %task_id,
-                        error = %compensate_err,
-                        "ADR-018 FAILED-compensation itself failed: task may \
-                         remain in WORKING until supervisor sweep"
-                    );
-                }
-                state.event_broker.notify(&task_id).await;
+                fail_unstarted_task(&state, tenant, owner, &target, &reason).await;
                 return Err(A2aError::Internal(reason));
             }
         }
