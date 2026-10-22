@@ -11,6 +11,8 @@
 //! the durable-queue envelope (the consumer side is covered in the
 //! Lambda crate's SQS tests).
 
+mod common;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -206,10 +208,9 @@ mod grpc {
             .connect_lazy();
         let request: turul_a2a_proto::SendMessageRequest =
             serde_json::from_value(send_request(true, false)).unwrap();
-        A2aServiceClient::new(channel)
-            .send_message(request)
-            .await
-            .expect("grpc send");
+        let mut client: A2aServiceClient<common::VersionedChannel> =
+            A2aServiceClient::with_interceptor(channel, common::with_a2a_version as _);
+        client.send_message(request).await.expect("grpc send");
         assert_eq!(*observed.lock().unwrap(), vec![expected_inputs()]);
     }
 }

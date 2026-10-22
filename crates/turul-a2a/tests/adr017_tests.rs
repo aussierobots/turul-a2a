@@ -20,6 +20,8 @@
 //!    (`SendMessageConfiguration.history_length`, a2a.proto:150-154):
 //!    unset = no limit, `0` = empty, `n>0` = last n.
 
+mod common;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -792,7 +794,7 @@ mod grpc_inline_push_config {
     use turul_a2a_proto::grpc::A2aServiceClient;
 
     async fn serve() -> (
-        A2aServiceClient<tonic::transport::Channel>,
+        A2aServiceClient<common::VersionedChannel>,
         tokio::task::JoinHandle<()>,
     ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -823,7 +825,10 @@ mod grpc_inline_push_config {
                 Err(e) => panic!("connect: {e}"),
             }
         };
-        (A2aServiceClient::new(channel), handle)
+        (
+            A2aServiceClient::with_interceptor(channel, common::with_a2a_version as _),
+            handle,
+        )
     }
 
     fn request(url: &str) -> turul_a2a_proto::SendMessageRequest {
@@ -849,7 +854,7 @@ mod grpc_inline_push_config {
     }
 
     async fn registered_urls(
-        client: &mut A2aServiceClient<tonic::transport::Channel>,
+        client: &mut A2aServiceClient<common::VersionedChannel>,
         task_id: &str,
     ) -> Vec<String> {
         client

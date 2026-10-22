@@ -11,6 +11,8 @@
 //! - `statusTimestampAfter` — only tasks whose status timestamp is at or
 //!   after the bound.
 
+mod common;
+
 use std::collections::HashMap;
 
 use async_trait::async_trait;
@@ -278,7 +280,7 @@ mod grpc {
     /// An HTTP router and a gRPC client over one shared storage.
     async fn dual() -> (
         axum::Router,
-        A2aServiceClient<tonic::transport::Channel>,
+        A2aServiceClient<common::VersionedChannel>,
         tokio::task::JoinHandle<()>,
     ) {
         let storage = InMemoryA2aStorage::new();
@@ -299,7 +301,11 @@ mod grpc {
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
             .unwrap()
             .connect_lazy();
-        (router, A2aServiceClient::new(channel), handle)
+        (
+            router,
+            A2aServiceClient::with_interceptor(channel, common::with_a2a_version as _),
+            handle,
+        )
     }
 
     fn request() -> turul_a2a_proto::ListTasksRequest {

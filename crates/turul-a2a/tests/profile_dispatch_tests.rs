@@ -20,6 +20,8 @@
 //! These tests therefore assert that the framework hands the message to
 //! the executor unchanged, not which skill runs.
 
+mod common;
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -482,7 +484,7 @@ mod grpc {
     use tonic::Code;
     use turul_a2a_proto::grpc::A2aServiceClient;
 
-    async fn client(seen: Seen) -> A2aServiceClient<tonic::transport::Channel> {
+    async fn client(seen: Seen) -> A2aServiceClient<common::VersionedChannel> {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let router = A2aServer::builder()
@@ -503,7 +505,7 @@ mod grpc {
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
             .unwrap()
             .connect_lazy();
-        A2aServiceClient::new(channel)
+        A2aServiceClient::with_interceptor(channel, common::with_a2a_version as _)
     }
 
     fn activated_request(
