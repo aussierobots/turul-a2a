@@ -4,10 +4,11 @@
 //!
 //! Demonstrates token-by-token SSE streaming via the
 //! `EventSink::emit_artifact(append, last_chunk)` contract. The
-//! executor tokenises a canned response and emits each word as a
-//! chunk appended to a single artifact; the final chunk flips
-//! `last_chunk=true` and then `complete(None)` fires the terminal
-//! StatusUpdate.
+//! executor tokenises a canned response and emits each word as a chunk
+//! of a single artifact: the first chunk starts it (`append=false`),
+//! every later chunk is appended to it (`append=true`), the final chunk
+//! flips `last_chunk=true`, and then `complete(None)` fires the
+//! terminal StatusUpdate.
 
 use std::time::Duration;
 
@@ -17,9 +18,9 @@ use turul_a2a::error::A2aError;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
 use turul_a2a_types::{Artifact, Message, Part, Task};
 
-/// Artifact id used for every chunk. Reused across emits so
-/// `append=true` merges them into a single growing artifact rather
-/// than producing N independent ones — this is the point of the demo.
+/// Artifact id used for every chunk. Reused across emits so the
+/// appended chunks grow a single artifact rather than producing N
+/// independent ones — this is the point of the demo.
 pub const ARTIFACT_ID: &str = "stream-1";
 
 /// Deterministic suffix so the smoke test can assert the reassembled
@@ -65,11 +66,14 @@ impl AgentExecutor for StreamingExecutor {
             } else {
                 format!(" {tok}")
             };
+            // `append` means "add to the artifact already sent with this
+            // id" (a2a.proto `TaskArtifactUpdateEvent.append`), so the
+            // first chunk, which starts the artifact, is not an append.
             let artifact = Artifact::new(ARTIFACT_ID, vec![Part::text(chunk_text)]);
             ctx.events
                 .emit_artifact(
                     artifact,
-                    /* append */ true,
+                    /* append */ i > 0,
                     /* last_chunk */ i == last_idx,
                 )
                 .await?;

@@ -5,24 +5,21 @@
 //! chunked-artifact + terminal invariants that the example exists to
 //! teach:
 //!
-//! 1. At least one run of `ArtifactUpdate` events with `append=true`
-//!    whose final member carries `last_chunk=true`.
-//! 2. The concatenated text payloads equal the executor's canned
+//! 1. The stream opens with the `Task` snapshot (A2A §3.1.2).
+//! 2. The artifact arrives in chunks: the first starts the artifact
+//!    (`append=false`), every later one appends to it (`append=true`,
+//!    a2a.proto `TaskArtifactUpdateEvent.append`), and only the final
+//!    one carries `last_chunk=true`.
+//! 3. The concatenated text payloads equal the executor's canned
 //!    suffix (prefixed with an echo segment for the test input).
-//! 3. A terminal `StatusUpdate` with `state=TASK_STATE_COMPLETED` is
-//!    the last `StatusUpdate` observed, and the stream closes after.
-//! 4. SSE ids are strictly monotonic.
-//!
-//! The test tolerates (but does not require) intermediate non-terminal
-//! `StatusUpdate` events (e.g. Submitted/Working) — the spec does not
-//! pin their exact placement and the goal of this test is the
-//! chunked-artifact contract, not status-framing minutiae.
+//! 4. `TASK_STATE_COMPLETED` is the only status update and the last
+//!    event, and the server closes the stream after it.
 
 use std::net::TcpListener;
 use std::time::Duration;
 
 use futures::StreamExt;
-use streaming_agent::StreamingExecutor;
+use streaming_agent::{ARTIFACT_ID, CANNED_SUFFIX, StreamingExecutor};
 use turul_a2a::A2aServer;
 use turul_a2a_client::{A2aClient, MessageBuilder, StreamEvent};
 
@@ -61,111 +58,71 @@ async fn streaming_agent_emits_chunks_then_completes() {
         .expect("connection opens promptly")
         .expect("send_streaming_message ok");
 
+    // Read until the server ends the stream; a stream still open when
+    // the wait elapses fails the test.
     let mut events = Vec::new();
-    while let Ok(Some(next)) = tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
-        events.push(next.expect("parse stream event"));
+    while let Some(next) = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the server closes the stream after the terminal event")
+    {
+        events.push(next.expect("parse stream event").event);
     }
 
+    // Invariant 1: the Task snapshot opens the stream.
     assert!(
-        !events.is_empty(),
-        "expected at least one SSE event from the streaming executor"
+        matches!(events.first(), Some(StreamEvent::Task(_))),
+        "the first event must be the Task snapshot, got {:?}",
+        events.first()
     );
 
-    // Invariant 4: strictly monotonic SSE ids (when present).
-    let sequences: Vec<u64> = events
+    // Invariant 2: append=false on the first chunk only, last_chunk on
+    // the final chunk only.
+    let chunks: Vec<(bool, bool, &serde_json::Value)> = events
         .iter()
-        .filter_map(|e| e.id.as_deref())
-        .filter_map(|id| id.rsplit_once(':').and_then(|(_, s)| s.parse::<u64>().ok()))
-        .collect();
-    for pair in sequences.windows(2) {
-        assert!(
-            pair[0] < pair[1],
-            "SSE sequence ids must be strictly monotonic: saw {} then {}",
-            pair[0],
-            pair[1]
-        );
-    }
-
-    // Invariant 1: artifact chunks with last_chunk=true on the final one.
-    let artifact_updates: Vec<(bool, bool, serde_json::Value)> = events
-        .iter()
-        .filter_map(|e| match &e.event {
+        .filter_map(|e| match e {
             StreamEvent::ArtifactUpdate {
                 append,
                 last_chunk,
                 artifact,
                 ..
-            } => Some((*append, *last_chunk, artifact.clone())),
+            } => Some((*append, *last_chunk, artifact)),
             _ => None,
         })
         .collect();
-    assert!(
-        !artifact_updates.is_empty(),
-        "expected one or more ArtifactUpdate events"
-    );
-    let (_, last_chunk_flag, _) = artifact_updates
-        .last()
-        .expect("artifact_updates non-empty above");
-    assert!(
-        *last_chunk_flag,
-        "final ArtifactUpdate must carry last_chunk=true (teaches the chunked-artifact contract)"
-    );
-    for (append, last_chunk, _) in &artifact_updates[..artifact_updates.len() - 1] {
-        assert!(
-            *append,
-            "intermediate ArtifactUpdates should have append=true"
-        );
-        assert!(
-            !*last_chunk,
-            "only the final ArtifactUpdate may set last_chunk=true"
+    assert!(chunks.len() > 1, "expected several chunks, got {chunks:?}");
+    let last = chunks.len() - 1;
+    for (i, (append, last_chunk, artifact)) in chunks.iter().enumerate() {
+        assert_eq!(artifact["artifactId"], ARTIFACT_ID, "chunk {i}");
+        assert_eq!(*append, i > 0, "chunk {i}: only later chunks append");
+        assert_eq!(
+            *last_chunk,
+            i == last,
+            "chunk {i}: only the final chunk is last"
         );
     }
 
-    // Invariant 2: concatenated text reassembles the canned suffix.
-    let assembled: String = artifact_updates
+    // Invariant 3: concatenated text reassembles the echo and the
+    // canned suffix.
+    let assembled: String = chunks
         .iter()
-        .filter_map(|(_, _, artifact_json)| {
-            artifact_json
-                .get("parts")
-                .and_then(|p| p.as_array())
-                .map(|parts| {
-                    parts
-                        .iter()
-                        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                        .collect::<String>()
-                })
-        })
+        .flat_map(|(_, _, artifact)| artifact["parts"].as_array().cloned().unwrap_or_default())
+        .filter_map(|p| p["text"].as_str().map(str::to_string))
         .collect();
-    assert!(
-        assembled.contains("the quick brown fox jumps over the lazy dog"),
-        "assembled artifact text must contain the canned suffix; got: {assembled:?}"
-    );
-    assert!(
-        assembled.contains("hi"),
-        "assembled artifact text must contain the echoed input; got: {assembled:?}"
-    );
+    assert_eq!(assembled, format!("[echo: hi] {CANNED_SUFFIX}"));
 
-    // Invariant 3: a Completed terminal StatusUpdate is present and is
-    // the last StatusUpdate in the stream. Non-terminal StatusUpdates
-    // (Submitted, Working) are tolerated at any position.
-    let status_states: Vec<String> = events
+    // Invariant 4: COMPLETED is the only status update after the
+    // snapshot, and the last event.
+    let status_states: Vec<&str> = events
         .iter()
-        .filter_map(|e| match &e.event {
-            StreamEvent::StatusUpdate { status, .. } => status
-                .get("state")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
+        .filter_map(|e| match e {
+            StreamEvent::StatusUpdate { status, .. } => status["state"].as_str(),
             _ => None,
         })
         .collect();
+    assert_eq!(status_states, ["TASK_STATE_COMPLETED"]);
     assert!(
-        !status_states.is_empty(),
-        "expected at least one StatusUpdate event"
-    );
-    assert_eq!(
-        status_states.last().map(String::as_str),
-        Some("TASK_STATE_COMPLETED"),
-        "final StatusUpdate must be TASK_STATE_COMPLETED (saw sequence: {status_states:?})"
+        matches!(events.last(), Some(StreamEvent::StatusUpdate { .. })),
+        "the terminal status update is the last event"
     );
 
     // Clean up the spawned server task so the test harness doesn't

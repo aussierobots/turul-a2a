@@ -4,8 +4,8 @@ Worked example of an A2A executor that emits chunked artifacts over SSE using
 `EventSink::emit_artifact(append, last_chunk)` — the contract from ADR-006
 (transport-level `last_chunk`) and ADR-010 (executor `EventSink`).
 
-The executor tokenises a canned response and emits each word as an appended
-chunk to a single artifact. Watching `curl --no-buffer` against
+The executor tokenises a canned response and emits each word as a chunk of a
+single artifact: the first chunk starts it, every later chunk is appended. Watching `curl --no-buffer` against
 `/message:stream` gives you the "tokens arriving in real time" experience
 that A2A streaming was designed for.
 
@@ -32,11 +32,13 @@ curl -s http://localhost:3002/.well-known/agent-card.json | jq .capabilities.str
 
 ## What it shows
 
-- `ctx.events.emit_artifact(artifact, append=true, last_chunk=<bool>)` used in
-  a loop — one call per token, `last_chunk=true` only on the final iteration.
-- `append=true` + reusing a single artifact id (`stream-1`) means all chunks
-  merge into one growing artifact, mirroring how an LLM streams tokens into a
-  single response.
+- `ctx.events.emit_artifact(artifact, append, last_chunk)` used in a loop —
+  one call per token, `append=false` on the first token (it starts the
+  artifact), `append=true` on every later one, `last_chunk=true` only on the
+  final iteration.
+- Appending to a single artifact id (`stream-1`) means all chunks merge into
+  one growing artifact, mirroring how an LLM streams tokens into a single
+  response.
 - `ctx.cancellation.is_cancelled()` checked each tick so `POST
   /tasks/{id}:cancel` from another client trips the loop and emits
   `ctx.events.cancelled(...)` — real cooperative cancel.
@@ -47,14 +49,13 @@ curl -s http://localhost:3002/.well-known/agent-card.json | jq .capabilities.str
 
 ## Expected SSE wire sequence
 
-Watching the `/message:stream` response, you'll see (order is guaranteed on
-monotonic SSE ids; intermediate StatusUpdates may appear):
+Watching the `/message:stream` response, you'll see, in order:
 
 | # | Event                 | Notes                                             |
 | - | --------------------- | ------------------------------------------------- |
-| 1 | `statusUpdate`        | non-terminal (Submitted/Working)                  |
-| 2 | `artifactUpdate`      | `append=true`, `lastChunk=false`, first token     |
-| … | `artifactUpdate` × N  | each adds one word                                |
+| 1 | `task`                | snapshot of the task, already `TASK_STATE_WORKING` |
+| 2 | `artifactUpdate`      | `append=false`, `lastChunk=false`, first token    |
+| … | `artifactUpdate` × N  | `append=true`, each adds one word                 |
 | N | `artifactUpdate`      | `append=true`, **`lastChunk=true`** — final token |
 | — | `statusUpdate`        | `state=TASK_STATE_COMPLETED` — stream closes      |
 
@@ -69,9 +70,10 @@ cargo test -p streaming-agent
 
 The test in `tests/smoke.rs` spawns the server on a random port, drives it
 through `turul-a2a-client::send_streaming_message`, and asserts the chunked
-contract — the terminal Completed status, reassembled canned text, monotonic
-SSE ids. It tolerates intermediate non-terminal StatusUpdates (their exact
-placement isn't pinned by the spec). The test doubles as the
+contract — the Task snapshot first, `append` false on the first chunk and true
+after, `lastChunk` on the final chunk only, the reassembled canned text, and
+the Completed status as the last event before the server closes the stream.
+The test doubles as the
 `turul-a2a-client` streaming example, which is otherwise undocumented.
 
 ## Runtime scope
