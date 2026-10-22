@@ -6,14 +6,15 @@ pub enum A2aStorageError {
     #[error("Task not found: {0}")]
     TaskNotFound(String),
 
-    #[error("Invalid state transition: {current:?} -> {requested:?}")]
+    #[error("Invalid state transition for task {task_id}: {current:?} -> {requested:?}")]
     InvalidTransition {
+        task_id: String,
         current: TaskState,
         requested: TaskState,
     },
 
-    #[error("Task is in terminal state: {0:?}")]
-    TerminalState(TaskState),
+    #[error("Task {task_id} is in terminal state: {state:?}")]
+    TerminalState { task_id: String, state: TaskState },
 
     /// The atomic store's single-terminal-writer invariant rejected a
     /// terminal write because the task was already in a terminal state

@@ -2341,7 +2341,12 @@ pub async fn test_invalid_transition_distinct_from_terminal_already_set(
         .await;
 
     match result {
-        Err(crate::storage::A2aStorageError::InvalidTransition { current, requested }) => {
+        Err(crate::storage::A2aStorageError::InvalidTransition {
+            task_id,
+            current,
+            requested,
+        }) => {
+            assert_eq!(task_id, "cas-dist-1");
             assert_eq!(current, TaskState::Submitted);
             assert_eq!(requested, TaskState::InputRequired);
         }

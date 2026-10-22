@@ -1425,7 +1425,7 @@ pub async fn core_cancel_task(
                 task_id: task_id.to_string(),
             });
         }
-        Err(A2aStorageError::TerminalState(_))
+        Err(A2aStorageError::TerminalState { .. })
         | Err(A2aStorageError::InvalidTransition { .. })
         | Err(A2aStorageError::TerminalStateAlreadySet { .. }) => {
             return Err(A2aError::TaskNotCancelable {
@@ -1544,7 +1544,7 @@ pub async fn core_cancel_task(
             Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
         }
         Err(A2aStorageError::TaskNotFound(id)) => Err(A2aError::TaskNotFound { task_id: id }),
-        Err(A2aStorageError::TerminalState(_)) | Err(A2aStorageError::InvalidTransition { .. }) => {
+        Err(A2aStorageError::TerminalState { .. }) | Err(A2aStorageError::InvalidTransition { .. }) => {
             Err(A2aError::TaskNotCancelable {
                 task_id: task_id.to_string(),
             })

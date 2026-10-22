@@ -737,11 +737,16 @@ impl A2aTaskStorage for SqliteA2aStorage {
         turul_a2a_types::state_machine::validate_transition(current_state, new_state).map_err(
             |e| match e {
                 turul_a2a_types::A2aTypeError::InvalidTransition { current, requested } => {
-                    A2aStorageError::InvalidTransition { current, requested }
+                    A2aStorageError::InvalidTransition {
+                        task_id: task_id.to_string(),
+                        current,
+                        requested,
+                    }
                 }
-                turul_a2a_types::A2aTypeError::TerminalState(s) => {
-                    A2aStorageError::TerminalState(s)
-                }
+                turul_a2a_types::A2aTypeError::TerminalState(s) => A2aStorageError::TerminalState {
+                    task_id: task_id.to_string(),
+                    state: s,
+                },
                 other => A2aStorageError::TypeError(other),
             },
         )?;
@@ -891,7 +896,10 @@ impl A2aTaskStorage for SqliteA2aStorage {
                         )));
                     }
                 };
-                Err(A2aStorageError::TerminalState(state))
+                Err(A2aStorageError::TerminalState {
+                    task_id: task_id.to_string(),
+                    state: state,
+                })
             }
         }
     }
@@ -1539,7 +1547,11 @@ impl A2aAtomicStore for SqliteA2aStorage {
         turul_a2a_types::state_machine::validate_transition(current_state, new_state).map_err(
             |e| match e {
                 turul_a2a_types::A2aTypeError::InvalidTransition { current, requested } => {
-                    A2aStorageError::InvalidTransition { current, requested }
+                    A2aStorageError::InvalidTransition {
+                        task_id: task_id.to_string(),
+                        current,
+                        requested,
+                    }
                 }
                 turul_a2a_types::A2aTypeError::TerminalState(s) => {
                     A2aStorageError::TerminalStateAlreadySet {

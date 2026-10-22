@@ -460,8 +460,9 @@ async fn marker_write_conditional_on_non_terminal() {
         .set_cancel_requested("default", "t-cond", "owner-c")
         .await;
     match result {
-        Err(turul_a2a::storage::A2aStorageError::TerminalState(s)) => {
-            assert_eq!(s, TaskState::Completed);
+        Err(turul_a2a::storage::A2aStorageError::TerminalState { task_id, state }) => {
+            assert_eq!(task_id, "t-cond");
+            assert_eq!(state, TaskState::Completed);
         }
         other => panic!("expected TerminalState on terminal marker write, got {other:?}"),
     }
