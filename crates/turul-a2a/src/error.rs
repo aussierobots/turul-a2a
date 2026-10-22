@@ -5,6 +5,7 @@
 //! `turul_a2a_types::wire::errors`.
 
 use serde_json::{Value, json};
+use turul_a2a_types::ErrorInfo;
 use turul_a2a_types::wire::errors;
 
 /// Server-level error for A2A operations.
@@ -131,13 +132,8 @@ impl A2aError {
     /// Build the google.rpc.ErrorInfo JSON object for this error.
     /// Returns `None` for non-A2A errors.
     pub fn error_info(&self) -> Option<Value> {
-        self.error_reason().map(|reason| {
-            json!({
-                "@type": errors::ERROR_INFO_TYPE,
-                "reason": reason,
-                "domain": errors::ERROR_DOMAIN,
-            })
-        })
+        self.error_reason()
+            .map(|reason| ErrorInfo::new(reason, errors::ERROR_DOMAIN).into())
     }
 
     /// Build the HTTP error response body: the `google.rpc.Status` JSON
@@ -389,6 +385,21 @@ mod tests {
         assert_eq!(keys, ["code", "details", "message", "status"]);
         assert_eq!(body["error"]["status"], "NOT_FOUND");
         assert!(body["error"]["message"].as_str().unwrap().contains("t-123"));
+    }
+
+    #[test]
+    fn error_bodies_are_byte_stable() {
+        let err = A2aError::TaskNotFound {
+            task_id: "t-1".into(),
+        };
+        assert_eq!(
+            err.to_http_error_body().to_string(),
+            r#"{"error":{"code":404,"details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","domain":"a2a-protocol.org","reason":"TASK_NOT_FOUND"}],"message":"Task not found: t-1","status":"NOT_FOUND"}}"#
+        );
+        assert_eq!(
+            err.to_jsonrpc_error(Some(&json!(7))).to_string(),
+            r#"{"error":{"code":-32001,"data":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","domain":"a2a-protocol.org","reason":"TASK_NOT_FOUND"}],"message":"Task not found: t-1"},"id":7,"jsonrpc":"2.0"}"#
+        );
     }
 
     #[test]

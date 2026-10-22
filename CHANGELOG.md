@@ -4,6 +4,25 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] — 2026-10-23
+
+### Added
+
+- `turul_a2a_types::ErrorInfo`: the `google.rpc.ErrorInfo` JSON object (`@type`, `reason`, `domain`, string `metadata`). Use it to put a machine-readable failure cause in a task's data part, or to read one, instead of hand-copying the shape. Deserializing rejects any other `@type`.
+
+### Changed
+
+- The server's error details (A2A errors and auth failures) are built through `ErrorInfo`. The bytes on the wire are unchanged.
+- `turul-a2a-client` takes the error reason from the detail typed as `google.rpc.ErrorInfo`, wherever it sits in `details`, and no longer from an untyped first entry.
+
+### Compatibility
+
+- A server that sends an error detail without the ErrorInfo `@type` now yields `A2aClientError::reason() == None` where 0.2.0 returned its `reason`. turul-a2a servers always send the `@type`.
+
+### Verification
+
+- Byte-exact fixtures on the HTTP and JSON-RPC error bodies (A2A and auth errors) pass.
+
 ## [0.2.0] — 2026-10-23
 
 A minor-version bump because this release breaks public APIs and the wire contract: Cargo treats 0.1 → 0.2 as incompatible, so dependents opt in explicitly. Brings the framework to **A2A v1.0.1** on all three transports (HTTP+JSON, JSON-RPC, gRPC) after a full audit of the code and its tests against the specification and the ADRs. Many of the changes alter what goes on the wire, so read **Compatibility** before upgrading. 0.1.33 to 0.1.36 were never published; their changes are included here.

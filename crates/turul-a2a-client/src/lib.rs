@@ -10,6 +10,7 @@ pub mod prelude;
 pub mod response;
 pub mod sse;
 
+use serde::Deserialize;
 use turul_a2a_proto as pb;
 use turul_a2a_types::wire;
 
@@ -491,14 +492,15 @@ impl A2aClient {
                 .unwrap_or("Unknown error")
                 .to_string();
 
-            // Extract ErrorInfo reason if present
             let reason = error
                 .get("details")
                 .and_then(|d| d.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|info| info.get("reason"))
-                .and_then(|r| r.as_str())
-                .map(|s| s.to_string());
+                .and_then(|details| {
+                    details
+                        .iter()
+                        .find_map(|detail| turul_a2a_types::ErrorInfo::deserialize(detail).ok())
+                })
+                .map(|info| info.reason);
 
             return A2aClientError::A2aError {
                 status,

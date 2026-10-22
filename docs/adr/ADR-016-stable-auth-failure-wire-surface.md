@@ -175,7 +175,9 @@ case (`MISSING_CREDENTIAL`, `INVALID_TOKEN`, `INVALID_API_KEY`,
 failure) — in the `turul-a2a` domain, distinct from the A2A protocol domain
 because these are transport failures, not A2A errors. Messages are fixed per
 kind and never echo validator or request detail. The owner is
-`MiddlewareError::{http_body, jsonrpc_body, message}`. The HTTP status and
+`MiddlewareError::{http_body, jsonrpc_body, message}`; the `ErrorInfo`
+detail itself is built by `turul_a2a_types::ErrorInfo`, the one owner of
+the ErrorInfo JSON shape (ADR-004). The HTTP status and
 the `WWW-Authenticate` challenge (§2.3) are unchanged.
 
 ### 2.3 WWW-Authenticate — Bearer challenges only
@@ -417,7 +419,8 @@ any affected adopter sees them.
    the named token field.
 4. **Use `A2aError` / `google.rpc.ErrorInfo` for auth failures**.
    Rejected — transport-level by design (ADR-007). Auth runs before
-   the protocol layer; `ErrorInfo` is for protocol errors.
+   the protocol layer, so its failures are not A2A errors: they carry
+   an `ErrorInfo` in the `turul-a2a` domain (§2.2), never an `A2aError`.
 5. **Sanitize `error_description` rather than omit it**. Rejected —
    sanitizing keeps the leak surface open (deciding what's safe to
    surface is error-prone) without gaining any stable adopter
@@ -491,6 +494,10 @@ any affected adopter sees them.
   JSON-RPC envelope, and auth-failure media types follow the transport
   layer (`application/json` for v0.3 requests). §2.1, §5.2 and test
   obligations 1 and 6–7 restated in terms of `ErrorInfo.reason`.
+- 2026-10-23 — §2.2: the auth-failure `ErrorInfo` detail is built by
+  `turul_a2a_types::ErrorInfo`; wire bytes unchanged (byte-exact fixtures
+  on the HTTP and JSON-RPC bodies). §7 item 4 restated: auth failures use
+  `ErrorInfo` in their own domain, not `A2aError`.
 
 ## 9. References
 

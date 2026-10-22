@@ -144,6 +144,51 @@ async fn get_task_not_found_returns_a2a_error() {
     assert_eq!(err.reason(), Some("TASK_NOT_FOUND"));
 }
 
+#[tokio::test]
+async fn error_reason_comes_from_the_error_info_detail_only() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tasks/t-1"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": {
+                "code": 404,
+                "message": "Task not found",
+                "details": [
+                    {"@type": "type.googleapis.com/google.rpc.RetryInfo", "reason": "NOT_IT"},
+                    {
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "TASK_NOT_FOUND",
+                        "domain": "a2a-protocol.org"
+                    }
+                ]
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tasks/t-2"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": {
+                "code": 404,
+                "message": "Task not found",
+                "details": [{"reason": "UNTYPED", "domain": "a2a-protocol.org"}]
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = A2aClient::new(server.uri());
+    let err = client.get_task("t-1", None).await.unwrap_err();
+    assert_eq!(err.reason(), Some("TASK_NOT_FOUND"));
+    let err = client.get_task("t-2", None).await.unwrap_err();
+    assert_eq!(err.status(), Some(404));
+    assert_eq!(
+        err.reason(),
+        None,
+        "a detail without the ErrorInfo @type is not an ErrorInfo"
+    );
+}
+
 // =========================================================
 // CancelTask — TaskNotCancelable error parsing
 // =========================================================

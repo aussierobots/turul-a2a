@@ -169,11 +169,7 @@ impl MiddlewareError {
     /// kind in upper snake case, `domain` is the turul auth domain.
     fn error_info(&self) -> serde_json::Value {
         use turul_a2a_types::wire::errors;
-        serde_json::json!({
-            "@type": errors::ERROR_INFO_TYPE,
-            "reason": self.reason(),
-            "domain": errors::AUTH_ERROR_DOMAIN,
-        })
+        turul_a2a_types::ErrorInfo::new(self.reason(), errors::AUTH_ERROR_DOMAIN).into()
     }
 
     /// HTTP+JSON error body (spec: every error response carries a code and
@@ -230,6 +226,19 @@ mod tests {
         assert_eq!(
             MiddlewareError::Internal("db down".into()).reason(),
             "INTERNAL_ERROR"
+        );
+    }
+
+    #[test]
+    fn error_bodies_are_byte_stable() {
+        let err = MiddlewareError::Unauthenticated(AuthFailureKind::MissingCredential);
+        assert_eq!(
+            err.http_body().to_string(),
+            r#"{"error":{"code":401,"details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","domain":"turul-a2a","reason":"MISSING_CREDENTIAL"}],"message":"authentication credentials are required","status":"UNAUTHENTICATED"}}"#
+        );
+        assert_eq!(
+            err.jsonrpc_body().to_string(),
+            r#"{"error":{"code":-32040,"data":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","domain":"turul-a2a","reason":"MISSING_CREDENTIAL"}],"message":"authentication credentials are required"},"id":null,"jsonrpc":"2.0"}"#
         );
     }
 
