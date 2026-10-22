@@ -62,7 +62,10 @@ pub const PUSH_CONTENT_TYPE: &str = "application/a2a+json";
 
 /// Runtime-configurable delivery parameters.
 ///
-/// Defaults: 8 attempts, exponential backoff from a 2s base capped at 60s.
+/// Defaults: 8 attempts (the first immediate), waits doubling from a
+/// 2s base and capped at 60s, ±25% jitter — 2+4+8+16+32+60+60 = 182s,
+/// a retry horizon of about 3 minutes. These are also the defaults of
+/// the server builders' `push_*` settings.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct PushDeliveryConfig {
@@ -70,10 +73,11 @@ pub struct PushDeliveryConfig {
     pub backoff_base: Duration,
     pub backoff_cap: Duration,
     pub backoff_jitter: f32,
+    /// Bound on the whole POST: connect, send and the full response.
     pub request_timeout: Duration,
     pub connect_timeout: Duration,
-    /// Accepted but currently unused: the read phase is bounded by
-    /// `request_timeout`.
+    /// Longest the POST waits for the receiver's response with nothing
+    /// arriving (status line and headers, then each body read).
     pub read_timeout: Duration,
     pub claim_expiry: Duration,
     pub max_payload_bytes: usize,
@@ -93,6 +97,25 @@ impl Default for PushDeliveryConfig {
             claim_expiry: Duration::from_secs(600),
             max_payload_bytes: 1024 * 1024,
             allow_insecure_urls: false,
+        }
+    }
+}
+
+impl PushDeliveryConfig {
+    /// The delivery parameters a server builder's `push_*` settings
+    /// select.
+    pub fn from_runtime_config(runtime: &crate::server::RuntimeConfig) -> Self {
+        Self {
+            max_attempts: runtime.push_max_attempts as u32,
+            backoff_base: runtime.push_backoff_base,
+            backoff_cap: runtime.push_backoff_cap,
+            backoff_jitter: runtime.push_backoff_jitter,
+            request_timeout: runtime.push_request_timeout,
+            connect_timeout: runtime.push_connect_timeout,
+            read_timeout: runtime.push_read_timeout,
+            claim_expiry: runtime.push_claim_expiry,
+            max_payload_bytes: runtime.push_max_payload_bytes,
+            allow_insecure_urls: runtime.allow_insecure_push_urls,
         }
     }
 }
@@ -205,7 +228,8 @@ impl PushDeliveryWorker {
     ///
     /// Per-attempt client config:
     /// - Connect timeout: `connect_timeout`.
-    /// - Read / total timeout: `request_timeout`.
+    /// - Read timeout (receiver silent): `read_timeout`.
+    /// - Total timeout: `request_timeout`.
     /// - Redirects: none (HTTP redirects are SSRF risk on push delivery).
     pub fn new(
         push_delivery_store: Arc<dyn A2aPushDeliveryStore>,
@@ -411,6 +435,13 @@ impl PushDeliveryWorker {
                         last_http_status: Some(status.as_u16()),
                     }
                 }
+                // A TLS handshake failure is a receiver misconfiguration
+                // that retrying within the horizon does not fix.
+                Err(DeliveryErrorClass::TlsRejected) => DeliveryOutcome::GaveUp {
+                    reason: GaveUpReason::TlsRejected,
+                    last_error_class: DeliveryErrorClass::TlsRejected,
+                    last_http_status: None,
+                },
                 Err(err_class) => DeliveryOutcome::Retry {
                     next_attempt_at: SystemTime::now() + self.backoff_for(new_count),
                     http_status: None,
@@ -644,6 +675,7 @@ impl PushDeliveryWorker {
 
         let client = reqwest::Client::builder()
             .connect_timeout(self.config.connect_timeout)
+            .read_timeout(self.config.read_timeout)
             .timeout(self.config.request_timeout)
             .redirect(reqwest::redirect::Policy::none())
             .resolve(&host, pinned)
@@ -682,17 +714,10 @@ impl PushDeliveryWorker {
 
         match resp {
             Ok(r) => Ok(r.status()),
-            Err(e) => {
-                if e.is_timeout() {
-                    Err(DeliveryErrorClass::Timeout)
-                } else if e.is_connect() {
-                    Err(DeliveryErrorClass::NetworkError)
-                } else if e.to_string().to_lowercase().contains("tls") {
-                    Err(DeliveryErrorClass::TlsRejected)
-                } else {
-                    Err(DeliveryErrorClass::NetworkError)
-                }
-            }
+            // TLS first: a handshake failure also reports `is_connect`.
+            Err(e) if is_tls_failure(&e) => Err(DeliveryErrorClass::TlsRejected),
+            Err(e) if e.is_timeout() => Err(DeliveryErrorClass::Timeout),
+            Err(_) => Err(DeliveryErrorClass::NetworkError),
         }
     }
 
@@ -712,6 +737,27 @@ impl PushDeliveryWorker {
         let final_ms = (target as i64).saturating_add(offset).max(0) as u64;
         Duration::from_millis(final_ms)
     }
+}
+
+/// Whether `err`, or any error in its source chain, is a TLS handshake
+/// failure (certificate rejected, receiver not speaking TLS). The TLS
+/// stream reports these as a `rustls::Error` wrapped in one or more
+/// `io::Error`s. `io::Error::source` skips the error it wraps, so the
+/// walk steps into each `io::Error`'s wrapped error explicitly.
+fn is_tls_failure(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(e) = current {
+        if e.is::<rustls::Error>() {
+            return true;
+        }
+        current = match e.downcast_ref::<std::io::Error>() {
+            Some(io) => io
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static)),
+            None => e.source(),
+        };
+    }
+    false
 }
 
 enum ClaimFailure {
@@ -814,6 +860,22 @@ mod tests {
             failed[0].last_error_class,
             DeliveryErrorClass::PayloadTooLarge
         ));
+    }
+
+    #[test]
+    fn certificate_rejection_is_a_tls_failure() {
+        // The shape the TLS stream reports: the rustls error inside two
+        // layers of `io::Error`.
+        let cert = std::io::Error::other(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+        ));
+        assert!(is_tls_failure(&cert));
+        assert!(is_tls_failure(&rustls::Error::InvalidCertificate(
+            rustls::CertificateError::Expired
+        )));
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert!(!is_tls_failure(&refused));
     }
 
     /// A plain `http://` URL with insecure URLs disallowed is never

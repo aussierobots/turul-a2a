@@ -795,3 +795,111 @@ fn with_sqs_return_immediately_enables_the_capability() {
         Some("sqs")
     );
 }
+
+// --------------------------------------------------------------------------
+// Outbound URL allowlist installed on the Lambda builder.
+// --------------------------------------------------------------------------
+
+/// The Lambda builder's validator reaches the delivery worker: a webhook
+/// URL it refuses is never POSTed and is recorded as an SSRF-blocked
+/// failed delivery, while an allowed URL on the same task is delivered.
+#[tokio::test]
+async fn lambda_builder_outbound_url_validator_refuses_unlisted_webhooks() {
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+    use turul_a2a::push::{A2aPushDeliveryStore, DeliveryErrorClass};
+    use turul_a2a::server::RuntimeConfig;
+    use turul_a2a_types::{TaskState, TaskStatus};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+
+    let storage = InMemoryA2aStorage::new().with_push_dispatch_enabled(true);
+    let mut cfg = RuntimeConfig::default();
+    cfg.allow_insecure_push_urls = true;
+    cfg.cancel_handler_grace = Duration::from_millis(50);
+    cfg.cancel_handler_poll_interval = Duration::from_millis(10);
+    cfg.push_max_attempts = 1;
+    cfg.push_backoff_cap = Duration::from_millis(10);
+    cfg.push_claim_expiry = Duration::from_secs(5);
+    let handler = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .storage(storage.clone())
+        .push_delivery_store(storage.clone())
+        .runtime_config(cfg)
+        .outbound_url_validator(Arc::new(|url: &url::Url| {
+            if url.path() == "/allowed" {
+                Ok(())
+            } else {
+                Err("not on the allowlist".into())
+            }
+        }))
+        .build()
+        .expect("lambda build");
+
+    let task_id = "task-lambda-push-allowlist";
+    let task = Task::new(task_id, TaskStatus::new(TaskState::Working))
+        .with_context_id("ctx-lambda-allowlist");
+    storage
+        .create_task("", "anonymous", task)
+        .await
+        .expect("seed task");
+
+    for (id, suffix) in [("cfg-allowed", "allowed"), ("cfg-refused", "refused")] {
+        let body = serde_json::json!({
+            "id": id,
+            "taskId": task_id,
+            "url": format!("{}/{suffix}", mock.uri()),
+        });
+        let req = http::Request::builder()
+            .method("POST")
+            .uri(format!("/tasks/{task_id}/pushNotificationConfigs"))
+            .header("content-type", "application/json")
+            .header("a2a-version", "1.0")
+            .body(lambda_http::Body::Text(body.to_string()))
+            .unwrap();
+        let resp = handler.handle(req).await.expect("handle");
+        assert!(
+            resp.status().is_success(),
+            "create config: {}",
+            resp.status()
+        );
+    }
+
+    let cancel = http::Request::builder()
+        .method("POST")
+        .uri(format!("/tasks/{task_id}:cancel"))
+        .header("a2a-version", "1.0")
+        .body(lambda_http::Body::Empty)
+        .unwrap();
+    let resp = handler.handle(cancel).await.expect("handle");
+    assert_eq!(resp.status(), http::StatusCode::OK, "cancel must succeed");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let failed = loop {
+        let failed = storage
+            .list_failed_deliveries("", SystemTime::UNIX_EPOCH, 10)
+            .await
+            .unwrap();
+        let posted = mock.received_requests().await.unwrap().len();
+        if failed.len() == 1 && posted == 1 {
+            break failed;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out: {} failed, {posted} posted",
+            failed.len()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let reqs = mock.received_requests().await.unwrap();
+    assert_eq!(reqs[0].url.path(), "/allowed");
+    assert_eq!(failed[0].config_id, "cfg-refused");
+    assert_eq!(failed[0].last_error_class, DeliveryErrorClass::SSRFBlocked);
+    assert_eq!(failed[0].delivery_attempt_count, 0, "never POSTed");
+}

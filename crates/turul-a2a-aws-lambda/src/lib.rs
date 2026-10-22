@@ -254,6 +254,7 @@ pub struct LambdaA2aServerBuilder {
     runtime_config: RuntimeConfig,
     durable_executor_queue: Option<Arc<dyn turul_a2a::durable_executor::DurableExecutorQueue>>,
     path_prefix: Option<String>,
+    outbound_url_validator: Option<turul_a2a::push::ssrf::OutboundUrlValidator>,
 }
 
 impl LambdaA2aServerBuilder {
@@ -270,6 +271,7 @@ impl LambdaA2aServerBuilder {
             runtime_config: RuntimeConfig::default(),
             durable_executor_queue: None,
             path_prefix: None,
+            outbound_url_validator: None,
         }
     }
 
@@ -429,6 +431,23 @@ impl LambdaA2aServerBuilder {
         self
     }
 
+    /// Operator allowlist for push webhook URLs.
+    ///
+    /// Called with each webhook URL on every delivery attempt, before
+    /// DNS resolution. Returning `Err` refuses the delivery: nothing is
+    /// resolved or POSTed, and the delivery is recorded as a failed
+    /// delivery with error class `SSRFBlocked`. The reason string is
+    /// not persisted. Runs in addition to the built-in scheme and
+    /// private-address checks, not instead of them. Takes effect only
+    /// when push delivery is wired (`push_delivery_store`).
+    pub fn outbound_url_validator(
+        mut self,
+        validator: turul_a2a::push::ssrf::OutboundUrlValidator,
+    ) -> Self {
+        self.outbound_url_validator = Some(validator);
+        self
+    }
+
     pub fn build(self) -> Result<LambdaA2aHandler, A2aError> {
         let executor = self
             .executor
@@ -538,64 +557,56 @@ impl LambdaA2aServerBuilder {
         // `PushDispatcher`. Under Lambda the dispatcher runs
         // opportunistically post-return; correctness
         // comes from the atomic marker + stream/scheduler recovery.
-        let push_dispatcher: Option<Arc<turul_a2a::push::PushDispatcher>> =
-            if let Some(delivery) = push_delivery_store.as_ref() {
-                let push_delivery_backend = delivery.backend_name();
-                if task_backend != push_delivery_backend {
-                    return Err(A2aError::Internal(format!(
-                        "Storage backend mismatch: task={task_backend}, \
+        let push_dispatcher: Option<Arc<turul_a2a::push::PushDispatcher>> = if let Some(delivery) =
+            push_delivery_store.as_ref()
+        {
+            let push_delivery_backend = delivery.backend_name();
+            if task_backend != push_delivery_backend {
+                return Err(A2aError::Internal(format!(
+                    "Storage backend mismatch: task={task_backend}, \
                          push_delivery={push_delivery_backend}. \
                          All storage traits must share the same backend."
-                    )));
-                }
+                )));
+            }
 
-                // claim expiry must exceed the worst-case
-                // retry horizon so a live claim is not mis-classified as
-                // stale mid-retry.
-                let retry_horizon = runtime_config
-                    .push_backoff_cap
-                    .saturating_mul(runtime_config.push_max_attempts as u32);
-                if runtime_config.push_claim_expiry <= retry_horizon {
-                    return Err(A2aError::Internal(format!(
-                        "push_claim_expiry ({:?}) must be greater than retry horizon \
+            // claim expiry must exceed the worst-case
+            // retry horizon so a live claim is not mis-classified as
+            // stale mid-retry.
+            let retry_horizon = runtime_config
+                .push_backoff_cap
+                .saturating_mul(runtime_config.push_max_attempts as u32);
+            if runtime_config.push_claim_expiry <= retry_horizon {
+                return Err(A2aError::Internal(format!(
+                    "push_claim_expiry ({:?}) must be greater than retry horizon \
                          (push_max_attempts={} * push_backoff_cap={:?} = {:?}). \
                          Raise push_claim_expiry or lower push_max_attempts/push_backoff_cap.",
-                        runtime_config.push_claim_expiry,
-                        runtime_config.push_max_attempts,
-                        runtime_config.push_backoff_cap,
-                        retry_horizon
-                    )));
-                }
+                    runtime_config.push_claim_expiry,
+                    runtime_config.push_max_attempts,
+                    runtime_config.push_backoff_cap,
+                    retry_horizon
+                )));
+            }
 
-                let mut delivery_cfg = turul_a2a::push::delivery::PushDeliveryConfig::default();
-                delivery_cfg.max_attempts = runtime_config.push_max_attempts as u32;
-                delivery_cfg.backoff_base = runtime_config.push_backoff_base;
-                delivery_cfg.backoff_cap = runtime_config.push_backoff_cap;
-                delivery_cfg.backoff_jitter = runtime_config.push_backoff_jitter;
-                delivery_cfg.request_timeout = runtime_config.push_request_timeout;
-                delivery_cfg.connect_timeout = runtime_config.push_connect_timeout;
-                delivery_cfg.read_timeout = runtime_config.push_read_timeout;
-                delivery_cfg.claim_expiry = runtime_config.push_claim_expiry;
-                delivery_cfg.max_payload_bytes = runtime_config.push_max_payload_bytes;
-                delivery_cfg.allow_insecure_urls = runtime_config.allow_insecure_push_urls;
+            let delivery_cfg =
+                turul_a2a::push::delivery::PushDeliveryConfig::from_runtime_config(&runtime_config);
 
-                let instance_id = format!("a2a-lambda-{}", uuid::Uuid::now_v7());
-                let worker = turul_a2a::push::delivery::PushDeliveryWorker::new(
-                    delivery.clone(),
-                    delivery_cfg,
-                    None,
-                    instance_id,
-                )
-                .map_err(|e| A2aError::Internal(format!("push worker build failed: {e}")))?;
+            let instance_id = format!("a2a-lambda-{}", uuid::Uuid::now_v7());
+            let worker = turul_a2a::push::delivery::PushDeliveryWorker::new(
+                delivery.clone(),
+                delivery_cfg,
+                self.outbound_url_validator.clone(),
+                instance_id,
+            )
+            .map_err(|e| A2aError::Internal(format!("push worker build failed: {e}")))?;
 
-                Some(Arc::new(turul_a2a::push::PushDispatcher::new(
-                    Arc::new(worker),
-                    push_storage.clone(),
-                    task_storage.clone(),
-                )))
-            } else {
-                None
-            };
+            Some(Arc::new(turul_a2a::push::PushDispatcher::new(
+                Arc::new(worker),
+                push_storage.clone(),
+                task_storage.clone(),
+            )))
+        } else {
+            None
+        };
 
         let state = AppState {
             executor,

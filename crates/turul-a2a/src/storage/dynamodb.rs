@@ -2449,8 +2449,6 @@ enum DdbErrorClassWire {
     HttpError429,
     SSRFBlocked,
     PayloadTooLarge,
-    ConfigDeleted,
-    TaskDeleted,
     TlsRejected,
 }
 impl From<DeliveryErrorClass> for DdbErrorClassWire {
@@ -2463,8 +2461,6 @@ impl From<DeliveryErrorClass> for DdbErrorClassWire {
             DeliveryErrorClass::HttpError429 => Self::HttpError429,
             DeliveryErrorClass::SSRFBlocked => Self::SSRFBlocked,
             DeliveryErrorClass::PayloadTooLarge => Self::PayloadTooLarge,
-            DeliveryErrorClass::ConfigDeleted => Self::ConfigDeleted,
-            DeliveryErrorClass::TaskDeleted => Self::TaskDeleted,
             DeliveryErrorClass::TlsRejected => Self::TlsRejected,
         }
     }
@@ -2479,8 +2475,6 @@ impl From<DdbErrorClassWire> for DeliveryErrorClass {
             DdbErrorClassWire::HttpError429 => DeliveryErrorClass::HttpError429,
             DdbErrorClassWire::SSRFBlocked => DeliveryErrorClass::SSRFBlocked,
             DdbErrorClassWire::PayloadTooLarge => DeliveryErrorClass::PayloadTooLarge,
-            DdbErrorClassWire::ConfigDeleted => DeliveryErrorClass::ConfigDeleted,
-            DdbErrorClassWire::TaskDeleted => DeliveryErrorClass::TaskDeleted,
             DdbErrorClassWire::TlsRejected => DeliveryErrorClass::TlsRejected,
         }
     }

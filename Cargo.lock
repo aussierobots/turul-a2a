@@ -4531,6 +4531,7 @@ dependencies = [
  "hyper 1.12.0",
  "rand",
  "reqwest",
+ "rustls 0.23.46",
  "secrecy",
  "serde",
  "serde_json",
@@ -4605,6 +4606,7 @@ dependencies = [
  "turul-a2a",
  "turul-a2a-proto",
  "turul-a2a-types",
+ "url",
  "uuid",
  "wiremock",
 ]

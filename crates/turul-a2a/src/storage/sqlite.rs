@@ -1920,8 +1920,6 @@ enum ErrorClassWire {
     HttpError429,
     SSRFBlocked,
     PayloadTooLarge,
-    ConfigDeleted,
-    TaskDeleted,
     TlsRejected,
 }
 impl From<DeliveryErrorClass> for ErrorClassWire {
@@ -1934,8 +1932,6 @@ impl From<DeliveryErrorClass> for ErrorClassWire {
             DeliveryErrorClass::HttpError429 => Self::HttpError429,
             DeliveryErrorClass::SSRFBlocked => Self::SSRFBlocked,
             DeliveryErrorClass::PayloadTooLarge => Self::PayloadTooLarge,
-            DeliveryErrorClass::ConfigDeleted => Self::ConfigDeleted,
-            DeliveryErrorClass::TaskDeleted => Self::TaskDeleted,
             DeliveryErrorClass::TlsRejected => Self::TlsRejected,
         }
     }
@@ -1950,8 +1946,6 @@ impl From<ErrorClassWire> for DeliveryErrorClass {
             ErrorClassWire::HttpError429 => DeliveryErrorClass::HttpError429,
             ErrorClassWire::SSRFBlocked => DeliveryErrorClass::SSRFBlocked,
             ErrorClassWire::PayloadTooLarge => DeliveryErrorClass::PayloadTooLarge,
-            ErrorClassWire::ConfigDeleted => DeliveryErrorClass::ConfigDeleted,
-            ErrorClassWire::TaskDeleted => DeliveryErrorClass::TaskDeleted,
             ErrorClassWire::TlsRejected => DeliveryErrorClass::TlsRejected,
         }
     }

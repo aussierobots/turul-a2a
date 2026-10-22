@@ -452,10 +452,10 @@ pub struct DeliveryClaim {
 ///   store does not distinguish "POST in flight" from "retry
 ///   scheduled" — those are worker-local states.
 /// - `Succeeded` — delivery confirmed (2xx / 3xx).
-/// - `GaveUp` — final failure after `push_max_attempts` OR a
-///   pre-POST rejection that operators should see
-///   (`SsrfBlocked`, `PayloadTooLarge`, `TlsRejected`). Row
-///   retained for operator inspection.
+/// - `GaveUp` — final failure: `push_max_attempts` spent, a
+///   pre-POST rejection (`SsrfBlocked`, `PayloadTooLarge`), or a
+///   permanent receiver failure (`NonRetryableHttpStatus`,
+///   `TlsRejected`). Row retained for operator inspection.
 /// - `Abandoned` — terminal but not failed (config deleted, task
 ///   deleted, non-HTTPS URL in production). Row retained; not
 ///   surfaced by `list_failed_deliveries`.
@@ -490,8 +490,8 @@ pub enum DeliveryOutcome {
     /// before the POST.
     ///
     /// `http_status` is present on HTTP-error retries (429, 5xx,
-    /// 408) and absent on pre-HTTP failures (DNS, connect, SSRF,
-    /// TLS). `error_class` is the classified failure reason —
+    /// 408) and absent on transport failures (DNS, connect,
+    /// timeout). `error_class` is the classified failure reason —
     /// enum-only by construction.
     Retry {
         next_attempt_at: SystemTime,
@@ -548,10 +548,12 @@ pub enum GaveUpReason {
     /// POST attempted; operators see it here to adjust the limit or
     /// investigate the oversized task.
     PayloadTooLarge,
-    /// TLS handshake rejected by the destination (cert invalid,
-    /// protocol mismatch). Treated as a final failure rather than a
-    /// transient retry, since TLS misconfiguration rarely resolves
-    /// on its own.
+    /// The TLS handshake with the receiver failed: its certificate
+    /// was rejected, or it does not speak TLS on that port. Recorded
+    /// on the first occurrence without retrying — a certificate or
+    /// protocol misconfiguration does not fix itself within the retry
+    /// horizon. `last_error_class` is
+    /// [`DeliveryErrorClass::TlsRejected`].
     TlsRejected,
 }
 
@@ -598,11 +600,9 @@ pub enum DeliveryErrorClass {
     SSRFBlocked,
     /// Serialised Task body exceeds `push_max_payload_bytes`.
     PayloadTooLarge,
-    /// Push config for this delivery no longer exists in storage.
-    ConfigDeleted,
-    /// Task for this delivery no longer exists in storage.
-    TaskDeleted,
-    /// TLS handshake failed (cert invalid, protocol mismatch).
+    /// TLS handshake failed: certificate rejected, or the receiver
+    /// does not speak TLS. Permanent; the delivery gives up with
+    /// [`GaveUpReason::TlsRejected`] without retrying.
     TlsRejected,
 }
 

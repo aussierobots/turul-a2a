@@ -2014,6 +2014,100 @@ async fn expired_claim_is_resumed_by_another_instance_within_the_budget() {
 }
 
 // ---------------------------------------------------------------------------
+// Read timeout. A receiver that accepts the request and then stays silent
+// fails the attempt after `read_timeout`, well inside `request_timeout`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn read_timeout_bounds_a_silent_receiver() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webhook"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(InMemoryA2aStorage::new());
+    let worker = PushDeliveryWorker::new(
+        store.clone(),
+        test_config(1, |c| {
+            c.read_timeout = Duration::from_millis(200);
+            c.request_timeout = Duration::from_secs(30);
+        }),
+        None,
+        "instance-read-timeout".into(),
+    )
+    .expect("worker");
+    let target = sentinel_target(&server.uri());
+
+    let started = std::time::Instant::now();
+    let report = worker.deliver(&target, b"{}").await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        report,
+        DeliveryReport::GaveUp(GaveUpReason::MaxAttemptsExhausted)
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "bounded by read_timeout, not the 5s response delay: {elapsed:?}"
+    );
+    let failed = store
+        .list_failed_deliveries(&target.tenant, SystemTime::UNIX_EPOCH, 10)
+        .await
+        .unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].last_error_class, DeliveryErrorClass::Timeout);
+}
+
+// ---------------------------------------------------------------------------
+// TLS handshake failure. A receiver that cannot complete a TLS handshake
+// (rejected certificate, or no TLS on the port) is a misconfiguration
+// that retrying does not fix: the delivery gives up on the first
+// attempt with `TlsRejected`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tls_handshake_failure_gives_up_without_retry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    // Answers every connection in plaintext, so the client's TLS
+    // handshake fails on the first record it reads.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let accepted = connections.clone();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            accepted.fetch_add(1, Ordering::SeqCst);
+            let _ = socket
+                .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            let _ = socket.shutdown().await;
+        }
+    });
+
+    let store = Arc::new(InMemoryA2aStorage::new());
+    let worker = fast_worker(store.clone(), 5);
+    let mut target = sentinel_target("https://127.0.0.1");
+    target.url = Url::parse(&format!("https://127.0.0.1:{port}/webhook")).unwrap();
+
+    let report = worker.deliver(&target, b"{}").await;
+    assert_eq!(report, DeliveryReport::GaveUp(GaveUpReason::TlsRejected));
+    assert_eq!(connections.load(Ordering::SeqCst), 1, "no retry");
+
+    let failed = store
+        .list_failed_deliveries(&target.tenant, SystemTime::UNIX_EPOCH, 10)
+        .await
+        .unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].last_error_class, DeliveryErrorClass::TlsRejected);
+    assert_eq!(failed[0].delivery_attempt_count, 1);
+    assert_eq!(failed[0].last_http_status, None);
+}
+
+// ---------------------------------------------------------------------------
 // SSRF, end to end through `deliver`. Insecure URLs are disallowed, so
 // the URL is https and the injected resolver answers with the address
 // under test. A blocked destination is recorded as a failed delivery

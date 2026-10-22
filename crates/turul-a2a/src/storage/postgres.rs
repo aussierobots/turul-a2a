@@ -1860,8 +1860,6 @@ enum PgErrorClassWire {
     HttpError429,
     SSRFBlocked,
     PayloadTooLarge,
-    ConfigDeleted,
-    TaskDeleted,
     TlsRejected,
 }
 impl From<DeliveryErrorClass> for PgErrorClassWire {
@@ -1874,8 +1872,6 @@ impl From<DeliveryErrorClass> for PgErrorClassWire {
             DeliveryErrorClass::HttpError429 => Self::HttpError429,
             DeliveryErrorClass::SSRFBlocked => Self::SSRFBlocked,
             DeliveryErrorClass::PayloadTooLarge => Self::PayloadTooLarge,
-            DeliveryErrorClass::ConfigDeleted => Self::ConfigDeleted,
-            DeliveryErrorClass::TaskDeleted => Self::TaskDeleted,
             DeliveryErrorClass::TlsRejected => Self::TlsRejected,
         }
     }
@@ -1890,8 +1886,6 @@ impl From<PgErrorClassWire> for DeliveryErrorClass {
             PgErrorClassWire::HttpError429 => DeliveryErrorClass::HttpError429,
             PgErrorClassWire::SSRFBlocked => DeliveryErrorClass::SSRFBlocked,
             PgErrorClassWire::PayloadTooLarge => DeliveryErrorClass::PayloadTooLarge,
-            PgErrorClassWire::ConfigDeleted => DeliveryErrorClass::ConfigDeleted,
-            PgErrorClassWire::TaskDeleted => DeliveryErrorClass::TaskDeleted,
             PgErrorClassWire::TlsRejected => DeliveryErrorClass::TlsRejected,
         }
     }
