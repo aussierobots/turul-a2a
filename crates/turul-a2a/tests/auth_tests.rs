@@ -282,17 +282,18 @@ async fn auth_middleware_rejects_unauthenticated_jsonrpc() {
 }
 
 #[tokio::test]
-async fn jsonrpc_auth_failure_is_labelled_a2a_json() {
+async fn jsonrpc_auth_failure_is_application_json_whatever_the_accept() {
     let router = build_router(state_with_auth());
     let req = Request::post("/jsonrpc")
         .header("content-type", "application/json")
+        .header("accept", "application/a2a+json")
         .header("a2a-version", "1.0")
         .body(Body::from(jrpc_body("ListTasks", 1)))
         .unwrap();
     let (_, headers, _) = response_with_headers(router, req).await;
     assert_eq!(
         headers.get("content-type").and_then(|v| v.to_str().ok()),
-        Some("application/a2a+json")
+        Some("application/json")
     );
 }
 

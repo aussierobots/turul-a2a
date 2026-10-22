@@ -238,6 +238,7 @@ Tests are written from the A2A proto/spec FIRST, then implementation follows. If
 - Subscribe: `GET` or `POST /tasks/{id=*}:subscribe` (proto annotation says GET, spec text says POST)
 - Version: `A2A-Version` header or `?A2A-Version=` query; gRPC `a2a-version` metadata (required)
 - Request Content-Type: `application/json` or `application/a2a+json`
+- Response Content-Type: HTTP+JSON is `application/a2a+json` when `Accept` names it (or `Accept` is absent/wildcard and the request was `application/a2a+json`), otherwise `application/json`; JSON-RPC is always `application/json` (spec §9.1)
 - Extended card: `GET /extendedAgentCard`
 - Discovery: `GET /.well-known/agent-card.json`
 - JSON-RPC: `POST /jsonrpc` (all 11 methods, PascalCase)

@@ -15,6 +15,7 @@ package interop
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -31,8 +32,9 @@ func serverURL() string {
 	return "http://localhost:3000"
 }
 
-func ctx() context.Context {
-	c, _ := context.WithTimeout(context.Background(), 10*time.Second)
+func ctx(t *testing.T) context.Context {
+	c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
 	return c
 }
 
@@ -41,7 +43,7 @@ func ctx() context.Context {
 // =========================================================
 
 func TestDiscoverAgentCard(t *testing.T) {
-	card, err := agentcard.DefaultResolver.Resolve(ctx(), serverURL())
+	card, err := agentcard.DefaultResolver.Resolve(ctx(t), serverURL())
 	if err != nil {
 		t.Fatalf("Failed to discover agent card: %v", err)
 	}
@@ -67,7 +69,7 @@ func TestSendMessage(t *testing.T) {
 	client := newClient(t)
 	defer client.Destroy()
 
-	result, err := client.SendMessage(ctx(), &a2a.SendMessageRequest{
+	result, err := client.SendMessage(ctx(t), &a2a.SendMessageRequest{
 		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hello from Go SDK")),
 	})
 	if err != nil {
@@ -95,7 +97,7 @@ func TestGetTask(t *testing.T) {
 	defer client.Destroy()
 
 	// Create a task first
-	result, err := client.SendMessage(ctx(), &a2a.SendMessageRequest{
+	result, err := client.SendMessage(ctx(t), &a2a.SendMessageRequest{
 		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("create for get")),
 	})
 	if err != nil {
@@ -104,7 +106,7 @@ func TestGetTask(t *testing.T) {
 	task := result.(*a2a.Task)
 
 	// Get the task
-	got, err := client.GetTask(ctx(), &a2a.GetTaskRequest{ID: task.ID})
+	got, err := client.GetTask(ctx(t), &a2a.GetTaskRequest{ID: task.ID})
 	if err != nil {
 		t.Fatalf("GetTask failed: %v", err)
 	}
@@ -125,7 +127,7 @@ func TestCancelCompletedTask(t *testing.T) {
 	defer client.Destroy()
 
 	// Create and complete a task
-	result, err := client.SendMessage(ctx(), &a2a.SendMessageRequest{
+	result, err := client.SendMessage(ctx(t), &a2a.SendMessageRequest{
 		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("complete me")),
 	})
 	if err != nil {
@@ -134,9 +136,9 @@ func TestCancelCompletedTask(t *testing.T) {
 	task := result.(*a2a.Task)
 
 	// Cancel should fail — task is already completed
-	_, err = client.CancelTask(ctx(), &a2a.CancelTaskRequest{ID: task.ID})
-	if err == nil {
-		t.Fatal("CancelTask on completed task should return error")
+	_, err = client.CancelTask(ctx(t), &a2a.CancelTaskRequest{ID: task.ID})
+	if !errors.Is(err, a2a.ErrTaskNotCancelable) {
+		t.Fatalf("CancelTask on completed task: want ErrTaskNotCancelable, got %v", err)
 	}
 
 	t.Logf("Cancel error (expected): %v", err)
@@ -151,7 +153,7 @@ func TestListTasks(t *testing.T) {
 	defer client.Destroy()
 
 	// Create a task first
-	_, err := client.SendMessage(ctx(), &a2a.SendMessageRequest{
+	_, err := client.SendMessage(ctx(t), &a2a.SendMessageRequest{
 		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("for listing")),
 	})
 	if err != nil {
@@ -159,7 +161,7 @@ func TestListTasks(t *testing.T) {
 	}
 
 	// List tasks
-	resp, err := client.ListTasks(ctx(), &a2a.ListTasksRequest{})
+	resp, err := client.ListTasks(ctx(t), &a2a.ListTasksRequest{})
 	if err != nil {
 		t.Fatalf("ListTasks failed: %v", err)
 	}
@@ -179,9 +181,9 @@ func TestGetTaskNotFound(t *testing.T) {
 	client := newClient(t)
 	defer client.Destroy()
 
-	_, err := client.GetTask(ctx(), &a2a.GetTaskRequest{ID: "nonexistent-go-interop"})
-	if err == nil {
-		t.Fatal("GetTask for nonexistent task should return error")
+	_, err := client.GetTask(ctx(t), &a2a.GetTaskRequest{ID: "nonexistent-go-interop"})
+	if !errors.Is(err, a2a.ErrTaskNotFound) {
+		t.Fatalf("GetTask for nonexistent task: want ErrTaskNotFound, got %v", err)
 	}
 
 	t.Logf("Not found error (expected): %v", err)
@@ -195,7 +197,7 @@ func TestSendStreamingMessage(t *testing.T) {
 	client := newClient(t)
 	defer client.Destroy()
 
-	events := client.SendStreamingMessage(ctx(), &a2a.SendMessageRequest{
+	events := client.SendStreamingMessage(ctx(t), &a2a.SendMessageRequest{
 		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("stream from Go SDK")),
 	})
 
@@ -238,7 +240,7 @@ func TestSubscribeToTask(t *testing.T) {
 	defer client.Destroy()
 
 	// First create a task that will complete
-	result, err := client.SendMessage(ctx(), &a2a.SendMessageRequest{
+	result, err := client.SendMessage(ctx(t), &a2a.SendMessageRequest{
 		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("for subscribe test")),
 	})
 	if err != nil {
@@ -250,30 +252,21 @@ func TestSubscribeToTask(t *testing.T) {
 		t.Fatalf("Expected Task, got %T", result)
 	}
 
-	// Subscribe to the completed task — should get UnsupportedOperation error
-	// (spec §3.1.6: terminal tasks return error)
-	events := client.SubscribeToTask(ctx(), &a2a.SubscribeToTaskRequest{ID: task.ID})
+	// Subscribe to the completed task: spec §3.1.6 says a terminal task
+	// returns UnsupportedOperationError instead of a stream.
+	events := client.SubscribeToTask(ctx(t), &a2a.SubscribeToTaskRequest{ID: task.ID})
 
-	var gotError bool
-	var eventCount int
 	for event, err := range events {
-		if err != nil {
-			gotError = true
-			t.Logf("Subscribe error (expected for terminal task): %v", err)
-			break
+		if err == nil {
+			t.Fatalf("SubscribeToTask on completed task yielded event %T, want an error", event)
 		}
-		eventCount++
-		t.Logf("Unexpected event: %T", event)
+		if !errors.Is(err, a2a.ErrUnsupportedOperation) {
+			t.Fatalf("SubscribeToTask on completed task: want ErrUnsupportedOperation, got %v", err)
+		}
+		t.Logf("Subscribe error (expected for terminal task): %v", err)
+		return
 	}
-
-	if !gotError && eventCount == 0 {
-		// Iterator completed without events or errors — the JSON-RPC error
-		// was returned as a non-SSE response, so the stream was empty.
-		// This is also acceptable terminal-task behavior.
-		t.Log("Subscribe returned empty stream for terminal task (error was non-SSE)")
-	} else if !gotError {
-		t.Error("SubscribeToTask on completed task should return error or empty stream")
-	}
+	t.Fatal("SubscribeToTask on completed task returned an empty stream, want ErrUnsupportedOperation")
 }
 
 // =========================================================
@@ -283,12 +276,12 @@ func TestSubscribeToTask(t *testing.T) {
 func newClient(t *testing.T) *a2aclient.Client {
 	t.Helper()
 
-	card, err := agentcard.DefaultResolver.Resolve(ctx(), serverURL())
+	card, err := agentcard.DefaultResolver.Resolve(ctx(t), serverURL())
 	if err != nil {
 		t.Fatalf("Failed to discover agent card: %v", err)
 	}
 
-	client, err := a2aclient.NewFromCard(ctx(), card)
+	client, err := a2aclient.NewFromCard(ctx(t), card)
 	if err != nil {
 		t.Fatalf("Failed to create client from card: %v", err)
 	}

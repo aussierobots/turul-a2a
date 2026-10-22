@@ -357,11 +357,15 @@ async fn get_requests_do_not_need_content_type() {
     assert_eq!(status, 200, "GET requests should not require Content-Type");
 }
 
-/// Spec Section 11.1: `application/a2a+json` SHOULD be used for responses.
-/// JSON responses (success and error) carry it; event streams keep
-/// `text/event-stream`.
+/// Spec Section 11.1: on the HTTP+JSON binding `application/a2a+json`
+/// SHOULD be used for responses. JSON responses (success and error) carry
+/// it when the client accepts it: `Accept` names it, or `Accept` is absent
+/// or a wildcard and the request was itself `application/a2a+json`. Any
+/// other client gets `application/json`; event streams keep
+/// `text/event-stream`. The JSON-RPC binding is always `application/json`
+/// (Section 9.1).
 #[tokio::test]
-async fn json_responses_use_the_a2a_media_type() {
+async fn json_response_media_type_follows_accept() {
     let content_type = |resp: &axum::response::Response| {
         resp.headers()
             .get("content-type")
@@ -369,35 +373,109 @@ async fn json_responses_use_the_a2a_media_type() {
             .unwrap_or("")
             .to_string()
     };
-    let router = build_router(test_state());
-    let req = Request::post("/message:send")
-        .header("a2a-version", "1.0")
-        .header("content-type", "application/json")
-        .body(Body::from(send_body()))
-        .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), 200);
-    assert_eq!(content_type(&resp), "application/a2a+json");
+    let send = |accept: Option<&str>, content_type: &str| {
+        let mut req = Request::post("/message:send")
+            .header("a2a-version", "1.0")
+            .header("content-type", content_type);
+        if let Some(a) = accept {
+            req = req.header("accept", a);
+        }
+        req.body(Body::from(send_body())).unwrap()
+    };
+    for (accept, request_type, expected) in [
+        (
+            Some("application/a2a+json"),
+            "application/json",
+            "application/a2a+json",
+        ),
+        (None, "application/a2a+json", "application/a2a+json"),
+        (Some("*/*"), "application/a2a+json", "application/a2a+json"),
+        (None, "application/json", "application/json"),
+        (
+            Some("application/json"),
+            "application/a2a+json",
+            "application/json",
+        ),
+    ] {
+        let resp = build_router(test_state())
+            .oneshot(send(accept, request_type))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            content_type(&resp),
+            expected,
+            "accept={accept:?} content-type={request_type}"
+        );
+    }
 
-    let router = build_router(test_state());
-    let req = Request::get("/tasks/nope")
+    let get_missing = |accept: Option<&str>, request_type: Option<&str>| {
+        let mut req = Request::get("/tasks/nope").header("a2a-version", "1.0");
+        if let Some(a) = accept {
+            req = req.header("accept", a);
+        }
+        if let Some(c) = request_type {
+            req = req.header("content-type", c);
+        }
+        req.body(Body::empty()).unwrap()
+    };
+    for (accept, request_type, expected) in [
+        (Some("application/a2a+json"), None, "application/a2a+json"),
+        (None, Some("application/a2a+json"), "application/a2a+json"),
+        (None, None, "application/json"),
+    ] {
+        let resp = build_router(test_state())
+            .oneshot(get_missing(accept, request_type))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        assert_eq!(
+            content_type(&resp),
+            expected,
+            "error: accept={accept:?} content-type={request_type:?}"
+        );
+    }
+
+    // A streaming call refused before the stream opens (this test agent
+    // does not stream) answers with a JSON error in a type the client
+    // listed: the official Go SDK sends this Accept and rejects any other
+    // JSON type.
+    let req = Request::post("/tasks/nope:subscribe")
         .header("a2a-version", "1.0")
+        .header("accept", "text/event-stream, application/json")
         .body(Body::empty())
         .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), 404);
-    assert_eq!(content_type(&resp), "application/a2a+json");
+    let resp = build_router(test_state()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    assert_eq!(content_type(&resp), "application/json");
 
-    let router = build_router(test_state());
-    let req = Request::post("/jsonrpc")
-        .header("a2a-version", "1.0")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"nope"}}"#,
-        ))
+    // JSON-RPC is `application/json` whatever the client accepts.
+    for accept in [
+        "text/event-stream, application/json",
+        "application/a2a+json",
+    ] {
+        let req = Request::post("/jsonrpc")
+            .header("a2a-version", "1.0")
+            .header("content-type", "application/a2a+json")
+            .header("accept", accept)
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"SubscribeToTask","params":{"id":"nope"}}"#,
+            ))
+            .unwrap();
+        let resp = build_router(test_state()).oneshot(req).await.unwrap();
+        assert_eq!(content_type(&resp), "application/json", "accept={accept}");
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
         .unwrap();
-    let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(content_type(&resp), "application/a2a+json");
+        assert_eq!(body["error"]["code"], -32004, "{body}");
+        assert_eq!(
+            body["error"]["data"][0]["reason"], "UNSUPPORTED_OPERATION",
+            "{body}"
+        );
+    }
 }
 
 /// The well-known agent card is version-independent: it is

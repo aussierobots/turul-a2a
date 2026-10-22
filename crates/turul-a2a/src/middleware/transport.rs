@@ -88,9 +88,9 @@ fn requested_version<B>(req: &Request<B>) -> Option<String> {
 /// `application/json` or the registered `application/a2a+json` (spec
 /// Section 14.1), with any media-type parameters such as `charset`.
 fn is_accepted_json_media_type(content_type: &str) -> bool {
-    let essence = content_type.split(';').next().unwrap_or_default().trim();
-    essence.eq_ignore_ascii_case(protocol::MEDIA_TYPE_JSON)
-        || essence.eq_ignore_ascii_case(protocol::MEDIA_TYPE_A2A_JSON)
+    let media_type = essence(content_type);
+    media_type.eq_ignore_ascii_case(protocol::MEDIA_TYPE_JSON)
+        || media_type.eq_ignore_ascii_case(protocol::MEDIA_TYPE_A2A_JSON)
 }
 
 /// Tower Layer for A2A transport compliance.
@@ -131,7 +131,14 @@ where
         Box::pin(async move {
             // Discovery documents keep `application/json` whatever the
             // request version, so every client generation reads them alike.
-            let relabel = !is_legacy_request(&req) && !super::is_bypass_path(req.uri().path());
+            // The JSON-RPC binding is `application/json` for requests and
+            // responses (spec Section 9.1); `application/a2a+json` belongs
+            // to the HTTP+JSON binding (Section 11.1).
+            let path = req.uri().path();
+            let relabel = !is_legacy_request(&req)
+                && !super::is_bypass_path(path)
+                && !crate::jsonrpc::is_jsonrpc_path(path)
+                && accepts_a2a_json(&req);
             let response = match check_request(&req) {
                 Err(err) if crate::jsonrpc::is_jsonrpc_path(req.uri().path()) => {
                     axum::Json(err.to_jsonrpc_error(None)).into_response()
@@ -158,6 +165,62 @@ fn is_legacy_request<B>(req: &Request<B>) -> bool {
             .is_none_or(|v| v.trim().is_empty() || is_legacy_version(v))
 }
 
+/// The media type of a header value, without parameters.
+fn essence(value: &str) -> &str {
+    value.split(';').next().unwrap_or_default().trim()
+}
+
+/// Whether an `Accept` media range carries `q=0`, which refuses its type.
+fn refuses(range: &str) -> bool {
+    range.split(';').skip(1).any(|param| {
+        param.split_once('=').is_some_and(|(key, q)| {
+            key.trim().eq_ignore_ascii_case("q") && q.trim().parse::<f32>() == Ok(0.0)
+        })
+    })
+}
+
+/// Whether the client takes `application/a2a+json` responses: its `Accept`
+/// names that type, or `Accept` is absent (or empty) or a wildcard and the
+/// request body was itself `application/a2a+json`. Every other client gets
+/// `application/json`, so one that asked for plain JSON (or for
+/// `text/event-stream, application/json` on a streaming call answered with
+/// an error) is never sent a type it did not accept. A range naming
+/// `application/a2a+json` with `q=0` refuses it whatever the wildcards say,
+/// since the more specific range wins.
+fn accepts_a2a_json<B>(req: &Request<B>) -> bool {
+    let is_a2a_json =
+        |media_type: &str| media_type.eq_ignore_ascii_case(protocol::MEDIA_TYPE_A2A_JSON);
+    let request_is_a2a_json = req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| is_a2a_json(essence(v)));
+    let ranges: Vec<(&str, bool)> = req
+        .headers()
+        .get_all(http::header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter(|range| !range.trim().is_empty())
+        .map(|range| (essence(range), refuses(range)))
+        .collect();
+    if ranges.is_empty() {
+        return request_is_a2a_json;
+    }
+    if ranges
+        .iter()
+        .any(|&(media_type, refused)| refused && is_a2a_json(media_type))
+    {
+        return false;
+    }
+    ranges.iter().any(|&(media_type, refused)| {
+        !refused
+            && (is_a2a_json(media_type)
+                || (request_is_a2a_json
+                    && (media_type == "*/*" || media_type.eq_ignore_ascii_case("application/*"))))
+    })
+}
+
 /// Label a JSON response with the registered A2A media type (spec Section
 /// 11.1: `application/a2a+json` SHOULD be used for requests and
 /// responses). Event streams and other media types are left alone.
@@ -166,12 +229,7 @@ fn with_a2a_media_type(mut response: Response<Body>) -> Response<Body> {
         .headers()
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(';').next())
-        .is_some_and(|essence| {
-            essence
-                .trim()
-                .eq_ignore_ascii_case(protocol::MEDIA_TYPE_JSON)
-        });
+        .is_some_and(|v| essence(v).eq_ignore_ascii_case(protocol::MEDIA_TYPE_JSON));
     if is_json {
         response.headers_mut().insert(
             http::header::CONTENT_TYPE,
@@ -259,6 +317,65 @@ mod tests {
             requested_version(&req).as_deref(),
             Some("1.0"),
             "header wins over query parameter"
+        );
+    }
+
+    #[test]
+    fn a2a_json_only_when_the_client_accepts_it() {
+        let req = |accept: Option<&str>, content_type: Option<&str>| {
+            let mut b = Request::post("/message:send");
+            if let Some(a) = accept {
+                b = b.header("accept", a);
+            }
+            if let Some(c) = content_type {
+                b = b.header("content-type", c);
+            }
+            b.body(()).unwrap()
+        };
+        let a2a = Some("application/a2a+json");
+        let json = Some("application/json");
+        for (accept, content_type, expected) in [
+            (a2a, json, true),
+            (
+                Some("application/json, application/a2a+json; charset=utf-8"),
+                None,
+                true,
+            ),
+            (None, a2a, true),
+            (None, json, false),
+            (None, None, false),
+            (Some("*/*"), a2a, true),
+            (Some("application/*"), a2a, true),
+            (Some("*/*"), json, false),
+            (json, a2a, false),
+            (Some("text/event-stream, application/json"), json, false),
+            (
+                Some("application/a2a+json;q=0, application/json"),
+                a2a,
+                false,
+            ),
+            (Some("application/a2a+json; q=0.5"), json, true),
+            (Some("Application/A2A+JSON"), json, true),
+            (Some("application/a2a+json; Q=0"), json, false),
+            (Some("*/*, application/a2a+json;q=0"), a2a, false),
+            (Some(""), a2a, true),
+            (Some(" , "), json, false),
+        ] {
+            assert_eq!(
+                accepts_a2a_json(&req(accept, content_type)),
+                expected,
+                "accept={accept:?} content-type={content_type:?}"
+            );
+        }
+
+        let split_accept = Request::get("/tasks")
+            .header("accept", "text/event-stream")
+            .header("accept", "application/a2a+json")
+            .body(())
+            .unwrap();
+        assert!(
+            accepts_a2a_json(&split_accept),
+            "Accept over several fields"
         );
     }
 

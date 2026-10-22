@@ -4,7 +4,7 @@ Tests the official Go A2A SDK client (`a2aproject/a2a-go v2`) against the turul-
 
 ## Prerequisites
 
-- Go 1.24+ (`brew install go`)
+- Go 1.26+
 - Running turul-a2a server (e.g., `cargo run -p echo-agent`)
 
 ## Run
@@ -27,9 +27,13 @@ All tests use the official Go SDK client via `a2aclient.NewFromCard()` — real 
 | Discover agent card | `agentcard.DefaultResolver.Resolve()` |
 | Send message | `client.SendMessage()` |
 | Get task | `client.GetTask()` |
-| Cancel completed task (error) | `client.CancelTask()` |
+| Cancel completed task (`ErrTaskNotCancelable`) | `client.CancelTask()` |
 | List tasks | `client.ListTasks()` |
-| Get task not found (error) | `client.GetTask()` |
+| Get task not found (`ErrTaskNotFound`) | `client.GetTask()` |
+| Streaming send | `client.SendStreamingMessage()` |
+| Subscribe to a completed task (`ErrUnsupportedOperation`) | `client.SubscribeToTask()` |
+
+Error tests assert the specific SDK error with `errors.Is`, so a response the SDK cannot decode fails the test.
 
 ## Transport
 
@@ -37,7 +41,7 @@ The Go SDK selects transport based on `protocolBinding` from the agent card's `s
 
 ## Version Alignment
 
-| Dimension | Our Server | Go SDK v2.2.0 |
+| Dimension | Our Server | Go SDK v2.7.0 |
 |-----------|-----------|---------------|
 | Spec version | v1.0 (proto `lf.a2a.v1`) | v1.0 |
 | AgentCard model | `supported_interfaces[].url` | `SupportedInterfaces[].URL` |

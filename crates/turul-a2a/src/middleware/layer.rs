@@ -118,7 +118,7 @@ fn middleware_error_to_response(err: &MiddlewareError, path: &str) -> Response<B
     };
 
     // Plain JSON: the transport layer relabels it `application/a2a+json`
-    // unless the request speaks the legacy 0.3 protocol.
+    // on the HTTP+JSON binding when the client accepts that type.
     let mut builder = Response::builder().status(status).header(
         http::header::CONTENT_TYPE,
         turul_a2a_types::wire::protocol::MEDIA_TYPE_JSON,

@@ -476,10 +476,9 @@ mod handle_http_event_value_tests {
     #[tokio::test]
     async fn handle_http_event_value_a2a_json_response_is_text() {
         let handler = build_handler();
-        let resp_json = handler
-            .handle_http_event_value(apigw_v2_get("/tasks"))
-            .await
-            .expect("ok");
+        let mut event = apigw_v2_get("/tasks");
+        event["headers"]["accept"] = serde_json::json!("application/a2a+json");
+        let resp_json = handler.handle_http_event_value(event).await.expect("ok");
         let resp: ApiGatewayV2httpResponse = serde_json::from_value(resp_json).unwrap();
         assert_eq!(resp.status_code, 200);
         assert_eq!(

@@ -4,6 +4,21 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.2] — 2026-10-23
+
+### Fixed
+
+- JSON-RPC responses are `application/json` again, as the spec requires for that binding. 0.2.0 and 0.2.1 labelled them `application/a2a+json`, which the official Go SDK (a2a-go) rejects when a streaming call is refused with an error, for example subscribing to a completed task.
+- HTTP+JSON responses follow the client's `Accept` header: `application/a2a+json` when `Accept` names that type, or when `Accept` is absent, `*/*` or `application/*` and the request was sent as `application/a2a+json`; otherwise `application/json`.
+
+### Compatibility
+
+- An HTTP+JSON client that relied on getting `application/a2a+json` without asking for it now receives `application/json` with the same body. Send `Accept: application/a2a+json` to keep the registered type.
+
+### Verification
+
+- Go SDK interop suite (a2a-go v2.7.0) passes, with error tests now asserting the specific A2A error; it fails against 0.2.1. Python SDK interop suite passes.
+
 ## [0.2.1] — 2026-10-23
 
 ### Added
