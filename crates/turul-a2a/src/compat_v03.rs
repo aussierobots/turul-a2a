@@ -41,6 +41,7 @@
 //! Transport layer only. No compat logic leaks into executors, skill handlers,
 //! or business code.
 
+use turul_a2a_types::TaskState;
 use turul_a2a_types::wire::jsonrpc as methods;
 
 // ---------------------------------------------------------------------------
@@ -238,23 +239,32 @@ fn denormalize_roles(value: &mut serde_json::Value) {
     }
 }
 
+/// The v0.3 name of a task state (v0.3 used lowercase kebab-case names).
+fn v03_state_name(state: TaskState) -> Option<&'static str> {
+    Some(match state {
+        TaskState::Submitted => "submitted",
+        TaskState::Working => "working",
+        TaskState::InputRequired => "input-required",
+        TaskState::Completed => "completed",
+        TaskState::Canceled => "canceled",
+        TaskState::Failed => "failed",
+        TaskState::Rejected => "rejected",
+        TaskState::AuthRequired => "auth-required",
+        _ => return None,
+    })
+}
+
 /// Convert proto task state enums to v0.3 lowercase names.
 fn normalize_task_state_enums(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
-            if let Some(state) = map.get_mut("state") {
-                if let Some(s) = state.as_str() {
-                    let normalized = match s {
-                        "TASK_STATE_SUBMITTED" => "submitted",
-                        "TASK_STATE_WORKING" => "working",
-                        "TASK_STATE_COMPLETED" => "completed",
-                        "TASK_STATE_CANCELED" => "canceled",
-                        "TASK_STATE_FAILED" => "failed",
-                        "TASK_STATE_INPUT_REQUIRED" => "input-required",
-                        other => other,
-                    };
-                    *state = serde_json::Value::String(normalized.to_string());
-                }
+            if let Some(state) = map.get_mut("state")
+                && let Some(name) = state
+                    .as_str()
+                    .and_then(TaskState::from_wire_name)
+                    .and_then(v03_state_name)
+            {
+                *state = serde_json::Value::String(name.to_string());
             }
             for (_, v) in map.iter_mut() {
                 normalize_task_state_enums(v);
@@ -454,6 +464,28 @@ mod tests {
         });
         maybe_normalize_params(&mut params, CompatMode::V03);
         assert_eq!(params["message"]["role"], "ROLE_USER");
+    }
+
+    #[test]
+    fn v03_compat_task_states_use_v03_names() {
+        let cases = [
+            (TaskState::Submitted, "submitted"),
+            (TaskState::Working, "working"),
+            (TaskState::InputRequired, "input-required"),
+            (TaskState::Completed, "completed"),
+            (TaskState::Canceled, "canceled"),
+            (TaskState::Failed, "failed"),
+            (TaskState::Rejected, "rejected"),
+            (TaskState::AuthRequired, "auth-required"),
+        ];
+        for (state, v03) in cases {
+            let mut v = serde_json::json!({"result": {"status": {"state": state.wire_name()}}});
+            normalize_task_state_enums(&mut v);
+            assert_eq!(v["result"]["status"]["state"], v03);
+        }
+        let mut unknown = serde_json::json!({"state": "TASK_STATE_UNSPECIFIED"});
+        normalize_task_state_enums(&mut unknown);
+        assert_eq!(unknown["state"], "TASK_STATE_UNSPECIFIED");
     }
 
     #[test]

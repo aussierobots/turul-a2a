@@ -58,9 +58,9 @@ The internal validation read on these paths needs only the stored status and man
 
 `last_chunk` remains transport metadata, not persisted (unchanged, see ADR-006).
 
-### 5. Ordering contract: artifact writes still touch the task record
+### 5. Ordering contract: artifact writes do not reorder the listing
 
-`list_tasks` orders by `updated_at DESC` with a `updated_at|task_id` pagination cursor (spec-compliance surface). Any artifact mutation MUST therefore still bump the task record's `updated_at` (and manifest), even though it no longer rewrites a blob containing bodies. The task record write stays — it is just small now.
+`list_tasks` orders by the task's status timestamp DESC with a `<status timestamp>|<task_id>` pagination cursor (A2A v1.0.1 §3.1.4; see ADR-003). An artifact mutation does not change the status, so it does not move the task in the listing. It still writes the task record — the manifest changes, and `updated_at` advances because it is the retention basis (ADR-026) — even though it no longer rewrites a blob containing bodies. The task record write stays — it is just small now.
 
 ### 6. Isolation and atomicity
 
@@ -107,7 +107,7 @@ Scenario/parity first (`parity_tests.rs`, every function takes trait objects and
 4. `update_task_with_events` carrying status + new artifact + terminal in one call (extends AT-004) → artifacts and events both durable.
 5. Artifact replace/removal via full-task write → removed artifact absent on read.
 6. Legacy inline-blob task (seeded through a backend test hook) → reads correctly; status transition preserves inline artifacts; first full-task write migrates it.
-7. Artifact mutation bumps `updated_at` → `list_tasks` ordering and cursor behavior unchanged.
+7. Artifact, history and full-task writes that keep the status leave the task's `list_tasks` position unchanged; a status write moves it to the top (`test_list_orders_by_status_timestamp`).
 8. `list_tasks` with `include_artifacts = true` → every page entry rehydrates full artifact bodies; with `include_artifacts = false`/unset → trimmed shape unchanged (both branches of `TaskFilter.include_artifacts`).
 9. Fingerprint determinism: encode/decode round-trip yields the identical fingerprint, and semantically equal artifacts built with different map insertion orders fingerprint identically (no spurious rewrites).
 10. `create_task` with artifacts already present → reads back identically; subsequent status transition leaves artifact records untouched (backend shape assertion below).
@@ -139,3 +139,7 @@ Runtime-behavior and storage-layout change with operator-facing notes (new SQL t
 - ADR-009 — durable event coordination (same-backend requirement; event replay constraint pinning §7).
 - ADR-019 — least-privilege storage bootstrap (no new DynamoDB infrastructure under §8).
 - ADR-026 — retention/TTL (artifact records adopt task TTL; cleanup deletes them with their task).
+
+## Revision log
+
+- 2026-10-22 — §5 and test-plan item 7: `list_tasks` orders by status timestamp (A2A v1.0.1 §3.1.4), not `updated_at`; artifact writes no longer move a task in the listing. `updated_at` is kept as the retention basis only.

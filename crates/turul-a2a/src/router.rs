@@ -633,6 +633,10 @@ pub(crate) struct ListTasksQuery {
     pub(crate) history_length: Option<i32>,
     #[serde(rename = "includeArtifacts")]
     pub(crate) include_artifacts: Option<bool>,
+    /// RFC 3339 / ISO 8601 instant (proto `google.protobuf.Timestamp`
+    /// JSON form).
+    #[serde(rename = "statusTimestampAfter")]
+    pub(crate) status_timestamp_after: Option<String>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -647,20 +651,6 @@ pub(crate) struct PushConfigQuery {
 // =========================================================
 // Core handler functions — all take tenant explicitly
 // =========================================================
-
-fn parse_task_state(s: &str) -> Option<TaskState> {
-    match s {
-        "TASK_STATE_SUBMITTED" => Some(TaskState::Submitted),
-        "TASK_STATE_WORKING" => Some(TaskState::Working),
-        "TASK_STATE_COMPLETED" => Some(TaskState::Completed),
-        "TASK_STATE_FAILED" => Some(TaskState::Failed),
-        "TASK_STATE_CANCELED" => Some(TaskState::Canceled),
-        "TASK_STATE_INPUT_REQUIRED" => Some(TaskState::InputRequired),
-        "TASK_STATE_REJECTED" => Some(TaskState::Rejected),
-        "TASK_STATE_AUTH_REQUIRED" => Some(TaskState::AuthRequired),
-        _ => None,
-    }
-}
 
 #[doc(hidden)]
 /// The task a `SendMessage` / `SendStreamingMessage` targets.
@@ -1304,9 +1294,21 @@ pub(crate) async fn core_list_tasks(
     query: &ListTasksQuery,
 ) -> Result<Json<serde_json::Value>, A2aError> {
     let status = match &query.status {
-        Some(s) => Some(parse_task_state(s).ok_or_else(|| A2aError::InvalidRequest {
-            message: format!("Invalid status value: {s}"),
-        })?),
+        Some(s) => Some(
+            TaskState::from_wire_name(s).ok_or_else(|| A2aError::InvalidRequest {
+                message: format!("Invalid status value: {s}"),
+            })?,
+        ),
+        None => None,
+    };
+    let status_timestamp_after = match &query.status_timestamp_after {
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|_| A2aError::InvalidRequest {
+                    message: format!("Invalid statusTimestampAfter value: {s}"),
+                })?
+                .with_timezone(&chrono::Utc),
+        ),
         None => None,
     };
 
@@ -1316,10 +1318,11 @@ pub(crate) async fn core_list_tasks(
         context_id: query.context_id.clone(),
         status,
         page_size: query.page_size,
-        page_token: query.page_token.clone(),
+        // proto3 leaves an unset string empty: "" asks for the first page.
+        page_token: query.page_token.clone().filter(|t| !t.is_empty()),
         history_length: query.history_length,
+        status_timestamp_after,
         include_artifacts: query.include_artifacts,
-        ..Default::default()
     };
 
     let page = state

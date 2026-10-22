@@ -209,7 +209,20 @@ impl pb::grpc::A2aService for GrpcService {
             page_size: req.page_size,
             page_token: Some(req.page_token.clone()).filter(|s| !s.is_empty()),
             history_length: req.history_length,
-            include_artifacts: None,
+            include_artifacts: req.include_artifacts,
+            status_timestamp_after: req
+                .status_timestamp_after
+                .as_ref()
+                .map(|ts| {
+                    chrono::DateTime::from_timestamp(ts.seconds, ts.nanos.max(0) as u32)
+                        .map(|at| at.to_rfc3339())
+                        .ok_or_else(|| {
+                            a2a_to_status(crate::error::A2aError::InvalidRequest {
+                                message: "statusTimestampAfter is out of range".into(),
+                            })
+                        })
+                })
+                .transpose()?,
         };
 
         let value = router::core_list_tasks(self.state.clone(), &tenant, &owner, &query)

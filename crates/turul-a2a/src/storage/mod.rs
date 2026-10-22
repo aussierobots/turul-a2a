@@ -9,7 +9,9 @@ pub mod error;
 pub mod event_store;
 pub mod filter;
 pub mod retention;
-pub mod terminal_cas;
+pub(crate) mod status_time;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) mod terminal_cas;
 pub mod traits;
 
 #[cfg(feature = "in-memory")]

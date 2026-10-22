@@ -9,6 +9,7 @@ use super::error::A2aStorageError;
 use super::event_store::A2aEventStore;
 use super::filter::{PushConfigListPage, TaskFilter, TaskListPage};
 use super::retention::RetentionConfig;
+use super::terminal_cas::TERMINAL_STATES_SQL;
 use super::traits::{A2aPushNotificationStorage, A2aTaskStorage};
 use crate::push::{
     A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
@@ -92,6 +93,7 @@ impl PostgresA2aStorage {
                 task_json JSONB NOT NULL,
                 context_id TEXT NOT NULL DEFAULT '',
                 status_state TEXT NOT NULL DEFAULT '',
+                status_timestamp TEXT COLLATE \"C\" NOT NULL,
                 cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -249,10 +251,10 @@ impl PostgresA2aStorage {
         Task::try_from(proto).map_err(A2aStorageError::TypeError)
     }
 
-    fn status_state_str(task: &Task) -> String {
+    fn status_state_str(task: &Task) -> &'static str {
         task.status()
             .and_then(|s| s.state().ok())
-            .map(|s| format!("{s:?}"))
+            .map(TaskState::wire_name)
             .unwrap_or_default()
     }
 
@@ -402,8 +404,9 @@ impl A2aTaskStorage for PostgresA2aStorage {
         &self,
         tenant: &str,
         owner: &str,
-        task: Task,
+        mut task: Task,
     ) -> Result<Task, A2aStorageError> {
+        super::status_time::stamp_status(&mut task, &mut []);
         let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
         let plan = super::artifacts::reconcile(&artifacts, &[])?;
@@ -416,16 +419,17 @@ impl A2aTaskStorage for PostgresA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
         sqlx::query(
-            "INSERT INTO a2a_tasks (tenant, task_id, owner, task_json, context_id, status_state, artifact_manifest, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())",
+            "INSERT INTO a2a_tasks (tenant, task_id, owner, task_json, context_id, status_state, artifact_manifest, status_timestamp, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())",
         )
         .bind(tenant)
         .bind(task.id())
         .bind(owner)
         .bind(&blob)
         .bind(task.context_id())
-        .bind(&state_str)
+        .bind(state_str)
         .bind(&manifest)
+        .bind(super::status_time::sort_key(&task))
         .execute(&mut *tx)
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
@@ -469,8 +473,9 @@ impl A2aTaskStorage for PostgresA2aStorage {
         &self,
         tenant: &str,
         owner: &str,
-        task: Task,
+        mut task: Task,
     ) -> Result<(), A2aStorageError> {
+        super::status_time::stamp_status(&mut task, &mut []);
         let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
 
@@ -488,16 +493,17 @@ impl A2aTaskStorage for PostgresA2aStorage {
             .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
 
         let result = sqlx::query(
-            "UPDATE a2a_tasks SET task_json = $1, status_state = $2, context_id = $3, artifact_manifest = $4, updated_at = NOW()
+            "UPDATE a2a_tasks SET task_json = $1, status_state = $2, context_id = $3, artifact_manifest = $4, status_timestamp = $8, updated_at = NOW()
              WHERE tenant = $5 AND task_id = $6 AND owner = $7",
         )
         .bind(&blob)
-        .bind(&state_str)
+        .bind(state_str)
         .bind(task.context_id())
         .bind(&manifest)
         .bind(tenant)
         .bind(task.id())
         .bind(owner)
+        .bind(super::status_time::sort_key(&task))
         .execute(&mut *tx)
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
@@ -551,97 +557,91 @@ impl A2aTaskStorage for PostgresA2aStorage {
     async fn list_tasks(&self, filter: TaskFilter) -> Result<TaskListPage, A2aStorageError> {
         let tenant = filter.tenant.as_deref().unwrap_or("");
         let owner = filter.owner.as_deref().unwrap_or("");
-        let page_size = filter.page_size.map(|ps| ps.clamp(1, 100)).unwrap_or(50);
+        let page_size = filter.resolved_page_size()?;
+        let cursor = filter
+            .page_token
+            .as_deref()
+            .map(super::status_time::decode_cursor)
+            .transpose()?;
 
-        // Count total with filters
-        let total_size: i64 = if let (Some(ctx), Some(status)) = (&filter.context_id, &filter.status) {
-            sqlx::query_scalar::<_, Option<i64>>(
-                "SELECT COUNT(*) FROM a2a_tasks WHERE tenant = $1 AND owner = $2 AND context_id = $3 AND status_state = $4",
-            )
-            .bind(tenant).bind(owner).bind(ctx).bind(format!("{status:?}"))
-            .fetch_one(&self.pool).await
-        } else if let Some(ctx) = filter.context_id.as_ref() {
-            sqlx::query_scalar::<_, Option<i64>>(
-                "SELECT COUNT(*) FROM a2a_tasks WHERE tenant = $1 AND owner = $2 AND context_id = $3",
-            )
-            .bind(tenant).bind(owner).bind(ctx)
-            .fetch_one(&self.pool).await
-        } else if let Some(status) = filter.status.as_ref() {
-            sqlx::query_scalar::<_, Option<i64>>(
-                "SELECT COUNT(*) FROM a2a_tasks WHERE tenant = $1 AND owner = $2 AND status_state = $3",
-            )
-            .bind(tenant).bind(owner).bind(format!("{status:?}"))
-            .fetch_one(&self.pool).await
-        } else {
-            sqlx::query_scalar::<_, Option<i64>>(
-                "SELECT COUNT(*) FROM a2a_tasks WHERE tenant = $1 AND owner = $2",
-            )
-            .bind(tenant).bind(owner)
-            .fetch_one(&self.pool).await
-        }.map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?
-        .unwrap_or(0);
-
-        // Build dynamic query — sorted by updated_at DESC, task_id DESC (spec §3.1.4)
-        let mut param_idx = 3u32; // $1=tenant, $2=owner already used
-        let mut extra_where = String::new();
-        let mut bind_values: Vec<String> = vec![];
-
+        // Filter predicates from a fixed allow-list with numbered
+        // placeholders; every value is bound, so no caller input reaches
+        // the SQL text. $1 = tenant, $2 = owner.
+        let mut where_clause = String::from("tenant = $1 AND owner = $2");
+        let mut values: Vec<String> = vec![];
+        let mut push = |predicate: &str, value: String| {
+            values.push(value);
+            where_clause.push_str(&format!(" AND {predicate} ${}", values.len() + 2));
+        };
         if let Some(ref ctx) = filter.context_id {
-            extra_where.push_str(&format!(" AND context_id = ${param_idx}"));
-            bind_values.push(ctx.clone());
-            param_idx += 1;
+            push("context_id =", ctx.clone());
         }
-        if let Some(ref status) = filter.status {
-            extra_where.push_str(&format!(" AND status_state = ${param_idx}"));
-            bind_values.push(format!("{status:?}"));
-            param_idx += 1;
+        if let Some(status) = filter.status {
+            push("status_state =", status.wire_name().to_string());
         }
-
-        // Cursor: "updated_at|task_id" — fetch items that sort after cursor in DESC order
-        let cursor_parts = filter.page_token.as_ref().and_then(|t| {
-            t.split_once('|')
-                .map(|(time, id)| (time.to_string(), id.to_string()))
-        });
-        if let Some((ref cursor_time, ref cursor_id)) = cursor_parts {
-            extra_where.push_str(&format!(
-                " AND (updated_at < ${p1}::timestamptz OR (updated_at = ${p1}::timestamptz AND task_id < ${p2}))",
-                p1 = param_idx, p2 = param_idx + 1
-            ));
-            bind_values.push(cursor_time.clone());
-            bind_values.push(cursor_id.clone());
-            param_idx += 2;
+        if let Some(ref after) = filter.status_timestamp_after {
+            push("status_timestamp >=", super::status_time::key_of(after));
         }
 
+        let count_sql = format!("SELECT COUNT(*) FROM a2a_tasks WHERE {where_clause}");
+        let mut count_query = sqlx::query_scalar::<_, Option<i64>>(sqlx::AssertSqlSafe(count_sql))
+            .bind(tenant)
+            .bind(owner);
+        for value in &values {
+            count_query = count_query.bind(value);
+        }
+        let total_size: i64 = count_query
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?
+            .unwrap_or(0);
+
+        // Status timestamp DESC, task_id DESC; the cursor is the last
+        // row's (status_timestamp, task_id). One extra row is fetched to
+        // tell whether another page follows.
+        let mut next = values.len() + 3;
+        let cursor_clause = if cursor.is_some() {
+            let clause = format!(
+                " AND (status_timestamp < ${next} OR (status_timestamp = ${next} AND task_id < ${}))",
+                next + 1
+            );
+            next += 2;
+            clause
+        } else {
+            String::new()
+        };
         let select_sql = format!(
-            "SELECT task_json, updated_at::text, artifact_manifest, task_id FROM a2a_tasks WHERE tenant = $1 AND owner = $2{extra_where} \
-             ORDER BY updated_at DESC, task_id DESC LIMIT ${param_idx}"
+            "SELECT task_json, status_timestamp, artifact_manifest, task_id FROM a2a_tasks \
+             WHERE {where_clause}{cursor_clause} \
+             ORDER BY status_timestamp DESC, task_id DESC LIMIT ${next}"
         );
-
-        // `select_sql` is built from an allow-list of conditions and
-        // numbered placeholders ($1, $2, ...); no caller-supplied SQL
-        // ever reaches this string.
         let mut query = sqlx::query_as::<
             _,
             (serde_json::Value, String, Option<serde_json::Value>, String),
         >(sqlx::AssertSqlSafe(select_sql))
         .bind(tenant)
         .bind(owner);
-        for val in &bind_values {
-            query = query.bind(val);
+        for value in &values {
+            query = query.bind(value);
         }
-        query = query.bind(page_size);
+        if let Some((key, id)) = cursor {
+            query = query.bind(key).bind(id);
+        }
+        query = query.bind(i64::from(page_size) + 1);
 
-        let rows: Vec<(serde_json::Value, String, Option<serde_json::Value>, String)> = query
+        let mut rows: Vec<(serde_json::Value, String, Option<serde_json::Value>, String)> = query
             .fetch_all(&self.pool)
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        let has_more = rows.len() > page_size as usize;
+        rows.truncate(page_size as usize);
 
         // Artifacts are fetched only when requested. Excluded listings
         // never read artifact rows: separated blobs carry no bodies, and
         // trimming clears any inline bodies on legacy rows.
         let include_artifacts = filter.include_artifacts.unwrap_or(false);
-        let mut tasks_with_times: Vec<(Task, String)> = Vec::with_capacity(rows.len());
-        for (json, updated_at, manifest, row_task_id) in &rows {
+        let mut tasks: Vec<Task> = Vec::with_capacity(rows.len());
+        for (json, _, manifest, row_task_id) in &rows {
             let task = if include_artifacts {
                 match self
                     .rehydrate_task(tenant, row_task_id, json, manifest.clone())
@@ -656,21 +656,16 @@ impl A2aTaskStorage for PostgresA2aStorage {
                     Err(_) => continue,
                 }
             };
-            tasks_with_times.push((
-                Self::trim_task(task, filter.history_length, include_artifacts),
-                updated_at.clone(),
+            tasks.push(Self::trim_task(
+                task,
+                filter.history_length,
+                include_artifacts,
             ));
         }
 
-        let tasks: Vec<Task> = tasks_with_times.iter().map(|(t, _)| t.clone()).collect();
-
-        let next_page_token = if tasks.len() as i32 >= page_size {
-            tasks_with_times
-                .last()
-                .map(|(t, updated_at)| format!("{}|{}", updated_at, t.id()))
-                .unwrap_or_default()
-        } else {
-            String::new()
+        let next_page_token = match rows.last() {
+            Some((_, key, _, id)) if has_more => super::status_time::encode_cursor(key, id),
+            _ => String::new(),
         };
 
         Ok(TaskListPage {
@@ -730,19 +725,21 @@ impl A2aTaskStorage for PostgresA2aStorage {
 
         let mut proto = task.as_proto().clone();
         proto.status = Some(new_status.into_proto());
-        let updated = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+        let mut updated = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+        super::status_time::stamp_status(&mut updated, &mut []);
         let new_blob = Self::task_to_json(&updated)?;
         let state_str = Self::status_state_str(&updated);
 
         sqlx::query(
-            "UPDATE a2a_tasks SET task_json = $1, status_state = $2, updated_at = NOW()
+            "UPDATE a2a_tasks SET task_json = $1, status_state = $2, status_timestamp = $6, updated_at = NOW()
              WHERE tenant = $3 AND task_id = $4 AND owner = $5",
         )
         .bind(&new_blob)
-        .bind(&state_str)
+        .bind(state_str)
         .bind(tenant)
         .bind(task_id)
         .bind(owner)
+        .bind(super::status_time::sort_key(&updated))
         .execute(&self.pool)
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
@@ -817,11 +814,12 @@ impl A2aTaskStorage for PostgresA2aStorage {
         task_id: &str,
         owner: &str,
     ) -> Result<(), A2aStorageError> {
-        let result = sqlx::query(
+        let terminal = TERMINAL_STATES_SQL.as_str();
+        let result = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE a2a_tasks SET cancel_requested = TRUE
              WHERE tenant = $1 AND task_id = $2 AND owner = $3
-               AND status_state NOT IN ('Completed', 'Failed', 'Canceled', 'Rejected')",
-        )
+               AND status_state NOT IN ({terminal})"
+        )))
         .bind(tenant)
         .bind(task_id)
         .bind(owner)
@@ -849,20 +847,12 @@ impl A2aTaskStorage for PostgresA2aStorage {
             Some((row_owner, _)) if row_owner != owner => {
                 Err(A2aStorageError::TaskNotFound(task_id.to_string()))
             }
-            Some((_, state_str)) => {
-                let state = match state_str.as_str() {
-                    "Completed" => turul_a2a_types::TaskState::Completed,
-                    "Failed" => turul_a2a_types::TaskState::Failed,
-                    "Canceled" => turul_a2a_types::TaskState::Canceled,
-                    "Rejected" => turul_a2a_types::TaskState::Rejected,
-                    other => {
-                        return Err(A2aStorageError::DatabaseError(format!(
-                            "unexpected status_state on set_cancel_requested classify: {other}"
-                        )));
-                    }
-                };
-                Err(A2aStorageError::TerminalState(state))
-            }
+            Some((_, state_str)) => match TaskState::from_wire_name(&state_str) {
+                Some(state) if state.is_terminal() => Err(A2aStorageError::TerminalState(state)),
+                _ => Err(A2aStorageError::DatabaseError(format!(
+                    "unexpected status_state on set_cancel_requested classify: {state_str}"
+                ))),
+            },
         }
     }
 }
@@ -878,11 +868,12 @@ impl crate::storage::A2aCancellationSupervisor for PostgresA2aStorage {
         tenant: &str,
         task_id: &str,
     ) -> Result<bool, A2aStorageError> {
-        let row: Option<(bool,)> = sqlx::query_as(
+        let terminal = TERMINAL_STATES_SQL.as_str();
+        let row: Option<(bool,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT cancel_requested FROM a2a_tasks
              WHERE tenant = $1 AND task_id = $2
-               AND status_state NOT IN ('Completed', 'Failed', 'Canceled', 'Rejected')",
-        )
+               AND status_state NOT IN ({terminal})"
+        )))
         .bind(tenant)
         .bind(task_id)
         .fetch_optional(&self.pool)
@@ -901,12 +892,13 @@ impl crate::storage::A2aCancellationSupervisor for PostgresA2aStorage {
         }
         // PostgreSQL supports `= ANY($N)` with array binding — cleaner
         // than dynamic IN-clause expansion.
-        let rows: Vec<(String,)> = sqlx::query_as(
+        let terminal = TERMINAL_STATES_SQL.as_str();
+        let rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT task_id FROM a2a_tasks
              WHERE tenant = $1 AND task_id = ANY($2)
                AND cancel_requested = TRUE
-               AND status_state NOT IN ('Completed', 'Failed', 'Canceled', 'Rejected')",
-        )
+               AND status_state NOT IN ({terminal})"
+        )))
         .bind(tenant)
         .bind(task_ids)
         .fetch_all(&self.pool)
@@ -1054,9 +1046,10 @@ impl A2aPushNotificationStorage for PostgresA2aStorage {
         page_token: Option<&str>,
         page_size: Option<i32>,
     ) -> Result<PushConfigListPage, A2aStorageError> {
-        let page_size = page_size.map(|ps| ps.clamp(1, 100)).unwrap_or(50);
+        let page_size = super::filter::push_config_page_size(page_size);
 
-        let rows: Vec<(serde_json::Value,)> = if let Some(token) = page_token {
+        // One extra row tells whether another page follows.
+        let mut rows: Vec<(serde_json::Value,)> = if let Some(token) = page_token {
             sqlx::query_as(
                 "SELECT config_json FROM a2a_push_configs
                  WHERE tenant = $1 AND task_id = $2 AND config_id > $3
@@ -1065,7 +1058,7 @@ impl A2aPushNotificationStorage for PostgresA2aStorage {
             .bind(tenant)
             .bind(task_id)
             .bind(token)
-            .bind(page_size)
+            .bind(page_size + 1)
             .fetch_all(&self.pool)
             .await
         } else {
@@ -1076,18 +1069,20 @@ impl A2aPushNotificationStorage for PostgresA2aStorage {
             )
             .bind(tenant)
             .bind(task_id)
-            .bind(page_size)
+            .bind(page_size + 1)
             .fetch_all(&self.pool)
             .await
         }
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
+        let has_more = rows.len() > page_size as usize;
+        rows.truncate(page_size as usize);
         let configs: Vec<turul_a2a_proto::TaskPushNotificationConfig> = rows
             .iter()
             .filter_map(|(json,)| serde_json::from_value(json.clone()).ok())
             .collect();
 
-        let next_page_token = if configs.len() as i32 >= page_size {
+        let next_page_token = if has_more {
             configs.last().map(|c| c.id.clone()).unwrap_or_default()
         } else {
             String::new()
@@ -1125,7 +1120,7 @@ impl A2aPushNotificationStorage for PostgresA2aStorage {
         page_token: Option<&str>,
         page_size: Option<i32>,
     ) -> Result<PushConfigListPage, A2aStorageError> {
-        let page_size = page_size.map(|ps| ps.clamp(1, 100)).unwrap_or(50);
+        let page_size = super::filter::push_config_page_size(page_size);
         let (sql, has_token) = if page_token.is_some() {
             (
                 "SELECT config_json FROM a2a_push_configs
@@ -1152,19 +1147,22 @@ impl A2aPushNotificationStorage for PostgresA2aStorage {
         if has_token {
             q = q.bind(page_token.unwrap_or(""));
         }
-        q = q.bind(page_size);
+        // One extra row tells whether another page follows.
+        q = q.bind(page_size + 1);
 
-        let rows: Vec<(serde_json::Value,)> = q
+        let mut rows: Vec<(serde_json::Value,)> = q
             .fetch_all(&self.pool)
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
+        let has_more = rows.len() > page_size as usize;
+        rows.truncate(page_size as usize);
         let configs: Vec<turul_a2a_proto::TaskPushNotificationConfig> = rows
             .into_iter()
             .filter_map(|(json,)| serde_json::from_value(json).ok())
             .collect();
 
-        let next_page_token = if configs.len() as i32 >= page_size {
+        let next_page_token = if has_more {
             configs.last().map(|c| c.id.clone()).unwrap_or_default()
         } else {
             String::new()
@@ -1358,9 +1356,10 @@ impl A2aAtomicStore for PostgresA2aStorage {
         &self,
         tenant: &str,
         owner: &str,
-        task: Task,
-        events: Vec<StreamEvent>,
+        mut task: Task,
+        mut events: Vec<StreamEvent>,
     ) -> Result<(Task, Vec<u64>), A2aStorageError> {
+        super::status_time::stamp_status(&mut task, &mut events);
         let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
         let plan = super::artifacts::reconcile(&artifacts, &[])?;
@@ -1374,16 +1373,17 @@ impl A2aAtomicStore for PostgresA2aStorage {
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
 
         sqlx::query(
-            "INSERT INTO a2a_tasks (tenant, task_id, owner, task_json, context_id, status_state, artifact_manifest, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())",
+            "INSERT INTO a2a_tasks (tenant, task_id, owner, task_json, context_id, status_state, artifact_manifest, status_timestamp, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())",
         )
         .bind(tenant)
         .bind(task.id())
         .bind(owner)
         .bind(&blob)
         .bind(task.context_id())
-        .bind(&state_str)
+        .bind(state_str)
         .bind(&manifest)
+        .bind(super::status_time::sort_key(&task))
         .execute(&mut *tx)
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
@@ -1447,7 +1447,7 @@ impl A2aAtomicStore for PostgresA2aStorage {
         task_id: &str,
         owner: &str,
         new_status: TaskStatus,
-        events: Vec<StreamEvent>,
+        mut events: Vec<StreamEvent>,
     ) -> Result<(Task, Vec<u64>), A2aStorageError> {
         let mut tx = self
             .pool
@@ -1488,8 +1488,7 @@ impl A2aAtomicStore for PostgresA2aStorage {
                 turul_a2a_types::A2aTypeError::TerminalState(s) => {
                     A2aStorageError::TerminalStateAlreadySet {
                         task_id: task_id.to_string(),
-                        current_state: crate::storage::terminal_cas::task_state_wire_name(s)
-                            .to_string(),
+                        current_state: s.wire_name().to_string(),
                     }
                 }
                 other => A2aStorageError::TypeError(other),
@@ -1498,7 +1497,8 @@ impl A2aAtomicStore for PostgresA2aStorage {
 
         let mut proto = task.as_proto().clone();
         proto.status = Some(new_status.into_proto());
-        let updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+        let mut updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+        super::status_time::stamp_status(&mut updated_task, &mut events);
 
         let task_json = Self::task_to_json(&updated_task)?;
         let state_str = Self::status_state_str(&updated_task);
@@ -1512,18 +1512,20 @@ impl A2aAtomicStore for PostgresA2aStorage {
         // count == 0 after the UPDATE ⇒ another writer committed a
         // terminal first; no events persist (the rollback at end-of-scope
         // discards event inserts below too).
-        let result = sqlx::query(
+        let terminal = TERMINAL_STATES_SQL.as_str();
+        let result = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE a2a_tasks
-               SET task_json = $1, status_state = $2, context_id = $3, updated_at = NOW()
+               SET task_json = $1, status_state = $2, context_id = $3, status_timestamp = $7, updated_at = NOW()
              WHERE tenant = $4 AND task_id = $5 AND owner = $6
-               AND status_state NOT IN ('Completed', 'Failed', 'Canceled', 'Rejected')",
-        )
+               AND status_state NOT IN ({terminal})"
+        )))
         .bind(&task_json)
-        .bind(&state_str)
+        .bind(state_str)
         .bind(updated_task.context_id())
         .bind(tenant)
         .bind(task_id)
         .bind(owner)
+        .bind(super::status_time::sort_key(&updated_task))
         .execute(&mut *tx)
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
@@ -1540,7 +1542,7 @@ impl A2aAtomicStore for PostgresA2aStorage {
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
             let current_state_str = current
-                .map(|(s,)| crate::storage::terminal_cas::debug_state_to_wire_name(&s))
+                .map(|(s,)| s)
                 .unwrap_or_else(|| "TASK_STATE_UNKNOWN".to_string());
             return Err(A2aStorageError::TerminalStateAlreadySet {
                 task_id: task_id.to_string(),
@@ -1655,9 +1657,10 @@ impl A2aAtomicStore for PostgresA2aStorage {
         &self,
         tenant: &str,
         owner: &str,
-        task: Task,
-        events: Vec<StreamEvent>,
+        mut task: Task,
+        mut events: Vec<StreamEvent>,
     ) -> Result<Vec<u64>, A2aStorageError> {
+        super::status_time::stamp_status(&mut task, &mut events);
         let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
 
@@ -1680,19 +1683,21 @@ impl A2aAtomicStore for PostgresA2aStorage {
         // disambiguates "task missing" vs "already terminal". Artifact
         // records are reconciled only after the CAS passes, so a rejected
         // write leaves no artifact rows behind.
-        let result = sqlx::query(
+        let terminal = TERMINAL_STATES_SQL.as_str();
+        let result = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE a2a_tasks
-               SET task_json = $1, status_state = $2, context_id = $3, artifact_manifest = $4, updated_at = NOW()
+               SET task_json = $1, status_state = $2, context_id = $3, artifact_manifest = $4, status_timestamp = $8, updated_at = NOW()
              WHERE tenant = $5 AND task_id = $6 AND owner = $7
-               AND status_state NOT IN ('Completed', 'Failed', 'Canceled', 'Rejected')",
-        )
+               AND status_state NOT IN ({terminal})"
+        )))
         .bind(&blob)
-        .bind(&state_str)
+        .bind(state_str)
         .bind(task.context_id())
         .bind(&manifest)
         .bind(tenant)
         .bind(task.id())
         .bind(owner)
+        .bind(super::status_time::sort_key(&task))
         .execute(&mut *tx)
         .await
         .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
@@ -1712,7 +1717,7 @@ impl A2aAtomicStore for PostgresA2aStorage {
             return match current {
                 Some((state,)) => Err(A2aStorageError::TerminalStateAlreadySet {
                     task_id: task.id().to_string(),
-                    current_state: crate::storage::terminal_cas::debug_state_to_wire_name(&state),
+                    current_state: state,
                 }),
                 None => Err(A2aStorageError::TaskNotFound(task.id().to_string())),
             };
@@ -2494,6 +2499,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_pagination_exact_multiple() {
+        parity_tests::test_list_pagination_exact_multiple(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_page_size_bounds() {
+        parity_tests::test_list_page_size_bounds(&storage().await).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_status_timestamp_after() {
+        parity_tests::test_list_status_timestamp_after(&storage().await).await;
+    }
+
+    #[tokio::test]
     async fn test_list_filter_by_status() {
         parity_tests::test_list_filter_by_status(&storage().await).await;
     }
@@ -2546,8 +2566,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_artifact_mutation_bumps_list_order() {
-        parity_tests::test_artifact_mutation_bumps_list_order(&storage().await).await;
+    async fn test_list_orders_by_status_timestamp() {
+        parity_tests::test_list_orders_by_status_timestamp(&storage().await).await;
     }
 
     #[tokio::test]
@@ -2627,6 +2647,44 @@ mod tests {
         );
     }
 
+    /// The persisted `status_state` is the proto wire name owned by
+    /// `TaskState::wire_name`, and `status_timestamp` is the sort key of
+    /// the status timestamp recorded on the task.
+    #[tokio::test]
+    async fn test_persisted_state_is_wire_name() {
+        let s = storage().await;
+        s.create_task(
+            "default",
+            "owner",
+            Task::new("pg-wire-1", TaskStatus::new(TaskState::Submitted)).with_context_id("ctx"),
+        )
+        .await
+        .unwrap();
+        let read = |s: PostgresA2aStorage| async move {
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT status_state, status_timestamp FROM a2a_tasks WHERE task_id = 'pg-wire-1'",
+            )
+            .fetch_one(&s.pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(read(s.clone()).await.0, "TASK_STATE_SUBMITTED");
+
+        let working = s
+            .update_task_status(
+                "default",
+                "pg-wire-1",
+                "owner",
+                TaskStatus::new(TaskState::Working),
+            )
+            .await
+            .unwrap();
+        let (state, ts) = read(s.clone()).await;
+        assert_eq!(state, "TASK_STATE_WORKING");
+        assert_eq!(ts, crate::storage::status_time::sort_key(&working));
+        assert!(!ts.is_empty());
+    }
+
     /// A pre-0.1.30 task row stores its artifacts inline in task_json with
     /// NULL manifest. It must read correctly, keep its inline artifacts
     /// through a status transition (no migration on status), and migrate
@@ -2640,8 +2698,8 @@ mod tests {
         legacy.push_text_artifact("art-legacy", "Result", "legacy body");
         let legacy_json = PostgresA2aStorage::task_to_json(&legacy).unwrap();
         sqlx::query(
-            "INSERT INTO a2a_tasks (tenant, task_id, owner, task_json, context_id, status_state, updated_at) \
-             VALUES ('default', 'pg-legacy-1', 'owner', $1, 'ctx', 'Submitted', NOW())",
+            "INSERT INTO a2a_tasks (tenant, task_id, owner, task_json, context_id, status_state, status_timestamp, updated_at) \
+             VALUES ('default', 'pg-legacy-1', 'owner', $1, 'ctx', 'TASK_STATE_SUBMITTED', '', NOW())",
         )
         .bind(&legacy_json)
         .execute(&s.pool)
@@ -2747,6 +2805,11 @@ mod tests {
         parity_tests::test_push_config_list_pagination(&storage().await).await;
     }
 
+    #[tokio::test]
+    async fn test_push_config_list_pagination_exact_multiple() {
+        parity_tests::test_push_config_list_pagination_exact_multiple(&storage().await).await;
+    }
+
     // Event store parity tests
 
     #[tokio::test]
@@ -2785,6 +2848,12 @@ mod tests {
     async fn test_atomic_create_task_with_events() {
         let s = storage().await;
         parity_tests::test_atomic_create_task_with_events(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_concurrent_sequence_integrity() {
+        let s = std::sync::Arc::new(storage().await);
+        parity_tests::test_atomic_concurrent_sequence_integrity(s).await;
     }
 
     #[tokio::test]

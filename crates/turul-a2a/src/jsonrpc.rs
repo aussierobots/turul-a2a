@@ -516,6 +516,10 @@ async fn dispatch_list_tasks(
             .and_then(|v| v.as_i64())
             .map(|v| v as i32),
         include_artifacts: params.get("includeArtifacts").and_then(|v| v.as_bool()),
+        status_timestamp_after: params
+            .get("statusTimestampAfter")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     };
 
     let Json(response) = crate::router::core_list_tasks(state, tenant, owner, &query).await?;

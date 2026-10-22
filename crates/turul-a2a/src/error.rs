@@ -187,6 +187,7 @@ impl From<crate::storage::A2aStorageError> for A2aError {
             A2aStorageError::InvalidTransition { .. } => A2aError::TaskNotCancelable {
                 task_id: String::new(),
             },
+            A2aStorageError::InvalidListRequest(message) => A2aError::InvalidRequest { message },
             other => A2aError::Internal(other.to_string()),
         }
     }

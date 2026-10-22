@@ -482,7 +482,8 @@ impl DynamoDbA2aStorage {
     /// - `pk`: partition key, from [`Self::task_key`].
     /// - `tenant`, `taskId`, `owner`, `contextId`, `statusState`:
     ///   scalar lookup/filter attributes (`list_tasks` filters on
-    ///   `tenant`, so it must persist across updates).
+    ///   `tenant`, so it must persist across updates). `statusState` is
+    ///   the proto wire name (`TASK_STATE_WORKING`, ...).
     /// - `taskJson`: serialized [`Task`] JSON, the source of truth.
     /// - `updatedAt`: write timestamp.
     /// - `latestEventSequence`: causal floor; present only on the
@@ -565,10 +566,10 @@ impl DynamoDbA2aStorage {
         Task::try_from(proto).map_err(A2aStorageError::TypeError)
     }
 
-    fn status_state_str(task: &Task) -> String {
+    fn status_state_str(task: &Task) -> &'static str {
         task.status()
             .and_then(|s| s.state().ok())
-            .map(|s| format!("{s:?}"))
+            .map(TaskState::wire_name)
             .unwrap_or_default()
     }
 
@@ -601,8 +602,9 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         &self,
         tenant: &str,
         owner: &str,
-        task: Task,
+        mut task: Task,
     ) -> Result<Task, A2aStorageError> {
+        super::status_time::stamp_status(&mut task, &mut []);
         let pk = Self::task_key(tenant, task.id());
         let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
@@ -615,7 +617,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             task.id(),
             owner,
             task.context_id(),
-            &state_str,
+            state_str,
             &blob,
             None,
             Self::ttl_epoch(self.config.task_ttl_seconds),
@@ -720,8 +722,9 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         &self,
         tenant: &str,
         owner: &str,
-        task: Task,
+        mut task: Task,
     ) -> Result<(), A2aStorageError> {
+        super::status_time::stamp_status(&mut task, &mut []);
         let pk = Self::task_key(tenant, task.id());
         let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
@@ -738,7 +741,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             task.id(),
             owner,
             task.context_id(),
-            &state_str,
+            state_str,
             &blob,
             None,
             Self::ttl_epoch(self.config.task_ttl_seconds),
@@ -847,94 +850,99 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
     async fn list_tasks(&self, filter: TaskFilter) -> Result<TaskListPage, A2aStorageError> {
         let tenant = filter.tenant.as_deref().unwrap_or("");
         let owner = filter.owner.as_deref().unwrap_or("");
-        let page_size = filter.page_size.map(|ps| ps.clamp(1, 100)).unwrap_or(50);
+        let page_size = filter.resolved_page_size()?;
+        let cursor = filter
+            .page_token
+            .as_deref()
+            .map(super::status_time::decode_cursor)
+            .transpose()?;
 
-        // Scan with filter (for production, use GSI on tenant+owner)
-        let mut scan = self
-            .client
-            .scan()
-            .table_name(&self.config.tasks_table)
-            .filter_expression("tenant = :t AND #o = :o")
-            .expression_attribute_names("#o", "owner")
-            .expression_attribute_values(":t", AttributeValue::S(tenant.to_string()))
-            .expression_attribute_values(":o", AttributeValue::S(owner.to_string()));
-
-        if let Some(ref ctx) = filter.context_id {
-            scan = scan
-                .filter_expression("tenant = :t AND #o = :o AND contextId = :ctx")
-                .expression_attribute_values(":ctx", AttributeValue::S(ctx.clone()));
+        let mut expr = String::from("tenant = :t AND #o = :o");
+        if filter.context_id.is_some() {
+            expr.push_str(" AND contextId = :ctx");
         }
-        if let Some(ref status) = filter.status {
-            let expr = if filter.context_id.is_some() {
-                "tenant = :t AND #o = :o AND contextId = :ctx AND statusState = :st"
-            } else {
-                "tenant = :t AND #o = :o AND statusState = :st"
-            };
-            scan = scan
-                .filter_expression(expr)
-                .expression_attribute_values(":st", AttributeValue::S(format!("{status:?}")));
+        if filter.status.is_some() {
+            expr.push_str(" AND statusState = :st");
         }
 
-        let result = scan
-            .send()
-            .await
-            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+        // Scan with filter (for production, use GSI on tenant+owner),
+        // following LastEvaluatedKey so no matching item is missed.
+        let mut items = Vec::new();
+        let mut start_key = None;
+        loop {
+            let mut scan = self
+                .client
+                .scan()
+                .table_name(&self.config.tasks_table)
+                .filter_expression(&expr)
+                .expression_attribute_names("#o", "owner")
+                .expression_attribute_values(":t", AttributeValue::S(tenant.to_string()))
+                .expression_attribute_values(":o", AttributeValue::S(owner.to_string()))
+                .set_exclusive_start_key(start_key);
+            if let Some(ref ctx) = filter.context_id {
+                scan = scan.expression_attribute_values(":ctx", AttributeValue::S(ctx.clone()));
+            }
+            if let Some(status) = filter.status {
+                scan = scan.expression_attribute_values(
+                    ":st",
+                    AttributeValue::S(status.wire_name().to_string()),
+                );
+            }
+            let out = scan
+                .send()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            items.extend(out.items.unwrap_or_default());
+            start_key = out.last_evaluated_key;
+            if start_key.is_none() {
+                break;
+            }
+        }
 
-        let items = result.items.unwrap_or_default();
-        let total_size = items.len() as i32;
-
-        // Sort by updated_at DESC, task_id DESC (spec §3.1.4 MUST). The
-        // task is parsed from the (possibly artifact-free) blob; the
-        // manifest is carried so a requested page can rehydrate bodies.
-        let mut tasks_with_times: Vec<(Task, String, Option<String>)> = items
+        // Status timestamp DESC, task_id DESC. The task is parsed from
+        // the (possibly artifact-free) blob; the manifest is carried so a
+        // requested page can rehydrate bodies.
+        let mut tasks_with_keys: Vec<(Task, String, Option<String>)> = items
             .iter()
             .filter_map(|item| {
                 let task = item
                     .get("taskJson")
                     .and_then(|v| v.as_s().ok())
                     .and_then(|json| Self::task_from_json(json).ok())?;
-                let updated_at = item
-                    .get("updatedAt")
-                    .and_then(|v| v.as_s().ok())
-                    .cloned()
-                    .unwrap_or_default();
                 let manifest_json = item
                     .get("artifactManifest")
                     .and_then(|v| v.as_s().ok())
                     .cloned();
-                Some((task, updated_at, manifest_json))
+                Some((task, manifest_json))
+            })
+            .filter(|(task, _)| filter.admits_status_time(task))
+            .map(|(task, manifest_json)| {
+                let key = super::status_time::sort_key(&task);
+                (task, key, manifest_json)
             })
             .collect();
-        tasks_with_times.sort_by(|(a_task, a_time, _), (b_task, b_time, _)| {
-            b_time
-                .cmp(a_time)
-                .then_with(|| b_task.id().cmp(a_task.id()))
+        tasks_with_keys.sort_by(|(a_task, a_key, _), (b_task, b_key, _)| {
+            b_key.cmp(a_key).then_with(|| b_task.id().cmp(a_task.id()))
         });
+        let total_size = tasks_with_keys.len() as i32;
 
-        // Apply cursor pagination: token is "updated_at|task_id"
-        let start_idx = if let Some(ref token) = filter.page_token {
-            if let Some((cursor_time, cursor_id)) = token.split_once('|') {
-                tasks_with_times
-                    .iter()
-                    .position(|(t, time, _)| (time.as_str(), t.id()) < (cursor_time, cursor_id))
-                    .unwrap_or(tasks_with_times.len())
-            } else {
-                tasks_with_times
-                    .iter()
-                    .position(|(t, _, _)| t.id() < token.as_str())
-                    .unwrap_or(tasks_with_times.len())
-            }
-        } else {
-            0
+        // The cursor is the (sort key, task_id) of the previous page's
+        // last task; this page starts at the first task sorting after it.
+        let start_idx = match cursor {
+            Some(cursor) => tasks_with_keys
+                .iter()
+                .position(|(t, key, _)| (key.as_str(), t.id()) < cursor)
+                .unwrap_or(tasks_with_keys.len()),
+            None => 0,
         };
 
         // Artifacts are fetched only when requested. Excluded listings
         // never read artifact items: separated blobs carry no bodies, and
         // trimming clears any inline bodies on legacy rows.
         let include_artifacts = filter.include_artifacts.unwrap_or(false);
-        let end_idx = (start_idx + page_size as usize).min(tasks_with_times.len());
+        let end_idx = (start_idx + page_size as usize).min(tasks_with_keys.len());
         let mut page_tasks: Vec<Task> = Vec::with_capacity(end_idx - start_idx);
-        for (task, _, manifest_json) in &tasks_with_times[start_idx..end_idx] {
+        for (task, _, manifest_json) in &tasks_with_keys[start_idx..end_idx] {
             let task = if include_artifacts {
                 let blob = Self::task_to_json(task)?;
                 self.rehydrate_task(tenant, task.id(), &blob, manifest_json.as_deref())
@@ -949,11 +957,9 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             ));
         }
 
-        let next_page_token = if end_idx < tasks_with_times.len() {
-            tasks_with_times
-                .get(end_idx - 1)
-                .map(|(t, updated_at, _)| format!("{}|{}", updated_at, t.id()))
-                .unwrap_or_default()
+        let next_page_token = if end_idx < tasks_with_keys.len() {
+            let (last, key, _) = &tasks_with_keys[end_idx - 1];
+            super::status_time::encode_cursor(key, last.id())
         } else {
             String::new()
         };
@@ -1034,7 +1040,8 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
 
         let mut proto = task.as_proto().clone();
         proto.status = Some(new_status.into_proto());
-        let updated = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+        let mut updated = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+        super::status_time::stamp_status(&mut updated, &mut []);
         let new_blob = Self::task_to_json(&updated)?;
         let state_str = Self::status_state_str(&updated);
 
@@ -1047,7 +1054,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .expression_attribute_names("#o", "owner")
             .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()))
             .expression_attribute_values(":blob", AttributeValue::S(new_blob.clone()))
-            .expression_attribute_values(":state", AttributeValue::S(state_str))
+            .expression_attribute_values(":state", AttributeValue::S(state_str.to_string()))
             .expression_attribute_values(":ts", AttributeValue::S(Self::now_iso()));
         update = if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
             update
@@ -1156,10 +1163,22 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .expression_attribute_names("#owner", "owner")
             .expression_attribute_values(":true", AttributeValue::Bool(true))
             .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()))
-            .expression_attribute_values(":completed", AttributeValue::S("Completed".to_string()))
-            .expression_attribute_values(":failed", AttributeValue::S("Failed".to_string()))
-            .expression_attribute_values(":canceled", AttributeValue::S("Canceled".to_string()))
-            .expression_attribute_values(":rejected", AttributeValue::S("Rejected".to_string()))
+            .expression_attribute_values(
+                ":completed",
+                AttributeValue::S(TaskState::Completed.wire_name().to_string()),
+            )
+            .expression_attribute_values(
+                ":failed",
+                AttributeValue::S(TaskState::Failed.wire_name().to_string()),
+            )
+            .expression_attribute_values(
+                ":canceled",
+                AttributeValue::S(TaskState::Canceled.wire_name().to_string()),
+            )
+            .expression_attribute_values(
+                ":rejected",
+                AttributeValue::S(TaskState::Rejected.wire_name().to_string()),
+            )
             .send()
             .await;
 
@@ -1223,10 +1242,9 @@ impl crate::storage::A2aCancellationSupervisor for DynamoDbA2aStorage {
             .get("statusState")
             .and_then(|v| v.as_s().ok())
             .map(String::as_str);
-        let is_terminal = matches!(
-            state_str,
-            Some("Completed") | Some("Failed") | Some("Canceled") | Some("Rejected")
-        );
+        let is_terminal = state_str
+            .and_then(TaskState::from_wire_name)
+            .is_some_and(|s| s.is_terminal());
         if is_terminal {
             return Ok(false);
         }
@@ -1283,10 +1301,9 @@ impl crate::storage::A2aCancellationSupervisor for DynamoDbA2aStorage {
                         .get("statusState")
                         .and_then(|v| v.as_s().ok())
                         .map(String::as_str);
-                    let is_terminal = matches!(
-                        state_str,
-                        Some("Completed") | Some("Failed") | Some("Canceled") | Some("Rejected")
-                    );
+                    let is_terminal = state_str
+                        .and_then(TaskState::from_wire_name)
+                        .is_some_and(|s| s.is_terminal());
                     if is_terminal {
                         continue;
                     }
@@ -1480,7 +1497,7 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
         page_token: Option<&str>,
         page_size: Option<i32>,
     ) -> Result<PushConfigListPage, A2aStorageError> {
-        let page_size = page_size.map(|ps| ps.clamp(1, 100)).unwrap_or(50);
+        let page_size = super::filter::push_config_page_size(page_size);
 
         let result = self
             .client
@@ -1556,7 +1573,7 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
         page_token: Option<&str>,
         page_size: Option<i32>,
     ) -> Result<PushConfigListPage, A2aStorageError> {
-        let page_size = page_size.map(|ps| ps.clamp(1, 100)).unwrap_or(50);
+        let page_size = super::filter::push_config_page_size(page_size);
 
         // Scan with filter on tenant + taskId + strict registeredAfter
         // upper bound. Pre-migration rows have the attribute absent;
@@ -1821,9 +1838,10 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         &self,
         tenant: &str,
         owner: &str,
-        task: Task,
-        events: Vec<StreamEvent>,
+        mut task: Task,
+        mut events: Vec<StreamEvent>,
     ) -> Result<(Task, Vec<u64>), A2aStorageError> {
+        super::status_time::stamp_status(&mut task, &mut events);
         let pk = Self::task_key(tenant, task.id());
         let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
@@ -1845,7 +1863,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             task.id(),
             owner,
             task.context_id(),
-            &state_str,
+            state_str,
             &blob,
             Some(latest_event_sequence),
             Self::ttl_epoch(self.config.task_ttl_seconds),
@@ -1911,7 +1929,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         task_id: &str,
         owner: &str,
         new_status: TaskStatus,
-        events: Vec<StreamEvent>,
+        mut events: Vec<StreamEvent>,
     ) -> Result<(Task, Vec<u64>), A2aStorageError> {
         let pk = Self::task_key(tenant, task_id);
 
@@ -1964,8 +1982,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 turul_a2a_types::A2aTypeError::TerminalState(s) => {
                     A2aStorageError::TerminalStateAlreadySet {
                         task_id: task_id.to_string(),
-                        current_state: crate::storage::terminal_cas::task_state_wire_name(s)
-                            .to_string(),
+                        current_state: s.wire_name().to_string(),
                     }
                 }
                 other => A2aStorageError::TypeError(other),
@@ -1976,7 +1993,8 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         // blob, changing only status.
         let mut proto = task.as_proto().clone();
         proto.status = Some(new_status.into_proto());
-        let updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+        let mut updated_task = Task::try_from(proto).map_err(A2aStorageError::TypeError)?;
+        super::status_time::stamp_status(&mut updated_task, &mut events);
 
         let task_json = Self::task_to_json(&updated_task)?;
         let state_str = Self::status_state_str(&updated_task);
@@ -2004,7 +2022,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             task_id,
             owner,
             updated_task.context_id(),
-            &state_str,
+            state_str,
             &task_json,
             Some(new_latest_event_sequence),
             Self::ttl_epoch(self.config.task_ttl_seconds),
@@ -2032,19 +2050,19 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                         .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()))
                         .expression_attribute_values(
                             ":completed",
-                            AttributeValue::S("Completed".to_string()),
+                            AttributeValue::S(TaskState::Completed.wire_name().to_string()),
                         )
                         .expression_attribute_values(
                             ":failed",
-                            AttributeValue::S("Failed".to_string()),
+                            AttributeValue::S(TaskState::Failed.wire_name().to_string()),
                         )
                         .expression_attribute_values(
                             ":canceled",
-                            AttributeValue::S("Canceled".to_string()),
+                            AttributeValue::S(TaskState::Canceled.wire_name().to_string()),
                         )
                         .expression_attribute_values(
                             ":rejected",
-                            AttributeValue::S("Rejected".to_string()),
+                            AttributeValue::S(TaskState::Rejected.wire_name().to_string()),
                         )
                         .build()
                         .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?,
@@ -2185,9 +2203,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                             {
                                 return Err(A2aStorageError::TerminalStateAlreadySet {
                                     task_id: task_id.to_string(),
-                                    current_state:
-                                        crate::storage::terminal_cas::task_state_wire_name(s)
-                                            .to_string(),
+                                    current_state: s.wire_name().to_string(),
                                 });
                             }
                         }
@@ -2210,9 +2226,10 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         &self,
         tenant: &str,
         owner: &str,
-        task: Task,
-        events: Vec<StreamEvent>,
+        mut task: Task,
+        mut events: Vec<StreamEvent>,
     ) -> Result<Vec<u64>, A2aStorageError> {
+        super::status_time::stamp_status(&mut task, &mut events);
         let pk = Self::task_key(tenant, task.id());
         let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
@@ -2240,7 +2257,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             task.id(),
             owner,
             task.context_id(),
-            &state_str,
+            state_str,
             &blob,
             Some(new_latest_event_sequence),
             Self::ttl_epoch(self.config.task_ttl_seconds),
@@ -2255,10 +2272,22 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
             )
             .expression_attribute_names("#owner", "owner")
             .expression_attribute_values(":owner", AttributeValue::S(owner.to_string()))
-            .expression_attribute_values(":completed", AttributeValue::S("Completed".to_string()))
-            .expression_attribute_values(":failed", AttributeValue::S("Failed".to_string()))
-            .expression_attribute_values(":canceled", AttributeValue::S("Canceled".to_string()))
-            .expression_attribute_values(":rejected", AttributeValue::S("Rejected".to_string()));
+            .expression_attribute_values(
+                ":completed",
+                AttributeValue::S(TaskState::Completed.wire_name().to_string()),
+            )
+            .expression_attribute_values(
+                ":failed",
+                AttributeValue::S(TaskState::Failed.wire_name().to_string()),
+            )
+            .expression_attribute_values(
+                ":canceled",
+                AttributeValue::S(TaskState::Canceled.wire_name().to_string()),
+            )
+            .expression_attribute_values(
+                ":rejected",
+                AttributeValue::S(TaskState::Rejected.wire_name().to_string()),
+            );
         let mut items = vec![
             aws_sdk_dynamodb::types::TransactWriteItem::builder()
                 .put(
@@ -2331,9 +2360,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                             {
                                 return Err(A2aStorageError::TerminalStateAlreadySet {
                                     task_id,
-                                    current_state:
-                                        crate::storage::terminal_cas::task_state_wire_name(s)
-                                            .to_string(),
+                                    current_state: s.wire_name().to_string(),
                                 });
                             }
                         }
@@ -4197,6 +4224,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_pagination_exact_multiple() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_list_pagination_exact_multiple(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_page_size_bounds() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_list_page_size_bounds(&s).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_status_timestamp_after() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_list_status_timestamp_after(&s).await;
+    }
+
+    #[tokio::test]
     async fn test_list_filter_by_status() {
         skip_unless_dynamodb_env!(s);
         parity_tests::test_list_filter_by_status(&s).await;
@@ -4259,9 +4304,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_artifact_mutation_bumps_list_order() {
+    async fn test_list_orders_by_status_timestamp() {
         skip_unless_dynamodb_env!(s);
-        parity_tests::test_artifact_mutation_bumps_list_order(&s).await;
+        parity_tests::test_list_orders_by_status_timestamp(&s).await;
     }
 
     #[tokio::test]
@@ -4280,6 +4325,152 @@ mod tests {
     async fn test_delete_task_removes_artifact_records() {
         skip_unless_dynamodb_env!(s);
         parity_tests::test_delete_task_removes_artifact_records(&s).await;
+    }
+
+    async fn get_task_item(
+        s: &TestStorage,
+        tenant: &str,
+        task_id: &str,
+    ) -> std::collections::HashMap<String, AttributeValue> {
+        s.inner
+            .client
+            .get_item()
+            .consistent_read(true)
+            .table_name(&s.inner.config.tasks_table)
+            .key(
+                "pk",
+                AttributeValue::S(DynamoDbA2aStorage::task_key(tenant, task_id)),
+            )
+            .send()
+            .await
+            .unwrap()
+            .item
+            .unwrap()
+    }
+
+    fn epoch_attr(item: &std::collections::HashMap<String, AttributeValue>, name: &str) -> u64 {
+        item.get(name)
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("item has no numeric `{name}` attribute: {item:?}"))
+    }
+
+    /// Engine-native TTL: every task and event item carries a numeric
+    /// `ttl` (epoch seconds) of now + the configured TTL, and the task's
+    /// `ttl` survives a status rewrite. DynamoDB reaps on it; the
+    /// application never scans and deletes.
+    #[tokio::test]
+    async fn test_native_ttl_attributes_on_tasks_and_events() {
+        skip_unless_dynamodb_env!(s);
+        let tenant = s.scoped_tenant("default");
+        let before = DynamoDbA2aStorage::now_epoch();
+        s.inner
+            .create_task_with_events(
+                &tenant,
+                "owner",
+                Task::new("ddb-ttl-1", TaskStatus::new(TaskState::Submitted))
+                    .with_context_id("ctx"),
+                vec![StreamEvent::StatusUpdate {
+                    status_update: crate::streaming::StatusUpdatePayload {
+                        task_id: "ddb-ttl-1".into(),
+                        context_id: "ctx".into(),
+                        status: serde_json::json!({"state": "TASK_STATE_SUBMITTED"}),
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+        s.inner
+            .update_task_status(
+                &tenant,
+                "ddb-ttl-1",
+                "owner",
+                TaskStatus::new(TaskState::Working),
+            )
+            .await
+            .unwrap();
+        let after = DynamoDbA2aStorage::now_epoch();
+
+        let task_ttl = s.inner.config.task_ttl_seconds;
+        let event_ttl = s.inner.config.event_ttl_seconds;
+        assert!(task_ttl > 0 && event_ttl > 0, "default config enables TTL");
+
+        let task_item = get_task_item(&s, &tenant, "ddb-ttl-1").await;
+        let ttl = epoch_attr(&task_item, "ttl");
+        assert!(
+            (before + task_ttl..=after + task_ttl).contains(&ttl),
+            "task ttl {ttl} not within now + task_ttl_seconds"
+        );
+
+        let event_item = s
+            .inner
+            .client
+            .get_item()
+            .consistent_read(true)
+            .table_name(&s.inner.config.events_table)
+            .key(
+                "pk",
+                AttributeValue::S(DynamoDbA2aStorage::task_key(&tenant, "ddb-ttl-1")),
+            )
+            .key(
+                "sk",
+                AttributeValue::S(DynamoDbA2aStorage::event_sort_key(1)),
+            )
+            .send()
+            .await
+            .unwrap()
+            .item
+            .expect("event item for sequence 1");
+        let ttl = epoch_attr(&event_item, "ttl");
+        assert!(
+            (before + event_ttl..=after + event_ttl).contains(&ttl),
+            "event ttl {ttl} not within now + event_ttl_seconds"
+        );
+    }
+
+    /// The persisted `statusState` attribute is the proto wire name owned
+    /// by `TaskState::wire_name`, so the terminal-state condition
+    /// expressions compare like with like.
+    #[tokio::test]
+    async fn test_persisted_state_is_wire_name() {
+        skip_unless_dynamodb_env!(s);
+        let tenant = s.scoped_tenant("default");
+        s.inner
+            .create_task(
+                &tenant,
+                "owner",
+                Task::new("ddb-wire-1", TaskStatus::new(TaskState::Submitted))
+                    .with_context_id("ctx"),
+            )
+            .await
+            .unwrap();
+        let state = |item: &std::collections::HashMap<String, AttributeValue>| {
+            item.get("statusState")
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(
+            state(&get_task_item(&s, &tenant, "ddb-wire-1").await),
+            "TASK_STATE_SUBMITTED"
+        );
+        for next in [TaskState::Working, TaskState::Completed] {
+            s.inner
+                .update_task_status(&tenant, "ddb-wire-1", "owner", TaskStatus::new(next))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            state(&get_task_item(&s, &tenant, "ddb-wire-1").await),
+            "TASK_STATE_COMPLETED"
+        );
+        // The terminal guard reads the same vocabulary.
+        assert!(matches!(
+            s.inner
+                .set_cancel_requested(&tenant, "ddb-wire-1", "owner")
+                .await,
+            Err(A2aStorageError::TerminalState(TaskState::Completed))
+        ));
     }
 
     /// Backend shape assertion: the task item carries no
@@ -4536,6 +4727,12 @@ mod tests {
         parity_tests::test_push_config_list_pagination(&s).await;
     }
 
+    #[tokio::test]
+    async fn test_push_config_list_pagination_exact_multiple() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_push_config_list_pagination_exact_multiple(&s).await;
+    }
+
     // Event store parity tests
 
     #[tokio::test]
@@ -4580,6 +4777,12 @@ mod tests {
     async fn test_atomic_create_task_with_events() {
         skip_unless_dynamodb_env!(s);
         parity_tests::test_atomic_create_task_with_events(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_concurrent_sequence_integrity() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_atomic_concurrent_sequence_integrity(std::sync::Arc::new(s)).await;
     }
 
     #[tokio::test]
