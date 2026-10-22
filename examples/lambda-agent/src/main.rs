@@ -87,6 +87,19 @@ fn lambda_builder(public_url: String) -> LambdaA2aServerBuilder {
         .storage(InMemoryA2aStorage::new())
 }
 
+fn public_url_or_warn() -> String {
+    match std::env::var("A2A_PUBLIC_URL") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            tracing::warn!(
+                "A2A_PUBLIC_URL not set; agent card will advertise a placeholder URL. \
+                 Set this env var to the real Function URL / API Gateway endpoint."
+            );
+            "https://lambda.invalid".to_string()
+        }
+    }
+}
+
 /// The handler `main` runs, built and driven in process with Lambda
 /// HTTP requests (no Lambda runtime, no network).
 #[cfg(test)]
@@ -136,18 +149,5 @@ mod tests {
             body["task"]["artifacts"][0]["parts"][0]["text"],
             "Hello from Lambda!"
         );
-    }
-}
-
-fn public_url_or_warn() -> String {
-    match std::env::var("A2A_PUBLIC_URL") {
-        Ok(v) if !v.is_empty() => v,
-        _ => {
-            tracing::warn!(
-                "A2A_PUBLIC_URL not set; agent card will advertise a placeholder URL. \
-                 Set this env var to the real Function URL / API Gateway endpoint."
-            );
-            "https://lambda.invalid".to_string()
-        }
     }
 }

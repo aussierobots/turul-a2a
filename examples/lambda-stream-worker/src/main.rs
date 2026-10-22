@@ -111,20 +111,6 @@ fn build_handler() -> Result<LambdaStreamRecoveryHandler, Error> {
     Ok(LambdaStreamRecoveryHandler::new(dispatcher))
 }
 
-#[cfg(test)]
-mod tests {
-    use aws_lambda_events::event::dynamodb::Event as DynamoDbEvent;
-
-    /// The handler `main` runs builds without AWS access, and an empty
-    /// stream batch reports no item failures.
-    #[tokio::test]
-    async fn handler_builds_and_an_empty_batch_has_no_failures() {
-        let handler = super::build_handler().expect("handler builds");
-        let response = handler.handle_stream_event(DynamoDbEvent::default()).await;
-        assert!(response.batch_item_failures.is_empty());
-    }
-}
-
 /// Local uuid helper — avoids taking a direct dep on `uuid` in this
 /// example when the transitive one would work, but also demonstrates
 /// that the instance id is an operator concern.
@@ -137,4 +123,18 @@ fn uuid_v7() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{now:x}-{}", std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use aws_lambda_events::event::dynamodb::Event as DynamoDbEvent;
+
+    /// The handler `main` runs builds without AWS access, and an empty
+    /// stream batch reports no item failures.
+    #[tokio::test]
+    async fn handler_builds_and_an_empty_batch_has_no_failures() {
+        let handler = super::build_handler().expect("handler builds");
+        let response = handler.handle_stream_event(DynamoDbEvent::default()).await;
+        assert!(response.batch_item_failures.is_empty());
+    }
 }
