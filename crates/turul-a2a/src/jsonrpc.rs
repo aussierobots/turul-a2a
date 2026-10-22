@@ -448,17 +448,20 @@ async fn dispatch_subscribe_to_task(
 }
 
 /// SSE whose every `data:` line is
-/// `{"jsonrpc":"2.0","result":{StreamResponse},"id":request_id}`.
+/// `{"jsonrpc":"2.0","result":{StreamResponse},"id":request_id}`; an
+/// error that ends the stream is sent as a final JSON-RPC error response
+/// with the same id.
 fn jsonrpc_sse_response(
     stream: crate::streaming::task_stream::TaskEventStream,
     request_id: Value,
 ) -> axum::response::Response {
-    crate::router::sse_response(stream, move |result| {
-        json!({
+    crate::router::sse_response(stream, move |item| match item {
+        Ok(result) => json!({
             "jsonrpc": "2.0",
             "result": result,
             "id": request_id,
-        })
+        }),
+        Err(e) => e.to_jsonrpc_error(Some(&request_id)),
     })
 }
 

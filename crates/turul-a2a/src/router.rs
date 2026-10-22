@@ -567,7 +567,7 @@ pub(crate) async fn core_send_streaming_message(
     body: String,
 ) -> Result<axum::response::Response, A2aError> {
     let stream = open_send_stream(state, tenant, owner, claims, body).await?;
-    Ok(sse_response(stream, |item| item))
+    Ok(sse_response(stream, http_sse_frame))
 }
 
 pub(crate) async fn core_subscribe_to_task(
@@ -577,30 +577,35 @@ pub(crate) async fn core_subscribe_to_task(
     task_id: &str,
 ) -> Result<axum::response::Response, A2aError> {
     let stream = open_subscribe_stream(state, tenant, owner, task_id).await?;
-    Ok(sse_response(stream, |item| item))
+    Ok(sse_response(stream, http_sse_frame))
+}
+
+/// HTTP+SSE frame: the `StreamResponse` JSON itself, or for an error the
+/// AIP-193 error object an HTTP error response carries.
+fn http_sse_frame(item: Result<serde_json::Value, A2aError>) -> serde_json::Value {
+    item.unwrap_or_else(|e| e.to_http_error_body())
 }
 
 /// Encode a task stream as SSE. Each item becomes one event whose
-/// `data:` is `wrap` applied to the `StreamResponse` JSON
-/// (`{"task": …}` / `{"statusUpdate": …}` / `{"artifactUpdate": …}`).
-/// A storage error ends the stream.
+/// `data:` is `frame` applied to the `StreamResponse` JSON
+/// (`{"task": …}` / `{"statusUpdate": …}` / `{"artifactUpdate": …}`),
+/// or to the error that ended the stream. The core stream stops after an
+/// error, so its error frame is the last one.
 pub(crate) fn sse_response(
     stream: TaskEventStream,
-    wrap: impl Fn(serde_json::Value) -> serde_json::Value + Send + 'static,
+    frame: impl Fn(Result<serde_json::Value, A2aError>) -> serde_json::Value + Send + 'static,
 ) -> axum::response::Response {
     use tokio_stream::StreamExt;
 
-    let events = stream.items.map_while(move |item| {
-        let body = match item.ok()? {
+    let events = stream.items.map(move |item| {
+        let body = item.map(|item| match item {
             StreamItem::Task(task) => {
                 serde_json::json!({"task": serde_json::to_value(&task).unwrap_or_default()})
             }
             StreamItem::Event(event) => serde_json::to_value(&event).unwrap_or_default(),
-        };
-        let data = serde_json::to_string(&wrap(body)).unwrap_or_default();
-        Some(Ok::<_, std::convert::Infallible>(
-            Event::default().data(data),
-        ))
+        });
+        let data = serde_json::to_string(&frame(body)).unwrap_or_default();
+        Ok::<_, std::convert::Infallible>(Event::default().data(data))
     });
     Sse::new(events)
         .keep_alive(KeepAlive::default())

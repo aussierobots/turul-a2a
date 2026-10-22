@@ -11,7 +11,9 @@
 //!   reflects;
 //! - the stream closes after a terminal state or INPUT_REQUIRED (§11.7)
 //!   and stays open across AUTH_REQUIRED, so an out-of-band credential
-//!   can resume work on the same stream (§7.6.1).
+//!   can resume work on the same stream (§7.6.1);
+//! - a storage error is delivered as the last item, after which the
+//!   stream ends; each transport encodes it as that binding's error.
 
 use std::sync::Arc;
 use std::time::Duration;
