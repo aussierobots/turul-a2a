@@ -263,6 +263,9 @@ impl A2aServerBuilder {
     }
 
     /// Read-phase timeout for a push POST.
+    ///
+    /// Accepted but currently has no effect: the whole POST, including
+    /// the read phase, is bounded by [`Self::push_request_timeout`].
     pub fn push_read_timeout(mut self, d: Duration) -> Self {
         self.runtime_config.push_read_timeout = d;
         self
@@ -277,6 +280,10 @@ impl A2aServerBuilder {
     }
 
     /// Push-config cache TTL inside the delivery worker.
+    ///
+    /// Accepted but currently has no effect: the delivery path has no
+    /// config cache and lists configs from storage on every terminal
+    /// event.
     pub fn push_config_cache_ttl(mut self, d: Duration) -> Self {
         self.runtime_config.push_config_cache_ttl = d;
         self
@@ -284,6 +291,10 @@ impl A2aServerBuilder {
 
     /// Retention for failed push delivery records (operator inspection).
     ///
+    /// Accepted but currently has no effect: the framework never prunes
+    /// claim rows. DynamoDB expires them through its own
+    /// `push_delivery_ttl_seconds` item TTL; the SQL and in-memory
+    /// backends keep them until the operator removes them.
     pub fn push_failed_delivery_retention(mut self, d: Duration) -> Self {
         self.runtime_config.push_failed_delivery_retention = d;
         self
@@ -1401,6 +1412,10 @@ mod tests {
             server.state.push_delivery_store.is_none(),
             ".storage() must NOT auto-wire push_delivery_store — push is opt-in via .push_delivery_store()"
         );
+        assert!(
+            server.state.push_dispatcher.is_none(),
+            "no delivery store, no dispatcher"
+        );
     }
 
     #[test]
@@ -1430,6 +1445,10 @@ mod tests {
             .build()
             .expect("build must succeed");
         assert!(server.state.push_delivery_store.is_some());
+        assert!(
+            server.state.push_dispatcher.is_some(),
+            "a wired delivery store gets a dispatcher, so terminal commits fan out"
+        );
     }
 
     // -----------------------------------------------------------------

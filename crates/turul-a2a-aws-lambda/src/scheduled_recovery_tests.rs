@@ -372,43 +372,79 @@ async fn scheduled_sweep_no_work_returns_zero_counts() {
 
 #[tokio::test]
 async fn scheduled_sweep_respects_stale_markers_limit() {
-    // the handler's batch limit MUST cap the number of
-    // markers processed per tick, so a scheduler outage doesn't
-    // produce unbounded work when it recovers.
+    // The batch limit caps the markers processed per tick, so a
+    // scheduler outage doesn't produce unbounded work when it
+    // recovers; markers beyond the limit survive to the next tick.
     let (storage, dispatcher, delivery) = build_stack().await;
 
-    // Seed 5 independent tasks+markers.
-    let mut webhook_urls = Vec::new();
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/webhook"))
         .respond_with(ResponseTemplate::new(200))
-        // up to 2 POSTs allowed; if the limit is ignored we'd see 5.
-        .expect(2)
+        .expect(3)
         .mount(&mock)
         .await;
-    for i in 0..5 {
-        let url = format!("{}/webhook", mock.uri());
+    let url = format!("{}/webhook", mock.uri());
+    for i in 0..3 {
         let _ = seed_task_with_marker(&storage, &url, &format!("task-{i}")).await;
-        webhook_urls.push(url);
     }
 
-    let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery).with_config(
+    let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery.clone()).with_config(
         LambdaScheduledRecoveryConfig {
             stale_cutoff: std::time::Duration::ZERO,
             stale_markers_limit: 2, // cap
             reclaimable_claims_limit: 16,
         },
     );
-    let response = handler.run_sweep().await;
+    let remaining = || async {
+        delivery
+            .list_stale_pending_dispatches(
+                std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+                16,
+            )
+            .await
+            .expect("list")
+            .len()
+    };
 
+    let first = handler.run_sweep().await;
     assert_eq!(
-        response.stale_markers_found, 2,
-        "stale_markers_limit=2 must cap the first-tick batch: {response:?}"
+        first.stale_markers_found, 2,
+        "stale_markers_limit=2 must cap the first-tick batch: {first:?}"
     );
-    assert_eq!(response.stale_markers_recovered, 2);
-    // wiremock's expect(2) assertion fires on Drop.
+    assert_eq!(first.stale_markers_recovered, 2);
+    assert_eq!(mock.received_requests().await.unwrap().len(), 2);
+    assert_eq!(
+        remaining().await,
+        1,
+        "the third marker waits for the next tick"
+    );
+
+    let second = handler.run_sweep().await;
+    assert_eq!(second.stale_markers_found, 1, "{second:?}");
+    assert_eq!(second.stale_markers_recovered, 1);
+    assert_eq!(mock.received_requests().await.unwrap().len(), 3);
+    assert_eq!(remaining().await, 0);
+
+    let third = handler.run_sweep().await;
+    assert_eq!(third.stale_markers_found, 0, "{third:?}");
     drop(mock);
+}
+
+#[test]
+fn readme_states_the_lambda_push_recovery_requirements() {
+    let readme = include_str!("../README.md");
+    for required in [
+        "EventBridge Scheduler",
+        "Mandatory backstop for all backends",
+        "DynamoDB Stream",
+        "with_push_dispatch_enabled(true)",
+    ] {
+        assert!(
+            readme.contains(required),
+            "crate README must state: {required}"
+        );
+    }
 }
 
 // Tiny lints referenced so the `ReclaimableClaim`/`PendingDispatch` imports

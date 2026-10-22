@@ -12,8 +12,8 @@
 //! | Lambda triggers                   | Runner                                         |
 //! |-----------------------------------|------------------------------------------------|
 //! | HTTP only (Function URL / APIGW)  | [`LambdaA2aHandler::run_http_only`]            |
-//! | SQS only (event source mapping)   | [`LambdaA2aHandler::run_sqs_only`] *(`sqs`)*   |
-//! | HTTP **and** SQS on one function  | [`LambdaA2aHandler::run_http_and_sqs`] *(`sqs`)* |
+//! | SQS only (event source mapping)   | `LambdaA2aHandler::run_sqs_only` *(`sqs`)*   |
+//! | HTTP **and** SQS on one function  | `LambdaA2aHandler::run_http_and_sqs` *(`sqs`)* |
 //! | not sure / just run it            | [`LambdaA2aHandler::run`]                      |
 //!
 //! [`LambdaA2aHandler::run`] is the default "it just works" entry
@@ -287,7 +287,7 @@ impl LambdaA2aServerBuilder {
     /// (the router will 404 on a genuinely unknown path, which is the
     /// correct failure mode). Applies to both
     /// [`LambdaA2aHandler::run_http_only`] and
-    /// [`LambdaA2aHandler::run_http_and_sqs`]. SQS events are
+    /// `LambdaA2aHandler::run_http_and_sqs`. SQS events are
     /// unaffected.
     pub fn strip_path_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.path_prefix = Some(prefix.into());
@@ -303,7 +303,7 @@ impl LambdaA2aServerBuilder {
     /// cannot be claimed without supplying the queue.
     ///
     /// Adopters should typically reach for the SQS-specific helper
-    /// [`Self::with_sqs_return_immediately`] instead; this generic
+    /// `Self::with_sqs_return_immediately` instead; this generic
     /// method exists so adopters can inject in-memory fakes for tests
     /// or provide non-SQS transports (Kinesis, Step Functions task
     /// token, self-invoke, etc.).
@@ -473,10 +473,9 @@ impl LambdaA2aServerBuilder {
                 "Storage backend mismatch: task={task_backend}, push={push_backend}, \
                  event={event_backend}, atomic={atomic_backend}, \
                  cancellation_supervisor={supervisor_backend}. \
-  requires all storage traits to share the same backend. \
-  requires the cancellation supervisor on the same backend \
-                 so cross-instance cancel markers are observable. \
-                 Use .storage() for unified backend."
+                 All storage traits, the cancellation supervisor included, \
+                 must share one backend so cross-instance cancel markers \
+                 are observable. Use .storage() for unified backend."
             )));
         }
 
@@ -513,12 +512,14 @@ impl LambdaA2aServerBuilder {
             }
         }
 
-        // §Decision Bug 1: the Lambda execution environment
-        // freezes after the HTTP response is flushed, so any
-        // `tokio::spawn`'d executor continuation is opportunistic only
-        //. Refuse `SendMessageConfiguration.return_immediately
-        // = true` at the `core_send_message` entry point via this
-        // capability flag instead of silently orphaning the executor.
+        // The Lambda execution environment can freeze once the HTTP
+        // response is flushed, so a `tokio::spawn`'d executor
+        // continuation is opportunistic only. Refuse
+        // `SendMessageConfiguration.return_immediately = true` at the
+        // `core_send_message` entry point (UnsupportedOperationError —
+        // an aspect of SendMessage this runtime cannot honour, A2A
+        // v1.0.1 §3.3.2) via this capability flag instead of silently
+        // orphaning the executor.
         //
         // if a durable executor queue is wired via
         // [`Self::with_durable_executor`] (or the SQS helper), the
@@ -544,7 +545,7 @@ impl LambdaA2aServerBuilder {
                     return Err(A2aError::Internal(format!(
                         "Storage backend mismatch: task={task_backend}, \
                          push_delivery={push_delivery_backend}. \
-  requires all storage traits to share the same backend."
+                         All storage traits must share the same backend."
                     )));
                 }
 

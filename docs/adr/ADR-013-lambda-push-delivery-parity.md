@@ -72,6 +72,10 @@
   - **Opt-in atomic gate from rev 3 preserved** — still the right
     fix for the non-push load-bearing problem.
   - **Deleted-task handling from rev 3 preserved** — still correct.
+- **2026-10-22** — §10 test plan mapped to the tests that pin it (no
+  contract change). §10.8, §10.9 and §10.11 gained tests; the crate
+  README now states the `with_push_dispatch_enabled(true)` requirement
+  §10.11 asks for.
 
 ## 1. Context
 
@@ -697,12 +701,16 @@ Parity across all four backends.
 
 - Both handlers invoked on the same marker within milliseconds.
   Claim fencing + marker-delete idempotency yield exactly one POST.
+  Pinned by `stream_recovery_tests::stream_and_scheduler_racing_on_one_marker_post_once`.
 
 ### 10.9 Scheduled worker — scan-and-fan-out
 
 - Seed three stale markers recorded before the cutoff; scheduled
   worker processes all three; three POSTs arrive; three markers
-  cleared.
+  cleared. Pinned by
+  `scheduled_recovery_tests::scheduled_sweep_respects_stale_markers_limit`,
+  which also caps a tick at two markers and shows the third survives
+  to the next tick.
 
 ### 10.10 Scheduled worker — reclaimable claims
 
@@ -713,7 +721,9 @@ Parity across all four backends.
 - README Lambda section calls out: EventBridge Scheduler mandatory;
   DDB Stream recommended on DynamoDB; `push_dispatch_enabled=true`
   required on the atomic store when push_delivery_store is wired.
-- ADR-008 cross-references ADR-013.
+  Pinned by `scheduled_recovery_tests::readme_states_the_lambda_push_recovery_requirements`.
+- ADR-008 cross-references ADR-013 (its header links it; not
+  test-pinned, since the ADRs are not shipped with the crate).
 
 ## 11. Follow-up: amend E.20
 

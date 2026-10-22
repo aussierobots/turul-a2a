@@ -7,15 +7,18 @@
 //!    `false` (AWS Lambda adapter). HTTP 400 / JSON-RPC -32004, no task
 //!    persisted.
 //! 2. Inline `SendMessageConfiguration.task_push_notification_config`
-//!    registered atomically with task creation before executor spawn.
-//!    URL validated up front (no task persisted on parse failure).
+//!    registered with the task before executor spawn, on blocking,
+//!    non-blocking and streaming sends (push configs operate
+//!    independently of execution mode, A2A v1.0.1 §3.2.2). URL
+//!    validated up front (no task persisted on parse failure).
 //!    Storage-side registration failure compensates by transitioning
 //!    the task to `FAILED` with an agent `Message` carrying the reason
-//!    (no executor spawn).
+//!    (no executor spawn) and returns the storage error unchanged.
 //! 3. `SendMessageConfiguration.history_length` honoured on both send
-//!    response paths, preserving the proto tri-state (proto/a2a.proto
-//!    §SendMessageConfiguration): unset = no limit, `0` = empty, `n>0`
-//!    = last n.
+//!    response paths for a continuation whose task already holds
+//!    several messages, preserving the proto tri-state
+//!    (`SendMessageConfiguration.history_length`, a2a.proto:150-154):
+//!    unset = no limit, `0` = empty, `n>0` = last n.
 
 use std::sync::Arc;
 
@@ -33,7 +36,7 @@ use turul_a2a::server::RuntimeConfig;
 use turul_a2a::server::in_flight::InFlightRegistry;
 use turul_a2a::storage::{A2aPushNotificationStorage, A2aStorageError, InMemoryA2aStorage};
 use turul_a2a::streaming::TaskEventBroker;
-use turul_a2a_types::{Message, Part, Role, Task, TaskState};
+use turul_a2a_types::{Message, Task, TaskState};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -125,7 +128,7 @@ fn send_request_body(configuration: serde_json::Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Bug 1 — Lambda gate on return_immediately=true
+// return_immediately=true refused where the runtime cannot honour it
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -153,7 +156,7 @@ async fn send_message_return_immediately_rejected_http() {
     assert_eq!(
         reason,
         Some("UNSUPPORTED_OPERATION"),
-        "error reason must be UNSUPPORTED_OPERATION (ADR-004); got body: {body}"
+        "error reason must be UNSUPPORTED_OPERATION; got body: {body}"
     );
 }
 
@@ -221,7 +224,7 @@ async fn send_message_return_immediately_rejected_persists_no_task() {
 }
 
 // ---------------------------------------------------------------------------
-// Bug 2 — inline push config registration
+// Inline push config registration
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -371,7 +374,7 @@ async fn send_message_inline_push_config_missing_url() {
 }
 
 // ---------------------------------------------------------------------------
-// Bug 2 — storage-failure compensation
+// Inline push config — storage-failure compensation
 // ---------------------------------------------------------------------------
 
 /// Push storage stub that delegates everything to an inner in-memory
@@ -442,8 +445,7 @@ impl A2aPushNotificationStorage for FailingCreatePushStorage {
     }
 }
 
-#[tokio::test]
-async fn send_message_inline_push_config_storage_failure_compensates() {
+async fn inline_push_config_storage_failure_compensates(send_path: &str) {
     let inner = Arc::new(InMemoryA2aStorage::new());
     let failing_push = Arc::new(FailingCreatePushStorage {
         inner: inner.clone(),
@@ -470,19 +472,19 @@ async fn send_message_inline_push_config_storage_failure_compensates() {
     let body = send_request_body(serde_json::json!({
         "taskPushNotificationConfig": {"url": "https://example.test/webhook-fails"},
     }));
-    let req = Request::post("/message:send")
+    let req = Request::post(send_path)
         .header("content-type", "application/json")
         .header("a2a-version", "1.0")
         .body(Body::from(body))
         .unwrap();
     let (status, resp_body) = json_response(router, req).await;
 
-    // The caller sees the registration error rather than a silent
-    // success after compensation.
-    assert!(
-        status >= 400,
-        "storage failure must surface to the caller, got {status}: {resp_body}"
-    );
+    // The caller sees the original registration error, unchanged.
+    let expected = A2aError::from(A2aStorageError::DatabaseError(
+        "simulated push storage outage".into(),
+    ));
+    assert_eq!(status, expected.http_status(), "{send_path}: {resp_body}");
+    assert_eq!(resp_body, expected.to_http_error_body(), "{send_path}");
 
     // The task exists, in FAILED state, with a reason message.
     let page = task_storage
@@ -534,8 +536,86 @@ async fn send_message_inline_push_config_storage_failure_compensates() {
     );
 }
 
+#[tokio::test]
+async fn send_message_inline_push_config_storage_failure_compensates() {
+    inline_push_config_storage_failure_compensates("/message:send").await;
+}
+
+#[tokio::test]
+async fn streaming_send_inline_push_config_storage_failure_compensates() {
+    inline_push_config_storage_failure_compensates("/message:stream").await;
+}
+
+#[tokio::test]
+async fn streaming_send_inline_push_config_registers() {
+    let state = base_state();
+    let push_storage = state.push_storage.clone();
+    let task_storage = state.task_storage.clone();
+    let router = build_router(state);
+
+    let body = send_request_body(serde_json::json!({
+        "taskPushNotificationConfig": {"url": "https://example.test/stream-hook"},
+    }));
+    let req = Request::post("/message:stream")
+        .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let _ = resp.into_body().collect().await.unwrap();
+
+    let page = task_storage
+        .list_tasks(turul_a2a::storage::TaskFilter {
+            tenant: Some(String::new()),
+            owner: Some("anonymous".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.tasks.len(), 1);
+    let task_id = page.tasks[0].id().to_string();
+    let configs = push_storage
+        .list_configs("", &task_id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(configs.configs.len(), 1);
+    assert_eq!(configs.configs[0].url, "https://example.test/stream-hook");
+    assert_eq!(configs.configs[0].task_id, task_id);
+}
+
+#[tokio::test]
+async fn streaming_send_inline_push_config_invalid_url_persists_no_task() {
+    for url in ["not a url", ""] {
+        let state = base_state();
+        let task_storage = state.task_storage.clone();
+        let router = build_router(state);
+
+        let body = send_request_body(serde_json::json!({
+            "taskPushNotificationConfig": {"url": url},
+        }));
+        let req = Request::post("/message:stream")
+            .header("content-type", "application/json")
+            .header("a2a-version", "1.0")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _body) = json_response(router, req).await;
+        assert_eq!(status, 400, "url {url:?}");
+
+        let page = task_storage
+            .list_tasks(turul_a2a::storage::TaskFilter {
+                tenant: Some(String::new()),
+                owner: Some("anonymous".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(page.tasks.is_empty(), "url {url:?}: no task persisted");
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Bug 3 — history_length tri-state
+// history_length tri-state
 // ---------------------------------------------------------------------------
 
 async fn send_and_get_task(router: Router, body: String) -> serde_json::Value {
@@ -549,7 +629,49 @@ async fn send_and_get_task(router: Router, body: String) -> serde_json::Value {
     resp
 }
 
-fn send_with_history_length(hl: Option<i32>, return_immediately: bool) -> String {
+/// Asks for more input on every turn except one whose text is
+/// "finish", which completes. Lets a test build up a task history
+/// across several turns.
+struct MultiTurnExecutor;
+
+#[async_trait]
+impl AgentExecutor for MultiTurnExecutor {
+    async fn execute(
+        &self,
+        task: &mut Task,
+        msg: &Message,
+        _ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        let state = if msg.joined_text() == "finish" {
+            turul_a2a_proto::TaskState::Completed
+        } else {
+            turul_a2a_proto::TaskState::InputRequired
+        };
+        let mut proto = task.as_proto().clone();
+        proto.status = Some(turul_a2a_proto::TaskStatus {
+            state: state.into(),
+            message: None,
+            timestamp: None,
+        });
+        *task = Task::try_from(proto).unwrap();
+        Ok(())
+    }
+
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        NoOpExecutor.agent_card()
+    }
+}
+
+fn turn_body(
+    task_id: Option<&str>,
+    text: &str,
+    hl: Option<i32>,
+    return_immediately: bool,
+) -> String {
+    let mut message = message_body(text);
+    if let Some(id) = task_id {
+        message["taskId"] = serde_json::Value::from(id);
+    }
     let mut configuration = serde_json::Map::new();
     if return_immediately {
         configuration.insert("returnImmediately".into(), serde_json::Value::Bool(true));
@@ -557,83 +679,236 @@ fn send_with_history_length(hl: Option<i32>, return_immediately: bool) -> String
     if let Some(n) = hl {
         configuration.insert("historyLength".into(), serde_json::Value::from(n));
     }
-    serde_json::json!({
-        "message": message_body("hello"),
-        "configuration": configuration,
-    })
-    .to_string()
+    serde_json::json!({"message": message, "configuration": configuration}).to_string()
+}
+
+/// Run three INPUT_REQUIRED turns, then a fourth turn with `hl` and
+/// `return_immediately`. Returns the fourth response's history and
+/// the task's full stored history afterwards.
+async fn continuation_history(
+    hl: Option<i32>,
+    return_immediately: bool,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let mut state = base_state();
+    state.executor = Arc::new(MultiTurnExecutor);
+    let task_storage = state.task_storage.clone();
+    let in_flight = state.in_flight.clone();
+    let router = build_router(state);
+
+    let first = send_and_get_task(router.clone(), turn_body(None, "one", None, false)).await;
+    let task_id = first
+        .pointer("/task/id")
+        .and_then(|v| v.as_str())
+        .expect("task id")
+        .to_string();
+    for text in ["two", "three", "finish"] {
+        // A follow-up is accepted once the previous turn's executor
+        // has returned.
+        let start = std::time::Instant::now();
+        while !in_flight.is_empty() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(2));
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let (hl, ri) = if text == "finish" {
+            (hl, return_immediately)
+        } else {
+            (None, false)
+        };
+        let resp = send_and_get_task(router.clone(), turn_body(Some(&task_id), text, hl, ri)).await;
+        if text == "finish" {
+            let history = resp
+                .pointer("/task/history")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let full = task_storage
+                .get_task("", &task_id, "anonymous", None)
+                .await
+                .unwrap()
+                .expect("task")
+                .history()
+                .iter()
+                .map(|m| serde_json::to_value(m).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                full.len(),
+                4,
+                "three prior user turns plus the current one are in the history"
+            );
+            return (history, full);
+        }
+    }
+    unreachable!()
 }
 
 #[tokio::test]
 async fn send_message_history_length_zero_empties_response() {
-    // Wire-contract anchor: Some(0) must EMPTY the response history,
-    // NOT fall through to "no limit" (proto a2a.proto:150-154;
-    // storage/postgres.rs:212-222).
-    let router = build_router(base_state());
-    let resp = send_and_get_task(router, send_with_history_length(Some(0), false)).await;
-    let history = resp
-        .pointer("/task/history")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    assert!(
-        history.is_empty(),
-        "historyLength=0 must return empty history, got {} entries",
-        history.len()
-    );
+    // Some(0) must EMPTY the response history, not fall through to
+    // "no limit" (a2a.proto:150-154).
+    let (history, _full) = continuation_history(Some(0), false).await;
+    assert!(history.is_empty(), "got {} entries", history.len());
 }
 
 #[tokio::test]
 async fn send_message_history_length_unset_is_unbounded() {
-    // Wire-contract anchor: omitting historyLength must NOT truncate
-    // (proto: "unset value means the client does not impose any limit").
-    let router = build_router(base_state());
-    let resp = send_and_get_task(router, send_with_history_length(None, false)).await;
-    let history = resp
-        .pointer("/task/history")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    assert!(
-        !history.is_empty(),
-        "unset historyLength must return the user message; got empty history"
-    );
+    // "An unset value means the client does not impose any limit."
+    let (history, full) = continuation_history(None, false).await;
+    assert_eq!(history, full, "the whole history is returned");
 }
 
 #[tokio::test]
 async fn send_message_history_length_one_return_immediately() {
-    // historyLength=1 on return_immediately path: one message retained.
-    let router = build_router(base_state());
-    let resp = send_and_get_task(router, send_with_history_length(Some(1), true)).await;
-    let history = resp
-        .pointer("/task/history")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let (history, full) = continuation_history(Some(1), true).await;
+    assert_eq!(history.len(), 1);
+    let stored_at_return = &history[0];
+    assert!(
+        full.contains(stored_at_return),
+        "the returned message comes from the task history"
+    );
     assert_eq!(
-        history.len(),
-        1,
-        "historyLength=1 must trim to one message; got {} entries",
-        history.len()
+        stored_at_return
+            .pointer("/parts/0/text")
+            .and_then(|v| v.as_str()),
+        Some("finish"),
+        "the most recent message is kept: {stored_at_return}"
     );
 }
 
 #[tokio::test]
 async fn send_message_history_length_one_blocking() {
-    // historyLength=1 on blocking-send path: same truncation contract.
-    let router = build_router(base_state());
-    let resp = send_and_get_task(router, send_with_history_length(Some(1), false)).await;
-    let history = resp
-        .pointer("/task/history")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let (history, full) = continuation_history(Some(1), false).await;
     assert_eq!(history.len(), 1);
+    assert_eq!(&history[0], full.last().unwrap(), "the most recent message");
 }
 
-// Unused helpers silence warnings when the test suite is compiled with
-// a subset of features — keep them referenced.
-#[allow(dead_code)]
-fn _use_unused() {
-    let _ = (Part::text("x"), Role::User);
+// ---------------------------------------------------------------------------
+// Inline push config over gRPC — the same shared registration path.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "grpc")]
+mod grpc_inline_push_config {
+    use super::*;
+    use tokio_stream::StreamExt;
+    use turul_a2a_proto::grpc::A2aServiceClient;
+
+    async fn serve() -> (
+        A2aServiceClient<tonic::transport::Channel>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let server = turul_a2a::server::A2aServer::builder()
+            .executor(NoOpExecutor)
+            .storage(InMemoryA2aStorage::new())
+            .bind(([127, 0, 0, 1], 0))
+            .build()
+            .expect("build");
+        let router = server.into_tonic_router();
+        let handle = tokio::spawn(async move {
+            let _ = router
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await;
+        });
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}")).unwrap();
+        let start = std::time::Instant::now();
+        let channel = loop {
+            match endpoint.connect().await {
+                Ok(c) => break c,
+                Err(e) if start.elapsed() < std::time::Duration::from_secs(5) => {
+                    let _ = e;
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("connect: {e}"),
+            }
+        };
+        (A2aServiceClient::new(channel), handle)
+    }
+
+    fn request(url: &str) -> turul_a2a_proto::SendMessageRequest {
+        turul_a2a_proto::SendMessageRequest {
+            message: Some(turul_a2a_proto::Message {
+                message_id: uuid::Uuid::now_v7().to_string(),
+                role: turul_a2a_proto::Role::User.into(),
+                parts: vec![turul_a2a_proto::Part {
+                    content: Some(turul_a2a_proto::part::Content::Text("hello".into())),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            configuration: Some(turul_a2a_proto::SendMessageConfiguration {
+                task_push_notification_config: Some(turul_a2a_proto::TaskPushNotificationConfig {
+                    url: url.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    async fn registered_urls(
+        client: &mut A2aServiceClient<tonic::transport::Channel>,
+        task_id: &str,
+    ) -> Vec<String> {
+        client
+            .list_task_push_notification_configs(tonic::Request::new(
+                turul_a2a_proto::ListTaskPushNotificationConfigsRequest {
+                    task_id: task_id.into(),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("list configs")
+            .into_inner()
+            .configs
+            .into_iter()
+            .map(|c| c.url)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn send_message_inline_push_config_grpc() {
+        let (mut client, handle) = serve().await;
+        let resp = client
+            .send_message(tonic::Request::new(request(
+                "https://example.test/grpc-hook",
+            )))
+            .await
+            .expect("send")
+            .into_inner();
+        let task_id = match resp.payload {
+            Some(turul_a2a_proto::send_message_response::Payload::Task(t)) => t.id,
+            other => panic!("expected a task, got {other:?}"),
+        };
+        assert_eq!(
+            registered_urls(&mut client, &task_id).await,
+            vec!["https://example.test/grpc-hook".to_string()]
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn send_streaming_message_inline_push_config_grpc() {
+        let (mut client, handle) = serve().await;
+        let mut stream = client
+            .send_streaming_message(tonic::Request::new(request(
+                "https://example.test/grpc-stream-hook",
+            )))
+            .await
+            .expect("stream")
+            .into_inner();
+        let first = stream.next().await.expect("first item").expect("ok item");
+        let task_id = match first.payload {
+            Some(turul_a2a_proto::stream_response::Payload::Task(t)) => t.id,
+            other => panic!("stream opens with the task, got {other:?}"),
+        };
+        while stream.next().await.is_some() {}
+        assert_eq!(
+            registered_urls(&mut client, &task_id).await,
+            vec!["https://example.test/grpc-stream-hook".to_string()]
+        );
+        handle.abort();
+    }
 }

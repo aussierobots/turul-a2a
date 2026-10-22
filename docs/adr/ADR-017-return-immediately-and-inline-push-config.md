@@ -1,6 +1,6 @@
 # ADR-017: `return_immediately` Lambda Gate, Inline `task_push_notification_config`, and `history_length` on SendMessage
 
-- **Status:** Accepted
+- **Status:** Accepted, amended 2026-10-22 (see the revision log)
 - **Date:** 2026-04-24
 
 ## Context
@@ -29,7 +29,11 @@ Add a boolean field `supports_return_immediately: bool` to `RuntimeConfig` (`cra
 
 Chosen over a Lambda-adapter pre-filter because `AppState.runtime_config` is already threaded into `core_send_message`; adding a field costs one `bool` read on the hot path. A pre-filter would require parsing the request body twice and cannot be unit-tested without the Lambda crate.
 
+**Spec justification (added 2026-10-22).** A2A v1.0.1 §3.2.2 says a non-blocking send "MUST return immediately after creating the task, even if processing is still in progress" — the promise behind the flag is that processing continues after the return. A Lambda invocation can be frozen as soon as its response is flushed, so without a durable queue that promise cannot be kept; accepting the flag would return a task that may never progress. §3.3.2 defines `UnsupportedOperationError` as "The requested operation or **a specific aspect of it** is not supported by this server agent implementation": non-blocking execution is an aspect of SendMessage this runtime does not support, so refusing it with that error, before any write, is the spec's own signal. Blocking SendMessage remains fully supported on Lambda. When a durable executor queue is wired (`LambdaA2aServerBuilder::with_durable_executor`, or `with_sqs_return_immediately` under the `sqs` feature — ADR-018), processing does survive the return and the capability is turned back on.
+
 ### Bug 2 — Inline push config registration with tight failure semantics
+
+> **Amendment 2026-10-22.** A2A v1.0.1 §3.2.2: `return_immediately` has no effect "on configured push notification configurations, which operates independently of execution mode". The inline config is therefore honoured on **SendStreamingMessage** too, not only SendMessage. Both `core_send_message` (blocking and non-blocking) and `open_send_stream` (streaming, every transport) run the same two helpers in `router.rs`: `inline_push_config` (step 1, before any write) and `register_inline_push_config` (steps 4–5, after the turn starts and before the executor is spawned). The FAILED compensation is one function, `fail_unstarted_task`, shared with ADR-018's enqueue-failure path.
 
 The registration is inserted into `core_send_message` with this ordering, explicitly addressing the partial-persistence risk:
 
@@ -80,7 +84,7 @@ In scope:
 Explicitly deferred:
 
 - `accepted_output_modes` — executor-contract design question.
-- Durable Lambda continuation (Step Functions / SQS / EventBridge) that would allow `return_immediately=true` on Lambda. Separate ADR when demand materialises.
+- Durable Lambda continuation (Step Functions / SQS / EventBridge) that would allow `return_immediately=true` on Lambda. Since delivered by ADR-018 (SQS, plus the `DurableExecutorQueue` trait).
 - Transactional `create_task_with_push_config` on `A2aAtomicStore`.
 
 ## Compliance
@@ -97,33 +101,34 @@ Explicitly deferred:
 
 ## Test obligations
 
+> **Amended 2026-10-22.** The tests below are named as they exist. Core-crate tests are in `crates/turul-a2a/tests/adr017_tests.rs` unless another file is given; Lambda tests are in `crates/turul-a2a-aws-lambda/src/builder_tests.rs`.
+
 **New — Lambda gate (HTTP + JSON-RPC only; gRPC on Lambda is out of scope):**
 
-- `turul_a2a_aws_lambda::tests::send_message_return_immediately_rejected_http` — HTTP `POST /message:send` through a `LambdaA2aHandler`-backed router with `configuration.returnImmediately=true` returns HTTP 400 with `ErrorInfo.reason=UNSUPPORTED_OPERATION`.
-- `turul_a2a_aws_lambda::tests::send_message_return_immediately_rejected_jsonrpc` — JSON-RPC `POST /jsonrpc` with method `SendMessage`, same assertion.
+- `builder_tests::build_disables_return_immediately_without_durable_executor` — `LambdaA2aServerBuilder::build` leaves `supports_return_immediately = false` even when the supplied runtime config asks for it; through the handler, HTTP `POST /message:send` with `returnImmediately=true` returns 400 with `ErrorInfo.reason=UNSUPPORTED_OPERATION`, JSON-RPC `SendMessage` returns `-32004`, and no task is persisted.
+- `builder_tests::build_enables_return_immediately_with_durable_executor` — with a durable executor queue the flag is `true` and the same send returns a WORKING task whose turn was enqueued. `builder_tests::with_sqs_return_immediately_enables_the_capability` (feature `sqs`) does the same for the SQS helper.
+- Router level, any runtime with the flag off: `send_message_return_immediately_rejected_{http,jsonrpc,persists_no_task}`.
 
-**New — inline push config (all three transports):**
+**New — inline push config (all three transports, blocking and streaming):**
 
-- `turul_a2a::tests::spec_compliance::send_message_inline_push_config_http` — HTTP send with `configuration.taskPushNotificationConfig.url` set; after send, `GET /tasks/{id}/pushNotificationConfigs` returns the registered config.
-- `turul_a2a::tests::spec_compliance::send_message_inline_push_config_jsonrpc` — JSON-RPC parity.
-- `turul_a2a::tests::spec_compliance::send_message_inline_push_config_grpc` — gated on `#[cfg(feature = "grpc")]`; gRPC `SendMessage` registers inline config; confirmed via a subsequent gRPC `ListTaskPushNotificationConfig`.
-- `turul_a2a::tests::spec_compliance::send_message_inline_push_config_invalid_url` — HTTP send with `task_push_notification_config.url = "not a url"`. Asserts:
-  1. Response is HTTP 400.
-  2. **No task row is persisted** (list tasks for the tenant returns 0 new rows; direct storage inspection confirms).
-  This is the P1 failure-semantics anchor.
-- `turul_a2a::tests::spec_compliance::send_message_inline_push_config_storage_failure_compensates` — injects a push-storage stub that rejects `create_config`; sends a valid inline config. Asserts:
-  1. Caller sees the registration error.
+- `send_message_inline_push_config_http` / `_jsonrpc` — the send registers the config against the new task.
+- `grpc_inline_push_config::send_message_inline_push_config_grpc` and `::send_streaming_message_inline_push_config_grpc` (feature `grpc`) — confirmed via gRPC `ListTaskPushNotificationConfigs`.
+- `streaming_send_inline_push_config_registers` — HTTP `SendStreamingMessage` registers it too.
+- `send_message_inline_push_config_invalid_url`, `send_message_inline_push_config_missing_url`, `streaming_send_inline_push_config_invalid_url_persists_no_task` — HTTP 400 and **no task row persisted**. This is the P1 failure-semantics anchor.
+- `send_message_inline_push_config_storage_failure_compensates` and `streaming_send_inline_push_config_storage_failure_compensates` — a push-storage stub rejects `create_config`. Asserts:
+  1. The caller receives the original storage error unchanged: HTTP status and body equal `A2aError::from(<the storage error>)`'s.
   2. Task exists in storage in `TASK_STATE_FAILED`.
-  3. The task's terminal `status.message` is an agent `Message` whose `Part::text` payload contains the substring `inline push notification config registration failed`. (`TaskStatus` has no `reason` field; the reason rides on the terminal status message per the pattern at `router.rs:1034-1054`.)
-  4. Executor was never spawned (in-flight registry count unchanged).
+  3. The task's terminal `status.message` is an agent `Message` whose text contains `inline push notification config registration failed`.
+  4. Executor was never spawned (in-flight registry empty).
   This is the P1 compensation anchor.
+- Delivery end to end with a real `push_delivery_store`: `push_dispatcher_server_tests::inline_push_config_on_{blocking,streaming}_send_delivers_one_terminal_post` — the receiver gets exactly one POST, the terminal one.
 
-**New — `history_length` (three-valued per proto `a2a.proto:150-154`):**
+**New — `history_length` (three-valued per proto `a2a.proto:150-154`).** Each test runs a continuation: two INPUT_REQUIRED turns, then a third turn carrying `historyLength`, so the task holds at least three messages.
 
-- `turul_a2a::tests::spec_compliance::send_message_respects_history_length_return_immediately` — continuation whose task has ≥3 historical messages; `configuration.historyLength = 1`. Asserts response task's `history.len() == 1`.
-- `turul_a2a::tests::spec_compliance::send_message_respects_history_length_blocking` — same assertion on the blocking send path.
-- `turul_a2a::tests::spec_compliance::send_message_history_length_zero_empties_response` — continuation whose task has ≥2 historical messages; `configuration.historyLength = 0`. Asserts response task's `history.len() == 0`. This is the wire-contract anchor that prevents collapsing `Some(0)` to `None`.
-- `turul_a2a::tests::spec_compliance::send_message_history_length_unset_is_unbounded` — continuation whose task has ≥3 historical messages; `configuration` omits `historyLength` entirely. Asserts response task's `history` is returned without truncation.
+- `send_message_history_length_one_return_immediately` — `historyLength = 1` on the non-blocking path: exactly one message, the latest.
+- `send_message_history_length_one_blocking` — same on the blocking path: exactly one message, equal to the last of the stored history.
+- `send_message_history_length_zero_empties_response` — `historyLength = 0`: empty history. The wire-contract anchor that prevents collapsing `Some(0)` to `None`.
+- `send_message_history_length_unset_is_unbounded` — `historyLength` omitted: the response history equals the full stored history.
 
 **Adapted (no modification required):**
 
@@ -135,7 +140,7 @@ Adopters on Lambda:
 
 > `return_immediately=true` on `SendMessage` now returns `UnsupportedOperationError` (HTTP 400 / JSON-RPC -32004) when the server is built with `LambdaA2aServerBuilder`. Previously the flag was silently accepted but the background executor had no guarantee of completing in the Lambda execution environment (ADR-008, ADR-013 §4.4). If your client sets `returnImmediately: true`, remove the flag for Lambda deployments or submit with `returnImmediately: false` for blocking send (respecting the API Gateway 29s upper bound). No action is required for non-Lambda deployments.
 >
-> `SendMessageConfiguration.taskPushNotificationConfig` inline push configs supplied on `SendMessage` are now registered with the newly-created task on all runtimes (HTTP, JSON-RPC, gRPC). If the URL is malformed, the send request fails with HTTP 400 before the task is persisted. If push-storage registration fails after the task was created, the task is transitioned to `TASK_STATE_FAILED` with reason `inline_push_config_registration_failed` and the error is returned to the caller. Callers that previously worked around the silent drop with a separate `CreateTaskPushNotificationConfig` round-trip may remove that workaround.
+> `SendMessageConfiguration.taskPushNotificationConfig` inline push configs supplied on `SendMessage` or `SendStreamingMessage` are now registered with the task on all runtimes (HTTP, JSON-RPC, gRPC). If the URL is malformed, the send request fails with HTTP 400 before the task is persisted. If push-storage registration fails after the task was created, the task is transitioned to `TASK_STATE_FAILED` with a status message reading `inline push notification config registration failed: <error>` and the storage error is returned to the caller. Callers that previously worked around the silent drop with a separate `CreateTaskPushNotificationConfig` round-trip may remove that workaround.
 >
 > `SendMessageConfiguration.historyLength` now trims response message history on both `return_immediately=true` and blocking send responses, matching the behavior on `GetTask`. The three-valued semantic matches the proto (`a2a.proto:150-154`): **unset** means no limit (return the full history), **`0`** means return no messages (empty `history`), and **`n > 0`** means return the last `n` messages. Callers that relied on receiving the full history regardless of the flag must omit `historyLength` — setting it to `0` now correctly clears the response history per the proto contract.
 
@@ -166,3 +171,7 @@ Adopters on Lambda:
 **Collapse `Some(0)` to `None` for `history_length`.** An earlier draft of this ADR proposed `if c.history_length > 0 { Some(c.history_length) } else { None }` as the extraction rule. Rejected: the proto (`a2a.proto:150-154`) explicitly distinguishes unset (no limit) from `Some(0)` (empty), and the storage layer's `trim_task` handles them differently (`storage/postgres.rs:212-222`). Collapsing them is a wire-contract regression. The three-case test matrix (`unset`, `0`, `n>0`) is non-negotiable for this ADR.
 
 **Carry the FAILED reason on a dedicated `reason` field.** An earlier draft referred to a `reason` property on `TaskStatus`. Rejected: no such field exists. `TaskStatus` is `{state, message, timestamp}` (`crates/turul-a2a-types/src/task.rs:81-99`). The framework-wide pattern at `router.rs:1034-1054` puts the reason in an agent `Message` attached via `with_message`; this ADR follows that pattern and asserts on the message text in tests.
+
+## Revision log
+
+- 2026-10-22 — Bug 1: recorded the spec justification for refusing `return_immediately` on Lambda (A2A v1.0.1 §3.3.2 "a specific aspect of it is not supported") and that ADR-018's durable executor turns the capability back on. Bug 2: inline push config now also honoured on `SendStreamingMessage` (§3.2.2, "operates independently of execution mode") through helpers shared with `SendMessage`; the compensation returns the original storage error unchanged. Test obligations renamed to the tests that exist, the Lambda gate tested through `LambdaA2aServerBuilder::build`, `history_length` tests moved onto real continuations, gRPC inline-config tests added. Migration text corrected to the actual status-message wording.

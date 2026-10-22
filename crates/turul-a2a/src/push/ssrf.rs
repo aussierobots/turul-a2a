@@ -174,36 +174,32 @@ pub fn validate_scheme(url: &Url, allow_insecure: bool) -> Result<(), SsrfBlockR
     }
 }
 
-/// Apply the SSRF decision to a parsed URL with a pre-resolved list
-/// of destination IPs.
-///
-/// Callers: the delivery worker resolves the hostname (via a
-/// single `tokio::net::lookup_host` or an injected DNS resolver for
-/// testability), passes the resolved IPs here, and receives either
-/// `Allow { resolved_ip }` — which the worker then uses to open a
-/// connection directly to that IP — or `Block(reason)`.
-///
-/// The allowlist validator, if present, runs BEFORE DNS; it sees
-/// the URL pre-resolution so deployments can reject by hostname
-/// regardless of how it resolves.
-pub fn decide(
+/// The checks that need no DNS answer: the URL has a host, its
+/// scheme is allowed, and the operator allowlist validator (if any)
+/// accepts it. The delivery worker runs these BEFORE resolving the
+/// hostname, so a URL the deployment refuses never causes a DNS
+/// query either.
+pub fn check_url(
     url: &Url,
-    resolved_ips: &[IpAddr],
     allow_insecure: bool,
     outbound_validator: Option<&OutboundUrlValidator>,
-) -> SsrfDecision {
-    // URL shape: must have a host.
+) -> Result<(), SsrfBlockReason> {
     if url.host_str().is_none() {
-        return SsrfDecision::Block(SsrfBlockReason::InvalidUrl);
+        return Err(SsrfBlockReason::InvalidUrl);
     }
-    if let Err(reason) = validate_scheme(url, allow_insecure) {
-        return SsrfDecision::Block(reason);
-    }
+    validate_scheme(url, allow_insecure)?;
     if let Some(validator) = outbound_validator
         && validator(url).is_err()
     {
-        return SsrfDecision::Block(SsrfBlockReason::ValidatorDenied);
+        return Err(SsrfBlockReason::ValidatorDenied);
     }
+    Ok(())
+}
+
+/// Choose the IP the worker connects to from one DNS answer: the
+/// first address outside the blocklist. The worker connects to that
+/// IP directly, so a later DNS answer cannot swap the destination.
+pub fn pick_destination(resolved_ips: &[IpAddr], allow_insecure: bool) -> SsrfDecision {
     // Pick the first IP that passes the blocklist. When
     // `allow_insecure` is true we also bypass the blocklist so
     // `http://127.0.0.1` works in local tests.
@@ -343,33 +339,31 @@ mod tests {
     }
 
     #[test]
-    fn decide_allows_public_https() {
+    fn public_https_url_and_public_ip_are_allowed() {
         let url = Url::parse("https://webhook.example.com/deliver").unwrap();
+        assert_eq!(check_url(&url, false, None), Ok(()));
         let ips = vec![ipv4(203, 0, 113, 10)];
         assert!(matches!(
-            decide(&url, &ips, false, None),
-            SsrfDecision::Allow { .. }
+            pick_destination(&ips, false),
+            SsrfDecision::Allow { resolved_ip } if resolved_ip == ipv4(203, 0, 113, 10)
         ));
     }
 
     #[test]
-    fn decide_blocks_private_ip() {
-        let url = Url::parse("https://metadata.attacker.example/").unwrap();
+    fn pick_destination_blocks_private_ip() {
         let ips = vec![ipv4(169, 254, 169, 254)];
         assert!(matches!(
-            decide(&url, &ips, false, None),
+            pick_destination(&ips, false),
             SsrfDecision::Block(SsrfBlockReason::PrivateIp)
         ));
     }
 
     #[test]
-    fn decide_prefers_first_public_ip_when_mixed() {
-        // DNS answer with a private IP first, a public IP second.
-        // The guard should pick the public one rather than block
-        // outright — "first passing IP" rule.
-        let url = Url::parse("https://webhook.example.com/").unwrap();
+    fn pick_destination_prefers_first_public_ip_when_mixed() {
+        // DNS answer with a private IP first, a public IP second: the
+        // public one is chosen rather than blocking outright.
         let ips = vec![ipv4(10, 0, 0, 5), ipv4(203, 0, 113, 10)];
-        match decide(&url, &ips, false, None) {
+        match pick_destination(&ips, false) {
             SsrfDecision::Allow { resolved_ip } => {
                 assert_eq!(resolved_ip, ipv4(203, 0, 113, 10));
             }
@@ -378,26 +372,26 @@ mod tests {
     }
 
     #[test]
-    fn decide_allows_private_in_insecure_mode() {
+    fn insecure_mode_allows_http_and_private_ip() {
         let url = Url::parse("http://localhost:3000/").unwrap();
+        assert_eq!(check_url(&url, true, None), Ok(()));
         let ips = vec![ipv4(127, 0, 0, 1)];
         assert!(matches!(
-            decide(&url, &ips, true, None),
-            SsrfDecision::Allow { .. }
+            pick_destination(&ips, true),
+            SsrfDecision::Allow { resolved_ip } if resolved_ip == ipv4(127, 0, 0, 1)
         ));
     }
 
     #[test]
-    fn decide_empty_dns_is_blocked() {
-        let url = Url::parse("https://nothing.example/").unwrap();
+    fn pick_destination_empty_dns_is_blocked() {
         assert!(matches!(
-            decide(&url, &[], false, None),
+            pick_destination(&[], false),
             SsrfDecision::Block(SsrfBlockReason::DnsResolutionFailed)
         ));
     }
 
     #[test]
-    fn decide_respects_outbound_validator() {
+    fn check_url_respects_outbound_validator() {
         let url = Url::parse("https://evil.attacker.com/").unwrap();
         let validator: OutboundUrlValidator = Arc::new(|u: &Url| {
             if u.host_str() == Some("webhook.example.com") {
@@ -409,38 +403,32 @@ mod tests {
                 ))
             }
         });
-        let ips = vec![ipv4(203, 0, 113, 10)];
-        assert!(matches!(
-            decide(&url, &ips, false, Some(&validator)),
-            SsrfDecision::Block(SsrfBlockReason::ValidatorDenied)
-        ));
+        assert_eq!(
+            check_url(&url, false, Some(&validator)),
+            Err(SsrfBlockReason::ValidatorDenied)
+        );
 
         // And the allowed host goes through.
         let ok_url = Url::parse("https://webhook.example.com/").unwrap();
-        assert!(matches!(
-            decide(&ok_url, &ips, false, Some(&validator)),
-            SsrfDecision::Allow { .. }
-        ));
+        assert_eq!(check_url(&ok_url, false, Some(&validator)), Ok(()));
     }
 
     #[test]
-    fn decide_rejects_non_https_in_production() {
+    fn check_url_rejects_non_https_in_production() {
         let url = Url::parse("http://webhook.example.com/").unwrap();
-        let ips = vec![ipv4(203, 0, 113, 10)];
-        assert!(matches!(
-            decide(&url, &ips, false, None),
-            SsrfDecision::Block(SsrfBlockReason::InsecureScheme)
-        ));
+        assert_eq!(
+            check_url(&url, false, None),
+            Err(SsrfBlockReason::InsecureScheme)
+        );
     }
 
     #[test]
-    fn decide_rejects_malformed_url() {
-        // `data:` URLs have no host; url crate allows parsing.
+    fn check_url_rejects_url_without_host() {
+        // `data:` URLs have no host; the url crate still parses them.
         let url = Url::parse("data:text/plain,hello").unwrap();
-        let ips = vec![ipv4(203, 0, 113, 10)];
-        assert!(matches!(
-            decide(&url, &ips, false, None),
-            SsrfDecision::Block(SsrfBlockReason::InvalidUrl)
-        ));
+        assert_eq!(
+            check_url(&url, false, None),
+            Err(SsrfBlockReason::InvalidUrl)
+        );
     }
 }

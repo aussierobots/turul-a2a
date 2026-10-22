@@ -193,6 +193,120 @@ mod tests {
         );
     }
 
+    /// Convert a raw API Gateway event the way the Lambda runtime does.
+    fn lambda_request_from_event(event: serde_json::Value) -> lambda_http::Request {
+        let req: lambda_http::request::LambdaRequest =
+            serde_json::from_value(event).expect("valid API Gateway event");
+        req.into()
+    }
+
+    /// The trust boundary: an authorizer value API Gateway put in
+    /// `requestContext` reaches the router as `x-authorizer-*`, while a
+    /// client-sent header of the same name — or any other
+    /// `x-authorizer-*` header — is dropped.
+    #[test]
+    fn apigw_v2_jwt_claims_survive_and_forged_headers_are_stripped() {
+        let event = serde_json::json!({
+            "version": "2.0",
+            "routeKey": "POST /message:send",
+            "rawPath": "/message:send",
+            "rawQueryString": "",
+            "headers": {
+                "content-type": "application/json",
+                "x-authorizer-sub": "forged-admin",
+                "x-authorizer-role": "superuser"
+            },
+            "requestContext": {
+                "accountId": "000000000000",
+                "apiId": "api",
+                "authorizer": {"jwt": {"claims": {"sub": "legit-user"}, "scopes": null}},
+                "domainName": "fake.execute-api",
+                "domainPrefix": "fake",
+                "http": {
+                    "method": "POST",
+                    "path": "/message:send",
+                    "protocol": "HTTP/1.1",
+                    "sourceIp": "127.0.0.1",
+                    "userAgent": "test"
+                },
+                "requestId": "rid",
+                "routeKey": "POST /message:send",
+                "stage": "$default",
+                "time": "01/Jan/2026:00:00:00 +0000",
+                "timeEpoch": 1_735_689_600_000i64
+            },
+            "body": "{}",
+            "isBase64Encoded": false
+        });
+
+        let axum_req = lambda_to_axum_request(lambda_request_from_event(event)).unwrap();
+        let values = |name: &str| -> Vec<String> {
+            axum_req
+                .headers()
+                .get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(values("x-authorizer-sub"), vec!["legit-user".to_string()]);
+        assert!(values("x-authorizer-role").is_empty(), "forged header kept");
+        assert_eq!(values("content-type"), vec!["application/json".to_string()]);
+    }
+
+    #[test]
+    fn apigw_v1_authorizer_context_survives_and_forged_headers_are_stripped() {
+        let event = serde_json::json!({
+            "resource": "/{proxy+}",
+            "path": "/message:send",
+            "httpMethod": "POST",
+            "headers": {
+                "content-type": "application/json",
+                "x-authorizer-principalid": "forged-admin",
+                "x-authorizer-role": "superuser"
+            },
+            "multiValueHeaders": {},
+            "queryStringParameters": null,
+            "multiValueQueryStringParameters": null,
+            "pathParameters": {"proxy": "message:send"},
+            "stageVariables": null,
+            "requestContext": {
+                "accountId": "000000000000",
+                "apiId": "abc123",
+                "authorizer": {"principalId": "legit-principal"},
+                "domainName": "fake.execute-api",
+                "domainPrefix": "fake",
+                "extendedRequestId": "xrid",
+                "httpMethod": "POST",
+                "identity": {"sourceIp": "127.0.0.1", "userAgent": "test"},
+                "path": "/message:send",
+                "protocol": "HTTP/1.1",
+                "requestId": "rid",
+                "requestTime": "01/Jan/2026:00:00:00 +0000",
+                "requestTimeEpoch": 1_735_689_600_000i64,
+                "resourceId": "rsrc",
+                "resourcePath": "/{proxy+}",
+                "stage": "$default"
+            },
+            "body": "{}",
+            "isBase64Encoded": false
+        });
+
+        let axum_req = lambda_to_axum_request(lambda_request_from_event(event)).unwrap();
+        let values = |name: &str| -> Vec<String> {
+            axum_req
+                .headers()
+                .get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(
+            values("x-authorizer-principalid"),
+            vec!["legit-principal".to_string()]
+        );
+        assert!(values("x-authorizer-role").is_empty(), "forged header kept");
+    }
+
     #[test]
     fn inject_authorizer_header_works() {
         let mut headers = http::HeaderMap::new();
