@@ -373,6 +373,19 @@ async fn json_response_media_type_follows_accept() {
             .unwrap_or("")
             .to_string()
     };
+    // The type depends on Accept (and, when v0.3 is served, on the
+    // version header), so responses say so for shared caches.
+    let vary = |resp: &axum::response::Response| {
+        resp.headers()
+            .get("vary")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let expected_vary = if cfg!(feature = "compat-v03") {
+        "Accept, A2A-Version"
+    } else {
+        "Accept"
+    };
     let send = |accept: Option<&str>, content_type: &str| {
         let mut req = Request::post("/message:send")
             .header("a2a-version", "1.0")
@@ -407,6 +420,11 @@ async fn json_response_media_type_follows_accept() {
             expected,
             "accept={accept:?} content-type={request_type}"
         );
+        assert_eq!(
+            vary(&resp).as_deref(),
+            Some(expected_vary),
+            "accept={accept:?}"
+        );
     }
 
     let get_missing = |accept: Option<&str>, request_type: Option<&str>| {
@@ -433,6 +451,11 @@ async fn json_response_media_type_follows_accept() {
             content_type(&resp),
             expected,
             "error: accept={accept:?} content-type={request_type:?}"
+        );
+        assert_eq!(
+            vary(&resp).as_deref(),
+            Some(expected_vary),
+            "error: accept={accept:?}"
         );
     }
 
@@ -464,6 +487,7 @@ async fn json_response_media_type_follows_accept() {
             .unwrap();
         let resp = build_router(test_state()).oneshot(req).await.unwrap();
         assert_eq!(content_type(&resp), "application/json", "accept={accept}");
+        assert_eq!(vary(&resp), None, "JSON-RPC is not negotiated");
         let body: serde_json::Value = serde_json::from_slice(
             &axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
@@ -478,27 +502,53 @@ async fn json_response_media_type_follows_accept() {
     }
 }
 
-/// The well-known agent card is version-independent: it is
-/// `application/json` with or without `A2A-Version`, whatever the features.
+/// The well-known agent card follows `Accept` like every HTTP+JSON
+/// response, with or without `A2A-Version` and whatever the features:
+/// `application/a2a+json` only for a client that asks for it.
 #[tokio::test]
-async fn agent_card_is_plain_json_for_every_client() {
+async fn agent_card_media_type_follows_accept() {
     for version in [None, Some("1.0")] {
-        let mut req = Request::get("/.well-known/agent-card.json");
-        if let Some(v) = version {
-            req = req.header("a2a-version", v);
+        for (accept, expected) in [
+            (None, "application/json"),
+            (Some("*/*"), "application/json"),
+            (Some("application/json"), "application/json"),
+            (
+                Some("application/a2a+json;q=0, application/json"),
+                "application/json",
+            ),
+            (Some("application/a2a+json"), "application/a2a+json"),
+            (
+                Some("application/a2a+json, application/json;q=0.5"),
+                "application/a2a+json",
+            ),
+        ] {
+            let mut req = Request::get("/.well-known/agent-card.json");
+            if let Some(v) = version {
+                req = req.header("a2a-version", v);
+            }
+            if let Some(a) = accept {
+                req = req.header("accept", a);
+            }
+            let resp = build_router(test_state())
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{version:?} {accept:?}");
+            assert_eq!(
+                resp.headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok()),
+                Some(expected),
+                "version={version:?} accept={accept:?}"
+            );
+            // Both variants say the type depends on Accept, so a cache in
+            // front of the card keeps them apart.
+            assert_eq!(
+                resp.headers().get("vary").and_then(|v| v.to_str().ok()),
+                Some("Accept"),
+                "version={version:?} accept={accept:?}"
+            );
         }
-        let resp = build_router(test_state())
-            .oneshot(req.body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "{version:?}");
-        assert_eq!(
-            resp.headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok()),
-            Some("application/json"),
-            "{version:?}"
-        );
     }
 }
 

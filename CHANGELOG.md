@@ -4,6 +4,21 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.3] — 2026-10-23
+
+### Changed
+
+- The well-known agent card (`/.well-known/agent-card.json`) follows the same `Accept` rule as every other HTTP+JSON response: a client that asks for `application/a2a+json` gets it, and other clients get `application/json` as before. This holds with or without `A2A-Version` and under `compat-v03`.
+- HTTP+JSON responses now carry `Vary: Accept` (`Vary: Accept, A2A-Version` under `compat-v03`, except on the agent card), so a CDN or gateway cache in front of the server keeps the two media types apart. JSON-RPC responses are unchanged.
+
+### Compatibility
+
+- Clients that do not ask for `application/a2a+json` get the same media type and body as before.
+
+### Verification
+
+- Media-type and `Vary` tests pass with and without `compat-v03`.
+
 ## [0.2.2] — 2026-10-23
 
 ### Fixed

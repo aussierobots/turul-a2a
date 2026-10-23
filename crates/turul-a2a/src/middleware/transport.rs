@@ -129,27 +129,32 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            // Discovery documents keep `application/json` whatever the
-            // request version, so every client generation reads them alike.
             // The JSON-RPC binding is `application/json` for requests and
             // responses (spec Section 9.1); `application/a2a+json` belongs
-            // to the HTTP+JSON binding (Section 11.1).
+            // to the HTTP+JSON binding (Section 11.1). The discovery card
+            // is version-independent, so only `Accept` decides its type;
+            // other v0.3 requests keep `application/json`.
             let path = req.uri().path();
-            let relabel = !is_legacy_request(&req)
-                && !super::is_bypass_path(path)
-                && !crate::jsonrpc::is_jsonrpc_path(path)
-                && accepts_a2a_json(&req);
+            let jsonrpc = crate::jsonrpc::is_jsonrpc_path(path);
+            let discovery = super::is_bypass_path(path);
+            let a2a_json = (discovery || !is_legacy_request(&req)) && accepts_a2a_json(&req);
+            // Under `compat-v03` the version header also selects the type
+            // (a v0.3 request keeps `application/json`), except on the
+            // version-independent discovery card.
+            let vary = if HTTP_SERVES_V03 && !discovery {
+                "Accept, A2A-Version"
+            } else {
+                "Accept"
+            };
             let response = match check_request(&req) {
-                Err(err) if crate::jsonrpc::is_jsonrpc_path(req.uri().path()) => {
-                    axum::Json(err.to_jsonrpc_error(None)).into_response()
-                }
+                Err(err) if jsonrpc => axum::Json(err.to_jsonrpc_error(None)).into_response(),
                 Err(err) => err.into_response(),
                 Ok(()) => inner.call(req).await?,
             };
-            Ok(if relabel {
-                with_a2a_media_type(response)
-            } else {
+            Ok(if jsonrpc {
                 response
+            } else {
+                label_json_response(response, a2a_json, vary)
             })
         })
     }
@@ -221,20 +226,33 @@ fn accepts_a2a_json<B>(req: &Request<B>) -> bool {
     })
 }
 
-/// Label a JSON response with the registered A2A media type (spec Section
-/// 11.1: `application/a2a+json` SHOULD be used for requests and
-/// responses). Event streams and other media types are left alone.
-fn with_a2a_media_type(mut response: Response<Body>) -> Response<Body> {
+/// Label an HTTP+JSON JSON response with the type negotiated for it:
+/// `application/a2a+json` when the client accepts it (spec Section 11.1:
+/// it SHOULD be used for requests and responses), otherwise the
+/// `application/json` it already carries. Either way the response names
+/// the request headers that chose the type in `Vary`, so a shared cache
+/// never serves a client a type it did not accept (RFC 9110 Section
+/// 12.5.5).
+/// Event streams and other media types are left alone.
+fn label_json_response(
+    mut response: Response<Body>,
+    a2a_json: bool,
+    vary: &'static str,
+) -> Response<Body> {
     let is_json = response
         .headers()
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| essence(v).eq_ignore_ascii_case(protocol::MEDIA_TYPE_JSON));
     if is_json {
-        response.headers_mut().insert(
-            http::header::CONTENT_TYPE,
-            http::HeaderValue::from_static(protocol::MEDIA_TYPE_A2A_JSON),
-        );
+        let headers = response.headers_mut();
+        headers.append(http::header::VARY, http::HeaderValue::from_static(vary));
+        if a2a_json {
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static(protocol::MEDIA_TYPE_A2A_JSON),
+            );
+        }
     }
     response
 }
