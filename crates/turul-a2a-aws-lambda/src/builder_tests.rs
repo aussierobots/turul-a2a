@@ -285,6 +285,11 @@ impl A2aCancellationSupervisor for FakeBackend {
     ) -> Result<Vec<String>, A2aStorageError> {
         Ok(vec![])
     }
+    async fn supervisor_list_executor_held_tasks(
+        &self,
+    ) -> Result<Vec<turul_a2a::storage::ExecutorHeldTask>, A2aStorageError> {
+        Ok(vec![])
+    }
 }
 
 // --------------------------------------------------------------------------

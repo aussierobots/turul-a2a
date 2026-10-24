@@ -2,12 +2,13 @@
 
 ## Current State
 
-- 7 publish crates (proto, types, server, client, auth, aws-lambda, patterns), 20 example crates, 27 ADRs.
+- 7 publish crates (proto, types, server, client, auth, aws-lambda, patterns), 20 example crates, 28 ADRs.
 - Targets A2A v1.0.1: the vendored `proto/a2a.proto` is byte-identical to upstream `main`, which differs from the v1.0.1 tag only in comments.
 - **Strong for** (server deployment):
   - Durable event coordination: atomic task+event writes with terminal-preservation CAS on all four storage backends (in-memory, SQLite, PostgreSQL, DynamoDB).
   - Multi-instance request/response correctness and cross-instance streaming subscription via shared backend. Verified by `tests/distributed_tests.rs` and `tests/d3_streaming_tests.rs`.
-  - Executor `EventSink` with spawn-and-track, two-deadline blocking timeout, and cross-instance cancellation propagation via the in-process cancel-marker poller (ADR-010, ADR-012).
+  - Executor `EventSink` with spawn-and-track, two-deadline blocking timeout, and cross-instance cancellation propagation via the in-process cancel-marker poller (ADR-010, ADR-012). A cancelled executor that ignores the token is aborted after `cancel_handler_grace`; an executor panic leaves its task FAILED.
+  - Opt-in startup reconciliation (`fail_orphaned_tasks`, single instance only) fails tasks a previous process left SUBMITTED or WORKING (ADR-028).
   - Auth middleware (Bearer JWT + API Key), client library.
 - **Lambda adapter** supports request/response, buffered-streaming SSE against the shared event store, and ADR-013 push-delivery recovery via stream and scheduled workers. Same-invocation cancellation works. The Lambda adapter does **not** run the persistent cross-instance cancel-marker poller that the server runtime uses, so cross-instance cancellation propagation to a live executor on a different warm Lambda invocation is not currently supported; see `crates/turul-a2a-aws-lambda/src/lib.rs` module docs for the exact scope.
 - Compliance and maturity claims still require a fresh upstream-spec diff per the Version Hygiene and Compliance Audit Gate sections before new public claims land.

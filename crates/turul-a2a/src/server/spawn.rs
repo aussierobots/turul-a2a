@@ -199,12 +199,35 @@ pub(crate) fn spawn_tracked_executor(
     // Supervisor: holds the sentinel that removes the registry entry
     // and aborts a still-live executor on every exit path.
     let sup_registry = deps.in_flight.clone();
-    let sup_key = key;
+    let sup_key = key.clone();
     let sup_handle = handle.clone();
+    let sup_sink = sink;
     tokio::spawn(async move {
         let _sentinel = SupervisorSentinel::new(sup_registry, sup_key, sup_handle.clone());
-        if let Some(jh) = sup_handle.take_spawned() {
-            let _ = jh.await;
+        if let Some(jh) = sup_handle.take_spawned()
+            && let Err(e) = jh.await
+            && e.is_panic()
+        {
+            let outcome = if sup_sink.is_closed() {
+                "task already terminal".to_string()
+            } else {
+                match sup_sink
+                    .commit_state_internal(TaskState::Failed, Some(agent_text("executor panicked")))
+                    .await
+                {
+                    Ok(_) => "task failed".to_string(),
+                    Err(_) if sup_sink.is_closed() => "task already terminal".to_string(),
+                    Err(e) => e.to_string(),
+                }
+            };
+            let (tenant, task_id) = key;
+            tracing::error!(
+                target: "turul_a2a::executor_panic",
+                %tenant,
+                %task_id,
+                %outcome,
+                "executor panicked"
+            );
         }
         // sentinel drops here, running cleanup.
     });

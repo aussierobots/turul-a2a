@@ -149,16 +149,19 @@ pub trait A2aTaskStorage: Send + Sync {
     ) -> Result<(), A2aStorageError>;
 }
 
-/// Supervisor-only cancel-marker reads.
+/// Supervisor-only reads that are not owner-scoped.
 ///
 /// **NOT for request handlers.** Methods on this trait deliberately omit
-/// the `owner` parameter. Authorization invariant: callers MUST operate
-/// only on `task_id`s already present in their own
-/// [`crate::server::in_flight::InFlightRegistry`], whose entries were
+/// the `owner` parameter. Authorization invariant for the cancel-marker
+/// reads: callers MUST operate only on `task_id`s already present in their
+/// own [`crate::server::in_flight::InFlightRegistry`], whose entries were
 /// owner-validated at spawn time. Re-checking owner on every poll tick
 /// would force the supervisor to carry per-task owner strings through its
 /// registry without producing any security benefit — the upstream
-/// validation already covered it.
+/// validation already covered it. The one exception is the store-wide
+/// listing of executor-held tasks, which is for the server's own startup
+/// reconciliation before it serves requests and is never reachable from
+/// a handler.
 ///
 /// External backend implementers implement this trait alongside
 /// [`A2aTaskStorage`], [`super::A2aEventStore`], and
@@ -210,6 +213,43 @@ pub trait A2aCancellationSupervisor: Send + Sync {
         tenant: &str,
         task_ids: &[String],
     ) -> Result<Vec<String>, A2aStorageError>;
+
+    /// Return every SUBMITTED or WORKING task across all tenants and
+    /// owners.
+    ///
+    /// Owner-unscoped like the other supervisor reads; the only caller is
+    /// startup reconciliation, which acts for the framework rather than a
+    /// requester.
+    async fn supervisor_list_executor_held_tasks(
+        &self,
+    ) -> Result<Vec<ExecutorHeldTask>, A2aStorageError>;
+}
+
+/// A task whose executor is expected to be running: identity and routing
+/// fields needed to act on it without a per-task read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExecutorHeldTask {
+    pub tenant: String,
+    pub task_id: String,
+    pub owner: String,
+    pub context_id: String,
+}
+
+impl ExecutorHeldTask {
+    pub fn new(
+        tenant: impl Into<String>,
+        task_id: impl Into<String>,
+        owner: impl Into<String>,
+        context_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            tenant: tenant.into(),
+            task_id: task_id.into(),
+            owner: owner.into(),
+            context_id: context_id.into(),
+        }
+    }
 }
 
 /// Storage trait for push notification configurations.

@@ -2548,6 +2548,84 @@ pub async fn test_supervisor_list_cancel_requested_parity(
     assert_eq!(result, vec!["cm-list-1".to_string()]);
 }
 
+/// Startup reconciliation listing: returns exactly the executor-held
+/// tasks (SUBMITTED, WORKING) across every tenant and owner, each with
+/// the tenant, owner and context id the reconciliation commit needs.
+/// Client-held (INPUT_REQUIRED, AUTH_REQUIRED) and terminal tasks are
+/// excluded. The listing is store-wide, so the assertion is restricted
+/// to this run's uniquely named tenants.
+pub async fn test_supervisor_list_executor_held_tasks_parity(
+    tasks: &dyn A2aTaskStorage,
+    atomic: &dyn A2aAtomicStore,
+    supervisor: &dyn crate::storage::A2aCancellationSupervisor,
+) {
+    let run = uuid::Uuid::now_v7().simple().to_string();
+    let tenants = [format!("held-a-{run}"), format!("held-b-{run}")];
+    let owners = ["owner-held-1", "owner-held-2"];
+    let states = [
+        TaskState::Submitted,
+        TaskState::Working,
+        TaskState::InputRequired,
+        TaskState::AuthRequired,
+        TaskState::Completed,
+        TaskState::Failed,
+        TaskState::Canceled,
+        TaskState::Rejected,
+    ];
+
+    let mut expected = Vec::new();
+    for (ti, tenant) in tenants.iter().enumerate() {
+        for (si, state) in states.iter().enumerate() {
+            let owner = owners[(ti + si) % owners.len()];
+            let task_id = format!("held-{ti}-{si}");
+            let context_id = format!("ctx-held-{ti}-{si}");
+            tasks
+                .create_task(tenant, owner, make_task(&task_id, &context_id))
+                .await
+                .unwrap();
+            if *state != TaskState::Submitted {
+                atomic
+                    .update_task_status_with_events(
+                        tenant,
+                        &task_id,
+                        owner,
+                        TaskStatus::new(TaskState::Working),
+                        vec![],
+                    )
+                    .await
+                    .unwrap();
+            }
+            if !matches!(state, TaskState::Submitted | TaskState::Working) {
+                atomic
+                    .update_task_status_with_events(
+                        tenant,
+                        &task_id,
+                        owner,
+                        TaskStatus::new(*state),
+                        vec![],
+                    )
+                    .await
+                    .unwrap();
+            }
+            if matches!(state, TaskState::Submitted | TaskState::Working) {
+                expected.push((tenant.clone(), task_id, owner.to_string(), context_id));
+            }
+        }
+    }
+
+    let mut listed: Vec<(String, String, String, String)> = supervisor
+        .supervisor_list_executor_held_tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|t| tenants.contains(&t.tenant))
+        .map(|t| (t.tenant, t.task_id, t.owner, t.context_id))
+        .collect();
+    listed.sort();
+    expected.sort();
+    assert_eq!(listed, expected);
+}
+
 /// AT-CAS-003: distinct error variants — `InvalidTransition` is NOT
 /// conflated with `TerminalStateAlreadySet`. Callers that translate
 /// atomic-store errors into executor-facing outcomes (for example,

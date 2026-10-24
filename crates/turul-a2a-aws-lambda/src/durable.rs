@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use aws_lambda_events::event::sqs::{BatchItemFailure, SqsBatchResponse, SqsEvent, SqsMessage};
 use aws_sdk_sqs::Client as SqsClient;
 use turul_a2a::durable_executor::{DurableExecutorQueue, QueueError, QueuedExecutorJob};
-use turul_a2a::router::AppState;
+use turul_a2a::router::{AppState, commit_framework_terminal};
 use turul_a2a::server::spawn::{SpawnDeps, SpawnScope, run_queued_executor_job};
 use turul_a2a_types::{Message, Part, Role, TaskState, TaskStatus};
 
@@ -194,23 +194,15 @@ async fn drive_sqs_record(state: &AppState, record: SqsMessage) -> Result<(), St
             vec![Part::text("canceled before durable executor dispatch")],
         );
         let canceled_status = TaskStatus::new(TaskState::Canceled).with_message(reason);
-        let canceled_event = turul_a2a::streaming::StreamEvent::StatusUpdate {
-            status_update: turul_a2a::streaming::StatusUpdatePayload {
-                task_id: job.task_id.clone(),
-                context_id: job.context_id.clone(),
-                status: serde_json::to_value(&canceled_status).unwrap_or_default(),
-            },
-        };
-        match state
-            .atomic_store
-            .update_task_status_with_events(
-                &job.tenant,
-                &job.task_id,
-                &job.owner,
-                canceled_status,
-                vec![canceled_event],
-            )
-            .await
+        match commit_framework_terminal(
+            state,
+            &job.tenant,
+            &job.owner,
+            &job.task_id,
+            &job.context_id,
+            canceled_status,
+        )
+        .await
         {
             Ok(_) => {
                 tracing::info!(
@@ -219,7 +211,6 @@ async fn drive_sqs_record(state: &AppState, record: SqsMessage) -> Result<(), St
                     task_id = %job.task_id,
                     "durable executor job canceled before dispatch: CANCELED committed, executor never invoked"
                 );
-                state.event_broker.notify(&job.task_id).await;
                 return Ok(());
             }
             Err(turul_a2a::storage::A2aStorageError::TerminalStateAlreadySet { .. }) => {

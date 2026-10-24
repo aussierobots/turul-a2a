@@ -106,6 +106,16 @@ pub struct InFlightHandle {
     /// [`InFlightHandle::set_spawned`] installs a real handle over an
     /// initial placeholder.
     abort_handle: Mutex<AbortHandle>,
+
+    /// Set by the first [`Self::cancel_then_abort_after`] call so
+    /// repeated cancel requests arm at most one deferred abort.
+    abort_armed: AtomicBool,
+
+    /// Set when the executor's own sink commits a terminal state. An
+    /// interrupted commit does not set it: an executor that raised
+    /// INPUT_REQUIRED or AUTH_REQUIRED and kept running has not
+    /// acknowledged a later cancel.
+    terminal_committed: AtomicBool,
 }
 
 impl InFlightHandle {
@@ -122,7 +132,32 @@ impl InFlightHandle {
             yielded_fired: AtomicBool::new(false),
             spawned: Mutex::new(Some(spawned)),
             abort_handle: Mutex::new(abort_handle),
+            abort_armed: AtomicBool::new(false),
+            terminal_committed: AtomicBool::new(false),
         }
+    }
+
+    /// Trip the cancellation token and arm a one-shot deferred abort.
+    ///
+    /// After `grace`, the executor task is aborted unless it has already
+    /// committed its own terminal state through its sink: an executor
+    /// that cooperated must be allowed to finish its post-terminal
+    /// cleanup. The first call arms the abort; later calls only re-trip
+    /// the token. This never writes a terminal state, so a cancel that
+    /// wins the store race is still the only terminal, and a late
+    /// executor write is refused by the closed sink.
+    pub fn cancel_then_abort_after(self: &Arc<Self>, grace: std::time::Duration) {
+        self.cancellation.cancel();
+        if self.abort_armed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let handle = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            if !handle.terminal_committed() {
+                handle.abort();
+            }
+        });
     }
 
     /// Abort the spawned executor task.
@@ -175,6 +210,16 @@ impl InFlightHandle {
             }
             Err(_) => false,
         }
+    }
+
+    /// Record that the executor's sink committed a terminal state.
+    pub(crate) fn mark_terminal_committed(&self) {
+        self.terminal_committed.store(true, Ordering::Release);
+    }
+
+    /// Whether the executor's sink has committed a terminal state.
+    pub(crate) fn terminal_committed(&self) -> bool {
+        self.terminal_committed.load(Ordering::Acquire)
     }
 
     /// Query whether `yielded` has fired.
@@ -460,7 +505,8 @@ impl Drop for SupervisorSentinel {
 /// 2. For each tenant, call
 ///    [`crate::storage::A2aCancellationSupervisor::supervisor_list_cancel_requested`]
 ///    to get the subset with the marker set.
-/// 3. Trip `cancellation` on each matching handle.
+/// 3. Trip `cancellation` on each matching handle and arm its deferred
+///    abort after `abort_grace` (see [`InFlightHandle::cancel_then_abort_after`]).
 ///
 /// This bridges the cross-instance case: a `:cancel` handler on another
 /// instance writes the marker via
@@ -478,6 +524,7 @@ pub async fn run_cross_instance_cancel_poller(
     registry: std::sync::Arc<InFlightRegistry>,
     supervisor: std::sync::Arc<dyn crate::storage::A2aCancellationSupervisor>,
     interval: std::time::Duration,
+    abort_grace: std::time::Duration,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     loop {
@@ -491,7 +538,7 @@ pub async fn run_cross_instance_cancel_poller(
                 return;
             }
         }
-        poll_once(&registry, supervisor.as_ref()).await;
+        poll_once(&registry, supervisor.as_ref(), abort_grace).await;
     }
 }
 
@@ -500,6 +547,7 @@ pub async fn run_cross_instance_cancel_poller(
 async fn poll_once(
     registry: &InFlightRegistry,
     supervisor: &dyn crate::storage::A2aCancellationSupervisor,
+    abort_grace: std::time::Duration,
 ) {
     let groups = registry.snapshot_by_tenant();
     for (tenant, task_ids) in groups {
@@ -511,7 +559,7 @@ async fn poll_once(
                 for task_id in marked {
                     let key = (tenant.clone(), task_id);
                     if let Some(handle) = registry.get_handle(&key) {
-                        handle.cancellation.cancel();
+                        handle.cancel_then_abort_after(abort_grace);
                     }
                 }
             }

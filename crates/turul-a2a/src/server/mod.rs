@@ -2,6 +2,7 @@
 
 pub mod in_flight;
 pub mod obs;
+pub(crate) mod orphans;
 pub mod spawn;
 
 use std::net::SocketAddr;
@@ -166,6 +167,7 @@ pub struct A2aServerBuilder {
     middleware: Vec<Arc<dyn A2aMiddleware>>,
     runtime_config: RuntimeConfig,
     outbound_url_validator: Option<crate::push::ssrf::OutboundUrlValidator>,
+    fail_orphans_on_start: bool,
 }
 
 impl A2aServerBuilder {
@@ -182,6 +184,7 @@ impl A2aServerBuilder {
             middleware: vec![],
             runtime_config: RuntimeConfig::default(),
             outbound_url_validator: None,
+            fail_orphans_on_start: false,
         }
     }
 
@@ -208,7 +211,9 @@ impl A2aServerBuilder {
     }
 
     /// How long the `CancelTask` handler waits for cancellation to resolve
-    /// before force-committing CANCELED itself.
+    /// before force-committing CANCELED itself. It is also the abort
+    /// deadline: an executor that has not committed its own terminal by
+    /// then is aborted.
     pub fn cancel_handler_grace(mut self, d: Duration) -> Self {
         self.runtime_config.cancel_handler_grace = d;
         self
@@ -487,6 +492,19 @@ impl A2aServerBuilder {
         self
     }
 
+    /// Fail tasks left `SUBMITTED` or `WORKING` by a previous process
+    /// before the server serves: [`A2aServer::bind`] (and so `run`)
+    /// reconciles them first, and `into_router`, `into_routers` and
+    /// `into_tonic_router` panic unless
+    /// [`A2aServer::fail_orphaned_tasks`] has completed. Off by default.
+    ///
+    /// Enable only when exactly one server instance uses the storage;
+    /// see [`A2aServer::fail_orphaned_tasks`].
+    pub fn fail_orphaned_tasks_on_start(mut self) -> Self {
+        self.fail_orphans_on_start = true;
+        self
+    }
+
     /// Add auth middleware. Multiple calls stack (AND semantics).
     /// Use `AnyOfMiddleware` for OR semantics.
     pub fn middleware(mut self, mw: Arc<dyn A2aMiddleware>) -> Self {
@@ -668,6 +686,8 @@ impl A2aServerBuilder {
             },
             merged_security: merged,
             bind_addr: self.bind_addr,
+            fail_orphans_on_start: self.fail_orphans_on_start,
+            orphans_failed: false,
         })
     }
 }
@@ -844,6 +864,8 @@ pub struct A2aServer {
     state: AppState,
     merged_security: SecurityContribution,
     bind_addr: SocketAddr,
+    fail_orphans_on_start: bool,
+    orphans_failed: bool,
 }
 
 impl A2aServer {
@@ -851,8 +873,46 @@ impl A2aServer {
         A2aServerBuilder::new()
     }
 
+    /// Commit `FAILED` (with a reason message) for every task left
+    /// `SUBMITTED` or `WORKING` in storage, across all tenants and
+    /// owners, and return how many were failed. `INPUT_REQUIRED`,
+    /// `AUTH_REQUIRED` and terminal tasks are untouched. Calling it again
+    /// returns 0.
+    ///
+    /// Operator contract: enable this only when exactly one server
+    /// instance uses the storage. The framework records no per-task
+    /// executor owner, so on a shared store it would fail tasks that a
+    /// live peer is still running. That includes the overlap of a rolling
+    /// or surge deploy, where the new instance starts while the old one
+    /// still runs executors (use a stop-first rollout), and any other
+    /// live writer of the same store, such as a Lambda handler.
+    ///
+    /// Serving consumes the server, so this runs before any request is
+    /// handled. It does not restart work: a client that wants the work
+    /// redone sends a new message.
+    pub async fn fail_orphaned_tasks(&mut self) -> Result<usize, A2aError> {
+        let failed = crate::server::orphans::fail_orphaned_tasks(&self.state).await?;
+        self.orphans_failed = true;
+        Ok(failed)
+    }
+
+    fn assert_orphans_reconciled(&self) {
+        if self.fail_orphans_on_start && !self.orphans_failed {
+            panic!(
+                "fail_orphaned_tasks_on_start is set but orphaned tasks were not reconciled: \
+                 await server.fail_orphaned_tasks() before into_router, into_routers or \
+                 into_tonic_router"
+            );
+        }
+    }
+
     /// Build the axum router — useful for testing.
     /// Augments the AgentCard with merged security contributions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the builder set `fail_orphaned_tasks_on_start` and
+    /// [`A2aServer::fail_orphaned_tasks`] has not completed on this server.
     pub fn into_router(self) -> axum::Router {
         let (state, had_security) = self.into_augmented_state();
         if !had_security {
@@ -870,6 +930,11 @@ impl A2aServer {
     /// deliberately not exposed — returning the inner service would
     /// permit adopters to compose it into a custom tonic server
     /// without the auth layer and silently bypass authentication.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the builder set `fail_orphaned_tasks_on_start` and
+    /// [`A2aServer::fail_orphaned_tasks`] has not completed on this server.
     #[cfg(feature = "grpc")]
     pub fn into_tonic_router(self) -> crate::grpc::LayeredGrpcRouter {
         let (state, _) = self.into_augmented_state();
@@ -886,6 +951,11 @@ impl A2aServer {
     /// executor is still running is refused). Calling `into_router` and
     /// `into_tonic_router` on two separately built servers would give
     /// each transport its own registry and broker.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the builder set `fail_orphaned_tasks_on_start` and
+    /// [`A2aServer::fail_orphaned_tasks`] has not completed on this server.
     #[cfg(feature = "grpc")]
     pub fn into_routers(self) -> (axum::Router, crate::grpc::LayeredGrpcRouter) {
         let (state, _) = self.into_augmented_state();
@@ -901,6 +971,7 @@ impl A2aServer {
     /// `push_delivery_store` survives the auth rebuild) without going
     /// through an HTTP round-trip.
     pub(crate) fn into_augmented_state(self) -> (AppState, bool) {
+        self.assert_orphans_reconciled();
         if self.merged_security.is_empty() {
             return (self.state, false);
         }
@@ -940,7 +1011,13 @@ impl A2aServer {
     /// including the OS-assigned port when the builder was given port 0 —
     /// before any request is served. Connections that arrive between
     /// `bind` and [`BoundA2aServer::run`] wait in the listen backlog.
-    pub async fn bind(self) -> Result<BoundA2aServer, A2aError> {
+    ///
+    /// With `fail_orphaned_tasks_on_start` set, orphaned tasks are failed
+    /// before the socket is bound and an error aborts startup.
+    pub async fn bind(mut self) -> Result<BoundA2aServer, A2aError> {
+        if self.fail_orphans_on_start && !self.orphans_failed {
+            self.fail_orphaned_tasks().await?;
+        }
         let listener = tokio::net::TcpListener::bind(self.bind_addr)
             .await
             .map_err(|e| A2aError::Internal(format!("Failed to bind: {e}")))?;
@@ -973,6 +1050,7 @@ impl A2aServer {
             .state
             .runtime_config
             .cross_instance_cancel_poll_interval;
+        let poller_abort_grace = self.state.runtime_config.cancel_handler_grace;
         let push_delivery_store_for_sweep = self.state.push_delivery_store.clone();
         let self_push_dispatcher_for_sweep = self.state.push_dispatcher.clone();
         let sweep_interval_for_task = self.state.runtime_config.push_reclaim_sweep_interval;
@@ -995,6 +1073,7 @@ impl A2aServer {
                 poller_registry,
                 poller_supervisor,
                 poller_interval,
+                poller_abort_grace,
                 poller_shutdown,
             ));
 

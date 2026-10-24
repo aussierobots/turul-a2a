@@ -4,6 +4,37 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.4] — 2026-10-25
+
+### Added
+
+- `A2aServer::fail_orphaned_tasks()` and the builder option `A2aServerBuilder::fail_orphaned_tasks_on_start()`. At startup they fail every task that a previous server process left `SUBMITTED` or `WORKING`, on every tenant. Each such task becomes `FAILED`, with a status message saying the server restarted while it was running. Tasks waiting on the client (`INPUT_REQUIRED`, `AUTH_REQUIRED`) and finished tasks are left alone. Running it again fails nothing new. This is opt-in, and it is **for single-instance deployments only**: with several instances sharing storage it would fail tasks a live instance is running. That includes the overlap of a rolling deploy, so use a stop-first rollout. With the builder option, `bind()` and `run()` reconcile before listening. With the builder option set and the router served yourself, `into_router()`, `into_routers()` and `into_tonic_router()` panic unless you have awaited `fail_orphaned_tasks()` first. See ADR-028.
+
+### Changed
+
+- `CancelTask` now stops an executor that ignores cancellation. Once `cancel_handler_grace` has passed, the executor is aborted. Before this release the task became `CANCELED` while the executor kept running and kept doing its work.
+  - **Cross-instance:** the instance running the executor applies the same grace after it sees the cancel.
+  - **Cooperating executors:** an executor that acknowledges the cancel through its sink is not aborted and can finish its cleanup. Raising `INPUT_REQUIRED` or `AUTH_REQUIRED` earlier does not count as an acknowledgement.
+  - **Disconnects:** a `CancelTask` whose client disconnects during the grace wait still ends with the task `CANCELED`.
+  - **Action for adopters:** an executor that needs longer than the grace before it acknowledges should get a larger `cancel_handler_grace`. Work an executor spawned separately (`tokio::spawn` inside `execute`) is not stopped by the abort.
+- `run_cross_instance_cancel_poller` takes the abort grace as a new argument.
+
+### Fixed
+
+- An executor that panics now leaves its task `FAILED` with the message "executor panicked", the same outcome as `execute` returning an error. A blocking `SendMessage` returns that task instead of an internal error. Before this release the task stayed `WORKING`.
+
+### Compatibility
+
+- `A2aCancellationSupervisor` has a new required method, `supervisor_list_executor_held_tasks`, which returns `ExecutorHeldTask` rows built with `ExecutorHeldTask::new`. The four built-in backends implement it; a storage backend written outside this workspace must add it.
+- Direct callers of `run_cross_instance_cancel_poller` must pass the new `abort_grace` argument.
+- No wire format changes.
+
+### Verification
+
+- Workspace tests, clippy on every storage feature and gRPC, rustdoc and `cargo package` passed.
+- Storage tests passed on SQLite, PostgreSQL and DynamoDB Local, including the new orphan listing.
+- Cancellation, executor-panic and orphan-reconciliation suites passed, including end-to-end runs over TCP.
+
 ## [0.2.3] — 2026-10-23
 
 ### Changed

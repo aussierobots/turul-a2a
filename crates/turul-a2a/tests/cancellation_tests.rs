@@ -3,8 +3,11 @@
 //! Covers the `CancelTask` contract end to end: a cooperative executor
 //! acknowledging the cancel, cross-instance propagation through the
 //! storage marker and the supervisor poll, the orphan grace-and-force
-//! path, both outcomes of the cancel-vs-complete race, a blocking send
-//! in flight while the task is cancelled, the cancel error cases from
+//! path, both outcomes of the cancel-vs-complete race, the abort of an
+//! executor that ignores the token once the grace window ends (same
+//! instance and across instances, sparing an executor that already
+//! committed its own terminal), a blocking send in flight while the
+//! task is cancelled, the cancel error cases from
 //! A2A v1.0.1 §3.1.5 on every transport, supervisor-panic cleanup, and
 //! the terminal event a subscriber sees.
 //!
@@ -13,7 +16,7 @@
 //! "returned before the grace window" is an exact statement about the
 //! code path taken, not a wall-clock race.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -130,6 +133,7 @@ impl AgentExecutor for CompletesOnCancel {
 /// Ignores cancellation and completes only when the test opens the gate;
 /// reports what `complete()` returned.
 struct GatedCompleter {
+    probe: Mutex<Option<oneshot::Receiver<()>>>,
     gate: Mutex<Option<oneshot::Receiver<()>>>,
     outcome: Mutex<Option<oneshot::Sender<Result<u64, String>>>>,
 }
@@ -142,6 +146,7 @@ impl AgentExecutor for GatedCompleter {
         _msg: &Message,
         ctx: &ExecutionContext,
     ) -> Result<(), A2aError> {
+        let _probe_held_in_future = self.probe.lock().unwrap().take();
         let gate = self.gate.lock().unwrap().take().expect("gate");
         let _ = gate.await;
         let result = ctx.events.complete(None).await.map_err(|e| e.to_string());
@@ -153,6 +158,105 @@ impl AgentExecutor for GatedCompleter {
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
         turul_a2a_proto::AgentCard::default()
     }
+}
+
+/// Ignores the cancellation token and sleeps; holds a drop probe so a
+/// test can observe the executor future being dropped (aborted).
+struct IgnoresToken {
+    probe: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+impl IgnoresToken {
+    fn new() -> (Self, oneshot::Sender<()>) {
+        let (tx, rx) = oneshot::channel();
+        (
+            Self {
+                probe: Mutex::new(Some(rx)),
+            },
+            tx,
+        )
+    }
+}
+
+#[async_trait]
+impl AgentExecutor for IgnoresToken {
+    async fn execute(
+        &self,
+        _task: &mut Task,
+        _msg: &Message,
+        _ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        let _probe_held_in_future = self.probe.lock().unwrap().take();
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        turul_a2a_proto::AgentCard::default()
+    }
+}
+
+/// Raises AUTH_REQUIRED, resumes WORKING and then ignores the token. The
+/// drop probe observes the executor future being dropped.
+struct InterruptsThenIgnoresToken {
+    probe: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+#[async_trait]
+impl AgentExecutor for InterruptsThenIgnoresToken {
+    async fn execute(
+        &self,
+        _task: &mut Task,
+        _msg: &Message,
+        ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        let _probe_held_in_future = self.probe.lock().unwrap().take();
+        ctx.events.require_auth(None).await?;
+        ctx.events.set_status(TaskState::Working, None).await?;
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        turul_a2a_proto::AgentCard::default()
+    }
+}
+
+/// Acknowledges the cancel through its sink, then keeps running cleanup
+/// well past the grace window and records that the cleanup finished.
+struct AcksThenCleansUp {
+    cleanup: Duration,
+    cleaned_up: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl AgentExecutor for AcksThenCleansUp {
+    async fn execute(
+        &self,
+        _task: &mut Task,
+        _msg: &Message,
+        ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        ctx.cancellation.cancelled().await;
+        ctx.events.cancelled(Some(ACK_REASON.into())).await?;
+        tokio::time::sleep(self.cleanup).await;
+        self.cleaned_up.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        turul_a2a_proto::AgentCard::default()
+    }
+}
+
+/// Waits until the registry holds no entry (supervisor cleanup ran).
+async fn await_registry_empty(state: &AppState) {
+    for _ in 0..500 {
+        if state.in_flight.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("in-flight registry entry was never removed");
 }
 
 fn state_on(storage: InMemoryA2aStorage, executor: Arc<dyn AgentExecutor>) -> AppState {
@@ -612,6 +716,7 @@ async fn cross_instance_cancel_handler_on_b_observes_terminal_committed_on_a() {
             state_a.in_flight.clone(),
             state_a.cancellation_supervisor.clone(),
             Duration::from_millis(50),
+            state_a.runtime_config.cancel_handler_grace,
             shutdown.clone(),
         ),
     );
@@ -667,16 +772,18 @@ async fn cancel_on_orphaned_task_resolves_via_grace_fallback() {
 
 // ---------------------------------------------------------------------------
 // Cancel-vs-complete, cancel wins: the executor ignores the token and is
-// held past the grace window; the framework commits CANCELED and the
-// executor's later complete() is refused.
+// held past the grace window; the framework commits CANCELED and aborts
+// the executor at the grace deadline, so it never reaches complete().
 // ---------------------------------------------------------------------------
 
 #[tokio::test(start_paused = true)]
-async fn cancel_vs_complete_cancel_wins_and_late_complete_is_refused() {
+async fn cancel_vs_complete_cancel_wins_and_executor_is_aborted_at_grace() {
     let storage = InMemoryA2aStorage::new();
     let (gate_tx, gate_rx) = oneshot::channel();
-    let (outcome_tx, outcome_rx) = oneshot::channel();
+    let (outcome_tx, mut outcome_rx) = oneshot::channel::<Result<u64, String>>();
+    let (probe_tx, probe_rx) = oneshot::channel::<()>();
     let executor = GatedCompleter {
+        probe: Mutex::new(Some(probe_rx)),
         gate: Mutex::new(Some(gate_rx)),
         outcome: Mutex::new(Some(outcome_tx)),
     };
@@ -692,17 +799,259 @@ async fn cancel_vs_complete_cancel_wins_and_late_complete_is_refused() {
         "the framework committed this CANCELED"
     );
 
-    gate_tx.send(()).expect("executor still waiting on gate");
-    let late = outcome_rx.await.expect("executor reports its complete()");
-    let err = late.expect_err("complete() after the framework's CANCELED must be refused");
+    await_dropped(probe_tx).await;
     assert!(
-        err.contains("EventSink is closed"),
-        "late complete must fail as a closed sink, got: {err}"
+        gate_tx.send(()).is_err(),
+        "the executor future was dropped, so nothing is left waiting on the gate"
+    );
+    await_registry_empty(&state).await;
+    assert!(
+        outcome_rx.try_recv().is_err(),
+        "an aborted executor never reaches complete()"
     );
 
     let terminals = terminal_events(&storage, "", &task_id).await;
     assert_eq!(terminals.len(), 1, "no second terminal: {terminals:?}");
     assert_eq!(terminals[0].1, TaskState::Canceled);
+}
+
+// ---------------------------------------------------------------------------
+// Cancel wins, late write refused: the executor's instance arms its abort
+// far beyond the committing instance's grace, so the executor is still
+// alive when it finally tries to complete and is refused by its closed sink.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn cancel_wins_cross_instance_late_write_is_refused() {
+    let storage = InMemoryA2aStorage::new();
+    let (gate_tx, gate_rx) = oneshot::channel();
+    let (outcome_tx, outcome_rx) = oneshot::channel();
+    let executor = GatedCompleter {
+        probe: Mutex::new(None),
+        gate: Mutex::new(Some(gate_rx)),
+        outcome: Mutex::new(Some(outcome_tx)),
+    };
+    let state_a = state_on(storage.clone(), Arc::new(executor));
+    let state_b = state_on(storage.clone(), Arc::new(NoopExecutor));
+    let task_id = start_non_blocking(&state_a, "owner-r").await;
+
+    let shutdown = CancellationToken::new();
+    let poller = tokio::spawn(
+        turul_a2a::server::in_flight::run_cross_instance_cancel_poller(
+            state_a.in_flight.clone(),
+            state_a.cancellation_supervisor.clone(),
+            Duration::from_millis(50),
+            Duration::from_secs(60),
+            shutdown.clone(),
+        ),
+    );
+
+    let axum::Json(task) = core_cancel_task(state_b.clone(), "", "owner-r", &task_id)
+        .await
+        .expect("cancel on B");
+    assert_eq!(state_of(&task), "TASK_STATE_CANCELED");
+    assert!(
+        task["status"].get("message").is_none_or(|m| m.is_null()),
+        "B committed this CANCELED"
+    );
+
+    gate_tx.send(()).expect("executor still waiting on gate");
+    let late = outcome_rx.await.expect("executor reports its complete()");
+    let err = late.expect_err("complete() after B's CANCELED must be refused");
+    assert!(
+        err.contains("EventSink is closed"),
+        "late complete must fail as a closed sink, got: {err}"
+    );
+    shutdown.cancel();
+    poller.await.expect("poller exits on shutdown");
+
+    let terminals = terminal_events(&storage, "", &task_id).await;
+    assert_eq!(terminals.len(), 1, "no second terminal: {terminals:?}");
+    assert_eq!(terminals[0].1, TaskState::Canceled);
+}
+
+// ---------------------------------------------------------------------------
+// Executor ignores the token: the handler returns the framework CANCELED at
+// grace and the executor future is dropped.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn executor_ignoring_token_is_aborted_and_framework_cancels_at_grace() {
+    let storage = InMemoryA2aStorage::new();
+    let (executor, probe_tx) = IgnoresToken::new();
+    let state = state_on(storage.clone(), Arc::new(executor));
+    let task_id = start_non_blocking(&state, "owner-i").await;
+
+    let start = tokio::time::Instant::now();
+    let axum::Json(task) = core_cancel_task(state.clone(), "", "owner-i", &task_id)
+        .await
+        .expect("cancel OK");
+    assert_eq!(state_of(&task), "TASK_STATE_CANCELED");
+    assert!(
+        task["status"].get("message").is_none_or(|m| m.is_null()),
+        "framework-committed CANCELED carries no message"
+    );
+    assert!(start.elapsed() >= state.runtime_config.cancel_handler_grace);
+
+    await_dropped(probe_tx).await;
+    await_registry_empty(&state).await;
+    let terminals = terminal_events(&storage, "", &task_id).await;
+    assert_eq!(
+        terminals.iter().map(|(_, s)| *s).collect::<Vec<_>>(),
+        vec![TaskState::Canceled],
+        "only the framework CANCELED persists"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// An earlier interrupted commit is not an acknowledgement of the cancel: an
+// executor that raised AUTH_REQUIRED, resumed and ignores the token is still
+// aborted at grace.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn executor_that_resumed_after_interrupt_is_aborted_on_cancel() {
+    let storage = InMemoryA2aStorage::new();
+    let (tx, rx) = oneshot::channel();
+    let state = state_on(
+        storage.clone(),
+        Arc::new(InterruptsThenIgnoresToken {
+            probe: Mutex::new(Some(rx)),
+        }),
+    );
+    let task_id = start_non_blocking(&state, "owner-r").await;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let t = storage
+            .get_task("", &task_id, "owner-r", Some(0))
+            .await
+            .unwrap()
+            .unwrap();
+        if t.status().and_then(|s| s.state().ok()) == Some(TaskState::Working) {
+            break;
+        }
+    }
+
+    let axum::Json(task) = core_cancel_task(state.clone(), "", "owner-r", &task_id)
+        .await
+        .expect("cancel OK");
+    assert_eq!(state_of(&task), "TASK_STATE_CANCELED");
+
+    await_dropped(tx).await;
+    await_registry_empty(&state).await;
+}
+
+// ---------------------------------------------------------------------------
+// The abort fires at grace even when the CancelTask request future is
+// dropped mid-grace; the CANCELED commit must not be lost with it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn dropped_cancel_request_still_commits_canceled() {
+    let storage = InMemoryA2aStorage::new();
+    let (executor, probe_tx) = IgnoresToken::new();
+    let state = state_on(storage.clone(), Arc::new(executor));
+    let task_id = start_non_blocking(&state, "owner-d").await;
+    let grace = state.runtime_config.cancel_handler_grace;
+
+    let res = tokio::time::timeout(
+        grace / 2,
+        core_cancel_task(state.clone(), "", "owner-d", &task_id),
+    )
+    .await;
+    assert!(res.is_err(), "request future dropped mid-grace");
+
+    tokio::time::sleep(grace * 2).await;
+    await_dropped(probe_tx).await;
+    let terminals = terminal_events(&storage, "", &task_id).await;
+    assert_eq!(
+        terminals.iter().map(|(_, s)| *s).collect::<Vec<_>>(),
+        vec![TaskState::Canceled],
+        "the task still reaches CANCELED"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Executor acknowledges through its sink and keeps cleaning up past the
+// grace deadline: the handler returns the executor's CANCELED and the
+// cleanup is not aborted.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn acknowledging_executor_cleanup_is_not_aborted_after_grace() {
+    let storage = InMemoryA2aStorage::new();
+    let cleaned_up = Arc::new(AtomicBool::new(false));
+    let state = state_on(
+        storage.clone(),
+        Arc::new(AcksThenCleansUp {
+            cleanup: Duration::from_secs(20),
+            cleaned_up: cleaned_up.clone(),
+        }),
+    );
+    let task_id = start_non_blocking(&state, "owner-k").await;
+
+    let start = tokio::time::Instant::now();
+    let axum::Json(task) = core_cancel_task(state.clone(), "", "owner-k", &task_id)
+        .await
+        .expect("cancel OK");
+    assert_eq!(state_of(&task), "TASK_STATE_CANCELED");
+    assert_eq!(status_text(&task).as_deref(), Some(ACK_REASON));
+    assert!(start.elapsed() < state.runtime_config.cancel_handler_grace);
+
+    tokio::time::sleep(state.runtime_config.cancel_handler_grace * 5).await;
+    assert!(
+        cleaned_up.load(Ordering::SeqCst),
+        "cleanup after the executor's own terminal must run to completion"
+    );
+    assert_eq!(terminal_events(&storage, "", &task_id).await.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-instance abort: A's poller observes B's marker and aborts A's
+// executor once A's grace elapses.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn cross_instance_cancel_aborts_executor_ignoring_token() {
+    let storage = InMemoryA2aStorage::new();
+    let (executor, probe_tx) = IgnoresToken::new();
+    let state_a = state_on(storage.clone(), Arc::new(executor));
+    let state_b = state_on(storage.clone(), Arc::new(NoopExecutor));
+    let task_id = start_non_blocking(&state_a, "owner-x").await;
+
+    let poll_interval = Duration::from_millis(50);
+    let grace = state_a.runtime_config.cancel_handler_grace;
+    let shutdown = CancellationToken::new();
+    let poller = tokio::spawn(
+        turul_a2a::server::in_flight::run_cross_instance_cancel_poller(
+            state_a.in_flight.clone(),
+            state_a.cancellation_supervisor.clone(),
+            poll_interval,
+            grace,
+            shutdown.clone(),
+        ),
+    );
+
+    let start = tokio::time::Instant::now();
+    let axum::Json(task) = core_cancel_task(state_b.clone(), "", "owner-x", &task_id)
+        .await
+        .expect("cancel on B");
+    assert_eq!(state_of(&task), "TASK_STATE_CANCELED");
+    assert!(
+        task["status"].get("message").is_none_or(|m| m.is_null()),
+        "B committed the framework CANCELED"
+    );
+
+    await_dropped(probe_tx).await;
+    assert!(
+        start.elapsed() <= poll_interval + grace + Duration::from_millis(100),
+        "A's executor must be dropped within poll interval + grace; took {:?}",
+        start.elapsed()
+    );
+    await_registry_empty(&state_a).await;
+    shutdown.cancel();
+    poller.await.expect("poller exits on shutdown");
+    assert_eq!(terminal_events(&storage, "", &task_id).await.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,6 +1417,11 @@ impl A2aCancellationSupervisor for CountingSupervisor {
             .supervisor_list_cancel_requested(tenant, task_ids)
             .await
     }
+    async fn supervisor_list_executor_held_tasks(
+        &self,
+    ) -> Result<Vec<turul_a2a::storage::ExecutorHeldTask>, A2aStorageError> {
+        self.inner.supervisor_list_executor_held_tasks().await
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -1105,6 +1459,7 @@ async fn cross_instance_poll_issues_one_query_per_tenant_per_tick() {
             state.in_flight.clone(),
             supervisor.clone(),
             interval,
+            Duration::from_secs(5),
             shutdown.clone(),
         ),
     );

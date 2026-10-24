@@ -159,6 +159,12 @@ The builder rejects inconsistent storage/builder configurations (ADR-013 §4.3);
 - Lambda exception: the adapter does not run the persistent cross-instance cancel-marker poller, so cross-instance cancellation propagation to a live executor on a different warm Lambda invocation is not currently supported (see `crates/turul-a2a-aws-lambda/src/lib.rs` module docs). Streaming subscription itself works.
 - See ADR-008 for the durable event coordination contract.
 
+### Executor Lifecycle After Cancel, Panic and Restart
+
+- **Cancel**: `CancelTask` trips the executor's token and, `cancel_handler_grace` later, aborts it unless it committed its own terminal through its sink — an earlier INPUT_REQUIRED/AUTH_REQUIRED does not count (`InFlightHandle::cancel_then_abort_after`; the cross-instance poller applies the same rule on the instance running the executor). The terminal is the handler's framework CANCELED or whichever writer wins the CAS; the grace wait and that commit run detached from the request, so a dropped request still ends CANCELED. Work an executor spawned detached from its own future is not reached. ADR-012 §3.
+- **Panic**: the supervisor commits FAILED ("executor panicked") through the sink; an aborted executor gets no commit from the supervisor. ADR-010 §4.4.
+- **Restart**: tasks a dead process left SUBMITTED/WORKING are failed by the opt-in `A2aServer::fail_orphaned_tasks()` / `A2aServerBuilder::fail_orphaned_tasks_on_start()` (run by `bind()`/`run()`; `into_router()` and friends panic if the flag is set and the method was not awaited). **Single instance only** — on a shared store with several instances it would fail a live peer's tasks. Client-held (INPUT_REQUIRED/AUTH_REQUIRED) and terminal tasks are untouched. Every framework-committed terminal (cancel fallback, blocking hard timeout, unstarted-turn compensation, Lambda pre-dispatch cancel, reconciliation) goes through one helper, `commit_framework_terminal` in `router.rs`. ADR-028.
+
 ### Architecture Decision Records
 
 Long-form rationale lives under `docs/adr/`. ADR refs belong in commit messages, PR descriptions, `CHANGELOG.md`, ADR cross-references, and `README.md` files. **They do NOT belong in code comments, docstrings, or rustdoc** — see §"Comment and Docstring Style" for the rule and the litmus test.

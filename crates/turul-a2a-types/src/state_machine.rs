@@ -77,6 +77,11 @@ pub const TERMINAL_STATES: [TaskState; 4] = [
     TaskState::Rejected,
 ];
 
+/// The executor-held states: an executor is expected to be running and to
+/// move a task in one of these on. `INPUT_REQUIRED` and `AUTH_REQUIRED`
+/// are held by the client instead, and terminal states by no one.
+pub const EXECUTOR_HELD_STATES: [TaskState; 2] = [TaskState::Submitted, TaskState::Working];
+
 /// Returns `true` if the state is terminal (no further transitions allowed).
 pub fn is_terminal(state: TaskState) -> bool {
     TERMINAL_STATES.contains(&state)

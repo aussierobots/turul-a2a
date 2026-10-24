@@ -1046,23 +1046,15 @@ async fn fail_unstarted_task(
         vec![turul_a2a_types::Part::text(reason)],
     );
     let failed_status = TaskStatus::new(TaskState::Failed).with_message(reason_msg);
-    let failed_event = StreamEvent::StatusUpdate {
-        status_update: crate::streaming::StatusUpdatePayload {
-            task_id: target.task_id.clone(),
-            context_id: target.context_id.clone(),
-            status: serde_json::to_value(&failed_status).unwrap_or_default(),
-        },
-    };
-    if let Err(compensate_err) = state
-        .atomic_store
-        .update_task_status_with_events(
-            tenant,
-            &target.task_id,
-            owner,
-            failed_status,
-            vec![failed_event],
-        )
-        .await
+    if let Err(compensate_err) = commit_framework_terminal(
+        state,
+        tenant,
+        owner,
+        &target.task_id,
+        &target.context_id,
+        failed_status,
+    )
+    .await
     {
         tracing::error!(
             tenant = tenant,
@@ -1072,7 +1064,6 @@ async fn fail_unstarted_task(
             "FAILED compensation itself failed: task may remain WORKING"
         );
     }
-    state.event_broker.notify(&target.task_id).await;
 }
 
 /// Request-level executor inputs: `configuration.accepted_output_modes`
@@ -1348,7 +1339,7 @@ pub async fn core_send_message(
 ///    cancellation token is already set; a well-behaved executor
 ///    observes it and emits `sink.cancelled(...)` (or another terminal).
 /// 3. **Hard deadline** (`soft + grace`): abort the executor, then
-///    force-commit `FAILED` via `update_task_status_with_events` —
+///    force-commit `FAILED` via `commit_framework_terminal` —
 ///    CAS-guarded. On `TerminalStateAlreadySet` another writer committed
 ///    a terminal first; re-read and return the persisted terminal.
 ///
@@ -1420,37 +1411,11 @@ async fn await_yielded_with_two_deadlines(
         )],
     );
     let failed_status = TaskStatus::new(TaskState::Failed).with_message(reason_msg);
-    let failed_event = StreamEvent::StatusUpdate {
-        status_update: crate::streaming::StatusUpdatePayload {
-            task_id: task_id.to_string(),
-            context_id: context_id.to_string(),
-            status: serde_json::to_value(&failed_status).unwrap_or_default(),
-        },
-    };
-
-    let failed_event_for_dispatch = failed_event.clone();
-    let result = state
-        .atomic_store
-        .update_task_status_with_events(tenant, task_id, owner, failed_status, vec![failed_event])
-        .await;
+    let result =
+        commit_framework_terminal(state, tenant, owner, task_id, context_id, failed_status).await;
 
     match result {
-        Ok((task, seqs)) => {
-            // framework-committed terminals fan out
-            // to push configs identically to executor-emitted ones.
-            // Hard-timeout FAILED lands here.
-            if let Some(dispatcher) = &state.push_dispatcher {
-                let seq = seqs.first().copied().unwrap_or(0);
-                dispatcher.dispatch(
-                    tenant.to_string(),
-                    owner.to_string(),
-                    task.clone(),
-                    vec![(seq, failed_event_for_dispatch)],
-                );
-            }
-            state.event_broker.notify(task_id).await;
-            Ok(task)
-        }
+        Ok((task, _)) => Ok(task),
         Err(crate::storage::A2aStorageError::TerminalStateAlreadySet { .. }) => {
             // Another writer (the executor's own sink, or a CancelTask
             // on any instance) committed a terminal first. Return the
@@ -1572,23 +1537,67 @@ pub(crate) async fn core_get_task(
     Ok(Json(serde_json::to_value(&task).unwrap_or_default()))
 }
 
+/// Commit a framework-authored status (a terminal the executor did not
+/// emit) through the atomic store's compare-and-set, then fan it out to
+/// push delivery and wake stream subscribers. Callers map the storage
+/// error themselves; nothing is dispatched or notified on failure.
+///
+/// Every terminal the framework writes on an executor's behalf goes
+/// through here, including the serverless adapter's.
+#[doc(hidden)]
+pub async fn commit_framework_terminal(
+    state: &AppState,
+    tenant: &str,
+    owner: &str,
+    task_id: &str,
+    context_id: &str,
+    status: TaskStatus,
+) -> Result<(Task, Vec<u64>), A2aStorageError> {
+    let event = StreamEvent::StatusUpdate {
+        status_update: crate::streaming::StatusUpdatePayload {
+            task_id: task_id.to_string(),
+            context_id: context_id.to_string(),
+            status: serde_json::to_value(&status).unwrap_or_default(),
+        },
+    };
+    let (task, seqs) = state
+        .atomic_store
+        .update_task_status_with_events(tenant, task_id, owner, status, vec![event.clone()])
+        .await?;
+    if let Some(dispatcher) = &state.push_dispatcher {
+        let seq = seqs.first().copied().unwrap_or(0);
+        dispatcher.dispatch(
+            tenant.to_string(),
+            owner.to_string(),
+            task.clone(),
+            vec![(seq, event)],
+        );
+    }
+    state.event_broker.notify(task_id).await;
+    Ok((task, seqs))
+}
+
 /// `CancelTask` handler.
 ///
 /// Sequence:
 /// 1. Validate existence + ownership (via owner-scoped `get_task`).
 /// 2. Reject with `TaskNotCancelable` if task is already terminal.
 /// 3. Write the cancel marker (owner-scoped, idempotent).
-/// 4. Trip the local in-flight cancellation token if present.
+/// 4. Trip the local in-flight cancellation token if present and arm
+///    its deferred abort at `cancel_handler_grace`.
 /// 5. Wait up to `cancel_handler_grace`, polling task state every
 ///    `cancel_handler_poll_interval`. On observed terminal, return that
-///    persisted task snapshot (cooperative cancel won the race).
+///    persisted task snapshot (cooperative cancel won the race). Steps 5
+///    and 6 run detached from the request, so a dropped request still
+///    ends in a terminal once the abort is armed; a failed read during
+///    the poll is logged and the wait continues.
 /// 6. On grace expiry, force-commit `CANCELED` via the atomic store
 ///    (CAS-guarded via the atomic store's terminal-preservation
 ///    contract). On success, return CANCELED. On
 ///    `TerminalStateAlreadySet`, re-read and return the actual persisted
 ///    terminal (another path won at the CAS layer).
 ///
-/// Framework-committed terminals carry `message = None` —
+/// The framework-committed CANCELED fallback carries `message = None` —
 /// the plain `TaskStatus::new(TaskState::Canceled)` constructor produces
 /// exactly that.
 #[doc(hidden)]
@@ -1649,9 +1658,31 @@ pub async fn core_cancel_task(
     // poll loop (see `server::in_flight::run_cross_instance_cancel_poller`).
     let in_flight_key = (tenant.to_string(), task_id.to_string());
     if let Some(handle) = state.in_flight.get(&in_flight_key) {
-        handle.cancellation.cancel();
+        handle.cancel_then_abort_after(state.runtime_config.cancel_handler_grace);
     }
 
+    // Steps 5-6 run detached: the abort armed above fires at grace
+    // whether or not this request is still alive, so the CANCELED commit
+    // must not be lost to a dropped request future (client disconnect,
+    // transport deadline).
+    let tenant = tenant.to_string();
+    let owner = owner.to_string();
+    let task_id = task_id.to_string();
+    tokio::spawn(async move {
+        cancel_grace_then_commit(state, &tenant, &owner, &task_id, &context_id).await
+    })
+    .await
+    .map_err(|e| A2aError::Internal(format!("cancel task failed: {e}")))?
+}
+
+/// Cancel steps 5 and 6: grace-wait, then force-commit `CANCELED`.
+async fn cancel_grace_then_commit(
+    state: AppState,
+    tenant: &str,
+    owner: &str,
+    task_id: &str,
+    context_id: &str,
+) -> Result<Json<serde_json::Value>, A2aError> {
     // Step 5: grace-wait with poll. Return early if the task reaches
     // a terminal state via the executor's cooperative response.
     let deadline = tokio::time::Instant::now() + state.runtime_config.cancel_handler_grace;
@@ -1666,9 +1697,18 @@ pub async fn core_cancel_task(
             .task_storage
             .get_task(tenant, task_id, owner, Some(0))
             .await
-            .map_err(A2aError::from)?
         {
-            Some(current) => {
+            Err(e) => {
+                // The abort fires at grace regardless, so a transient read
+                // failure must still end in the CANCELED commit below.
+                tracing::warn!(
+                    target: "turul_a2a::cancel_grace_poll_error",
+                    task_id = %task_id,
+                    error = %e,
+                    "cancel grace poll read failed; will commit at grace"
+                );
+            }
+            Ok(Some(current)) => {
                 if let Some(status) = current.status()
                     && let Ok(s) = status.state()
                     && turul_a2a_types::state_machine::is_terminal(s)
@@ -1679,7 +1719,7 @@ pub async fn core_cancel_task(
                     return Ok(Json(serde_json::to_value(&current).unwrap_or_default()));
                 }
             }
-            None => {
+            Ok(None) => {
                 return Err(A2aError::TaskNotFound {
                     task_id: task_id.to_string(),
                 });
@@ -1698,44 +1738,18 @@ pub async fn core_cancel_task(
     // Framework-committed terminals use `message = None` so history /
     // SSE consumers can distinguish them from executor-authored cancels
     // without conflating framework telemetry with agent output.
-    let cancel_event = StreamEvent::StatusUpdate {
-        status_update: crate::streaming::StatusUpdatePayload {
-            task_id: task_id.to_string(),
-            context_id,
-            status: serde_json::to_value(TaskStatus::new(TaskState::Canceled)).unwrap_or_default(),
-        },
-    };
-    let cancel_event_for_dispatch = cancel_event.clone();
-
-    let result = state
-        .atomic_store
-        .update_task_status_with_events(
-            tenant,
-            task_id,
-            owner,
-            TaskStatus::new(TaskState::Canceled),
-            vec![cancel_event],
-        )
-        .await;
+    let result = commit_framework_terminal(
+        &state,
+        tenant,
+        owner,
+        task_id,
+        context_id,
+        TaskStatus::new(TaskState::Canceled),
+    )
+    .await;
 
     match result {
-        Ok((task, seqs)) => {
-            // framework-committed CANCELED must
-            // trigger push delivery exactly like an executor-emitted
-            // cancel. The :cancel grace-expiry path reaches this
-            // arm after the executor failed to react in time.
-            if let Some(dispatcher) = &state.push_dispatcher {
-                let seq = seqs.first().copied().unwrap_or(0);
-                dispatcher.dispatch(
-                    tenant.to_string(),
-                    owner.to_string(),
-                    task.clone(),
-                    vec![(seq, cancel_event_for_dispatch)],
-                );
-            }
-            state.event_broker.notify(task_id).await;
-            Ok(Json(serde_json::to_value(&task).unwrap_or_default()))
-        }
+        Ok((task, _)) => Ok(Json(serde_json::to_value(&task).unwrap_or_default())),
         Err(A2aStorageError::TerminalStateAlreadySet { .. }) => {
             // Race resolved at the atomic-store CAS: another writer
             // (executor emitting its own terminal, or a concurrent

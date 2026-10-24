@@ -630,6 +630,32 @@ impl crate::storage::A2aCancellationSupervisor for InMemoryA2aStorage {
         }
         Ok(out)
     }
+
+    async fn supervisor_list_executor_held_tasks(
+        &self,
+    ) -> Result<Vec<super::traits::ExecutorHeldTask>, A2aStorageError> {
+        let tasks = self.tasks.read().await;
+        Ok(tasks
+            .values()
+            .filter(|stored| {
+                stored
+                    .task
+                    .status()
+                    .and_then(|s| s.state().ok())
+                    .is_some_and(|s| {
+                        turul_a2a_types::state_machine::EXECUTOR_HELD_STATES.contains(&s)
+                    })
+            })
+            .map(|stored| {
+                super::traits::ExecutorHeldTask::new(
+                    stored.tenant.clone(),
+                    stored.task.id(),
+                    stored.owner.clone(),
+                    stored.task.context_id(),
+                )
+            })
+            .collect())
+    }
 }
 
 #[async_trait]
@@ -2029,6 +2055,12 @@ mod tests {
     async fn test_supervisor_list_cancel_requested_parity() {
         let s = storage();
         parity_tests::test_supervisor_list_cancel_requested_parity(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_list_executor_held_tasks_parity() {
+        let s = storage();
+        parity_tests::test_supervisor_list_executor_held_tasks_parity(&s, &s, &s).await;
     }
 
     #[tokio::test]

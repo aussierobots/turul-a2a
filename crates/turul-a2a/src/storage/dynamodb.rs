@@ -1648,6 +1648,58 @@ impl crate::storage::A2aCancellationSupervisor for DynamoDbA2aStorage {
         }
         Ok(hits)
     }
+
+    async fn supervisor_list_executor_held_tasks(
+        &self,
+    ) -> Result<Vec<crate::storage::ExecutorHeldTask>, A2aStorageError> {
+        let mut out = Vec::new();
+        let mut start_key = None;
+        loop {
+            let held = turul_a2a_types::state_machine::EXECUTOR_HELD_STATES;
+            let placeholders: Vec<String> = (0..held.len()).map(|i| format!(":held{i}")).collect();
+            let mut scan = self
+                .client
+                .scan()
+                .table_name(&self.config.tasks_table)
+                .consistent_read(true)
+                .filter_expression(format!("statusState IN ({})", placeholders.join(", ")));
+            for (placeholder, state) in placeholders.iter().zip(held) {
+                scan = scan.expression_attribute_values(
+                    placeholder,
+                    AttributeValue::S(state.wire_name().to_string()),
+                );
+            }
+            let page = scan
+                .projection_expression("tenant, taskId, #o, contextId")
+                .expression_attribute_names("#o", "owner")
+                .set_exclusive_start_key(start_key)
+                .send()
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+            for item in page.items() {
+                let attr = |name: &str| {
+                    item.get(name)
+                        .and_then(|v| v.as_s().ok())
+                        .cloned()
+                        .ok_or_else(|| {
+                            A2aStorageError::DatabaseError(format!(
+                                "task item missing string attribute {name}"
+                            ))
+                        })
+                };
+                out.push(crate::storage::ExecutorHeldTask::new(
+                    attr("tenant")?,
+                    attr("taskId")?,
+                    attr("owner")?,
+                    attr("contextId")?,
+                ));
+            }
+            match page.last_evaluated_key {
+                Some(k) => start_key = Some(k),
+                None => return Ok(out),
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -4089,6 +4141,22 @@ mod tests {
                 &self.inner, &self.scoped_tenant(tenant), task_ids,
             ).await
         }
+
+        async fn supervisor_list_executor_held_tasks(
+            &self,
+        ) -> Result<Vec<crate::storage::ExecutorHeldTask>, A2aStorageError> {
+            let prefix = format!("{}_", self.tenant_prefix);
+            let all = <DynamoDbA2aStorage as crate::storage::A2aCancellationSupervisor>::supervisor_list_executor_held_tasks(
+                &self.inner,
+            ).await?;
+            Ok(all
+                .into_iter()
+                .filter_map(|mut t| {
+                    t.tenant = t.tenant.strip_prefix(&prefix)?.to_string();
+                    Some(t)
+                })
+                .collect())
+        }
     }
 
     #[async_trait]
@@ -5101,6 +5169,12 @@ mod tests {
     async fn test_supervisor_list_cancel_requested_parity() {
         skip_unless_dynamodb_env!(s);
         parity_tests::test_supervisor_list_cancel_requested_parity(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_list_executor_held_tasks_parity() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_supervisor_list_executor_held_tasks_parity(&s, &s, &s).await;
     }
 
     #[tokio::test]

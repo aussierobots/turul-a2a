@@ -369,6 +369,7 @@ impl EventSinkInner {
                 self.is_interrupted.store(is_interrupted, Ordering::Release);
                 if is_terminal {
                     self.is_closed.store(true, Ordering::Release);
+                    self.handle.mark_terminal_committed();
                 }
                 if is_terminal || is_interrupted {
                     self.handle.fire_yielded(task);

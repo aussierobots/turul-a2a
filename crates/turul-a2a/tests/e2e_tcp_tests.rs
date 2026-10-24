@@ -569,3 +569,98 @@ async fn e2e_tcp_message_builder_ergonomics() {
     let task = resp.task().expect("Expected Task");
     assert!(!task.id().is_empty());
 }
+
+// =========================================================
+// CancelTask aborts an executor that ignores the token
+// =========================================================
+
+/// Ignores the cancellation token. Holds a drop probe so the test can
+/// observe the executor future being aborted.
+struct IgnoresCancelExecutor {
+    probe: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait::async_trait]
+impl AgentExecutor for IgnoresCancelExecutor {
+    async fn execute(
+        &self,
+        _task: &mut Task,
+        _msg: &Message,
+        _ctx: &turul_a2a::executor::ExecutionContext,
+    ) -> Result<(), A2aError> {
+        let _probe_held_in_future = self.probe.lock().unwrap().take();
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        AgentCardBuilder::new("Ignores Cancel Agent", "1.0.0")
+            .description("Never observes the cancellation token")
+            .url("http://localhost", "JSONRPC", "1.0")
+            .default_input_modes(vec!["text/plain"])
+            .default_output_modes(vec!["text/plain"])
+            .build()
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn cancel_task_over_http_aborts_executor_ignoring_token() {
+    let (probe_tx, probe_rx) = tokio::sync::oneshot::channel::<()>();
+    let bound = turul_a2a::server::A2aServer::builder()
+        .executor(IgnoresCancelExecutor {
+            probe: std::sync::Mutex::new(Some(probe_rx)),
+        })
+        .storage(InMemoryA2aStorage::new())
+        .cancel_handler_grace(Duration::from_millis(300))
+        .bind(([127, 0, 0, 1], 0u16))
+        .build()
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let base = format!("http://{}", bound.local_addr());
+    let serving = tokio::spawn(bound.run());
+    common::wait_http_ready(&base).await;
+
+    let http = reqwest::Client::new();
+    let sent: serde_json::Value = http
+        .post(format!("{base}/message:send"))
+        .header("A2A-Version", "1.0")
+        .json(&serde_json::json!({
+            "message": {
+                "messageId": "m-ignore-cancel",
+                "role": "ROLE_USER",
+                "parts": [{"text": "work"}],
+            },
+            "configuration": {"returnImmediately": true},
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = sent["task"]["id"].as_str().expect("task id").to_string();
+
+    let resp = http
+        .post(format!("{base}/tasks/{task_id}:cancel"))
+        .header("A2A-Version", "1.0")
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let task: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(task["status"]["state"], "TASK_STATE_CANCELED");
+
+    let mut probe_tx = probe_tx;
+    tokio::time::timeout(Duration::from_secs(5), probe_tx.closed())
+        .await
+        .expect("executor future was never dropped after the grace window");
+
+    serving.abort();
+    let _ = serving.await;
+}
