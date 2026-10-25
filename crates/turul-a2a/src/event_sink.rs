@@ -349,7 +349,7 @@ impl EventSinkInner {
                 let seq = seqs.first().copied().unwrap_or(0);
                 let is_terminal = turul_a2a_types::state_machine::is_terminal(state);
                 let is_interrupted =
-                    matches!(state, TaskState::InputRequired | TaskState::AuthRequired);
+                    turul_a2a_types::state_machine::CLIENT_HELD_STATES.contains(&state);
 
                 // Push delivery fan-out. The dispatcher
                 // filters for terminal status events internally; we

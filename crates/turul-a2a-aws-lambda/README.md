@@ -75,6 +75,10 @@ let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery_store)
     .with_config(LambdaScheduledRecoveryConfig::default());
 // Lambda input type: aws_lambda_events::eventbridge::EventBridgeEvent
 // Response: LambdaScheduledRecoveryResponse (per-stage counts + error sample)
+
+// Optional: also cancel tasks left in INPUT_REQUIRED / AUTH_REQUIRED for
+// longer than the A2A handler's RuntimeConfig::idle_task_timeout.
+let handler = handler.with_idle_task_sweep(a2a_handler.clone());
 ```
 
 Release-gate invariants (pinned by tests in `src/stream_recovery_tests.rs` and `src/scheduled_recovery_tests.rs`):

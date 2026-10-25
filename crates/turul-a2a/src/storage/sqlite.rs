@@ -9,7 +9,7 @@ use super::error::A2aStorageError;
 use super::event_store::A2aEventStore;
 use super::filter::{PushConfigListPage, TaskFilter, TaskListPage};
 use super::retention::RetentionConfig;
-use super::terminal_cas::{EXECUTOR_HELD_STATES_SQL, TERMINAL_STATES_SQL};
+use super::terminal_cas::{CLIENT_HELD_STATES_SQL, EXECUTOR_HELD_STATES_SQL, TERMINAL_STATES_SQL};
 use super::traits::{A2aPushNotificationStorage, A2aTaskStorage};
 use crate::push::{
     A2aPushDeliveryStore, AbandonedReason, ClaimStatus, DeliveryClaim, DeliveryErrorClass,
@@ -906,7 +906,7 @@ impl crate::storage::A2aCancellationSupervisor for SqliteA2aStorage {
     async fn supervisor_list_expired_executor_leases(
         &self,
         now_micros: i64,
-    ) -> Result<Vec<super::traits::ExecutorHeldTask>, A2aStorageError> {
+    ) -> Result<Vec<super::traits::SupervisedTask>, A2aStorageError> {
         let held = EXECUTOR_HELD_STATES_SQL.as_str();
         let rows: Vec<(String, String, String, String)> =
             sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -921,7 +921,33 @@ impl crate::storage::A2aCancellationSupervisor for SqliteA2aStorage {
         Ok(rows
             .into_iter()
             .map(|(tenant, task_id, owner, context_id)| {
-                super::traits::ExecutorHeldTask::new(tenant, task_id, owner, context_id)
+                super::traits::SupervisedTask::new(tenant, task_id, owner, context_id)
+            })
+            .collect())
+    }
+
+    async fn supervisor_list_idle_client_held_tasks(
+        &self,
+        status_before_micros: i64,
+        limit: usize,
+    ) -> Result<Vec<super::traits::SupervisedTask>, A2aStorageError> {
+        let held = CLIENT_HELD_STATES_SQL.as_str();
+        let before = super::status_time::key_of_micros(status_before_micros);
+        let rows: Vec<(String, String, String, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT tenant, task_id, owner, context_id FROM a2a_tasks
+                 WHERE status_state IN ({held}) AND status_timestamp < ?
+                 LIMIT ?"
+            )))
+            .bind(before)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|(tenant, task_id, owner, context_id)| {
+                super::traits::SupervisedTask::new(tenant, task_id, owner, context_id)
             })
             .collect())
     }
@@ -3083,6 +3109,12 @@ mod tests {
     async fn test_supervisor_executor_lease_parity() {
         let s = storage().await;
         parity_tests::test_supervisor_executor_lease_parity(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_idle_client_held_parity() {
+        let s = storage().await;
+        parity_tests::test_supervisor_idle_client_held_parity(&s, &s, &s).await;
     }
 
     #[tokio::test]

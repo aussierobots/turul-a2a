@@ -243,21 +243,33 @@ pub trait A2aCancellationSupervisor: Send + Sync {
     async fn supervisor_list_expired_executor_leases(
         &self,
         now_micros: i64,
-    ) -> Result<Vec<ExecutorHeldTask>, A2aStorageError>;
+    ) -> Result<Vec<SupervisedTask>, A2aStorageError>;
+
+    /// Return at most `limit` INPUT_REQUIRED or AUTH_REQUIRED tasks,
+    /// across all tenants and owners, whose status timestamp is earlier
+    /// than `status_before_micros` (epoch microseconds).
+    ///
+    /// Owner-unscoped and store-wide; the only callers are the idle-task
+    /// sweeps, which act for the framework rather than a requester.
+    async fn supervisor_list_idle_client_held_tasks(
+        &self,
+        status_before_micros: i64,
+        limit: usize,
+    ) -> Result<Vec<SupervisedTask>, A2aStorageError>;
 }
 
-/// A task whose executor is expected to be running: identity and routing
-/// fields needed to act on it without a per-task read.
+/// A task the framework acts on outside any request: identity and routing
+/// fields needed to commit to it without a per-task read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct ExecutorHeldTask {
+pub struct SupervisedTask {
     pub tenant: String,
     pub task_id: String,
     pub owner: String,
     pub context_id: String,
 }
 
-impl ExecutorHeldTask {
+impl SupervisedTask {
     pub fn new(
         tenant: impl Into<String>,
         task_id: impl Into<String>,

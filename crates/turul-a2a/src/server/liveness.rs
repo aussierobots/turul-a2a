@@ -7,6 +7,9 @@
 //!   that ran their executor stopped renewing it.
 //! - **Stall watchdog** fails and aborts executors in this process that
 //!   stopped making progress.
+//! - **Idle-task sweep** cancels tasks that have waited on their client
+//!   for longer than the idle timeout, so they reach a terminal state
+//!   and expire under task retention.
 //!
 //! Each loop holds the in-flight registry weakly and exits when the
 //! server state that owns it is dropped. The loops commit framework
@@ -22,7 +25,7 @@ use turul_a2a_types::{Message, Part, Role, TaskState, TaskStatus};
 
 use crate::router::{AppState, commit_framework_terminal};
 use crate::server::in_flight::InFlightRegistry;
-use crate::storage::{A2aCancellationSupervisor, A2aStorageError};
+use crate::storage::{A2aCancellationSupervisor, A2aStorageError, SupervisedTask};
 
 const LEASE_LOST_REASON: &str =
     "task failed: the server running its executor stopped renewing the executor's lease";
@@ -31,7 +34,10 @@ const LEASE_LOST_REASON: &str =
 /// from within a tokio runtime.
 pub(crate) fn spawn_loops(state: &AppState) {
     let config = &state.runtime_config;
-    if config.executor_lease_ttl.is_none() && config.executor_stall_timeout.is_none() {
+    if config.executor_lease_ttl.is_none()
+        && config.executor_stall_timeout.is_none()
+        && config.idle_task_timeout.is_none()
+    {
         return;
     }
     let registry = Arc::downgrade(&state.in_flight);
@@ -49,6 +55,9 @@ pub(crate) fn spawn_loops(state: &AppState) {
             committer.clone(),
             ttl,
         ));
+    }
+    if let Some(timeout) = config.idle_task_timeout {
+        tokio::spawn(idle_loop(registry.clone(), committer.clone(), timeout));
     }
     if let Some(timeout) = config.executor_stall_timeout {
         tokio::spawn(stall_loop(
@@ -243,6 +252,137 @@ async fn stall_loop(
                 }
             }
             handle.cancel_then_abort_after(abort_grace);
+        }
+    }
+}
+
+/// Tasks read per idle-task listing page.
+const IDLE_PAGE: usize = 100;
+
+/// Outcome of one idle-task sweep.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct IdleSweep {
+    /// Tasks this sweep committed `CANCELED`.
+    pub canceled: usize,
+    /// Tasks whose commit failed with a storage error; they are retried
+    /// by the next sweep.
+    pub errors: usize,
+}
+
+async fn idle_loop(registry: Weak<InFlightRegistry>, committer: AppState, timeout: Duration) {
+    loop {
+        let Some(live) = registry.upgrade() else {
+            return;
+        };
+        let _ = cancel_idle_tasks(&committer, Some(&live), timeout).await;
+        drop(live);
+        tokio::time::sleep(timeout / 4).await;
+    }
+}
+
+/// Cancel every task whose status has been INPUT_REQUIRED or
+/// AUTH_REQUIRED for longer than `idle_for`, committing `CANCELED`
+/// through the framework terminal path. An executor still running for
+/// such a task in `registry` is cancelled and aborted after
+/// `cancel_abort_grace`. Pages through the store until a page comes back
+/// short or every commit in it failed. Errors listing the store end the sweep and
+/// are returned; per-task commit errors are logged and counted.
+#[doc(hidden)]
+pub async fn cancel_idle_tasks(
+    state: &AppState,
+    registry: Option<&InFlightRegistry>,
+    idle_for: Duration,
+) -> Result<IdleSweep, A2aStorageError> {
+    let mut sweep = IdleSweep::default();
+    let reason = format!("task canceled: no client input for {idle_for:?}");
+    loop {
+        let before =
+            now_micros().saturating_sub(i64::try_from(idle_for.as_micros()).unwrap_or(i64::MAX));
+        let page = state
+            .cancellation_supervisor
+            .supervisor_list_idle_client_held_tasks(before, IDLE_PAGE)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(
+                    target: "turul_a2a::idle_task_sweep_error",
+                    error = %e,
+                    "listing idle tasks failed; will retry next sweep"
+                )
+            })?;
+        let mut page_errors = 0;
+        for task in &page {
+            match cancel_idle_task(state, registry, task, &reason).await {
+                IdleOutcome::Canceled => sweep.canceled += 1,
+                IdleOutcome::Resolved => {}
+                IdleOutcome::Failed => page_errors += 1,
+            }
+        }
+        sweep.errors += page_errors;
+        // A page of failures would be listed again unchanged.
+        if page.len() < IDLE_PAGE || page_errors == page.len() {
+            return Ok(sweep);
+        }
+    }
+}
+
+enum IdleOutcome {
+    Canceled,
+    /// Another writer made the task terminal, or it was deleted.
+    Resolved,
+    /// The commit failed; the task is still idle.
+    Failed,
+}
+
+/// Commit `CANCELED` for one idle task.
+async fn cancel_idle_task(
+    state: &AppState,
+    registry: Option<&InFlightRegistry>,
+    task: &SupervisedTask,
+    reason: &str,
+) -> IdleOutcome {
+    let message = Message::new(
+        uuid::Uuid::now_v7().to_string(),
+        Role::Agent,
+        vec![Part::text(reason)],
+    );
+    let status = TaskStatus::new(TaskState::Canceled).with_message(message);
+    match commit_framework_terminal(
+        state,
+        &task.tenant,
+        &task.owner,
+        &task.task_id,
+        &task.context_id,
+        status,
+    )
+    .await
+    {
+        Ok(_) => {
+            tracing::warn!(
+                target: "turul_a2a::idle_task_canceled",
+                tenant = %task.tenant,
+                task_id = %task.task_id,
+                "canceled task left waiting on its client"
+            );
+            if let Some(handle) =
+                registry.and_then(|r| r.get(&(task.tenant.clone(), task.task_id.clone())))
+            {
+                handle.cancel_then_abort_after(state.runtime_config.cancel_abort_grace);
+            }
+            IdleOutcome::Canceled
+        }
+        Err(A2aStorageError::TerminalStateAlreadySet { .. } | A2aStorageError::TaskNotFound(_)) => {
+            IdleOutcome::Resolved
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "turul_a2a::idle_task_sweep_error",
+                tenant = %task.tenant,
+                task_id = %task.task_id,
+                error = %e,
+                "canceling idle task failed; will retry next sweep"
+            );
+            IdleOutcome::Failed
         }
     }
 }

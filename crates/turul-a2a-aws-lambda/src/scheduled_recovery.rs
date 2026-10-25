@@ -23,7 +23,11 @@
 //!    claim rows via
 //!    [`A2aPushDeliveryStore::list_reclaimable_claims`] and drives
 //!    each through [`PushDispatcher::redispatch_one`].
-//! 3. Returns a [`LambdaScheduledRecoveryResponse`] summary with
+//! 3. When built [`LambdaScheduledRecoveryHandler::with_idle_task_sweep`],
+//!    cancels tasks left waiting on their client for longer than the
+//!    handler's `idle_task_timeout`
+//!    ([`crate::LambdaA2aHandler::cancel_idle_tasks`]).
+//! 4. Returns a [`LambdaScheduledRecoveryResponse`] summary with
 //!    per-stage counts and a capped list of error strings for
 //!    telemetry.
 //!
@@ -38,6 +42,8 @@ use aws_lambda_events::event::eventbridge::EventBridgeEvent;
 use serde::Serialize;
 use turul_a2a::push::{A2aPushDeliveryStore, PushDispatcher};
 use turul_a2a::storage::{A2aEventStore, A2aStorageError};
+
+use crate::LambdaA2aHandler;
 
 /// Summary returned from a single scheduled-recovery tick.
 ///
@@ -61,6 +67,10 @@ pub struct LambdaScheduledRecoveryResponse {
     /// Claims redispatched (fire-and-forget — error signal isn't
     /// plumbed back through `redispatch_one`).
     pub reclaimable_claims_processed: usize,
+    /// Idle client-held tasks committed `CANCELED` by this tick.
+    pub idle_tasks_canceled: usize,
+    /// Idle tasks whose cancel hit a storage error; retried next tick.
+    pub idle_task_errors: usize,
     /// First few error strings surfaced during the sweep. Capped at
     /// [`LambdaScheduledRecoveryHandler::ERROR_SAMPLE_LIMIT`] to keep
     /// the response body bounded.
@@ -99,6 +109,7 @@ pub struct LambdaScheduledRecoveryHandler {
     dispatcher: Arc<PushDispatcher>,
     delivery_store: Arc<dyn A2aPushDeliveryStore>,
     config: LambdaScheduledRecoveryConfig,
+    idle_task_sweep: Option<LambdaA2aHandler>,
 }
 
 impl LambdaScheduledRecoveryHandler {
@@ -114,7 +125,16 @@ impl LambdaScheduledRecoveryHandler {
             dispatcher,
             delivery_store,
             config: LambdaScheduledRecoveryConfig::default(),
+            idle_task_sweep: None,
         }
+    }
+
+    /// Also cancel, on every tick, the tasks of `handler`'s store left
+    /// waiting on their client for longer than its runtime configuration's
+    /// `idle_task_timeout`. With no timeout set the stage does nothing.
+    pub fn with_idle_task_sweep(mut self, handler: LambdaA2aHandler) -> Self {
+        self.idle_task_sweep = Some(handler);
+        self
     }
 
     pub fn with_config(mut self, config: LambdaScheduledRecoveryConfig) -> Self {
@@ -203,6 +223,19 @@ impl LambdaScheduledRecoveryHandler {
                     &mut response.errors,
                     format!("list_reclaimable_claims: {e}"),
                 );
+            }
+        }
+
+        // Stage 3: idle client-held tasks.
+        if let Some(handler) = &self.idle_task_sweep {
+            match handler.cancel_idle_tasks().await {
+                Ok(sweep) => {
+                    response.idle_tasks_canceled = sweep.canceled;
+                    response.idle_task_errors = sweep.errors;
+                }
+                Err(e) => {
+                    self.sample_error(&mut response.errors, format!("idle tasks: {e}"));
+                }
             }
         }
 

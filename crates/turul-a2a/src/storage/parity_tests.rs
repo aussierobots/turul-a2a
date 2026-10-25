@@ -2606,6 +2606,82 @@ async fn seed_one_task_per_state(
     seeded
 }
 
+/// Idle client-held listing parity. Returns exactly the INPUT_REQUIRED and
+/// AUTH_REQUIRED tasks whose status timestamp is earlier than the cutoff,
+/// across tenants and owners, and at most `limit` of them. Tenant A is
+/// seeded before the cutoff and tenant B after it. The listing is
+/// store-wide, so assertions are restricted to this run's tenants.
+pub async fn test_supervisor_idle_client_held_parity(
+    tasks: &dyn A2aTaskStorage,
+    atomic: &dyn A2aAtomicStore,
+    supervisor: &dyn crate::storage::A2aCancellationSupervisor,
+) {
+    let run = uuid::Uuid::now_v7().simple().to_string();
+    let tenants = [format!("idle-a-{run}"), format!("idle-b-{run}")];
+    let seeded_a = seed_one_task_per_state(tasks, atomic, &tenants[0], "idle-0", 0).await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let cutoff = chrono::Utc::now().timestamp_micros();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let seeded_b = seed_one_task_per_state(tasks, atomic, &tenants[1], "idle-1", 1).await;
+
+    // A lease on a client-held and on a terminal task must not add rows
+    // (on DynamoDB a lease is a separate item in the tasks table).
+    for (id, state, _, _) in &seeded_a {
+        if matches!(state, TaskState::InputRequired | TaskState::Completed) {
+            supervisor
+                .supervisor_renew_executor_leases(&tenants[0], std::slice::from_ref(id), Some(1))
+                .await
+                .unwrap();
+        }
+    }
+
+    let tenants = &tenants;
+    let list = |before: i64, limit: usize| async move {
+        let mut listed: Vec<(String, String, String, String)> = supervisor
+            .supervisor_list_idle_client_held_tasks(before, limit)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|t| tenants.contains(&t.tenant))
+            .map(|t| (t.tenant, t.task_id, t.owner, t.context_id))
+            .collect();
+        listed.sort();
+        listed
+    };
+    let client_held = |tenant: &str, seeded: &[(String, TaskState, String, String)]| {
+        seeded
+            .iter()
+            .filter(|t| matches!(t.1, TaskState::InputRequired | TaskState::AuthRequired))
+            .map(|t| (tenant.to_string(), t.0.clone(), t.2.clone(), t.3.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    let mut expected = client_held(&tenants[0], &seeded_a);
+    expected.sort();
+    assert_eq!(
+        list(cutoff, usize::MAX).await,
+        expected,
+        "only client-held tasks older than the cutoff are listed"
+    );
+
+    let later = chrono::Utc::now().timestamp_micros() + 60_000_000;
+    let mut expected_all = client_held(&tenants[0], &seeded_a);
+    expected_all.extend(client_held(&tenants[1], &seeded_b));
+    expected_all.sort();
+    assert_eq!(list(later, usize::MAX).await, expected_all);
+
+    let earlier = chrono::Utc::now().timestamp_micros() - 3_600_000_000;
+    assert!(list(earlier, usize::MAX).await.is_empty());
+
+    // At least four tasks qualify store-wide, so a limit of one returns
+    // exactly one.
+    let limited = supervisor
+        .supervisor_list_idle_client_held_tasks(later, 1)
+        .await
+        .unwrap();
+    assert_eq!(limited.len(), 1, "the listing honours its limit");
+}
+
 /// Executor lease parity. Renewal is scoped to its tenant and never
 /// creates a task. The expired-lease listing returns exactly the
 /// SUBMITTED or WORKING tasks whose lease is earlier than `now`, across

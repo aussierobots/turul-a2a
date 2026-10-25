@@ -44,6 +44,12 @@ pub(crate) fn key_of(at: &DateTime<Utc>) -> String {
     at.format(SORT_KEY_FORMAT).to_string()
 }
 
+/// Format an instant given in epoch microseconds as a sort key. Out of
+/// range values clamp to the earliest representable instant.
+pub(crate) fn key_of_micros(micros: i64) -> String {
+    key_of(&DateTime::<Utc>::from_timestamp_micros(micros).unwrap_or(DateTime::<Utc>::MIN_UTC))
+}
+
 /// The ListTasks sort key of `task`: its status timestamp, or the empty
 /// string (sorting last) when it has none.
 pub(crate) fn sort_key(task: &Task) -> String {

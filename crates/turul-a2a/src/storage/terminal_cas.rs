@@ -8,7 +8,7 @@
 
 use std::sync::LazyLock;
 
-use turul_a2a_types::state_machine::{EXECUTOR_HELD_STATES, TERMINAL_STATES};
+use turul_a2a_types::state_machine::{CLIENT_HELD_STATES, EXECUTOR_HELD_STATES, TERMINAL_STATES};
 
 /// `'TASK_STATE_COMPLETED', 'TASK_STATE_FAILED', ...` — the body of a SQL
 /// `IN (...)` list over the terminal states. Wire names are fixed
@@ -25,6 +25,16 @@ pub(crate) static TERMINAL_STATES_SQL: LazyLock<String> = LazyLock::new(|| {
 /// `IN (...)` list over the states an executor holds.
 pub(crate) static EXECUTOR_HELD_STATES_SQL: LazyLock<String> = LazyLock::new(|| {
     EXECUTOR_HELD_STATES
+        .iter()
+        .map(|s| format!("'{}'", s.wire_name()))
+        .collect::<Vec<_>>()
+        .join(", ")
+});
+
+/// `'TASK_STATE_INPUT_REQUIRED', 'TASK_STATE_AUTH_REQUIRED'` — the body
+/// of a SQL `IN (...)` list over the states the client holds.
+pub(crate) static CLIENT_HELD_STATES_SQL: LazyLock<String> = LazyLock::new(|| {
+    CLIENT_HELD_STATES
         .iter()
         .map(|s| format!("'{}'", s.wire_name()))
         .collect::<Vec<_>>()

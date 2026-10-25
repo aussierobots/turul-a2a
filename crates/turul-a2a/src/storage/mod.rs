@@ -56,7 +56,7 @@ pub use event_store::A2aEventStore;
 pub use filter::{PushConfigListPage, TaskFilter, TaskListPage};
 pub use retention::RetentionConfig;
 pub use traits::{
-    A2aCancellationSupervisor, A2aPushNotificationStorage, A2aTaskStorage, ExecutorHeldTask,
+    A2aCancellationSupervisor, A2aPushNotificationStorage, A2aTaskStorage, SupervisedTask,
 };
 
 #[cfg(feature = "in-memory")]

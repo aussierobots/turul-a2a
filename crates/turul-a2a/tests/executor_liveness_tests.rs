@@ -1,10 +1,12 @@
 //! Executor liveness: the lease that lets a peer fail the tasks of a dead
-//! instance, and the stall watchdog that fails and aborts an executor
-//! that stops making progress inside a live one.
+//! instance, the stall watchdog that fails and aborts an executor that
+//! stops making progress inside a live one, and the idle-task sweep that
+//! cancels tasks left waiting on their client.
 //!
 //! Lease timestamps come from the wall clock, so the lease tests run on
-//! the real clock with durations of a few hundred milliseconds. The
-//! stall tests only use tokio timers and run on the paused clock.
+//! the real clock with durations of a few hundred milliseconds, as do
+//! the idle-task tests (status timestamps are wall-clock). The stall
+//! tests only use tokio timers and run on the paused clock.
 
 mod common;
 
@@ -24,7 +26,7 @@ use turul_a2a::error::A2aError;
 use turul_a2a::executor::{AgentExecutor, ExecutionContext};
 use turul_a2a::storage::{
     A2aAtomicStore, A2aCancellationSupervisor, A2aEventStore, A2aStorageError, A2aTaskStorage,
-    ExecutorHeldTask, InMemoryA2aStorage,
+    InMemoryA2aStorage, SupervisedTask,
 };
 use turul_a2a::streaming::{StatusUpdatePayload, StreamEvent};
 use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
@@ -243,6 +245,29 @@ impl AgentExecutor for InterruptsThenIdles {
     }
 }
 
+/// Raises INPUT_REQUIRED, then hangs holding a drop probe in its future.
+struct InterruptsThenHangs {
+    probe: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+#[async_trait]
+impl AgentExecutor for InterruptsThenHangs {
+    async fn execute(
+        &self,
+        _task: &mut Task,
+        _msg: &Message,
+        ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        let _probe_held_in_future = self.probe.lock().unwrap().take();
+        ctx.events.require_input(None).await?;
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        card()
+    }
+}
+
 /// Raises INPUT_REQUIRED, resumes WORKING on its own, then goes silent.
 struct InterruptsResumesThenSilent;
 
@@ -363,9 +388,18 @@ impl A2aCancellationSupervisor for LeaseSpy {
     async fn supervisor_list_expired_executor_leases(
         &self,
         now_micros: i64,
-    ) -> Result<Vec<ExecutorHeldTask>, A2aStorageError> {
+    ) -> Result<Vec<SupervisedTask>, A2aStorageError> {
         self.inner
             .supervisor_list_expired_executor_leases(now_micros)
+            .await
+    }
+    async fn supervisor_list_idle_client_held_tasks(
+        &self,
+        status_before_micros: i64,
+        limit: usize,
+    ) -> Result<Vec<SupervisedTask>, A2aStorageError> {
+        self.inner
+            .supervisor_list_idle_client_held_tasks(status_before_micros, limit)
             .await
     }
 }
@@ -1047,10 +1081,11 @@ fn builder() -> turul_a2a::server::A2aServerBuilder {
 }
 
 #[test]
-fn build_without_a_runtime_rejects_lease_and_stall_timeout() {
+fn build_without_a_runtime_rejects_liveness_options() {
     for configured in [
         builder().executor_lease(Duration::from_secs(1)),
         builder().executor_stall_timeout(Duration::from_secs(1)),
+        builder().idle_task_timeout(Duration::from_secs(1)),
     ] {
         let err = configured.build().err().expect("no runtime: build fails");
         assert!(
@@ -1064,7 +1099,7 @@ fn build_without_a_runtime_rejects_lease_and_stall_timeout() {
 }
 
 #[tokio::test]
-async fn build_rejects_zero_lease_ttl_and_zero_stall_timeout() {
+async fn build_rejects_zero_liveness_durations() {
     let err = builder()
         .executor_lease(Duration::ZERO)
         .build()
@@ -1077,12 +1112,141 @@ async fn build_rejects_zero_lease_ttl_and_zero_stall_timeout() {
         .err()
         .expect("zero stall timeout rejected");
     assert!(err.to_string().contains("executor_stall_timeout"), "{err}");
+    let err = builder()
+        .idle_task_timeout(Duration::ZERO)
+        .build()
+        .err()
+        .expect("zero idle timeout rejected");
+    assert!(err.to_string().contains("idle_task_timeout"), "{err}");
 
     builder()
         .executor_lease(Duration::from_secs(1))
         .executor_stall_timeout(Duration::from_secs(1))
+        .idle_task_timeout(Duration::from_secs(1))
         .build()
         .expect("non-zero options inside a runtime build");
+}
+
+// ---------------------------------------------------------------------------
+// Idle-task sweep
+// ---------------------------------------------------------------------------
+
+const IDLE: Duration = Duration::from_millis(300);
+const IDLE_REASON: &str = "task canceled: no client input for 300ms";
+
+#[tokio::test]
+async fn idle_sweep_cancels_client_held_tasks_and_retention_then_deletes_them() {
+    let storage =
+        InMemoryA2aStorage::new().with_retention(turul_a2a::storage::RetentionConfig::new(1, 0));
+    seed(&storage, "t-input", TaskState::InputRequired).await;
+    seed(&storage, "t-auth", TaskState::AuthRequired).await;
+    seed(&storage, "t-working", TaskState::Working).await;
+    seed(&storage, "t-submitted", TaskState::Submitted).await;
+
+    let (executor, _started) = Forever::new();
+    let _router = A2aServer::builder()
+        .executor(executor)
+        .storage(storage.clone())
+        .idle_task_timeout(IDLE)
+        .build()
+        .unwrap()
+        .into_router();
+
+    for id in ["t-input", "t-auth"] {
+        let canceled =
+            wait_for_state(&storage, id, TaskState::Canceled, Duration::from_secs(5)).await;
+        assert_eq!(status_text(&canceled).as_deref(), Some(IDLE_REASON));
+        assert_eq!(status_role(&canceled).as_deref(), Some("ROLE_AGENT"));
+        assert_eq!(
+            terminal_states(&storage, id).await,
+            vec![TaskState::Canceled],
+            "exactly one CANCELED status update"
+        );
+    }
+
+    // A task that only just started waiting on its client is kept.
+    seed(&storage, "t-fresh", TaskState::InputRequired).await;
+    tokio::time::sleep(IDLE / 2).await;
+    assert_eq!(
+        state_of(&get_task(&storage, "t-fresh").await),
+        TaskState::InputRequired
+    );
+    // Executor-held tasks past the timeout are the lease's, not the sweep's.
+    for (id, state) in [
+        ("t-working", TaskState::Working),
+        ("t-submitted", TaskState::Submitted),
+    ] {
+        assert_eq!(state_of(&get_task(&storage, id).await), state);
+    }
+
+    // Once past the task TTL, the cancelled tasks expire like any
+    // terminal task; live ones stay.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    storage.cleanup_expired().await.unwrap();
+    for id in ["t-input", "t-auth"] {
+        assert!(
+            storage
+                .get_task(TENANT, id, OWNER, None)
+                .await
+                .unwrap()
+                .is_none(),
+            "{id} is deleted by retention"
+        );
+    }
+    assert_eq!(
+        state_of(&get_task(&storage, "t-working").await),
+        TaskState::Working
+    );
+}
+
+#[tokio::test]
+async fn without_the_idle_timeout_client_held_tasks_are_kept() {
+    let storage = InMemoryA2aStorage::new();
+    seed(&storage, "t-input", TaskState::InputRequired).await;
+    let (executor, _started) = Forever::new();
+    let _router = A2aServer::builder()
+        .executor(executor)
+        .storage(storage.clone())
+        .build()
+        .unwrap()
+        .into_router();
+    tokio::time::sleep(IDLE * 2).await;
+    assert_eq!(
+        state_of(&get_task(&storage, "t-input").await),
+        TaskState::InputRequired
+    );
+}
+
+#[tokio::test]
+async fn idle_sweep_aborts_an_executor_still_running_after_its_interrupt() {
+    let storage = InMemoryA2aStorage::new();
+    let (probe_tx, probe_rx) = oneshot::channel();
+    let router = A2aServer::builder()
+        .executor(InterruptsThenHangs {
+            probe: Mutex::new(Some(probe_rx)),
+        })
+        .storage(storage.clone())
+        .idle_task_timeout(IDLE)
+        .cancel_abort_grace(Duration::from_millis(100))
+        .build()
+        .unwrap()
+        .into_router();
+
+    let task = send(&router, None, true).await;
+    let task_id = task["id"].as_str().unwrap().to_string();
+    let canceled = wait_for_state(
+        &storage,
+        &task_id,
+        TaskState::Canceled,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(status_text(&canceled).as_deref(), Some(IDLE_REASON));
+
+    let mut probe = probe_tx;
+    tokio::time::timeout(Duration::from_secs(5), probe.closed())
+        .await
+        .expect("the executor was never aborted");
 }
 
 // ---------------------------------------------------------------------------

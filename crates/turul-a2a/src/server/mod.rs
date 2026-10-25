@@ -1,7 +1,9 @@
 //! A2aServer builder and runtime.
 
 pub mod in_flight;
-pub(crate) mod liveness;
+#[doc(hidden)]
+pub mod liveness;
+pub use liveness::IdleSweep;
 pub mod obs;
 pub mod spawn;
 
@@ -29,7 +31,8 @@ use crate::streaming::TaskEventBroker;
 /// handler grace / poll intervals, abort grace and cross-instance
 /// cancel-marker poll interval (`cancel_handler_*`, `cancel_abort_grace`,
 /// `cross_instance_cancel_poll_interval`); executor liveness
-/// (`executor_lease_ttl`, `executor_stall_timeout`); push delivery tuning
+/// (`executor_lease_ttl`, `executor_stall_timeout`); idle client-held
+/// task cancellation (`idle_task_timeout`); push delivery tuning
 /// (`push_*`, `allow_insecure_push_urls`).
 ///
 /// Exposed publicly so tests and advanced consumers can construct
@@ -56,6 +59,11 @@ pub struct RuntimeConfig {
     /// watchdog fails its task, or `None` to disable the watchdog. See
     /// [`A2aServerBuilder::executor_stall_timeout`].
     pub executor_stall_timeout: Option<Duration>,
+
+    /// How long a task may wait in INPUT_REQUIRED or AUTH_REQUIRED
+    /// before it is cancelled, or `None` to keep it until its client
+    /// cancels it. See [`A2aServerBuilder::idle_task_timeout`].
+    pub idle_task_timeout: Option<Duration>,
 
     pub push_max_attempts: usize,
     pub push_backoff_base: Duration,
@@ -148,6 +156,7 @@ impl Default for RuntimeConfig {
             cross_instance_cancel_poll_interval: Duration::from_secs(1),
             executor_lease_ttl: None,
             executor_stall_timeout: None,
+            idle_task_timeout: None,
             push_max_attempts: push.max_attempts as usize,
             push_backoff_base: push.backoff_base,
             push_backoff_cap: push.backoff_cap,
@@ -290,6 +299,26 @@ impl A2aServerBuilder {
     /// current.
     pub fn executor_stall_timeout(mut self, timeout: Duration) -> Self {
         self.runtime_config.executor_stall_timeout = Some(timeout);
+        self
+    }
+
+    /// Cancel tasks left waiting on their client: a task whose status has
+    /// been INPUT_REQUIRED or AUTH_REQUIRED for longer than `timeout` is
+    /// committed `CANCELED` with an agent-role reason message, after which
+    /// it expires under the storage backend's task retention like any
+    /// terminal task. If its executor is still running in this process,
+    /// the executor is cancelled and aborted after
+    /// [`Self::cancel_abort_grace`]. Off by default.
+    ///
+    /// Each server sweeps the whole store once at startup and then every
+    /// `timeout / 4`, so a task is cancelled between `timeout` and
+    /// `1.25 * timeout` after its last status change. A client message
+    /// that lands in the same storage round trip as the sweep's commit is
+    /// lost to the cancel. On DynamoDB each sweep scans the tasks table.
+    /// `build()` rejects a zero `timeout`, and rejects the option when no
+    /// tokio runtime is current.
+    pub fn idle_task_timeout(mut self, timeout: Duration) -> Self {
+        self.runtime_config.idle_task_timeout = Some(timeout);
         self
     }
 
@@ -581,12 +610,19 @@ impl A2aServerBuilder {
                 "executor_stall_timeout must be greater than zero".into(),
             ));
         }
-        if (liveness.executor_lease_ttl.is_some() || liveness.executor_stall_timeout.is_some())
+        if liveness.idle_task_timeout.is_some_and(|d| d.is_zero()) {
+            return Err(A2aError::Internal(
+                "idle_task_timeout must be greater than zero".into(),
+            ));
+        }
+        if (liveness.executor_lease_ttl.is_some()
+            || liveness.executor_stall_timeout.is_some()
+            || liveness.idle_task_timeout.is_some())
             && tokio::runtime::Handle::try_current().is_err()
         {
             return Err(A2aError::Internal(
-                "executor_lease and executor_stall_timeout start background tasks: \
-                 call build() from within a tokio runtime"
+                "executor_lease, executor_stall_timeout and idle_task_timeout start \
+                 background tasks: call build() from within a tokio runtime"
                     .into(),
             ));
         }

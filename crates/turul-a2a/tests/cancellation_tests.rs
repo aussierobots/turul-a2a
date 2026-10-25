@@ -1433,9 +1433,18 @@ impl A2aCancellationSupervisor for CountingSupervisor {
     async fn supervisor_list_expired_executor_leases(
         &self,
         now_micros: i64,
-    ) -> Result<Vec<turul_a2a::storage::ExecutorHeldTask>, A2aStorageError> {
+    ) -> Result<Vec<turul_a2a::storage::SupervisedTask>, A2aStorageError> {
         self.inner
             .supervisor_list_expired_executor_leases(now_micros)
+            .await
+    }
+    async fn supervisor_list_idle_client_held_tasks(
+        &self,
+        status_before_micros: i64,
+        limit: usize,
+    ) -> Result<Vec<turul_a2a::storage::SupervisedTask>, A2aStorageError> {
+        self.inner
+            .supervisor_list_idle_client_held_tasks(status_before_micros, limit)
             .await
     }
 }

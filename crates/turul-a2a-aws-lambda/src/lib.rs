@@ -554,6 +554,16 @@ impl LambdaA2aServerBuilder {
         // would never be renewed and peers would fail the live task.
         runtime_config.executor_lease_ttl = None;
         runtime_config.executor_stall_timeout = None;
+        // The idle-task sweep needs no loop: the scheduled-recovery
+        // handler runs it.
+        if runtime_config
+            .idle_task_timeout
+            .is_some_and(|d| d.is_zero())
+        {
+            return Err(A2aError::Internal(
+                "idle_task_timeout must be greater than zero".into(),
+            ));
+        }
 
         // Push dispatcher wiring. When
         // `push_delivery_store` is present, validate its backend matches,
@@ -670,11 +680,8 @@ impl Default for LambdaA2aServerBuilder {
 #[derive(Clone)]
 pub struct LambdaA2aHandler {
     router: axum::Router,
-    /// Held for SQS-event dispatch (`handle_sqs`). Always
-    /// populated — the SQS handler method is gated behind the `sqs`
-    /// feature but the state is carried unconditionally so callers can
-    /// reach it for diagnostics or future non-HTTP / non-SQS handlers.
-    #[cfg_attr(not(feature = "sqs"), allow(dead_code))]
+    /// Held for SQS-event dispatch (`handle_sqs`) and the idle-task
+    /// sweep (`cancel_idle_tasks`).
     state: AppState,
     /// Leading path segment to strip from each incoming HTTP request
     /// before the A2A router sees it. `None` = no stripping. Set via
@@ -685,6 +692,27 @@ pub struct LambdaA2aHandler {
 impl LambdaA2aHandler {
     pub fn builder() -> LambdaA2aServerBuilder {
         LambdaA2aServerBuilder::new()
+    }
+
+    /// Cancel tasks left waiting on their client for longer than the
+    /// runtime configuration's `idle_task_timeout`; see
+    /// [`turul_a2a::server::A2aServerBuilder::idle_task_timeout`]. With no
+    /// timeout set this does nothing. Run by
+    /// [`LambdaScheduledRecoveryHandler::with_idle_task_sweep`].
+    pub async fn cancel_idle_tasks(
+        &self,
+    ) -> Result<turul_a2a::server::IdleSweep, turul_a2a::storage::A2aStorageError> {
+        match self.state.runtime_config.idle_task_timeout {
+            Some(idle_for) => {
+                turul_a2a::server::liveness::cancel_idle_tasks(
+                    &self.state,
+                    Some(&self.state.in_flight),
+                    idle_for,
+                )
+                .await
+            }
+            None => Ok(Default::default()),
+        }
     }
 
     /// Handle a Lambda HTTP request.

@@ -1854,7 +1854,7 @@ impl crate::storage::A2aCancellationSupervisor for DynamoDbA2aStorage {
     async fn supervisor_list_expired_executor_leases(
         &self,
         now_micros: i64,
-    ) -> Result<Vec<crate::storage::ExecutorHeldTask>, A2aStorageError> {
+    ) -> Result<Vec<crate::storage::SupervisedTask>, A2aStorageError> {
         let db_err = |e: &dyn std::fmt::Debug| A2aStorageError::DatabaseError(format!("{e:?}"));
 
         // Lease items are the only items carrying `leaseExpiresAt`.
@@ -1956,7 +1956,7 @@ impl crate::storage::A2aCancellationSupervisor for DynamoDbA2aStorage {
                     });
                     if held {
                         held_keys.insert((tenant.clone(), task_id.clone()));
-                        out.push(crate::storage::ExecutorHeldTask::new(
+                        out.push(crate::storage::SupervisedTask::new(
                             tenant, task_id, owner, context_id,
                         ));
                     }
@@ -1980,6 +1980,88 @@ impl crate::storage::A2aCancellationSupervisor for DynamoDbA2aStorage {
                         "failed to delete stale executor lease"
                     );
                 }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn supervisor_list_idle_client_held_tasks(
+        &self,
+        status_before_micros: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::storage::SupervisedTask>, A2aStorageError> {
+        let db_err = |e: &dyn std::fmt::Debug| A2aStorageError::DatabaseError(format!("{e:?}"));
+        let before = super::status_time::key_of_micros(status_before_micros);
+        let held = turul_a2a_types::state_machine::CLIENT_HELD_STATES;
+        let placeholders = (0..held.len())
+            .map(|i| format!(":held{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values: HashMap<String, AttributeValue> = held
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                (
+                    format!(":held{i}"),
+                    AttributeValue::S(s.wire_name().to_string()),
+                )
+            })
+            .collect();
+
+        // The status timestamp lives in the task JSON, so the filter
+        // selects client-held task items and the age is checked here.
+        let mut out = Vec::new();
+        let mut start_key = None;
+        loop {
+            let page = self
+                .client
+                .scan()
+                .table_name(&self.config.tasks_table)
+                .filter_expression(format!("statusState IN ({placeholders})"))
+                .set_expression_attribute_values(Some(values.clone()))
+                .projection_expression("tenant, taskId, #o, contextId, taskJson")
+                .expression_attribute_names("#o", "owner")
+                .set_exclusive_start_key(start_key)
+                .send()
+                .await
+                .map_err(|e| db_err(&e))?;
+            for item in page.items() {
+                let attr = |name: &str| item.get(name).and_then(|v| v.as_s().ok());
+                let (Some(tenant), Some(task_id), Some(owner), Some(context_id), Some(json)) = (
+                    attr("tenant"),
+                    attr("taskId"),
+                    attr("owner"),
+                    attr("contextId"),
+                    attr("taskJson"),
+                ) else {
+                    continue;
+                };
+                let task = match Self::task_from_json(json) {
+                    Ok(task) => task,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "turul_a2a::idle_task_sweep_error",
+                            tenant = %tenant, task_id = %task_id, error = %e,
+                            "skipping malformed task item in idle-task listing"
+                        );
+                        continue;
+                    }
+                };
+                if super::status_time::sort_key(&task) < before {
+                    out.push(crate::storage::SupervisedTask::new(
+                        tenant.clone(),
+                        task_id.clone(),
+                        owner.clone(),
+                        context_id.clone(),
+                    ));
+                    if out.len() >= limit {
+                        return Ok(out);
+                    }
+                }
+            }
+            match page.last_evaluated_key {
+                Some(k) => start_key = Some(k),
+                None => break,
             }
         }
         Ok(out)
@@ -4523,7 +4605,7 @@ mod tests {
         async fn supervisor_list_expired_executor_leases(
             &self,
             now_micros: i64,
-        ) -> Result<Vec<crate::storage::ExecutorHeldTask>, A2aStorageError> {
+        ) -> Result<Vec<crate::storage::SupervisedTask>, A2aStorageError> {
             let prefix = format!("{}_", self.tenant_prefix);
             let all = <DynamoDbA2aStorage as crate::storage::A2aCancellationSupervisor>::supervisor_list_expired_executor_leases(
                 &self.inner, now_micros,
@@ -4534,6 +4616,25 @@ mod tests {
                     t.tenant = t.tenant.strip_prefix(&prefix)?.to_string();
                     Some(t)
                 })
+                .collect())
+        }
+
+        async fn supervisor_list_idle_client_held_tasks(
+            &self,
+            status_before_micros: i64,
+            limit: usize,
+        ) -> Result<Vec<crate::storage::SupervisedTask>, A2aStorageError> {
+            let prefix = format!("{}_", self.tenant_prefix);
+            let all = <DynamoDbA2aStorage as crate::storage::A2aCancellationSupervisor>::supervisor_list_idle_client_held_tasks(
+                &self.inner, status_before_micros, usize::MAX,
+            ).await?;
+            Ok(all
+                .into_iter()
+                .filter_map(|mut t| {
+                    t.tenant = t.tenant.strip_prefix(&prefix)?.to_string();
+                    Some(t)
+                })
+                .take(limit)
                 .collect())
         }
     }
@@ -6102,6 +6203,12 @@ mod tests {
     async fn test_supervisor_executor_lease_parity() {
         skip_unless_dynamodb_env!(s);
         parity_tests::test_supervisor_executor_lease_parity(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_idle_client_held_parity() {
+        skip_unless_dynamodb_env!(s);
+        parity_tests::test_supervisor_idle_client_held_parity(&s, &s, &s).await;
     }
 
     #[tokio::test]

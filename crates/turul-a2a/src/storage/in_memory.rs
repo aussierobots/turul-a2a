@@ -658,7 +658,7 @@ impl crate::storage::A2aCancellationSupervisor for InMemoryA2aStorage {
     async fn supervisor_list_expired_executor_leases(
         &self,
         now_micros: i64,
-    ) -> Result<Vec<super::traits::ExecutorHeldTask>, A2aStorageError> {
+    ) -> Result<Vec<super::traits::SupervisedTask>, A2aStorageError> {
         let tasks = self.tasks.read().await;
         Ok(tasks
             .values()
@@ -673,7 +673,38 @@ impl crate::storage::A2aCancellationSupervisor for InMemoryA2aStorage {
                         })
             })
             .map(|stored| {
-                super::traits::ExecutorHeldTask::new(
+                super::traits::SupervisedTask::new(
+                    stored.tenant.clone(),
+                    stored.task.id(),
+                    stored.owner.clone(),
+                    stored.task.context_id(),
+                )
+            })
+            .collect())
+    }
+
+    async fn supervisor_list_idle_client_held_tasks(
+        &self,
+        status_before_micros: i64,
+        limit: usize,
+    ) -> Result<Vec<super::traits::SupervisedTask>, A2aStorageError> {
+        let before = super::status_time::key_of_micros(status_before_micros);
+        let tasks = self.tasks.read().await;
+        Ok(tasks
+            .values()
+            .filter(|stored| {
+                stored
+                    .task
+                    .status()
+                    .and_then(|s| s.state().ok())
+                    .is_some_and(|s| {
+                        turul_a2a_types::state_machine::CLIENT_HELD_STATES.contains(&s)
+                    })
+                    && super::status_time::sort_key(&stored.task) < before
+            })
+            .take(limit)
+            .map(|stored| {
+                super::traits::SupervisedTask::new(
                     stored.tenant.clone(),
                     stored.task.id(),
                     stored.owner.clone(),
@@ -2108,6 +2139,12 @@ mod tests {
     async fn test_supervisor_executor_lease_parity() {
         let s = storage();
         parity_tests::test_supervisor_executor_lease_parity(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_idle_client_held_parity() {
+        let s = storage();
+        parity_tests::test_supervisor_idle_client_held_parity(&s, &s, &s).await;
     }
 
     #[tokio::test]

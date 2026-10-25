@@ -287,11 +287,21 @@ pub trait A2aCancellationSupervisor: Send + Sync {
     async fn supervisor_list_expired_executor_leases(
         &self,
         now_micros: i64,
-    ) -> Result<Vec<ExecutorHeldTask>, A2aStorageError>;
+    ) -> Result<Vec<SupervisedTask>, A2aStorageError>;
+
+    /// At most `limit` INPUT_REQUIRED / AUTH_REQUIRED tasks, across all
+    /// tenants and owners, whose status timestamp is earlier than
+    /// `status_before_micros`. Store-wide: its only callers are the
+    /// idle-task sweeps (ADR-026 §2a).
+    async fn supervisor_list_idle_client_held_tasks(
+        &self,
+        status_before_micros: i64,
+        limit: usize,
+    ) -> Result<Vec<SupervisedTask>, A2aStorageError>;
 }
 ```
 
-The registry-scoping authorization invariant above binds the two cancel-marker reads and the lease renewal. `supervisor_list_expired_executor_leases` is the one store-wide read; it carries no requester identity at all and is reachable only from the lease reaper (ADR-029 §1).
+The registry-scoping authorization invariant above binds the two cancel-marker reads and the lease renewal. `supervisor_list_expired_executor_leases` and `supervisor_list_idle_client_held_tasks` are the store-wide reads; they carry no requester identity at all and are reachable only from the lease reaper (ADR-029 §1) and the idle-task sweeps (ADR-026 §2a).
 
 **AppState wiring**: `AppState::cancellation_supervisor: Arc<dyn A2aCancellationSupervisor>` is a separate field from `task_storage`. In practice, the same backend type satisfies both traits; the builder wires a single `Arc` into both fields. Cross-type safety: `AppState` does not expose `cancellation_supervisor` to handler code — it is used only by the `InFlightRegistry` constructor and the supervisor task body.
 
@@ -467,3 +477,4 @@ Taken together: panicked supervisors do not leak registry entries, do not leave 
 - 2026-10-22 — Amended to what ships and what the tests prove. Supervisor-panic observability is the ERROR tracing event at `turul_a2a::supervisor_panic`; the `framework.supervisor_panics` metric was never implemented and is removed (§3, §12, R5, test #13). `CancelTaskRequest.metadata` recorded as accepted and not interpreted on every transport (§2). Required tests restated as implemented: #1, #2 (instance B runs the full handler over A's live executor), #4 (both sub-cases forced), #6 (every terminal state, all transports, no marker write), #7, #10, #11 (store sequence check; no resume), #12 (bounded correctness test of one batch query per tenant per tick, replacing the benchmark wording), #13 (tracing event, awaited abort, full follow-up), #14 (doctest), new #15 (TaskNotFound and metadata on every transport, interrupted states cancelable).
 - 2026-10-25 — Abort after grace (§3): a cancel's token trip arms an abort of the executor `cancel_handler_grace` later, owned by `InFlightHandle::cancel_then_abort_after` on both the same-instance and the cross-instance path; an executor that committed its own terminal state is not aborted (an interrupt commit does not count, so the handle tracks the executor's terminal commit separately from `yielded`). The grace wait and fallback commit run detached from the request so a dropped request cannot strand the task after the abort, and a grace-poll read failure no longer ends the cancel early (§2). §10 gains `supervisor_list_executor_held_tasks`, the one store-wide supervisor read, for ADR-028. Previously an executor that ignored the token kept running behind a CANCELED task; the blocking-send timeout already aborted. `run_cross_instance_cancel_poller` takes the abort grace. §2 configuration, §9 table, R2 and test #4 (cancel wins: the executor is now aborted and never reaches `complete()`; the late-write refusal moves to a cross-instance sub-case) updated; tests #16–#21 added. §5 points restart orphans at ADR-028.
 - 2026-10-25 — Abort deadline split from the handler wait: `cancel_abort_grace` (default 5s) sets when a cancelled executor is aborted, on both the handler and the cross-instance poller paths; `cancel_handler_grace` is only the handler's wait (§2, §3, §9; test #22). §5 and §10 point to ADR-029's executor lease, which replaces ADR-028's startup reconciliation; the supervisor trait loses `supervisor_list_executor_held_tasks` and gains the two lease methods.
+- 2026-10-25 — Trait listing gains `supervisor_list_idle_client_held_tasks` (ADR-026 §2a); the listing row type is renamed `SupervisedTask`.

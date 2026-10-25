@@ -451,3 +451,103 @@ fn readme_states_the_lambda_push_recovery_requirements() {
 // don't get flagged as unused on a build where the transient test is
 // excluded. Accessing types is enough.
 fn _assert_reexports(_p: PendingDispatch, _c: ReclaimableClaim) {}
+
+// --------------------------------------------------------------------------
+// Idle-task sweep stage
+// --------------------------------------------------------------------------
+
+struct IdleExecutor;
+
+#[async_trait]
+impl turul_a2a::executor::AgentExecutor for IdleExecutor {
+    async fn execute(
+        &self,
+        _task: &mut Task,
+        _msg: &Message,
+        _ctx: &turul_a2a::executor::ExecutionContext,
+    ) -> Result<(), turul_a2a::error::A2aError> {
+        Ok(())
+    }
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        turul_a2a::card_builder::AgentCardBuilder::new("Idle", "1.0.0")
+            .url("http://localhost", "JSONRPC", "1.0")
+            .build()
+            .unwrap()
+    }
+}
+
+async fn seed_input_required(storage: &InMemoryA2aStorage, id: &str) {
+    let task =
+        Task::new(id, TaskStatus::new(TaskState::Submitted)).with_context_id(format!("ctx-{id}"));
+    storage.create_task("", "anonymous", task).await.unwrap();
+    for state in [TaskState::Working, TaskState::InputRequired] {
+        storage
+            .update_task_status_with_events("", id, "anonymous", TaskStatus::new(state), vec![])
+            .await
+            .unwrap();
+    }
+}
+
+fn lambda_handler(
+    storage: &InMemoryA2aStorage,
+    idle: Option<std::time::Duration>,
+) -> crate::LambdaA2aHandler {
+    let mut cfg = turul_a2a::server::RuntimeConfig::default();
+    cfg.idle_task_timeout = idle;
+    crate::LambdaA2aHandler::builder()
+        .executor(IdleExecutor)
+        .storage(storage.clone())
+        .runtime_config(cfg)
+        .build()
+        .expect("builds")
+}
+
+#[tokio::test]
+async fn scheduled_sweep_cancels_idle_client_held_tasks() {
+    let (_push_storage, dispatcher, delivery) = build_stack().await;
+    let storage = InMemoryA2aStorage::new();
+    seed_input_required(&storage, "t-idle").await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let handler = LambdaScheduledRecoveryHandler::new(dispatcher, delivery).with_idle_task_sweep(
+        lambda_handler(&storage, Some(std::time::Duration::from_millis(50))),
+    );
+    let response = handler.run_sweep().await;
+
+    assert_eq!(response.idle_tasks_canceled, 1);
+    assert_eq!(response.idle_task_errors, 0);
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let task = storage
+        .get_task("", "t-idle", "anonymous", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.status().unwrap().state().unwrap(), TaskState::Canceled);
+
+    // Already terminal: the next tick cancels nothing.
+    assert_eq!(handler.run_sweep().await.idle_tasks_canceled, 0);
+}
+
+#[tokio::test]
+async fn scheduled_sweep_without_idle_timeout_cancels_nothing() {
+    let (_push_storage, dispatcher, delivery) = build_stack().await;
+    let storage = InMemoryA2aStorage::new();
+    seed_input_required(&storage, "t-idle").await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let response = LambdaScheduledRecoveryHandler::new(dispatcher, delivery)
+        .with_idle_task_sweep(lambda_handler(&storage, None))
+        .run_sweep()
+        .await;
+
+    assert_eq!(response.idle_tasks_canceled, 0);
+    let task = storage
+        .get_task("", "t-idle", "anonymous", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        task.status().unwrap().state().unwrap(),
+        TaskState::InputRequired
+    );
+}

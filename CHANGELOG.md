@@ -4,6 +4,24 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.6] — 2026-10-25
+
+### Added
+
+- **Idle-task timeout** (`A2aServerBuilder::idle_task_timeout(timeout)`, opt-in). A task whose status has been `INPUT_REQUIRED` or `AUTH_REQUIRED` for longer than `timeout` is committed `CANCELED`, with a status message saying no client input arrived in that time; task retention then deletes it like any finished task. If its executor is still running on the same instance, the executor is cancelled and aborted after `cancel_abort_grace`. Each server sweeps the store when built and then every `timeout / 4`, so a task is cancelled between `timeout` and `1.25 × timeout` after its last status change; several instances may share a store. A client message that lands in the same storage round trip as the cancel is lost to it. `SUBMITTED` and `WORKING` tasks are left to the executor lease. On DynamoDB each sweep scans the tasks table. See ADR-026.
+- **Lambda:** `LambdaScheduledRecoveryHandler::with_idle_task_sweep(handler)` runs the same sweep on each scheduled tick, using the handler's `idle_task_timeout` (set through `RuntimeConfig`); the response reports `idleTasksCanceled` and `idleTaskErrors`. `LambdaA2aHandler::cancel_idle_tasks()` runs one sweep directly.
+
+### Compatibility
+
+- `A2aCancellationSupervisor` gains a required method, `supervisor_list_idle_client_held_tasks`. The four built-in backends implement it; a storage backend written outside this workspace must too.
+- `ExecutorHeldTask` is renamed `SupervisedTask`.
+- `RuntimeConfig` gains `idle_task_timeout` (default `None`). `LambdaScheduledRecoveryResponse` gains two counters.
+- No storage schema or wire format changes.
+
+### Verification
+
+- Idle-task listing parity tests passed on in-memory, SQLite, PostgreSQL and DynamoDB Local; the idle sweep, Lambda scheduled-recovery and liveness suites passed.
+
 ## [0.2.5] — 2026-10-25
 
 ### Added

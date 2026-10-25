@@ -296,7 +296,14 @@ impl A2aCancellationSupervisor for FakeBackend {
     async fn supervisor_list_expired_executor_leases(
         &self,
         _now_micros: i64,
-    ) -> Result<Vec<turul_a2a::storage::ExecutorHeldTask>, A2aStorageError> {
+    ) -> Result<Vec<turul_a2a::storage::SupervisedTask>, A2aStorageError> {
+        Ok(vec![])
+    }
+    async fn supervisor_list_idle_client_held_tasks(
+        &self,
+        _status_before_micros: i64,
+        _limit: usize,
+    ) -> Result<Vec<turul_a2a::storage::SupervisedTask>, A2aStorageError> {
         Ok(vec![])
     }
 }
@@ -532,13 +539,14 @@ fn lambda_builder_rejects_retry_horizon_violation() {
 }
 
 #[test]
-fn lambda_builder_clears_executor_lease_and_stall_timeout() {
+fn lambda_builder_clears_lease_and_stall_and_keeps_idle_timeout() {
     use std::time::Duration;
     use turul_a2a::server::RuntimeConfig;
 
     let mut cfg = RuntimeConfig::default();
     cfg.executor_lease_ttl = Some(Duration::from_secs(30));
     cfg.executor_stall_timeout = Some(Duration::from_secs(60));
+    cfg.idle_task_timeout = Some(Duration::from_secs(90));
     let handler = LambdaA2aHandler::builder()
         .executor(DummyExecutor)
         .storage(InMemoryA2aStorage::new())
@@ -553,6 +561,25 @@ fn lambda_builder_clears_executor_lease_and_stall_timeout() {
             .executor_stall_timeout
             .is_none()
     );
+    assert_eq!(
+        handler.state.runtime_config.idle_task_timeout,
+        Some(Duration::from_secs(90)),
+        "the idle-task sweep needs no loop, so the option is kept"
+    );
+}
+
+#[test]
+fn lambda_builder_rejects_zero_idle_task_timeout() {
+    let mut cfg = turul_a2a::server::RuntimeConfig::default();
+    cfg.idle_task_timeout = Some(std::time::Duration::ZERO);
+    let err = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .storage(InMemoryA2aStorage::new())
+        .runtime_config(cfg)
+        .build()
+        .err()
+        .expect("zero idle timeout rejected");
+    assert!(err.to_string().contains("idle_task_timeout"), "{err}");
 }
 
 // --------------------------------------------------------------------------

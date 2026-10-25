@@ -82,6 +82,10 @@ pub const TERMINAL_STATES: [TaskState; 4] = [
 /// are held by the client instead, and terminal states by no one.
 pub const EXECUTOR_HELD_STATES: [TaskState; 2] = [TaskState::Submitted, TaskState::Working];
 
+/// The client-held states: the task waits on the client, and no executor
+/// is expected to move it on until the client sends a message.
+pub const CLIENT_HELD_STATES: [TaskState; 2] = [TaskState::InputRequired, TaskState::AuthRequired];
+
 /// Returns `true` if the state is terminal (no further transitions allowed).
 pub fn is_terminal(state: TaskState) -> bool {
     TERMINAL_STATES.contains(&state)
