@@ -18,18 +18,24 @@ This ADR makes retention real and uniform: it defines what `cleanup_expired()` d
 
 Retention enforcement covers **both** expired events and expired tasks. Event TTL was already part of the ADR-009 contract (and DynamoDB already had a task TTL); this ADR makes both real across all backends through the single `cleanup_expired()` entry point.
 
-### 2. Semantic: age-based everywhere
+### 2. Semantic: age-based, and tasks only once terminal
 
-Expiry is **age-based for both tasks and events on every backend**, with no state filter.
+Expiry is age-based on every backend. Events are expired by age alone; tasks are expired by age **only once they are terminal**.
 
-- An **event** is expired when `created_at < now - event_ttl`.
-- A **task** is expired when its retention timestamp is older than `now - task_ttl`, **regardless of `TaskState`** — a task past its TTL is reaped whether it is terminal (Completed/Failed/Canceled/Rejected) or still live (Submitted/Working/InputRequired/AuthRequired).
+- An **event** is expired when `created_at < now - event_ttl`, whatever its task's state. Streams start from a task snapshot (ADR-014), so a live task does not need its old events.
+- A **task** is expired when it is terminal (`COMPLETED`, `FAILED`, `CANCELED`, `REJECTED`) **and** its retention timestamp is older than `now - task_ttl`. A `SUBMITTED`, `WORKING`, `INPUT_REQUIRED` or `AUTH_REQUIRED` task is never deleted by retention, however old.
 
-This matches DynamoDB's engine-native TTL, which reaps on the `ttl` attribute without consulting task state. Choosing the same semantic everywhere means the four backends agree: there is no backend where a TTL'd task survives because it happens to be non-terminal.
+**Why live tasks are spared.** Deleting a live task destroys work in progress: the executor's writes start failing and the client's next `GetTask` returns `TaskNotFound` for a task that never finished. Tasks whose executor died are not left live forever: the executor lease (ADR-029) moves them to `FAILED`, after which retention applies.
 
-**Documented hazard.** Because task expiry ignores state, **setting a non-zero task TTL can reap a long-running live task** while its executor is still working. A deployment whose tasks can legitimately outlive the configured task TTL must either leave task TTL at `0` (no expiry) or set it comfortably above the worst-case task lifetime. This hazard is intentional and is the price of cross-backend parity with DynamoDB native TTL; it is called out in the retention config docs and the operator-facing README, not hidden.
+**Consequence.** A task a client abandons in `INPUT_REQUIRED` or `AUTH_REQUIRED` is kept until the client cancels it or an operator deletes it. Retention bounds terminal history, not abandoned conversations.
 
-`0` means **no expiry** for that class. The default for SQL and in-memory backends is `0` (retention OFF) so adopting this release changes no behaviour until an operator opts in. DynamoDB keeps its existing 24h task/event defaults so its behaviour is unchanged.
+**Consequence without the lease.** The executor lease is opt-in. On a server without it, a task left `SUBMITTED` or `WORKING` by a dead process is never moved to `FAILED`, so retention never deletes it; it stays until a client cancels it. Deployments that set a task TTL should enable the lease.
+
+DynamoDB follows the same rule through its engine-native TTL: a task item carries the `ttl` attribute only once the task is terminal. The write that makes a task terminal sets `ttl` to now + `task_ttl_seconds`; later writes to a terminal task refresh it. Non-terminal writes never set it. Event items keep their write-time `ttl`.
+
+The task's own child items follow the task: artifact items (in the events table) and push-notification config items carry no `ttl` while the task is live, so a long-running task never loses its artifact bodies or its push callbacks. The write that moves a task from a non-terminal to a terminal state stamps the same `ttl` onto the task's existing artifact and push-config items, once; later writes to the terminal task refresh only the task item, because finding push-config items is a table scan. A child item written while the task is already terminal gets the task TTL at write time. The stamp follows the terminal commit and is best effort: a failure is logged at WARN (target `turul_a2a::retention_child_ttl_error`) and leaves those items without a `ttl`, which keeps data rather than losing it. The event-sequence counter keeps its existing lifetime (the longer of the event and task TTLs, refreshed on every event write), so it outlives the events it numbers.
+
+`0` means **no expiry** for that class. The default for SQL and in-memory backends is `0` (retention OFF) so adopting this release changes no behaviour until an operator opts in. DynamoDB keeps its existing 24h task/event defaults.
 
 ### 3. `cleanup_expired()` is the single idempotent maintenance entry point
 
@@ -51,7 +57,7 @@ A backend-agnostic `RetentionConfig` carries the two TTLs (seconds; `0` = no exp
 
 To keep this a backward-compatible change, `DynamoDbConfig` is left untouched: it keeps its own `task_ttl_seconds` / `event_ttl_seconds` fields (24h defaults), which it writes as the native `ttl` attribute. DynamoDB does not consume `RetentionConfig` — it never runs app-driven cleanup, so there is nothing to unify, and folding its fields away would be a needless breaking change. `RetentionConfig` brings the TTL concept to the other three backends without disturbing DynamoDB.
 
-`RetentionConfig` is the single place the TTL semantic is documented for the app-driven backends, including the live-task-reaping hazard from §2.
+`RetentionConfig` is the single place the TTL semantic is documented for the app-driven backends, including the terminal-only rule for tasks from §2.
 
 ### 5. Trigger: configuration, two modes by deployment topology
 
@@ -67,11 +73,16 @@ Both modes call the same `cleanup_expired()` method. Neither changes default beh
 
 This is a **patch** bump. At its core this corrects a defect — `cleanup_expired()` was documented (ADR-009) to reap expired events but did nothing on any backend and was never invoked — which is a bug fix, not a new contract. The surrounding new surface is purely additive and opt-in: the `RetentionConfig` type, per-backend `.with_retention()` builders, the self-hosted maintenance method, and the Lambda maintenance handler. `DynamoDbConfig` is left unchanged (§4), so there is no breaking change. No existing call site changes behaviour without opting in. The root `Cargo.toml` `[workspace.package].version` is bumped accordingly and `CHANGELOG.md` records the fix.
 
+### 7. Required tests
+
+1. **Terminal-only task expiry parity** (in-memory, SQLite, PostgreSQL). With a task TTL set and every task past it, `cleanup_expired()` deletes the `COMPLETED`, `FAILED`, `CANCELED` and `REJECTED` tasks and keeps the `SUBMITTED`, `WORKING`, `INPUT_REQUIRED` and `AUTH_REQUIRED` ones; expired events are deleted whatever their task's state.
+2. **DynamoDB native TTL** (DynamoDB Local). A task item, its artifact items and its push-config items have no `ttl` while the task is non-terminal (create, WORKING, INPUT_REQUIRED, artifact writes, push-config create); the write that makes the task terminal sets the task's `ttl` to now + `task_ttl_seconds` and stamps the same value on its artifact and push-config items, and a later write to the terminal task does not re-stamp them; a push config created on a terminal task gets it at write. Event items carry their write-time `ttl`.
+
 ## Consequences
 
 - ADR-009's retention claim becomes true: expired events are actually deleted — on the backends that do app-driven cleanup (SQL, in-memory) when maintenance is wired, and engine-side on DynamoDB.
 - SQL and in-memory deployments can now bound storage growth, but only after an operator opts in; nothing is deleted silently on upgrade.
-- The four backends agree on the age-based, state-agnostic expiry semantic, at the documented cost that a non-zero task TTL can reap live long-running tasks.
+- The four backends agree on the expiry semantic: events by age, tasks by age once terminal. A live task is never reaped; an abandoned client-held task is kept until cancelled.
 - DynamoDB's no-op `cleanup_expired()` is now a documented, intentional divergence rather than an unexplained stub.
 - The app-driven backends gain a shared `RetentionConfig`; DynamoDB keeps its own TTL fields, so the fix lands without a breaking change.
 - Batched, committed deletion keeps a large retention backlog from stalling the database (long transaction / WAL growth) or the in-memory write lock.
@@ -89,3 +100,4 @@ This is a **patch** bump. At its core this corrects a defect — `cleanup_expire
 - 2026-06-02 — Initial acceptance. Defines age-based, state-agnostic retention for events and tasks across all four backends; introduces a backend-agnostic `RetentionConfig` (TTLs + batch size) for the app-driven backends while leaving `DynamoDbConfig` unchanged; `cleanup_expired()` becomes the single idempotent maintenance entry point (batched, committed DELETE on SQL, lock-releasing sweep in-memory, intentional no-op on DynamoDB); dual trigger model (opt-in self-hosted background loop vs Lambda EventBridge discrete handler); patch bump (fixes the never-implemented ADR-009 cleanup claim, no breaking change).
 - 2026-10-22 — `cleanup_expired()` additionally reaps failed push-delivery records past their retention on the SQL and in-memory backends (ADR-011); the returned count includes them.
 - 2026-10-22 — Retention basis named explicitly as `updated_at` (last write of any kind), distinct from the ListTasks status timestamp. A DynamoDB live test (`test_native_ttl_attributes_on_tasks_and_events`) pins the engine-native contract: task and event items carry a numeric `ttl` of now + the configured TTL, and the task's `ttl` survives a status rewrite.
+- 2026-10-25 — §2 reversed for tasks: retention deletes a task only once it is terminal, on every backend (SQL and in-memory filter on the terminal states; DynamoDB writes the task `ttl` only on terminal writes). The state-blind rule and its live-task-reaping hazard are removed. Executor-held tasks of a dead process reach `FAILED` through ADR-029's lease. The DynamoDB live test now pins: no `ttl` on a non-terminal task item; `ttl` of now + TTL once terminal. Without the lease a dead process's executor-held tasks are never reaped; stated as a consequence. DynamoDB artifact and push-config items carry no `ttl` while their task is live and are stamped when it becomes terminal.

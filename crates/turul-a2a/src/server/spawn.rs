@@ -52,7 +52,7 @@ use crate::error::A2aError;
 use crate::event_sink::EventSink;
 use crate::executor::{AgentExecutor, ExecutionContext};
 use crate::server::in_flight::{InFlightHandle, InFlightKey, InFlightRegistry, SupervisorSentinel};
-use crate::storage::{A2aAtomicStore, A2aTaskStorage};
+use crate::storage::{A2aAtomicStore, A2aCancellationSupervisor, A2aTaskStorage};
 use crate::streaming::TaskEventBroker;
 
 /// Shared spawn-path dependencies pulled out of `AppState` to keep the
@@ -141,9 +141,14 @@ pub(crate) struct SpawnResult {
 /// for `(tenant, task_id)` — that would indicate a framework bug
 /// (double-spawn for the same task) which must not silently overwrite
 /// a live handle.
+///
+/// `lease_clearer` is set when the executor lease is enabled: once the
+/// executor has left the registry having ended its turn through its sink,
+/// the supervisor clears the task's lease through it.
 pub(crate) fn spawn_tracked_executor(
     deps: SpawnDeps,
     scope: SpawnScope,
+    lease_clearer: Option<Arc<dyn A2aCancellationSupervisor>>,
 ) -> Result<SpawnResult, A2aError> {
     let key: InFlightKey = (scope.tenant.clone(), scope.task_id.clone());
 
@@ -161,6 +166,8 @@ pub(crate) fn spawn_tracked_executor(
         yielded_tx,
         placeholder_jh,
     ));
+
+    handle.set_identity(scope.owner.clone(), scope.context_id.clone());
 
     // Register BEFORE spawn so an immediate `:cancel` on this instance
     // can trip the token even if the executor hasn't started running yet.
@@ -202,6 +209,8 @@ pub(crate) fn spawn_tracked_executor(
     let sup_key = key.clone();
     let sup_handle = handle.clone();
     let sup_sink = sink;
+    let lease_tenant = key.0.clone();
+    let lease_task_id = key.1.clone();
     tokio::spawn(async move {
         let _sentinel = SupervisorSentinel::new(sup_registry, sup_key, sup_handle.clone());
         if let Some(jh) = sup_handle.take_spawned()
@@ -229,7 +238,35 @@ pub(crate) fn spawn_tracked_executor(
                 "executor panicked"
             );
         }
-        // sentinel drops here, running cleanup.
+        // Clear only when the executor ended its turn through its sink
+        // (terminal, or INPUT_REQUIRED/AUTH_REQUIRED; a panic's FAILED goes
+        // through the same sink). An executor that exits without ending its
+        // turn (aborted by a cancel or the blocking-send deadline) keeps its
+        // lease, so the reaper fails the task if the framework's terminal
+        // commit never lands. Leave the registry before clearing. A renewal
+        // pass that took its registry snapshot earlier can still re-stamp
+        // the lease after the clear; the operator contract (every instance
+        // runs the lease) covers that window.
+        let ended_turn = sup_handle.terminal_committed() || sup_handle.client_held();
+        drop(_sentinel);
+        if ended_turn
+            && let Some(supervisor) = lease_clearer
+            && let Err(e) = supervisor
+                .supervisor_renew_executor_leases(
+                    &lease_tenant,
+                    std::slice::from_ref(&lease_task_id),
+                    None,
+                )
+                .await
+        {
+            tracing::warn!(
+                target: "turul_a2a::executor_lease_renew_error",
+                tenant = %lease_tenant,
+                task_id = %lease_task_id,
+                error = %e,
+                "clearing executor lease failed"
+            );
+        }
     });
 
     Ok(SpawnResult {

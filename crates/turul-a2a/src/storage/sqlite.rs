@@ -47,7 +47,8 @@ pub struct SqliteA2aStorage {
     /// opt-in — see `InMemoryA2aStorage::push_dispatch_enabled`.
     push_dispatch_enabled: bool,
     /// Age-based retention thresholds applied by `cleanup_expired`.
-    /// Zero TTL (the default) disables reaping for that record kind.
+    /// Zero TTL (the default) disables reaping for that record kind;
+    /// tasks are reaped only once terminal.
     retention: RetentionConfig,
 }
 
@@ -98,6 +99,7 @@ impl SqliteA2aStorage {
                 status_timestamp TEXT NOT NULL,
                 cancel_requested INTEGER NOT NULL DEFAULT 0,
                 latest_event_sequence INTEGER NOT NULL DEFAULT 0,
+                lease_expires_at INTEGER,
                 artifact_manifest TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -869,15 +871,50 @@ impl crate::storage::A2aCancellationSupervisor for SqliteA2aStorage {
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
-    async fn supervisor_list_executor_held_tasks(
+    async fn supervisor_renew_executor_leases(
         &self,
+        tenant: &str,
+        task_ids: &[String],
+        expires_at_micros: Option<i64>,
+    ) -> Result<(), A2aStorageError> {
+        if task_ids.is_empty() {
+            return Ok(());
+        }
+        // Chunked to stay under SQLite's bound-variable limit.
+        for chunk in task_ids.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "UPDATE a2a_tasks SET lease_expires_at = ?
+                 WHERE tenant = ? AND task_id IN ({placeholders})"
+            );
+            // `placeholders` is a comma-joined list of `?`; no user input
+            // ever reaches the SQL string itself (only the bind values).
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(expires_at_micros)
+                .bind(tenant);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            query
+                .execute(&self.pool)
+                .await
+                .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn supervisor_list_expired_executor_leases(
+        &self,
+        now_micros: i64,
     ) -> Result<Vec<super::traits::ExecutorHeldTask>, A2aStorageError> {
         let held = EXECUTOR_HELD_STATES_SQL.as_str();
         let rows: Vec<(String, String, String, String)> =
             sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT tenant, task_id, owner, context_id FROM a2a_tasks
-                 WHERE status_state IN ({held})"
+                 WHERE status_state IN ({held})
+                   AND lease_expires_at IS NOT NULL AND lease_expires_at < ?"
             )))
+            .bind(now_micros)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
@@ -1264,8 +1301,8 @@ impl A2aEventStore for SqliteA2aStorage {
     }
 
     async fn cleanup_expired(&self) -> Result<u64, A2aStorageError> {
-        // Age-based reaping, independent of task state. A non-zero task
-        // TTL can therefore reap long-running live tasks, by design.
+        // Only terminal tasks past the TTL are reaped; live tasks are
+        // never deleted.
         // Timestamps are stored as datetime('now') UTC text, which orders
         // lexicographically, so a textual `<` comparison is correct.
         // Rows are deleted in committed batches so a large backlog does
@@ -1317,11 +1354,13 @@ impl A2aEventStore for SqliteA2aStorage {
 
         if self.retention.task_ttl_seconds > 0 {
             let modifier = format!("-{} seconds", self.retention.task_ttl_seconds);
+            let terminal = TERMINAL_STATES_SQL.as_str();
             loop {
-                let n = sqlx::query(
+                let n = sqlx::query(sqlx::AssertSqlSafe(format!(
                     "DELETE FROM a2a_tasks WHERE rowid IN \
-                     (SELECT rowid FROM a2a_tasks WHERE updated_at < datetime('now', ?) LIMIT ?)",
-                )
+                     (SELECT rowid FROM a2a_tasks WHERE status_state IN ({terminal}) \
+                      AND updated_at < datetime('now', ?) LIMIT ?)"
+                )))
                 .bind(&modifier)
                 .bind(batch)
                 .execute(&self.pool)
@@ -3009,6 +3048,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cleanup_reaps_only_terminal_tasks() {
+        let s = storage_with_retention(RetentionConfig::new(1, 1)).await;
+        parity_tests::test_cleanup_reaps_only_terminal_tasks(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
     async fn test_cleanup_batched_drains_beyond_batch_size() {
         let s = storage_with_retention(RetentionConfig::new(1, 1).with_batch_size(2)).await;
         parity_tests::test_cleanup_batched_drains_beyond_batch_size(&s, &s, &s).await;
@@ -3035,9 +3080,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_supervisor_list_executor_held_tasks_parity() {
+    async fn test_supervisor_executor_lease_parity() {
         let s = storage().await;
-        parity_tests::test_supervisor_list_executor_held_tasks_parity(&s, &s, &s).await;
+        parity_tests::test_supervisor_executor_lease_parity(&s, &s, &s).await;
     }
 
     #[tokio::test]

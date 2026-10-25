@@ -550,6 +550,10 @@ impl LambdaA2aServerBuilder {
         if self.durable_executor_queue.is_none() {
             runtime_config.supports_return_immediately = false;
         }
+        // No background loops run on Lambda, so a lease written here
+        // would never be renewed and peers would fail the live task.
+        runtime_config.executor_lease_ttl = None;
+        runtime_config.executor_stall_timeout = None;
 
         // Push dispatcher wiring. When
         // `push_delivery_store` is present, validate its backend matches,

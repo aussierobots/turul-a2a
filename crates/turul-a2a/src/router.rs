@@ -537,7 +537,14 @@ pub(crate) async fn open_send_stream(
         request_metadata,
         activated_extensions,
     };
-    let _spawn = crate::server::spawn::spawn_tracked_executor(spawn_deps, scope)?;
+    let _spawn = crate::server::spawn::spawn_tracked_executor(
+        spawn_deps,
+        scope,
+        state
+            .runtime_config
+            .executor_lease_ttl
+            .map(|_| state.cancellation_supervisor.clone()),
+    )?;
 
     Ok(task_event_stream(
         state.event_store,
@@ -956,6 +963,23 @@ pub(crate) async fn start_task_turn(
         state.event_broker.notify(&target.task_id).await;
     }
 
+    // The lease is written before WORKING so no reaper ever sees the
+    // task executor-held with a lease from an earlier turn.
+    if let Some(ttl) = state.runtime_config.executor_lease_ttl {
+        let expires_at = chrono::Utc::now()
+            .timestamp_micros()
+            .saturating_add(i64::try_from(ttl.as_micros()).unwrap_or(i64::MAX));
+        state
+            .cancellation_supervisor
+            .supervisor_renew_executor_leases(
+                tenant,
+                std::slice::from_ref(&target.task_id),
+                Some(expires_at),
+            )
+            .await
+            .map_err(A2aError::from)?;
+    }
+
     state
         .atomic_store
         .update_task_status_with_events(
@@ -1270,7 +1294,14 @@ pub async fn core_send_message(
         request_metadata,
         activated_extensions,
     };
-    let spawn = crate::server::spawn::spawn_tracked_executor(spawn_deps, scope)?;
+    let spawn = crate::server::spawn::spawn_tracked_executor(
+        spawn_deps,
+        scope,
+        state
+            .runtime_config
+            .executor_lease_ttl
+            .map(|_| state.cancellation_supervisor.clone()),
+    )?;
 
     if return_immediately {
         // Non-blocking send (A2A spec §3.2.2, proto
@@ -1335,6 +1366,10 @@ pub async fn core_send_message(
 /// 1. **Soft deadline** (`blocking_task_timeout`): wait for the
 ///    executor to emit a terminal or interrupted event. If the deadline
 ///    fires first, trip `cancellation` and enter the cooperative window.
+///    If something else trips `cancellation` first, re-read the task every
+///    `cancel_handler_poll_interval` and return it once terminal, since a
+///    framework-committed terminal never fires `yielded`; the hard
+///    deadline still bounds the wait.
 /// 2. **Cooperative window** (through `timeout_abort_grace`): the
 ///    cancellation token is already set; a well-behaved executor
 ///    observes it and emits `sink.cancelled(...)` (or another terminal).
@@ -1358,23 +1393,60 @@ async fn await_yielded_with_two_deadlines(
     let soft = tokio::time::Instant::now() + state.runtime_config.blocking_task_timeout;
     let hard = soft + state.runtime_config.timeout_abort_grace;
 
-    // Soft wait: wait for yielded OR the soft deadline.
+    // Soft wait: wait for yielded, the soft deadline, or a cancel that
+    // something else tripped (CancelTask, the stall watchdog, another
+    // instance's cancel marker).
     let soft_outcome = tokio::select! {
         result = &mut yielded_rx => YieldedOutcome::Yielded(result.ok()),
         _ = tokio::time::sleep_until(soft) => YieldedOutcome::SoftTimeout,
+        _ = cancellation.cancelled() => YieldedOutcome::Cancelled,
     };
 
-    if let YieldedOutcome::Yielded(Some(task)) = soft_outcome {
-        return Ok(task);
-    }
-    if let YieldedOutcome::Yielded(None) = soft_outcome {
+    match soft_outcome {
+        YieldedOutcome::Yielded(Some(task)) => return Ok(task),
         // The yielded sender was dropped without firing — the
         // supervisor sentinel ran its cleanup before any terminal
         // landed. Surface this as Internal so the client sees a clear
         // failure rather than hanging.
-        return Err(A2aError::Internal(
-            "executor exited without emitting a terminal or interrupted event".into(),
-        ));
+        YieldedOutcome::Yielded(None) => {
+            return Err(A2aError::Internal(
+                "executor exited without emitting a terminal or interrupted event".into(),
+            ));
+        }
+        YieldedOutcome::Cancelled => {
+            // A framework-committed terminal never fires `yielded`, so
+            // read the task until it is terminal or the hard deadline.
+            let poll_interval = state.runtime_config.cancel_handler_poll_interval;
+            loop {
+                tokio::select! {
+                    result = &mut yielded_rx => {
+                        return result.map_err(|_| {
+                            A2aError::Internal(
+                                "executor exited without emitting a terminal or interrupted event"
+                                    .into(),
+                            )
+                        });
+                    }
+                    _ = tokio::time::sleep_until(hard) => break,
+                    _ = tokio::time::sleep(poll_interval) => {
+                        if let Some(task) = state
+                            .task_storage
+                            .get_task(tenant, task_id, owner, None)
+                            .await
+                            .ok()
+                            .flatten()
+                            && task
+                                .status()
+                                .and_then(|s| s.state().ok())
+                                .is_some_and(turul_a2a_types::state_machine::is_terminal)
+                        {
+                            return Ok(task);
+                        }
+                    }
+                }
+            }
+        }
+        YieldedOutcome::SoftTimeout | YieldedOutcome::HardTimeout => {}
     }
 
     // Cooperative wait: soft deadline expired. Trip the cancellation
@@ -1439,6 +1511,7 @@ async fn await_yielded_with_two_deadlines(
 enum YieldedOutcome {
     Yielded(Option<Task>),
     SoftTimeout,
+    Cancelled,
     HardTimeout,
 }
 
@@ -1584,7 +1657,7 @@ pub async fn commit_framework_terminal(
 /// 2. Reject with `TaskNotCancelable` if task is already terminal.
 /// 3. Write the cancel marker (owner-scoped, idempotent).
 /// 4. Trip the local in-flight cancellation token if present and arm
-///    its deferred abort at `cancel_handler_grace`.
+///    its deferred abort at `cancel_abort_grace`.
 /// 5. Wait up to `cancel_handler_grace`, polling task state every
 ///    `cancel_handler_poll_interval`. On observed terminal, return that
 ///    persisted task snapshot (cooperative cancel won the race). Steps 5
@@ -1658,7 +1731,7 @@ pub async fn core_cancel_task(
     // poll loop (see `server::in_flight::run_cross_instance_cancel_poller`).
     let in_flight_key = (tenant.to_string(), task_id.to_string());
     if let Some(handle) = state.in_flight.get(&in_flight_key) {
-        handle.cancel_then_abort_after(state.runtime_config.cancel_handler_grace);
+        handle.cancel_then_abort_after(state.runtime_config.cancel_abort_grace);
     }
 
     // Steps 5-6 run detached: the abort armed above fires at grace

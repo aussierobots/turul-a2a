@@ -5,10 +5,10 @@
 //! delete rows older than the configured window; `0` disables expiry for
 //! that row class.
 //!
-//! Age-based expiry is state-independent: a task past `task_ttl_seconds`
-//! is reaped regardless of its `TaskState`. Setting a non-zero task TTL
-//! can therefore reap long-running live tasks — choose a window larger
-//! than the longest expected task lifetime, or leave it `0`.
+//! Events expire by age alone. A task expires by age only once it is
+//! terminal; a `SUBMITTED`, `WORKING`, `INPUT_REQUIRED` or
+//! `AUTH_REQUIRED` task is never deleted by retention, however old, so
+//! retention bounds terminal history, not abandoned conversations.
 //!
 //! Cleanup deletes in bounded batches of `cleanup_batch_size` rows,
 //! committing each batch, so a large backlog does not hold one
@@ -31,9 +31,10 @@ pub const DEFAULT_CLEANUP_BATCH_SIZE: usize = 1000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RetentionConfig {
-    /// Maximum task age in seconds before it is eligible for cleanup.
-    /// `0` disables task expiry. Measured against the task's
-    /// `updated_at` (last status/content write).
+    /// Maximum age in seconds of a terminal task before it is eligible
+    /// for cleanup. `0` disables task expiry. Measured against the
+    /// task's `updated_at` (last status/content write); non-terminal
+    /// tasks are never eligible.
     pub task_ttl_seconds: u64,
     /// Maximum event age in seconds before it is eligible for cleanup.
     /// `0` disables event expiry. Measured against the event's

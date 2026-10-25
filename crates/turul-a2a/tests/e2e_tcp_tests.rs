@@ -614,6 +614,7 @@ async fn cancel_task_over_http_aborts_executor_ignoring_token() {
         })
         .storage(InMemoryA2aStorage::new())
         .cancel_handler_grace(Duration::from_millis(300))
+        .cancel_abort_grace(Duration::from_millis(300))
         .bind(([127, 0, 0, 1], 0u16))
         .build()
         .unwrap()

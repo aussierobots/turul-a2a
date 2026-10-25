@@ -255,6 +255,16 @@ impl EventSink {
             .await
     }
 
+    /// Record that the executor is still making progress, writing
+    /// nothing. Call it at least once per stall timeout during long
+    /// silent work; every event the sink commits counts as progress too.
+    /// Has no effect unless the server enables the stall watchdog.
+    pub fn heartbeat(&self) {
+        if let Some(inner) = &self.inner {
+            inner.handle.record_progress();
+        }
+    }
+
     /// Framework-internal commit helper. Bypasses the public API's
     /// terminal rejection on `set_status` so the framework's
     /// post-execute detection rule can commit whatever final state the
@@ -366,7 +376,9 @@ impl EventSinkInner {
                     );
                 }
 
+                self.handle.record_progress();
                 self.is_interrupted.store(is_interrupted, Ordering::Release);
+                self.handle.set_client_held(is_interrupted);
                 if is_terminal {
                     self.is_closed.store(true, Ordering::Release);
                     self.handle.mark_terminal_committed();
@@ -440,6 +452,7 @@ impl EventSinkInner {
         match result {
             Ok(seqs) => {
                 let seq = seqs.first().copied().unwrap_or(0);
+                self.handle.record_progress();
                 self.event_broker.notify(&self.task_id).await;
                 Ok(seq)
             }

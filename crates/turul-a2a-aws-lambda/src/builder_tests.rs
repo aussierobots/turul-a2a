@@ -285,8 +285,17 @@ impl A2aCancellationSupervisor for FakeBackend {
     ) -> Result<Vec<String>, A2aStorageError> {
         Ok(vec![])
     }
-    async fn supervisor_list_executor_held_tasks(
+    async fn supervisor_renew_executor_leases(
         &self,
+        _t: &str,
+        _tids: &[String],
+        _expires_at_micros: Option<i64>,
+    ) -> Result<(), A2aStorageError> {
+        Ok(())
+    }
+    async fn supervisor_list_expired_executor_leases(
+        &self,
+        _now_micros: i64,
     ) -> Result<Vec<turul_a2a::storage::ExecutorHeldTask>, A2aStorageError> {
         Ok(vec![])
     }
@@ -519,6 +528,30 @@ fn lambda_builder_rejects_retry_horizon_violation() {
     assert!(
         err.contains("retry horizon") || err.contains("push_claim_expiry"),
         "lambda error must cite the retry horizon: {err}"
+    );
+}
+
+#[test]
+fn lambda_builder_clears_executor_lease_and_stall_timeout() {
+    use std::time::Duration;
+    use turul_a2a::server::RuntimeConfig;
+
+    let mut cfg = RuntimeConfig::default();
+    cfg.executor_lease_ttl = Some(Duration::from_secs(30));
+    cfg.executor_stall_timeout = Some(Duration::from_secs(60));
+    let handler = LambdaA2aHandler::builder()
+        .executor(DummyExecutor)
+        .storage(InMemoryA2aStorage::new())
+        .runtime_config(cfg)
+        .build()
+        .expect("builds");
+    assert!(handler.state.runtime_config.executor_lease_ttl.is_none());
+    assert!(
+        handler
+            .state
+            .runtime_config
+            .executor_stall_timeout
+            .is_none()
     );
 }
 

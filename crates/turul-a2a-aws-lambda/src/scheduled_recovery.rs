@@ -223,7 +223,7 @@ impl LambdaScheduledRecoveryHandler {
 /// maintenance loop, so retention cleanup is driven externally: an
 /// EventBridge Scheduler cron invokes the function, the adopter routes
 /// the event here, and this calls `cleanup_expired` on the event store
-/// to reap expired events and tasks (age-based, state-independent — see
+/// to reap expired events and tasks (events by age, tasks by age once terminal — see
 /// [`A2aEventStore::cleanup_expired`]) and, on the SQL and in-memory
 /// backends, failed push-delivery records past their retention. On
 /// DynamoDB `cleanup_expired` removes nothing; the table's item TTL

@@ -60,7 +60,8 @@ This refines ADR-010 §5. The `CancelTask` handler **waits** up to a configurabl
 **Why blocking**: clients expect `CancelTask` to reflect the cancel's effect in its response. A non-blocking handler returning a still-`WORKING` task forces every adopter to write poll-until-terminal logic for a basic cancel. Blocking up to 5 seconds is well within normal HTTP request timeouts and gives a 99th-percentile UX that's consistent with the proto's `return_immediately = false` default for `SendMessage`.
 
 **Configuration**:
-- `A2aServer::builder().cancel_handler_grace(Duration)` — how long the handler waits before committing CANCELED itself, and how long an executor may keep running after its token is tripped for a cancel before it is aborted (§3, "Abort after grace"). Default 5s. Shared default with ADR-010's `cancellation_grace` but distinct config field.
+- `A2aServer::builder().cancel_handler_grace(Duration)` — how long the handler waits before committing CANCELED itself. Default 5s. Shared default with ADR-010's `cancellation_grace` but distinct config field.
+- `A2aServer::builder().cancel_abort_grace(Duration)` — how long an executor may keep running after its token is tripped for a cancel before it is aborted (§3, "Abort after grace"). Default 5s. Independent of `cancel_handler_grace`: a deployment can give executors longer to clean up than the handler waits, or abort them sooner.
 - `A2aServer::builder().cancel_handler_poll_interval(Duration)` — how often the handler re-reads task state within the grace wait. Default 100ms. Lower values reduce latency at slight storage-load cost.
 
 ### 3. In-Flight Supervisor Integration
@@ -79,9 +80,9 @@ The poll is per-tenant: each tick issues one query per tenant with active in-fli
 
 **Path interaction**: both paths can trip the token. `CancellationToken::cancel()` is idempotent; multiple trips are harmless. If same-instance sets marker AND trips local token AND cross-instance poll observes marker on the same instance (rare: shouldn't happen — the registry is per-instance), the second trip is a no-op.
 
-**Abort after grace — an executor does not outlive the cancel**: both paths trip the token through one owner, `InFlightHandle::cancel_then_abort_after(grace)` with `grace = cancel_handler_grace`. It trips the token and arms a one-shot abort that fires `grace` later. When it fires, the executor is aborted (`InFlightHandle::abort`, the same abort the blocking-send hard deadline uses, ADR-010 §4.1) unless it has by then committed a terminal state through its own sink — an executor that acknowledged the cancel is cooperating, and its post-terminal cleanup (ADR-010 §4.4) is left to finish. An interrupted commit (INPUT_REQUIRED / AUTH_REQUIRED) does not count: an executor that raised an interrupt, resumed WORKING and then ignores a cancel has not acknowledged it. The handle records the executor's own terminal commit in a flag of its own, distinct from the `yielded` signal, which fires on interrupts too. Arming is idempotent per handle: the poller re-observes the marker on every tick, and the handler and poller on one instance may both trip; only the first call arms.
+**Abort after grace — an executor does not outlive the cancel**: both paths trip the token through one owner, `InFlightHandle::cancel_then_abort_after(grace)` with `grace = cancel_abort_grace`. It trips the token and arms a one-shot abort that fires `grace` later. When it fires, the executor is aborted (`InFlightHandle::abort`, the same abort the blocking-send hard deadline uses, ADR-010 §4.1) unless it has by then committed a terminal state through its own sink — an executor that acknowledged the cancel is cooperating, and its post-terminal cleanup (ADR-010 §4.4) is left to finish. An interrupted commit (INPUT_REQUIRED / AUTH_REQUIRED) does not count: an executor that raised an interrupt, resumed WORKING and then ignores a cancel has not acknowledged it. The handle records the executor's own terminal commit in a flag of its own, distinct from the `yielded` signal, which fires on interrupts too. Arming is idempotent per handle: the poller re-observes the marker on every tick, and the handler and poller on one instance may both trip; only the first call arms.
 
-- **Timing**: on the instance that runs both the handler and the executor, the abort fires at the same deadline as the framework CANCELED commit (§2 step 5). Cross-instance, it fires `grace` after the owning instance's poller observes the marker, so within `cross_instance_cancel_poll_interval` of the handler's commit on the other instance.
+- **Timing**: on the instance that runs both the handler and the executor, the abort fires `cancel_abort_grace` after the handler trips the token; with equal defaults that is the deadline of the framework CANCELED commit (§2 step 5). Cross-instance, it fires `cancel_abort_grace` after the owning instance's poller observes the marker.
 - **The abort writes nothing**: the terminal stays with the handler's fallback commit (§2 step 5) or whichever writer wins the CAS. The supervisor does not treat an aborted executor as failed (ADR-010 §4.4).
 - **Reach**: the abort drops the executor's future. Work the executor detached from its own future (`tokio::spawn` inside `execute`) is not reachable by it; an executor that spawns detached work owns its cancellation.
 - **Why**: before this, the framework committed CANCELED and left an executor that ignored the token running, with its side effects (outbound calls, I/O, compute) continuing behind a task that reports CANCELED. Its writes fail at the CAS, so the wire stayed consistent, but the task's state contradicted what the process was doing. The blocking-send timeout already aborted at its hard deadline; cancel now follows the same rule.
@@ -154,7 +155,7 @@ Scenario: task persisted in storage as `WORKING`, no executor running on any ins
 
 **No special "orphan" handling code**: the same grace-with-fallback path handles both genuine orphans and slow executors. This is load-bearing for the design's simplicity.
 
-Orphans left by a process restart, which no client may ever cancel, are resolved separately at startup by ADR-028 (opt-in, single instance), which commits `FAILED` rather than `CANCELED`.
+Orphans left by a dead process, which no client may ever cancel, are resolved separately by the executor lease (ADR-029, opt-in, safe with several instances), which commits `FAILED` rather than `CANCELED`.
 
 ### 6. Race Handling
 
@@ -197,7 +198,8 @@ ADR-010 §4.1 defines `timeout_abort_grace` for blocking-send timeouts. ADR-012 
 |---|---|---|---|
 | `blocking_task_timeout` | Blocking SendMessage timeout | 30s | How long a blocking send waits before giving up on the executor |
 | `timeout_abort_grace` | Time between soft and hard timeout | 5s | Cooperative window after cancellation trip during timeout |
-| `cancel_handler_grace` | CancelTask handler wait; abort deadline after a cancel trips the token | 5s | How long the handler waits for cancellation to resolve, and how long the executor gets before it is aborted (§3) |
+| `cancel_handler_grace` | CancelTask handler wait | 5s | How long the handler waits for cancellation to resolve before committing CANCELED |
+| `cancel_abort_grace` | Abort deadline after a cancel trips the token | 5s | How long the executor gets before it is aborted (§3) |
 | `cross_instance_cancel_poll_interval` | Supervisor polling | 1s | How often supervisor checks marker for cross-instance cancels |
 | `cancel_handler_poll_interval` | Handler internal loop | 100ms | How often the handler re-reads task state while waiting |
 
@@ -267,17 +269,29 @@ pub trait A2aCancellationSupervisor: Send + Sync {
         task_ids: &[String],
     ) -> Result<Vec<String>, A2aStorageError>;
 
-    /// Every SUBMITTED / WORKING task across all tenants and owners.
-    /// Store-wide, not registry-scoped: its only caller is startup
-    /// reconciliation (ADR-028), which acts for the framework before the
-    /// server serves any request.
-    async fn supervisor_list_executor_held_tasks(
+    /// Set (or, with `None`, clear) the executor-lease expiry on the
+    /// named tasks of one tenant. Registry-scoped: the caller passes the
+    /// ids of executors running in its own process, or the tasks the
+    /// reaper just resolved (ADR-029).
+    async fn supervisor_renew_executor_leases(
         &self,
+        tenant: &str,
+        task_ids: &[String],
+        expires_at_micros: Option<i64>,
+    ) -> Result<(), A2aStorageError>;
+
+    /// Every SUBMITTED / WORKING task, across all tenants and owners,
+    /// whose executor lease expired before `now_micros`. Store-wide: its
+    /// only caller is the lease reaper (ADR-029), which acts for the
+    /// framework, not for a requester.
+    async fn supervisor_list_expired_executor_leases(
+        &self,
+        now_micros: i64,
     ) -> Result<Vec<ExecutorHeldTask>, A2aStorageError>;
 }
 ```
 
-The registry-scoping authorization invariant above binds the two cancel-marker reads. `supervisor_list_executor_held_tasks` is the one store-wide read; it carries no requester identity at all and is reachable only from `A2aServer::fail_orphaned_tasks`, which runs before serving (ADR-028 §1).
+The registry-scoping authorization invariant above binds the two cancel-marker reads and the lease renewal. `supervisor_list_expired_executor_leases` is the one store-wide read; it carries no requester identity at all and is reachable only from the lease reaper (ADR-029 §1).
 
 **AppState wiring**: `AppState::cancellation_supervisor: Arc<dyn A2aCancellationSupervisor>` is a separate field from `task_storage`. In practice, the same backend type satisfies both traits; the builder wires a single `Arc` into both fields. Cross-type safety: `AppState` does not expose `cancellation_supervisor` to handler code — it is used only by the `InFlightRegistry` constructor and the supervisor task body.
 
@@ -345,7 +359,7 @@ These gate ADR-012 acceptance. Timing assertions run on tokio's paused clock, so
     On HTTP, JSON-RPC and gRPC: an unknown task id returns `TaskNotFound` (404 / −32001 / `NOT_FOUND`); a request carrying `metadata` cancels exactly as one without (§2, request metadata). Through the handler: INPUT_REQUIRED and AUTH_REQUIRED tasks are cancelable (interrupted states are not terminal).
 
 16. **Executor that ignores the token is aborted at the grace deadline**
-    Same instance, paused clock. The executor ignores `ctx.cancellation` and sleeps in a loop. Assert: the handler returns the framework's CANCELED (no message) at the grace deadline; the executor's future is dropped (drop probe); the in-flight registry entry is removed; the only terminal event is CANCELED (no FAILED from the abort).
+    Same instance, paused clock. The executor ignores `ctx.cancellation` and sleeps in a loop. Assert: the handler returns the framework's CANCELED (no message) at the handler grace deadline; the executor is aborted at the abort grace deadline; the executor's future is dropped (drop probe); the in-flight registry entry is removed; the only terminal event is CANCELED (no FAILED from the abort).
 
 17. **Executor that acknowledged is not aborted**
     The executor answers the token with `sink.cancelled(reason)`, then keeps running post-terminal cleanup past the grace deadline and records that the cleanup finished. Assert: the handler returns the executor's CANCELED before grace; the cleanup runs to completion (not aborted).
@@ -361,6 +375,9 @@ These gate ADR-012 acceptance. Timing assertions run on tokio's paused clock, so
 
 21. **Dropped cancel request still commits**
     The `CancelTask` request future is dropped during the grace wait. Assert: the task still ends with exactly one CANCELED terminal and the executor is aborted.
+
+22. **Abort deadline is its own setting**
+    `cancel_abort_grace` longer than `cancel_handler_grace`: the handler returns CANCELED at its grace and the executor keeps running until the abort deadline, then is aborted. `cancel_abort_grace` shorter: the executor is aborted before the handler's CANCELED commit, which still lands as the only terminal. The cross-instance poller uses `cancel_abort_grace` too.
 
 ### 12. What Changes in Existing Code
 
@@ -449,3 +466,4 @@ Taken together: panicked supervisors do not leak registry entries, do not leave 
 - 2026-10-22 — HTTP status for `TaskNotCancelable` updated 409 → 400 to follow the A2A v1.0.1 error-mapping table (see ADR-004). No behavioural change to the cancellation contract.
 - 2026-10-22 — Amended to what ships and what the tests prove. Supervisor-panic observability is the ERROR tracing event at `turul_a2a::supervisor_panic`; the `framework.supervisor_panics` metric was never implemented and is removed (§3, §12, R5, test #13). `CancelTaskRequest.metadata` recorded as accepted and not interpreted on every transport (§2). Required tests restated as implemented: #1, #2 (instance B runs the full handler over A's live executor), #4 (both sub-cases forced), #6 (every terminal state, all transports, no marker write), #7, #10, #11 (store sequence check; no resume), #12 (bounded correctness test of one batch query per tenant per tick, replacing the benchmark wording), #13 (tracing event, awaited abort, full follow-up), #14 (doctest), new #15 (TaskNotFound and metadata on every transport, interrupted states cancelable).
 - 2026-10-25 — Abort after grace (§3): a cancel's token trip arms an abort of the executor `cancel_handler_grace` later, owned by `InFlightHandle::cancel_then_abort_after` on both the same-instance and the cross-instance path; an executor that committed its own terminal state is not aborted (an interrupt commit does not count, so the handle tracks the executor's terminal commit separately from `yielded`). The grace wait and fallback commit run detached from the request so a dropped request cannot strand the task after the abort, and a grace-poll read failure no longer ends the cancel early (§2). §10 gains `supervisor_list_executor_held_tasks`, the one store-wide supervisor read, for ADR-028. Previously an executor that ignored the token kept running behind a CANCELED task; the blocking-send timeout already aborted. `run_cross_instance_cancel_poller` takes the abort grace. §2 configuration, §9 table, R2 and test #4 (cancel wins: the executor is now aborted and never reaches `complete()`; the late-write refusal moves to a cross-instance sub-case) updated; tests #16–#21 added. §5 points restart orphans at ADR-028.
+- 2026-10-25 — Abort deadline split from the handler wait: `cancel_abort_grace` (default 5s) sets when a cancelled executor is aborted, on both the handler and the cross-instance poller paths; `cancel_handler_grace` is only the handler's wait (§2, §3, §9; test #22). §5 and §10 point to ADR-029's executor lease, which replaces ADR-028's startup reconciliation; the supervisor trait loses `supervisor_list_executor_held_tasks` and gains the two lease methods.

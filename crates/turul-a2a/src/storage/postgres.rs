@@ -98,6 +98,7 @@ impl PostgresA2aStorage {
                 status_timestamp TEXT COLLATE \"C\" NOT NULL,
                 cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
                 latest_event_sequence BIGINT NOT NULL DEFAULT 0,
+                lease_expires_at BIGINT,
                 artifact_manifest JSONB NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -848,15 +849,40 @@ impl crate::storage::A2aCancellationSupervisor for PostgresA2aStorage {
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
-    async fn supervisor_list_executor_held_tasks(
+    async fn supervisor_renew_executor_leases(
         &self,
+        tenant: &str,
+        task_ids: &[String],
+        expires_at_micros: Option<i64>,
+    ) -> Result<(), A2aStorageError> {
+        if task_ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "UPDATE a2a_tasks SET lease_expires_at = $1
+             WHERE tenant = $2 AND task_id = ANY($3)",
+        )
+        .bind(expires_at_micros)
+        .bind(tenant)
+        .bind(task_ids)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn supervisor_list_expired_executor_leases(
+        &self,
+        now_micros: i64,
     ) -> Result<Vec<super::traits::ExecutorHeldTask>, A2aStorageError> {
         let held = EXECUTOR_HELD_STATES_SQL.as_str();
         let rows: Vec<(String, String, String, String)> =
             sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT tenant, task_id, owner, context_id FROM a2a_tasks
-                 WHERE status_state IN ({held})"
+                 WHERE status_state IN ({held})
+                   AND lease_expires_at IS NOT NULL AND lease_expires_at < $1"
             )))
+            .bind(now_micros)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| A2aStorageError::DatabaseError(e.to_string()))?;
@@ -1240,8 +1266,8 @@ impl A2aEventStore for PostgresA2aStorage {
     }
 
     async fn cleanup_expired(&self) -> Result<u64, A2aStorageError> {
-        // Age-based reaping, independent of task state. A non-zero task
-        // TTL can therefore reap long-running live tasks, by design.
+        // Only terminal tasks past the TTL are reaped; live tasks are
+        // never deleted.
         // Rows are deleted in committed batches (each statement
         // autocommits) so a large backlog never holds one long
         // transaction; each loop runs until the eligible rows are drained.
@@ -1291,11 +1317,13 @@ impl A2aEventStore for PostgresA2aStorage {
 
         if self.retention.task_ttl_seconds > 0 {
             let interval = format!("{} seconds", self.retention.task_ttl_seconds);
+            let terminal = TERMINAL_STATES_SQL.as_str();
             loop {
-                let n = sqlx::query(
+                let n = sqlx::query(sqlx::AssertSqlSafe(format!(
                     "DELETE FROM a2a_tasks WHERE ctid IN \
-                     (SELECT ctid FROM a2a_tasks WHERE updated_at < NOW() - $1::interval LIMIT $2)",
-                )
+                     (SELECT ctid FROM a2a_tasks WHERE status_state IN ({terminal}) \
+                      AND updated_at < NOW() - $1::interval LIMIT $2)"
+                )))
                 .bind(&interval)
                 .bind(batch)
                 .execute(&self.pool)
@@ -2925,6 +2953,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cleanup_reaps_only_terminal_tasks() {
+        let s = storage_with_retention(crate::storage::RetentionConfig::new(1, 1)).await;
+        parity_tests::test_cleanup_reaps_only_terminal_tasks(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
     async fn test_cleanup_batched_drains_beyond_batch_size() {
         let s =
             storage_with_retention(crate::storage::RetentionConfig::new(1, 1).with_batch_size(2))
@@ -2953,9 +2987,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_supervisor_list_executor_held_tasks_parity() {
+    async fn test_supervisor_executor_lease_parity() {
         let s = storage().await;
-        parity_tests::test_supervisor_list_executor_held_tasks_parity(&s, &s, &s).await;
+        parity_tests::test_supervisor_executor_lease_parity(&s, &s, &s).await;
     }
 
     #[tokio::test]

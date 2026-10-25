@@ -43,12 +43,11 @@ pub trait A2aEventStore: Send + Sync {
 
     /// Delete all expired events and tasks based on the configured TTL.
     ///
-    /// Age-based, state-independent expiry: events older than the
-    /// configured event TTL (measured from each event's `created_at`)
-    /// and tasks older than the configured task TTL (measured from each
-    /// task's `updated_at`) are deleted regardless of `TaskState` — a
-    /// terminal task and a long-running live task past the window are
-    /// reaped alike.
+    /// Age-based expiry: events older than the configured event TTL
+    /// (measured from each event's `created_at`) are deleted. Tasks are
+    /// deleted only once terminal and older than the configured task TTL
+    /// (measured from each task's `updated_at`); a live task is never
+    /// deleted.
     ///
     /// Failed push-delivery records past their retention (see
     /// [`crate::push::DeliveryOutcome::GaveUp`]) are deleted too,

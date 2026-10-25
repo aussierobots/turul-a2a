@@ -44,7 +44,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinHandle};
@@ -116,6 +116,20 @@ pub struct InFlightHandle {
     /// INPUT_REQUIRED or AUTH_REQUIRED and kept running has not
     /// acknowledged a later cancel.
     terminal_committed: AtomicBool,
+
+    /// Whether the latest status the executor's sink committed is
+    /// INPUT_REQUIRED or AUTH_REQUIRED: the task waits on the client.
+    /// Cleared by any later non-interrupted status commit.
+    client_held: AtomicBool,
+
+    /// When the executor last made progress: handle creation, every
+    /// event its sink commits, and [`crate::event_sink::EventSink::heartbeat`].
+    last_progress: Mutex<tokio::time::Instant>,
+
+    /// `(owner, context_id)` of the task, recorded when the executor is
+    /// spawned. The stall watchdog needs them to commit a terminal on
+    /// the executor's behalf.
+    identity: OnceLock<(String, String)>,
 }
 
 impl InFlightHandle {
@@ -134,7 +148,36 @@ impl InFlightHandle {
             abort_handle: Mutex::new(abort_handle),
             abort_armed: AtomicBool::new(false),
             terminal_committed: AtomicBool::new(false),
+            client_held: AtomicBool::new(false),
+            last_progress: Mutex::new(tokio::time::Instant::now()),
+            identity: OnceLock::new(),
         }
+    }
+
+    /// Record that the executor made progress now.
+    pub(crate) fn record_progress(&self) {
+        *self
+            .last_progress
+            .lock()
+            .expect("last_progress Mutex poisoned") = tokio::time::Instant::now();
+    }
+
+    /// Time since the executor last made progress.
+    pub(crate) fn since_progress(&self) -> std::time::Duration {
+        self.last_progress
+            .lock()
+            .expect("last_progress Mutex poisoned")
+            .elapsed()
+    }
+
+    /// Record the task's owner and context id. The first call wins.
+    pub(crate) fn set_identity(&self, owner: String, context_id: String) {
+        let _ = self.identity.set((owner, context_id));
+    }
+
+    /// The task's `(owner, context_id)`, once recorded.
+    pub(crate) fn identity(&self) -> Option<&(String, String)> {
+        self.identity.get()
     }
 
     /// Trip the cancellation token and arm a one-shot deferred abort.
@@ -215,6 +258,18 @@ impl InFlightHandle {
     /// Record that the executor's sink committed a terminal state.
     pub(crate) fn mark_terminal_committed(&self) {
         self.terminal_committed.store(true, Ordering::Release);
+    }
+
+    /// Record whether the latest status the executor's sink committed is
+    /// an interrupt.
+    pub(crate) fn set_client_held(&self, held: bool) {
+        self.client_held.store(held, Ordering::Release);
+    }
+
+    /// Whether the latest status the executor's sink committed is an
+    /// interrupt.
+    pub(crate) fn client_held(&self) -> bool {
+        self.client_held.load(Ordering::Acquire)
     }
 
     /// Whether the executor's sink has committed a terminal state.
@@ -363,6 +418,16 @@ impl InFlightRegistry {
             out.entry(tenant.clone()).or_default().push(task_id.clone());
         }
         out
+    }
+
+    /// Every registered handle with its key, copied out of the lock.
+    pub(crate) fn snapshot_handles(&self) -> Vec<(InFlightKey, Arc<InFlightHandle>)> {
+        self.map
+            .read()
+            .expect("InFlightRegistry RwLock poisoned")
+            .iter()
+            .map(|(k, h)| (k.clone(), Arc::clone(h)))
+            .collect()
     }
 
     /// Get a handle by key. Test-friendly alias for `get` to make the

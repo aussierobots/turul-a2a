@@ -28,6 +28,9 @@ struct StoredTask {
     updated_at: String,
     /// cancel-requested marker. Storage-internal; never on wire.
     cancel_requested: bool,
+    /// Executor-lease expiry, epoch microseconds. Storage-internal;
+    /// written only by `supervisor_renew_executor_leases`, never on wire.
+    lease_expires_at: Option<i64>,
     /// causal floor: monotonic per-task event sequence
     /// maintained UNCONDITIONALLY on every atomic commit (regardless
     /// of `push_dispatch_enabled`). `create_config` reads this value
@@ -133,7 +136,8 @@ pub struct InMemoryA2aStorage {
     push_dispatch_enabled: bool,
     /// Age-based retention window. Zero TTLs (the default) disable
     /// cleanup entirely; a non-zero TTL makes `cleanup_expired` reap
-    /// rows older than the window regardless of task state.
+    /// events older than the window and terminal tasks older than the
+    /// window.
     retention: RetentionConfig,
     #[cfg(test)]
     cas_hook: Arc<RwLock<Option<CasHook>>>,
@@ -245,6 +249,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
             task: task.clone(),
             updated_at: now_iso(),
             cancel_requested: false,
+            lease_expires_at: None,
             latest_event_sequence: 0,
         };
         let mut tasks = self.tasks.write().await;
@@ -285,6 +290,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
                 // cleared by a full-task replacement) and latest_event_sequence
                 // (monotonic; maintained by atomic commits).
                 let cancel_requested = stored.cancel_requested;
+                let lease_expires_at = stored.lease_expires_at;
                 let latest_event_sequence = stored.latest_event_sequence;
                 tasks.insert(
                     key,
@@ -294,6 +300,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
                         task,
                         updated_at: now_iso(),
                         cancel_requested,
+                        lease_expires_at,
                         latest_event_sequence,
                     },
                 );
@@ -460,6 +467,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
         // Preserve cancel_requested (monotonic) and latest_event_sequence
         // (monotonic, maintained by atomic commits only).
         let cancel_requested = stored.cancel_requested;
+        let lease_expires_at = stored.lease_expires_at;
         let latest_event_sequence = stored.latest_event_sequence;
         tasks.insert(
             key,
@@ -469,6 +477,7 @@ impl A2aTaskStorage for InMemoryA2aStorage {
                 task: updated_task.clone(),
                 updated_at: now_iso(),
                 cancel_requested,
+                lease_expires_at,
                 latest_event_sequence,
             },
         );
@@ -631,20 +640,37 @@ impl crate::storage::A2aCancellationSupervisor for InMemoryA2aStorage {
         Ok(out)
     }
 
-    async fn supervisor_list_executor_held_tasks(
+    async fn supervisor_renew_executor_leases(
         &self,
+        tenant: &str,
+        task_ids: &[String],
+        expires_at_micros: Option<i64>,
+    ) -> Result<(), A2aStorageError> {
+        let mut tasks = self.tasks.write().await;
+        for task_id in task_ids {
+            if let Some(stored) = tasks.get_mut(&(tenant.to_string(), task_id.clone())) {
+                stored.lease_expires_at = expires_at_micros;
+            }
+        }
+        Ok(())
+    }
+
+    async fn supervisor_list_expired_executor_leases(
+        &self,
+        now_micros: i64,
     ) -> Result<Vec<super::traits::ExecutorHeldTask>, A2aStorageError> {
         let tasks = self.tasks.read().await;
         Ok(tasks
             .values()
             .filter(|stored| {
-                stored
-                    .task
-                    .status()
-                    .and_then(|s| s.state().ok())
-                    .is_some_and(|s| {
-                        turul_a2a_types::state_machine::EXECUTOR_HELD_STATES.contains(&s)
-                    })
+                stored.lease_expires_at.is_some_and(|l| l < now_micros)
+                    && stored
+                        .task
+                        .status()
+                        .and_then(|s| s.state().ok())
+                        .is_some_and(|s| {
+                            turul_a2a_types::state_machine::EXECUTOR_HELD_STATES.contains(&s)
+                        })
             })
             .map(|stored| {
                 super::traits::ExecutorHeldTask::new(
@@ -962,8 +988,8 @@ impl A2aEventStore for InMemoryA2aStorage {
             .unwrap_or_default()
             .as_secs();
 
-        // Tasks: age-based on `updated_at`, state-independent. A task
-        // older than the window is reaped even if still live. Removed in
+        // Tasks: age-based on `updated_at`, terminal tasks only. A live
+        // task is never reaped however old. Removed in
         // batches of `batch`, dropping the write lock between batches so
         // a large sweep does not stall concurrent access.
         if task_ttl_seconds > 0 {
@@ -972,9 +998,14 @@ impl A2aEventStore for InMemoryA2aStorage {
                 let expired: Vec<TaskKey> = tasks
                     .iter()
                     .filter(|(_, stored)| {
-                        epoch_secs(&stored.updated_at)
-                            .map(|t| now_secs.saturating_sub(t) >= task_ttl_seconds)
-                            .unwrap_or(false)
+                        stored
+                            .task
+                            .status()
+                            .and_then(|s| s.state().ok())
+                            .is_some_and(turul_a2a_types::state_machine::is_terminal)
+                            && epoch_secs(&stored.updated_at)
+                                .map(|t| now_secs.saturating_sub(t) >= task_ttl_seconds)
+                                .unwrap_or(false)
                     })
                     .map(|(key, _)| key.clone())
                     .take(batch)
@@ -1093,6 +1124,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
                 task: task.clone(),
                 updated_at: now_iso(),
                 cancel_requested: false,
+                lease_expires_at: None,
                 latest_event_sequence,
             },
         );
@@ -1195,6 +1227,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         // Preserve cancel_requested (monotonic) and snapshot previous
         // latest_event_sequence; the final value is max(prev, new_seqs).
         let cancel_requested = stored.cancel_requested;
+        let lease_expires_at = stored.lease_expires_at;
         let prev_latest = stored.latest_event_sequence;
 
         // Append events with atomic sequence assignment. When the
@@ -1257,6 +1290,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
                 task: updated_task.clone(),
                 updated_at: now_iso(),
                 cancel_requested,
+                lease_expires_at,
                 latest_event_sequence: new_latest,
             },
         );
@@ -1311,10 +1345,16 @@ impl A2aAtomicStore for InMemoryA2aStorage {
         // Preserve cancel_requested (monotonic) and snapshot
         // latest_event_sequence so it can extend (never shrink) even
         // when the full-task replacement rewrites task JSON.
-        let (cancel_requested, prev_latest) = tasks
+        let (cancel_requested, lease_expires_at, prev_latest) = tasks
             .get(&task_key)
-            .map(|s| (s.cancel_requested, s.latest_event_sequence))
-            .unwrap_or((false, 0));
+            .map(|s| {
+                (
+                    s.cancel_requested,
+                    s.lease_expires_at,
+                    s.latest_event_sequence,
+                )
+            })
+            .unwrap_or((false, None, 0));
 
         // Append events with atomic sequence assignment.
         let mut sequences = Vec::with_capacity(events.len());
@@ -1345,6 +1385,7 @@ impl A2aAtomicStore for InMemoryA2aStorage {
                 task,
                 updated_at: now_iso(),
                 cancel_requested,
+                lease_expires_at,
                 latest_event_sequence: new_latest,
             },
         );
@@ -2032,6 +2073,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cleanup_reaps_only_terminal_tasks() {
+        let s = storage().with_retention(RetentionConfig::new(1, 1));
+        parity_tests::test_cleanup_reaps_only_terminal_tasks(&s, &s, &s).await;
+    }
+
+    #[tokio::test]
     async fn test_cleanup_batched_drains_beyond_batch_size() {
         let s = storage().with_retention(RetentionConfig::new(1, 1).with_batch_size(2));
         parity_tests::test_cleanup_batched_drains_beyond_batch_size(&s, &s, &s).await;
@@ -2058,9 +2105,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_supervisor_list_executor_held_tasks_parity() {
+    async fn test_supervisor_executor_lease_parity() {
         let s = storage();
-        parity_tests::test_supervisor_list_executor_held_tasks_parity(&s, &s, &s).await;
+        parity_tests::test_supervisor_executor_lease_parity(&s, &s, &s).await;
     }
 
     #[tokio::test]

@@ -158,10 +158,10 @@ pub trait A2aTaskStorage: Send + Sync {
 /// owner-validated at spawn time. Re-checking owner on every poll tick
 /// would force the supervisor to carry per-task owner strings through its
 /// registry without producing any security benefit — the upstream
-/// validation already covered it. The one exception is the store-wide
-/// listing of executor-held tasks, which is for the server's own startup
-/// reconciliation before it serves requests and is never reachable from
-/// a handler.
+/// validation already covered it. Lease renewal follows the same rule.
+/// The one exception is the store-wide listing of expired executor
+/// leases, which only the server's lease reaper calls, acting for the
+/// framework; it is never reachable from a handler.
 ///
 /// External backend implementers implement this trait alongside
 /// [`A2aTaskStorage`], [`super::A2aEventStore`], and
@@ -214,14 +214,35 @@ pub trait A2aCancellationSupervisor: Send + Sync {
         task_ids: &[String],
     ) -> Result<Vec<String>, A2aStorageError>;
 
-    /// Return every SUBMITTED or WORKING task across all tenants and
-    /// owners.
+    /// Set the executor-lease expiry (epoch microseconds) on the named
+    /// tasks of `tenant`, whatever their state, or clear it with `None`.
+    /// Ids absent from storage never gain a task and are never listed by
+    /// `supervisor_list_expired_executor_leases`; a backend that stores the
+    /// lease apart from the task may keep a lease row for such an id until
+    /// that listing removes it.
     ///
-    /// Owner-unscoped like the other supervisor reads; the only caller is
-    /// startup reconciliation, which acts for the framework rather than a
-    /// requester.
-    async fn supervisor_list_executor_held_tasks(
+    /// The lease is storage-internal: it is not part of the task's wire
+    /// shape, and ordinary task writes never change it.
+    async fn supervisor_renew_executor_leases(
         &self,
+        tenant: &str,
+        task_ids: &[String],
+        expires_at_micros: Option<i64>,
+    ) -> Result<(), A2aStorageError>;
+
+    /// Return every SUBMITTED or WORKING task, across all tenants and
+    /// owners, that has an executor lease expiring before `now_micros`.
+    /// A task that never had a lease is never returned.
+    ///
+    /// Owner-unscoped and store-wide; the only caller is the lease
+    /// reaper, which acts for the framework rather than a requester.
+    /// A backend that stores the lease apart from the task may, as its only
+    /// side effect, delete (best effort, and only if the lease is unchanged
+    /// since it was read) expired leases whose task is gone or is not
+    /// SUBMITTED or WORKING.
+    async fn supervisor_list_expired_executor_leases(
+        &self,
+        now_micros: i64,
     ) -> Result<Vec<ExecutorHeldTask>, A2aStorageError>;
 }
 

@@ -101,6 +101,10 @@ impl EventSink {
 
     /// Returns true if this sink has already emitted a terminal event.
     pub fn is_closed(&self) -> bool;
+
+    /// Record executor progress without writing anything. Only the
+    /// opt-in stall watchdog reads it (ADR-029 §2).
+    pub fn heartbeat(&self);
 }
 ```
 
@@ -145,7 +149,7 @@ Behavior:
 1. Framework creates task (SUBMITTED via `A2aAtomicStore::create_task_with_events`).
 2. Framework spawns the executor on a tracked handle (§4.4), passes an `EventSink`.
 3. Request future awaits `InFlightHandle.yielded` — fires on first commit of a terminal OR interrupted event (§4.4). Does NOT wait for executor exit.
-4. `yielded` fires when **any** of: (a) executor emits terminal/interrupted through its sink (`complete`, `fail`, `cancelled`, `reject`, `require_input`, `require_auth`), (b) executor returns `Err` and framework writes terminal `FAILED`, (c) framework writes terminal `CANCELED` due to a cancel request that the executor didn't acknowledge within grace, (d) hard-timeout force-abort resolves the race (framework commits `FAILED` OR reads the executor-committed terminal — see timeout sequence below).
+4. `yielded` fires when **any** of: (a) executor emits terminal/interrupted through its sink (`complete`, `fail`, `cancelled`, `reject`, `require_input`, `require_auth`), (b) executor returns `Err` and framework writes terminal `FAILED`, (c) a cancel (or another framework path, such as the stall watchdog of ADR-029) trips the executor's token while the send waits — see "Cancellation observed" below, (d) hard-timeout force-abort resolves the race (framework commits `FAILED` OR reads the executor-committed terminal — see timeout sequence below).
 5. Framework returns the task snapshot delivered via `yielded`.
 
 **Blocking return signal**: blocking `SendMessage` completion does NOT depend on executor exit. It depends on **first commit** of a terminal or interrupted event (`COMPLETED`, `FAILED`, `CANCELED`, `REJECTED`, `INPUT_REQUIRED`, `AUTH_REQUIRED`) per A2A v1.0 §3.2.2. The framework exposes this as `InFlightHandle.yielded: oneshot::Sender<Task>` (see §4.4). As soon as the atomic store commits one of these states, the framework fires `yielded` with the persisted task snapshot; blocking send returns immediately. Registry cleanup continues independently until the `JoinHandle` resolves — this decoupling is load-bearing.
@@ -171,6 +175,8 @@ Sequence on timeout:
 5. **Cleanup**: supervisor task (§4.4) awaits `JoinHandle` resolution — regardless of cooperative-vs-abort path — and removes the registry entry on exit. Blocking send has already returned; cleanup does not block the client.
 
 **No zombies, no FAILED on top of cooperative CANCELED**. The force-abort always terminates the executor task (via `abort()` at the next `.await`). The race-aware FAILED commit preserves the single-terminal-writer invariant from §1/§7.1.
+
+**Cancellation observed.** Framework-committed terminals (the `CancelTask` fallback CANCELED, a stall FAILED, a CANCELED committed on another instance) do not go through the executor's sink, so they do not fire `yielded`. While waiting for the soft deadline, the blocking send therefore also watches the executor's cancellation token. Once the token is tripped by anything other than its own soft deadline, the send re-reads the task every `cancel_handler_poll_interval` and returns it as soon as it is terminal; `yielded` firing still returns at once. The hard deadline stays the backstop. Without this, a blocking send on a task cancelled through `CancelTask` waited out `blocking_task_timeout + timeout_abort_grace` before returning the CANCELED task.
 
 **Interrupted states** (`INPUT_REQUIRED`, `AUTH_REQUIRED`) also fire `yielded` per §3.2.2. Blocking send returns with the task in that state. The executor ought to return from `execute()` promptly after emitting an interrupt; if it doesn't, the supervisor eventually handles cleanup. But blocking send has already returned — the client is not held hostage to executor cleanup discipline.
 
@@ -397,6 +403,9 @@ These tests gate ADR-010 acceptance and phase-2 completion. All must be green on
 16. **Executor panic commits FAILED**
     Four sub-cases. (a) Non-blocking send, the executor commits an artifact through the sink and then panics: the task reaches FAILED with the reason "executor panicked" in an agent-role message, one terminal event, registry entry removed. (b) Blocking send, the executor panics: the send returns the FAILED task (not an internal error). (c) The executor completes through the sink and then panics during post-terminal cleanup: the task stays COMPLETED, one terminal event. (d) The executor raises INPUT_REQUIRED through the sink and then panics: the task reaches FAILED, as for an `Err` return.
 
+17. **Blocking send returns a cancel promptly**
+    A blocking send runs an executor that ignores its token; a `CancelTask` arrives while the send waits, with `blocking_task_timeout` far above `cancel_handler_grace`. Assert: the send returns the CANCELED task within `cancel_handler_grace` plus one poll interval, not at the blocking deadline. Cross-instance variant: the send waits on instance A, `CancelTask` runs on instance B over the shared store; A's poller trips the token and the send returns B's CANCELED within `cross_instance_cancel_poll_interval + cancel_handler_grace` plus one poll interval.
+
 ### 10. What Changes in Existing Code
 
 **New**:
@@ -425,7 +434,7 @@ These tests gate ADR-010 acceptance and phase-2 completion. All must be green on
 
 ### 11. Risks and Mitigations
 
-**R1 — Executor crashes mid-execution with non-terminal state**. Mitigation: a panic ends the executor's tokio task; the supervisor observes it on the `JoinHandle` and commits `FAILED` with the reason "executor panicked" through the sink (§4.4 (b)). The registry entry is always cleaned up on executor task exit, regardless of reason. A crash of the whole process takes the supervisor with it; those tasks are resolved at the next start by ADR-028 (opt-in, single instance).
+**R1 — Executor crashes mid-execution with non-terminal state**. Mitigation: a panic ends the executor's tokio task; the supervisor observes it on the `JoinHandle` and commits `FAILED` with the reason "executor panicked" through the sink (§4.4 (b)). The registry entry is always cleaned up on executor task exit, regardless of reason. A crash of the whole process takes the supervisor with it; their leases stop being renewed and any lease-enabled instance fails them (ADR-029, opt-in). An executor that hangs without crashing is caught by ADR-029's stall watchdog.
 
 **R2 — Sink's atomic-store call fails** (DB down, constraint violation). Mitigation: the error surfaces from `sink.emit_*().await` directly. Executors that ignore the error are implementer bugs, but the framework still functions — the event is NOT in the store, so subscribers don't see it, and eventually the executor completes or times out. No silent half-commit.
 
@@ -480,3 +489,4 @@ These tests gate ADR-010 acceptance and phase-2 completion. All must be green on
 - 2026-10-22 — §7.2 detection rule completed: an executor that raises INPUT_REQUIRED / AUTH_REQUIRED through `ctx.events` and then returns `Ok` keeps the interrupted state. The code had forced FAILED in that case, because only a terminal closes the sink; the rule now names the three non-terminal outcomes explicitly.
 - 2026-10-22 — #11(c) restated: the earlier entry's premise that "a sink-emitted terminal never reaches the hard-deadline CAS" is false — a sink commit that races the hard deadline can land before the framework's FAILED write, which then loses the CAS. The concurrent `CancelTask` writer is kept because it is the deterministic way to force the CAS-loss branch, not because it is the only writer that can reach it.
 - 2026-10-25 — §4.4 supervisor duties restated as implemented, and the panic case implemented. The supervisor never inspected task state on executor exit: a normal return is resolved inside the executor task by the §7.2 rule, and the panic commit R1 described did not exist — a panicking executor left its task WORKING and a blocking send got an internal error. The supervisor now treats a panic as an `Err` return — it commits `FAILED` ("executor panicked") through the sink unless a terminal already closed it — and does nothing on an abort, which the aborting path owns. R1 corrected; test #16 added. Process crashes point at ADR-028.
+- 2026-10-25 — §4.1 "Cancellation observed": a blocking send watches the executor's token and returns a framework-committed terminal (cancel fallback, stall, another instance's CANCELED) by re-reading the task, instead of waiting for the hard deadline; item 4(c) restated, since a framework commit never fired `yielded`. §2 adds `EventSink::heartbeat()` for ADR-029's stall watchdog. Test #17 added.

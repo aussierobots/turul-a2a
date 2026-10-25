@@ -1,6 +1,6 @@
 # ADR-028: Startup Reconciliation of Orphaned Tasks
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-029
 - **Date:** 2026-10-25
 - **Related:** ADR-009 (durable event coordination), ADR-010 (executor lifecycle, tracked handle), ADR-012 (cancellation; §5 orphan cancel, §10 supervisor-scope trait), ADR-018 (Lambda durable executor), ADR-026 (retention)
 
@@ -124,3 +124,4 @@ The AWS Lambda adapter has no `A2aServer` and does not expose this. Under ADR-01
 ## Revision log
 
 - 2026-10-25: Initial acceptance. The shared framework-terminal commit also absorbs the unstarted-turn FAILED compensation and the Lambda pre-dispatch CANCELED, which committed inline without push dispatch.
+- 2026-10-25: Superseded by ADR-029. The executor lease resolves the same orphans without the single-instance restriction; `fail_orphaned_tasks`, `fail_orphaned_tasks_on_start` and `supervisor_list_executor_held_tasks` are deleted. §3 (`commit_framework_terminal` as the one commit path for framework terminals) carries over into ADR-029.

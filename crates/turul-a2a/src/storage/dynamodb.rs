@@ -6,6 +6,10 @@
 //! conditional writes (owner enforcement). Task IDs are server-generated
 //! UUID v7, so collisions within a tenant are not possible in normal operation.
 //!
+//! The tasks table also holds one executor-lease item per leased task, keyed
+//! `lease|{tenant}|{task_id}` (delimiters escaped, so it never collides with
+//! a task key).
+//!
 //! Tables are shareable across tenants (tenant is in the PK). However, owner
 //! isolation is enforced at the application layer via conditional expressions,
 //! not via the key structure. If multiple independent agents share the same
@@ -41,9 +45,12 @@ pub struct DynamoDbConfig {
     /// Pending-dispatch marker table. See
     /// [`crate::push::A2aPushDeliveryStore::record_pending_dispatch`].
     pub push_pending_dispatches_table: String,
-    /// TTL for task items in seconds. 0 = no expiry. Default: 1 day (86400).
-    /// Written as a native `ttl` attribute (epoch seconds) per item; the
-    /// engine reaps expired rows.
+    /// TTL for terminal task items in seconds. 0 = no expiry. Default:
+    /// 1 day (86400). Written as a native `ttl` attribute (epoch seconds)
+    /// once the task is terminal and refreshed by later writes to it; a
+    /// non-terminal task item carries no `ttl` and is never reaped. The
+    /// task's artifact and push-config items receive the same `ttl` once
+    /// it is terminal. The engine reaps expired rows.
     pub task_ttl_seconds: u64,
     /// TTL for event items in seconds. 0 = no expiry. Default: 24 hours (86400).
     /// Written as a native `ttl` attribute (epoch seconds) per item; the
@@ -328,6 +335,131 @@ impl DynamoDbA2aStorage {
         )
     }
 
+    /// Key of a task's executor-lease item, in the tasks table.
+    ///
+    /// Task items use `{tenant}#{task_id}` and so contain a literal `#`;
+    /// the `lease|`-prefixed, delimiter-escaped form contains none, so the
+    /// two key sets are disjoint for every tenant/task-id. The lease is a
+    /// separate item because task writes replace the whole task item from
+    /// an earlier read and would otherwise overwrite a concurrent renewal.
+    fn lease_pk(tenant: &str, task_id: &str) -> String {
+        format!(
+            "lease|{}|{}",
+            Self::enc_key_component(tenant),
+            Self::enc_key_component(task_id)
+        )
+    }
+
+    /// Stamp the terminal task's `ttl` onto its existing artifact and
+    /// push-config items, which carry none while the task is live. Best
+    /// effort: a failure is logged and leaves those items without a
+    /// `ttl`, which keeps data rather than losing it. `None` (task not
+    /// terminal, or retention off) is a no-op.
+    async fn stamp_child_ttl(&self, tenant: &str, task_id: &str, ttl: Option<&AttributeValue>) {
+        let Some(ttl) = ttl else { return };
+        if let Err(e) = self.try_stamp_child_ttl(tenant, task_id, ttl).await {
+            tracing::warn!(
+                target: "turul_a2a::retention_child_ttl_error",
+                tenant,
+                task_id,
+                error = %e,
+                "failed to stamp ttl on a terminal task's child items"
+            );
+        }
+    }
+
+    async fn try_stamp_child_ttl(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        ttl: &AttributeValue,
+    ) -> Result<(), A2aStorageError> {
+        let db_err = |e: &dyn std::fmt::Debug| A2aStorageError::DatabaseError(format!("{e:?}"));
+        // (table, key) of every child item.
+        let mut targets: Vec<(&str, HashMap<String, AttributeValue>)> = Vec::new();
+
+        let art_pk = Self::artifact_pk(tenant, task_id);
+        let mut start_key = None;
+        loop {
+            let out = self
+                .client
+                .query()
+                .table_name(&self.config.events_table)
+                .key_condition_expression("pk = :pk")
+                .expression_attribute_values(":pk", AttributeValue::S(art_pk.clone()))
+                .projection_expression("pk, sk")
+                .set_exclusive_start_key(start_key)
+                .send()
+                .await
+                .map_err(|e| db_err(&e))?;
+            targets.extend(
+                out.items
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|key| (self.config.events_table.as_str(), key)),
+            );
+            match out.last_evaluated_key {
+                Some(k) if !k.is_empty() => start_key = Some(k),
+                _ => break,
+            }
+        }
+
+        let mut start_key = None;
+        loop {
+            let out = self
+                .client
+                .scan()
+                .table_name(&self.config.push_configs_table)
+                .filter_expression("tenant = :t AND taskId = :tid")
+                .expression_attribute_values(":t", AttributeValue::S(tenant.to_string()))
+                .expression_attribute_values(":tid", AttributeValue::S(task_id.to_string()))
+                .projection_expression("pk")
+                .set_exclusive_start_key(start_key)
+                .send()
+                .await
+                .map_err(|e| db_err(&e))?;
+            targets.extend(
+                out.items
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|key| (self.config.push_configs_table.as_str(), key)),
+            );
+            match out.last_evaluated_key {
+                Some(k) => start_key = Some(k),
+                None => break,
+            }
+        }
+
+        // The existence condition keeps an item deleted since the query
+        // from being recreated as a stub.
+        let mut first_error = None;
+        for chunk in targets.chunks(32) {
+            let results = futures::future::join_all(chunk.iter().map(|(table, key)| {
+                self.client
+                    .update_item()
+                    .table_name(*table)
+                    .set_key(Some(key.clone()))
+                    .condition_expression("attribute_exists(pk)")
+                    .update_expression("SET #ttl = :ttl")
+                    .expression_attribute_names("#ttl", "ttl")
+                    .expression_attribute_values(":ttl", ttl.clone())
+                    .send()
+            }))
+            .await;
+            for result in results {
+                if let Err(e) = result
+                    && !e
+                        .as_service_error()
+                        .is_some_and(|s| s.is_conditional_check_failed_exception())
+                    && first_error.is_none()
+                {
+                    first_error = Some(db_err(&e));
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// Serialize a task with its artifact bodies stripped out, returning
     /// the artifact-free JSON blob and the removed artifacts.
     fn split_task(
@@ -340,8 +472,9 @@ impl DynamoDbA2aStorage {
     }
 
     /// One artifact item for the events table: `pk = art|...`,
-    /// `sk = artifact_id`. Carries the task TTL so DynamoDB's native TTL
-    /// reaps artifact bodies with their task.
+    /// `sk = artifact_id`. `ttl` is set only while the owning task is
+    /// terminal, so DynamoDB's native TTL reaps artifact bodies with their
+    /// task and never while it is live.
     fn build_artifact_item(
         art_pk: &str,
         artifact_id: &str,
@@ -377,8 +510,8 @@ impl DynamoDbA2aStorage {
         &self,
         art_pk: &str,
         plan: &super::artifacts::ReconcilePlan,
+        ttl: Option<&AttributeValue>,
     ) -> Result<Vec<aws_sdk_dynamodb::types::TransactWriteItem>, A2aStorageError> {
-        let ttl = Self::ttl_epoch(self.config.task_ttl_seconds);
         let mut items = Vec::with_capacity(plan.writes.len() + plan.deletes.len());
         for (artifact, fingerprint) in &plan.writes {
             let body = super::artifacts::artifact_to_json(artifact)?;
@@ -387,7 +520,7 @@ impl DynamoDbA2aStorage {
                 &artifact.artifact_id,
                 &body,
                 fingerprint,
-                ttl.clone(),
+                ttl.cloned(),
             );
             let put = aws_sdk_dynamodb::types::Put::builder()
                 .table_name(&self.config.events_table)
@@ -560,13 +693,14 @@ impl DynamoDbA2aStorage {
             .ok_or_else(|| A2aStorageError::DatabaseError("Missing artifact_manifest".into()))
     }
 
-    /// Read the stored artifact manifest for a task. A missing item
-    /// reconciles against an empty prior set.
+    /// Read the stored artifact manifest of a task and whether the task is
+    /// already terminal. A missing item reconciles against an empty prior
+    /// set and is not terminal.
     async fn fetch_stored_manifest(
         &self,
         tenant: &str,
         task_id: &str,
-    ) -> Result<Vec<super::artifacts::ManifestEntry>, A2aStorageError> {
+    ) -> Result<(Vec<super::artifacts::ManifestEntry>, bool), A2aStorageError> {
         let pk = Self::task_key(tenant, task_id);
         let out = self
             .client
@@ -574,13 +708,20 @@ impl DynamoDbA2aStorage {
             .consistent_read(true)
             .table_name(&self.config.tasks_table)
             .key("pk", AttributeValue::S(pk))
-            .projection_expression("pk, artifactManifest")
+            .projection_expression("pk, artifactManifest, statusState")
             .send()
             .await
             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
         match out.item {
-            Some(item) => super::artifacts::manifest_from_json(Self::stored_manifest(&item)?),
-            None => Ok(Vec::new()),
+            Some(item) => {
+                let was_terminal = item
+                    .get("statusState")
+                    .and_then(|v| v.as_s().ok())
+                    .is_some_and(|s| TERMINAL_STATES.iter().any(|t| t.wire_name() == s));
+                let manifest = super::artifacts::manifest_from_json(Self::stored_manifest(&item)?)?;
+                Ok((manifest, was_terminal))
+            }
+            None => Ok((Vec::new(), false)),
         }
     }
 
@@ -844,7 +985,8 @@ impl DynamoDbA2aStorage {
     /// - `latestEventSequence`: causal floor; present only on the
     ///   `*_with_events` paths.
     /// - `ttl`: optional epoch-seconds attribute for DynamoDB TTL;
-    ///   omitted when the backend is configured without task TTL.
+    ///   callers pass it only for a terminal task (see
+    ///   [`Self::task_ttl`]).
     ///
     /// Exposed `pub(crate)` so unit tests in the same crate can exercise
     /// the shape directly without a live backend.
@@ -916,6 +1058,17 @@ impl DynamoDbA2aStorage {
         ))
     }
 
+    /// The task item's `ttl`: set only once the task is terminal, so the
+    /// engine never reaps a live task. The write that makes a task
+    /// terminal sets it and later writes to the terminal task refresh it.
+    fn task_ttl(&self, state_str: &str) -> Option<AttributeValue> {
+        turul_a2a_types::state_machine::TERMINAL_STATES
+            .iter()
+            .any(|s| s.wire_name() == state_str)
+            .then(|| Self::ttl_epoch(self.config.task_ttl_seconds))
+            .flatten()
+    }
+
     fn task_to_json(task: &Task) -> Result<String, A2aStorageError> {
         serde_json::to_string(task).map_err(|e| A2aStorageError::SerializationError(e.to_string()))
     }
@@ -952,6 +1105,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         let state_str = Self::status_state_str(&task);
         let plan = super::artifacts::reconcile(&artifacts, &[])?;
         let manifest_json = super::artifacts::manifest_to_json(&plan.manifest)?;
+        let ttl = self.task_ttl(state_str);
 
         let item = Self::build_task_item(
             &pk,
@@ -963,7 +1117,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             &blob,
             &manifest_json,
             None,
-            Self::ttl_epoch(self.config.task_ttl_seconds),
+            ttl.clone(),
         );
 
         if plan.writes.is_empty() {
@@ -978,7 +1132,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
                 .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
         } else {
             let art_pk = Self::artifact_pk(tenant, task.id());
-            let artifact_items = self.artifact_transact_items(&art_pk, &plan)?;
+            let artifact_items = self.artifact_transact_items(&art_pk, &plan, ttl.as_ref())?;
             Self::check_artifact_transaction_cap(artifact_items.len(), 1)?;
             let task_put = aws_sdk_dynamodb::types::Put::builder()
                 .table_name(&self.config.tasks_table)
@@ -1070,9 +1224,10 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         let (blob, artifacts) = Self::split_task(&task)?;
         let state_str = Self::status_state_str(&task);
 
-        let stored = self.fetch_stored_manifest(tenant, task.id()).await?;
+        let (stored, was_terminal) = self.fetch_stored_manifest(tenant, task.id()).await?;
         let plan = super::artifacts::reconcile(&artifacts, &stored)?;
         let manifest_json = super::artifacts::manifest_to_json(&plan.manifest)?;
+        let ttl = self.task_ttl(state_str);
 
         // Conditional write: only succeeds if the item exists AND owner matches.
         // This prevents ownership transfer and ensures isolation.
@@ -1086,14 +1241,14 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             &blob,
             &manifest_json,
             None,
-            Self::ttl_epoch(self.config.task_ttl_seconds),
+            ttl.clone(),
         );
 
         let artifact_items = if plan.writes.is_empty() && plan.deletes.is_empty() {
             Vec::new()
         } else {
             let art_pk = Self::artifact_pk(tenant, task.id());
-            self.artifact_transact_items(&art_pk, &plan)?
+            self.artifact_transact_items(&art_pk, &plan, ttl.as_ref())?
         };
 
         // Both write paths map their distinct SDK error types to the
@@ -1145,7 +1300,14 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
         };
 
         match result {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Child items are stamped once, on the write that makes the
+                // task terminal.
+                if !was_terminal {
+                    self.stamp_child_ttl(tenant, task.id(), ttl.as_ref()).await;
+                }
+                Ok(())
+            }
             Err(err_str) => {
                 if err_str.contains("ConditionalCheckFailed") {
                     Err(A2aStorageError::OwnerMismatch {
@@ -1184,6 +1346,15 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .send()
             .await
             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+        // The task item is already gone; an orphan lease is removed by the
+        // next expired-lease listing, so a failure here is not the caller's.
+        if let Err(e) = self.delete_lease_item(tenant, task_id).await {
+            tracing::warn!(
+                target: "turul_a2a::lease_orphan_cleanup_error",
+                %tenant, %task_id, error = %e,
+                "failed to delete executor lease of a deleted task"
+            );
+        }
 
         Ok(true)
     }
@@ -1390,7 +1561,8 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .expression_attribute_values(":blob", AttributeValue::S(new_blob.clone()))
             .expression_attribute_values(":state", AttributeValue::S(state_str.to_string()))
             .expression_attribute_values(":ts", AttributeValue::S(Self::now_iso()));
-        update = if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
+        let ttl = self.task_ttl(state_str);
+        update = if let Some(ttl) = ttl.clone() {
             update
                 .update_expression(
                     "SET taskJson = :blob, statusState = :state, updatedAt = :ts, #ttl = :ttl",
@@ -1404,6 +1576,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .send()
             .await
             .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
+        self.stamp_child_ttl(tenant, task_id, ttl.as_ref()).await;
 
         self.rehydrate_task(tenant, task_id, &new_blob, manifest_json)
             .await
@@ -1462,6 +1635,7 @@ impl A2aTaskStorage for DynamoDbA2aStorage {
             .client
             .scan()
             .table_name(&self.config.tasks_table)
+            .filter_expression("attribute_exists(taskJson)")
             .select(aws_sdk_dynamodb::types::Select::Count)
             .send()
             .await
@@ -1649,56 +1823,235 @@ impl crate::storage::A2aCancellationSupervisor for DynamoDbA2aStorage {
         Ok(hits)
     }
 
-    async fn supervisor_list_executor_held_tasks(
+    async fn supervisor_renew_executor_leases(
         &self,
+        tenant: &str,
+        task_ids: &[String],
+        expires_at_micros: Option<i64>,
+    ) -> Result<(), A2aStorageError> {
+        // Concurrent in chunks so a large in-flight set renews well
+        // inside one tick; a failed id does not stop the rest.
+        let mut first_error = None;
+        for chunk in task_ids.chunks(32) {
+            let results = futures::future::join_all(chunk.iter().map(|task_id| async move {
+                match expires_at_micros {
+                    Some(expiry) => self.write_lease_item(tenant, task_id, expiry).await,
+                    None => self.delete_lease_item(tenant, task_id).await,
+                }
+            }))
+            .await;
+            for result in results {
+                if let Err(e) = result
+                    && first_error.is_none()
+                {
+                    first_error = Some(e);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn supervisor_list_expired_executor_leases(
+        &self,
+        now_micros: i64,
     ) -> Result<Vec<crate::storage::ExecutorHeldTask>, A2aStorageError> {
-        let mut out = Vec::new();
+        let db_err = |e: &dyn std::fmt::Debug| A2aStorageError::DatabaseError(format!("{e:?}"));
+
+        // Lease items are the only items carrying `leaseExpiresAt`.
+        let mut expired: Vec<(String, String, AttributeValue)> = Vec::new();
         let mut start_key = None;
         loop {
-            let held = turul_a2a_types::state_machine::EXECUTOR_HELD_STATES;
-            let placeholders: Vec<String> = (0..held.len()).map(|i| format!(":held{i}")).collect();
-            let mut scan = self
+            let page = self
                 .client
                 .scan()
                 .table_name(&self.config.tasks_table)
                 .consistent_read(true)
-                .filter_expression(format!("statusState IN ({})", placeholders.join(", ")));
-            for (placeholder, state) in placeholders.iter().zip(held) {
-                scan = scan.expression_attribute_values(
-                    placeholder,
-                    AttributeValue::S(state.wire_name().to_string()),
-                );
-            }
-            let page = scan
-                .projection_expression("tenant, taskId, #o, contextId")
-                .expression_attribute_names("#o", "owner")
+                .filter_expression("leaseExpiresAt < :now")
+                .expression_attribute_values(":now", AttributeValue::N(now_micros.to_string()))
+                .projection_expression("tenant, taskId, leaseExpiresAt")
                 .set_exclusive_start_key(start_key)
                 .send()
                 .await
-                .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?;
-            for item in page.items() {
-                let attr = |name: &str| {
-                    item.get(name)
-                        .and_then(|v| v.as_s().ok())
-                        .cloned()
-                        .ok_or_else(|| {
-                            A2aStorageError::DatabaseError(format!(
-                                "task item missing string attribute {name}"
-                            ))
-                        })
-                };
-                out.push(crate::storage::ExecutorHeldTask::new(
-                    attr("tenant")?,
-                    attr("taskId")?,
-                    attr("owner")?,
-                    attr("contextId")?,
-                ));
-            }
+                .map_err(|e| db_err(&e))?;
+            expired.extend(page.items().iter().filter_map(|item| {
+                let tenant = item.get("tenant")?.as_s().ok()?;
+                let task_id = item.get("taskId")?.as_s().ok()?;
+                let seen = item.get("leaseExpiresAt")?;
+                Some((tenant.clone(), task_id.clone(), seen.clone()))
+            }));
             match page.last_evaluated_key {
                 Some(k) => start_key = Some(k),
-                None => return Ok(out),
+                None => break,
             }
         }
+
+        let mut out = Vec::new();
+        for chunk in expired.chunks(100) {
+            let mut held_keys: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
+            let keys = chunk
+                .iter()
+                .map(|(tenant, task_id, _)| {
+                    HashMap::from([(
+                        "pk".to_string(),
+                        AttributeValue::S(Self::task_key(tenant, task_id)),
+                    )])
+                })
+                .collect();
+            let mut request = Some(
+                aws_sdk_dynamodb::types::KeysAndAttributes::builder()
+                    .set_keys(Some(keys))
+                    .consistent_read(true)
+                    .projection_expression("tenant, taskId, #o, contextId, statusState")
+                    .expression_attribute_names("#o", "owner")
+                    .build()
+                    .map_err(|e| db_err(&e))?,
+            );
+            while let Some(keys) = request.take() {
+                let resp = self
+                    .client
+                    .batch_get_item()
+                    .request_items(self.config.tasks_table.clone(), keys)
+                    .send()
+                    .await
+                    .map_err(|e| db_err(&e))?;
+                for item in resp
+                    .responses()
+                    .and_then(|r| r.get(&self.config.tasks_table))
+                    .into_iter()
+                    .flatten()
+                {
+                    let attr = |name: &str| {
+                        item.get(name)
+                            .and_then(|v| v.as_s().ok())
+                            .cloned()
+                            .ok_or_else(|| {
+                                A2aStorageError::DatabaseError(format!(
+                                    "task item missing string attribute {name}"
+                                ))
+                            })
+                    };
+                    let parsed = (|| {
+                        Ok::<_, A2aStorageError>((
+                            attr("tenant")?,
+                            attr("taskId")?,
+                            attr("owner")?,
+                            attr("contextId")?,
+                            attr("statusState")?,
+                        ))
+                    })();
+                    let (tenant, task_id, owner, context_id, state) = match parsed {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "turul_a2a::executor_lease_reap_error",
+                                error = %e,
+                                "skipping malformed task item in expired-lease listing"
+                            );
+                            continue;
+                        }
+                    };
+                    let held = TaskState::from_wire_name(&state).is_some_and(|s| {
+                        turul_a2a_types::state_machine::EXECUTOR_HELD_STATES.contains(&s)
+                    });
+                    if held {
+                        held_keys.insert((tenant.clone(), task_id.clone()));
+                        out.push(crate::storage::ExecutorHeldTask::new(
+                            tenant, task_id, owner, context_id,
+                        ));
+                    }
+                }
+                request = resp
+                    .unprocessed_keys
+                    .and_then(|mut u| u.remove(&self.config.tasks_table));
+            }
+            // A lease whose task is gone or no longer executor-held is
+            // stale; drop it unless it was renewed since the scan read it.
+            for (tenant, task_id, seen) in chunk.iter().filter(|(tenant, task_id, _)| {
+                !held_keys.contains(&(tenant.clone(), task_id.clone()))
+            }) {
+                if let Err(e) = self
+                    .delete_lease_item_if_expiry(tenant, task_id, seen)
+                    .await
+                {
+                    tracing::warn!(
+                        target: "turul_a2a::lease_orphan_cleanup_error",
+                        tenant = %tenant, task_id = %task_id, error = %e,
+                        "failed to delete stale executor lease"
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl DynamoDbA2aStorage {
+    /// Set a task's lease item with a plain put. It never touches the task
+    /// item, so it cannot conflict with concurrent task writes; a lease
+    /// written for an id with no task is removed by the next expired-lease
+    /// listing.
+    async fn write_lease_item(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        expires_at_micros: i64,
+    ) -> Result<(), A2aStorageError> {
+        self.client
+            .put_item()
+            .table_name(&self.config.tasks_table)
+            .item("pk", AttributeValue::S(Self::lease_pk(tenant, task_id)))
+            .item("tenant", AttributeValue::S(tenant.to_string()))
+            .item("taskId", AttributeValue::S(task_id.to_string()))
+            .item(
+                "leaseExpiresAt",
+                AttributeValue::N(expires_at_micros.to_string()),
+            )
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))
+    }
+
+    /// Remove a task's lease item only while its expiry still equals
+    /// `seen`; a lease renewed or replaced since is left alone.
+    async fn delete_lease_item_if_expiry(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        seen: &AttributeValue,
+    ) -> Result<(), A2aStorageError> {
+        match self
+            .client
+            .delete_item()
+            .table_name(&self.config.tasks_table)
+            .key("pk", AttributeValue::S(Self::lease_pk(tenant, task_id)))
+            .condition_expression("leaseExpiresAt = :seen")
+            .expression_attribute_values(":seen", seen.clone())
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|se| se.is_conditional_check_failed_exception()) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(A2aStorageError::DatabaseError(format!("{e:?}"))),
+        }
+    }
+
+    /// Remove a task's lease item; idempotent.
+    async fn delete_lease_item(&self, tenant: &str, task_id: &str) -> Result<(), A2aStorageError> {
+        self.client
+            .delete_item()
+            .table_name(&self.config.tasks_table)
+            .key("pk", AttributeValue::S(Self::lease_pk(tenant, task_id)))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))
     }
 }
 
@@ -1742,17 +2095,23 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
                     .await?;
 
             // Build the ConditionCheck — branch on task existence.
-            let task_exists = self
+            let task_item = self
                 .client
                 .get_item()
                 .table_name(&self.config.tasks_table)
                 .key("pk", AttributeValue::S(task_pk.clone()))
-                .projection_expression("pk")
+                .projection_expression("pk, statusState")
                 .send()
                 .await
                 .map_err(|e| A2aStorageError::DatabaseError(format!("{e:?}")))?
-                .item
-                .is_some();
+                .item;
+            let task_exists = task_item.is_some();
+            // A config carries the retention `ttl` only when it is created
+            // on a task that is already terminal.
+            let ttl = task_item
+                .as_ref()
+                .and_then(|item| item.get("statusState")?.as_s().ok())
+                .and_then(|state| self.task_ttl(state));
 
             let condition_check = if task_exists {
                 aws_sdk_dynamodb::types::ConditionCheck::builder()
@@ -1786,7 +2145,7 @@ impl A2aPushNotificationStorage for DynamoDbA2aStorage {
                     "registeredAfterEventSequence",
                     AttributeValue::N(seq_read.to_string()),
                 );
-            if let Some(ttl) = Self::ttl_epoch(self.config.task_ttl_seconds) {
+            if let Some(ttl) = ttl {
                 config_put = config_put.item("ttl", ttl);
             }
             let config_put = config_put
@@ -2148,6 +2507,7 @@ impl A2aEventStore for DynamoDbA2aStorage {
     /// No-op on DynamoDB: expired tasks and events are reaped by the
     /// engine's native TTL on each item's `ttl` attribute (epoch
     /// seconds), written from `task_ttl_seconds` / `event_ttl_seconds`.
+    /// A task item carries `ttl` only once terminal.
     /// There is no application-side delete to perform, so this always
     /// returns `Ok(0)`.
     /// Native TTL deletion is asynchronous and typically completes within
@@ -2182,6 +2542,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let manifest_json = super::artifacts::manifest_to_json(&plan.manifest)?;
 
         let art_pk = Self::artifact_pk(tenant, task.id());
+        let ttl = self.task_ttl(state_str);
         let mut retry = SequenceCommitRetry::default();
         loop {
             let mut allocation = self.allocate_event_sequences(&pk, events.len()).await?;
@@ -2200,7 +2561,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 &blob,
                 &manifest_json,
                 Some(allocation.latest()),
-                Self::ttl_epoch(self.config.task_ttl_seconds),
+                ttl.clone(),
             );
             let task_put = aws_sdk_dynamodb::types::Put::builder()
                 .table_name(&self.config.tasks_table)
@@ -2215,7 +2576,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                     .build(),
             ];
 
-            let artifact_items = self.artifact_transact_items(&art_pk, &plan)?;
+            let artifact_items = self.artifact_transact_items(&art_pk, &plan, ttl.as_ref())?;
             Self::check_artifact_transaction_cap(
                 artifact_items.len(),
                 1 + events.len() + usize::from(allocation.counter_write.is_some()),
@@ -2350,6 +2711,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
 
             let task_json = Self::task_to_json(&updated_task)?;
             let state_str = Self::status_state_str(&updated_task);
+            let ttl = self.task_ttl(state_str);
 
             let mut allocation = self.allocate_event_sequences(&pk, events.len()).await?;
 
@@ -2375,7 +2737,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 &task_json,
                 manifest_json,
                 Some(prior_latest.max(allocation.latest())),
-                Self::ttl_epoch(self.config.task_ttl_seconds),
+                ttl.clone(),
             );
             let mut items = vec![
                 aws_sdk_dynamodb::types::TransactWriteItem::builder()
@@ -2452,6 +2814,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                     // The write kept the blob artifact-free; rehydrate the
                     // returned task so callers (push dispatch, yielded-result
                     // handlers) observe its artifacts.
+                    self.stamp_child_ttl(tenant, task_id, ttl.as_ref()).await;
                     let rehydrated = self
                         .rehydrate_task(tenant, task_id, &task_json, manifest_json)
                         .await?;
@@ -2513,13 +2876,14 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
         let state_str = Self::status_state_str(&task);
         let art_pk = Self::artifact_pk(tenant, task.id());
         let task_id = task.id().to_string();
+        let ttl = self.task_ttl(state_str);
 
         // Each attempt re-reads the stored manifest and causal floor, so a
         // retry after losing the sequence race reconciles artifacts against
         // the winner's records instead of orphaning them.
         let mut retry = SequenceCommitRetry::default();
         loop {
-            let stored = self.fetch_stored_manifest(tenant, &task_id).await?;
+            let (stored, _) = self.fetch_stored_manifest(tenant, &task_id).await?;
             let plan = super::artifacts::reconcile(&artifacts, &stored)?;
             let manifest_json = super::artifacts::manifest_to_json(&plan.manifest)?;
 
@@ -2545,7 +2909,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 &blob,
                 &manifest_json,
                 Some(prior_latest.max(allocation.latest())),
-                Self::ttl_epoch(self.config.task_ttl_seconds),
+                ttl.clone(),
             );
             let task_put = aws_sdk_dynamodb::types::Put::builder()
                 .table_name(&self.config.tasks_table)
@@ -2570,7 +2934,7 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                     .build(),
             ];
 
-            let artifact_items = self.artifact_transact_items(&art_pk, &plan)?;
+            let artifact_items = self.artifact_transact_items(&art_pk, &plan, ttl.as_ref())?;
             Self::check_artifact_transaction_cap(
                 artifact_items.len(),
                 1 + events.len() + usize::from(allocation.counter_write.is_some()),
@@ -2586,7 +2950,10 @@ impl A2aAtomicStore for DynamoDbA2aStorage {
                 .send()
                 .await
             {
-                Ok(_) => return Ok(allocation.sequences),
+                Ok(_) => {
+                    self.stamp_child_ttl(tenant, &task_id, ttl.as_ref()).await;
+                    return Ok(allocation.sequences);
+                }
                 Err(err)
                     if lost_sequence_race(cancellation_reasons(&err), sequence_items.as_ref()) =>
                 {
@@ -4142,12 +4509,24 @@ mod tests {
             ).await
         }
 
-        async fn supervisor_list_executor_held_tasks(
+        async fn supervisor_renew_executor_leases(
             &self,
+            tenant: &str,
+            task_ids: &[String],
+            expires_at_micros: Option<i64>,
+        ) -> Result<(), A2aStorageError> {
+            <DynamoDbA2aStorage as crate::storage::A2aCancellationSupervisor>::supervisor_renew_executor_leases(
+                &self.inner, &self.scoped_tenant(tenant), task_ids, expires_at_micros,
+            ).await
+        }
+
+        async fn supervisor_list_expired_executor_leases(
+            &self,
+            now_micros: i64,
         ) -> Result<Vec<crate::storage::ExecutorHeldTask>, A2aStorageError> {
             let prefix = format!("{}_", self.tenant_prefix);
-            let all = <DynamoDbA2aStorage as crate::storage::A2aCancellationSupervisor>::supervisor_list_executor_held_tasks(
-                &self.inner,
+            let all = <DynamoDbA2aStorage as crate::storage::A2aCancellationSupervisor>::supervisor_list_expired_executor_leases(
+                &self.inner, now_micros,
             ).await?;
             Ok(all
                 .into_iter()
@@ -4646,10 +5025,69 @@ mod tests {
             .unwrap_or_else(|| panic!("item has no numeric `{name}` attribute: {item:?}"))
     }
 
-    /// Engine-native TTL: every task and event item carries a numeric
-    /// `ttl` (epoch seconds) of now + the configured TTL, and the task's
-    /// `ttl` survives a status rewrite. DynamoDB reaps on it; the
-    /// application never scans and deletes.
+    async fn artifact_item(
+        s: &TestStorage,
+        tenant: &str,
+        task_id: &str,
+        artifact_id: &str,
+    ) -> std::collections::HashMap<String, AttributeValue> {
+        s.inner
+            .client
+            .get_item()
+            .consistent_read(true)
+            .table_name(&s.inner.config.events_table)
+            .key(
+                "pk",
+                AttributeValue::S(DynamoDbA2aStorage::artifact_pk(tenant, task_id)),
+            )
+            .key("sk", AttributeValue::S(artifact_id.to_string()))
+            .send()
+            .await
+            .unwrap()
+            .item
+            .expect("artifact item")
+    }
+
+    async fn create_push_config(
+        s: &TestStorage,
+        tenant: &str,
+        task_id: &str,
+    ) -> std::collections::HashMap<String, AttributeValue> {
+        let created = A2aPushNotificationStorage::create_config(
+            &s.inner,
+            tenant,
+            turul_a2a_proto::TaskPushNotificationConfig {
+                tenant: String::new(),
+                id: String::new(),
+                task_id: task_id.to_string(),
+                url: "https://example.com/webhook".to_string(),
+                token: String::new(),
+                authentication: None,
+            },
+        )
+        .await
+        .unwrap();
+        s.inner
+            .client
+            .get_item()
+            .consistent_read(true)
+            .table_name(&s.inner.config.push_configs_table)
+            .key(
+                "pk",
+                AttributeValue::S(format!("{tenant}#{task_id}#{}", created.id)),
+            )
+            .send()
+            .await
+            .unwrap()
+            .item
+            .expect("push config item")
+    }
+
+    /// Engine-native TTL: a task item carries no `ttl` while non-terminal
+    /// (create, WORKING, artifact write), the write that makes it terminal
+    /// sets `ttl` to now + the configured TTL, and event items carry their
+    /// write-time `ttl`. DynamoDB reaps on it; the application never scans
+    /// and deletes.
     #[tokio::test]
     async fn test_native_ttl_attributes_on_tasks_and_events() {
         skip_unless_dynamodb_env!(s);
@@ -4671,12 +5109,57 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(
+            !get_task_item(&s, &tenant, "ddb-ttl-1")
+                .await
+                .contains_key("ttl"),
+            "a created task has no ttl"
+        );
+
         s.inner
             .update_task_status(
                 &tenant,
                 "ddb-ttl-1",
                 "owner",
                 TaskStatus::new(TaskState::Working),
+            )
+            .await
+            .unwrap();
+        s.inner
+            .append_artifact(
+                &tenant,
+                "ddb-ttl-1",
+                "owner",
+                Artifact::new("art-1", vec![turul_a2a_types::Part::text("body")]),
+                false,
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !get_task_item(&s, &tenant, "ddb-ttl-1")
+                .await
+                .contains_key("ttl"),
+            "a WORKING task, including after an artifact write, has no ttl"
+        );
+        assert!(
+            !artifact_item(&s, &tenant, "ddb-ttl-1", "art-1")
+                .await
+                .contains_key("ttl"),
+            "an artifact of a live task has no ttl"
+        );
+        let live_config = create_push_config(&s, &tenant, "ddb-ttl-1").await;
+        assert!(
+            !live_config.contains_key("ttl"),
+            "a push config of a live task has no ttl"
+        );
+
+        s.inner
+            .update_task_status(
+                &tenant,
+                "ddb-ttl-1",
+                "owner",
+                TaskStatus::new(TaskState::Completed),
             )
             .await
             .unwrap();
@@ -4690,7 +5173,37 @@ mod tests {
         let ttl = epoch_attr(&task_item, "ttl");
         assert!(
             (before + task_ttl..=after + task_ttl).contains(&ttl),
-            "task ttl {ttl} not within now + task_ttl_seconds"
+            "terminal task ttl {ttl} not within now + task_ttl_seconds"
+        );
+        assert_eq!(
+            task_item.get("ttl"),
+            artifact_item(&s, &tenant, "ddb-ttl-1", "art-1")
+                .await
+                .get("ttl"),
+            "the terminal write stamps the task ttl onto its artifact items"
+        );
+        let stamped_config = s
+            .inner
+            .client
+            .get_item()
+            .consistent_read(true)
+            .table_name(&s.inner.config.push_configs_table)
+            .key("pk", live_config["pk"].clone())
+            .send()
+            .await
+            .unwrap()
+            .item
+            .unwrap();
+        assert_eq!(
+            task_item.get("ttl"),
+            stamped_config.get("ttl"),
+            "the terminal write stamps the task ttl onto its push configs"
+        );
+        let late_config = create_push_config(&s, &tenant, "ddb-ttl-1").await;
+        let late_ttl = epoch_attr(&late_config, "ttl");
+        assert!(
+            (before + task_ttl..=DynamoDbA2aStorage::now_epoch() + task_ttl).contains(&late_ttl),
+            "a push config created on a terminal task carries a ttl at write"
         );
 
         let event_item = s
@@ -4716,6 +5229,420 @@ mod tests {
         assert!(
             (before + event_ttl..=after + event_ttl).contains(&ttl),
             "event ttl {ttl} not within now + event_ttl_seconds"
+        );
+    }
+
+    async fn lease_item(
+        s: &TestStorage,
+        tenant: &str,
+        task_id: &str,
+    ) -> Option<std::collections::HashMap<String, AttributeValue>> {
+        s.inner
+            .client
+            .get_item()
+            .consistent_read(true)
+            .table_name(&s.inner.config.tasks_table)
+            .key(
+                "pk",
+                AttributeValue::S(DynamoDbA2aStorage::lease_pk(tenant, task_id)),
+            )
+            .send()
+            .await
+            .unwrap()
+            .item
+    }
+
+    async fn renew(s: &TestStorage, tenant: &str, ids: &[String], expiry: Option<i64>) {
+        crate::storage::A2aCancellationSupervisor::supervisor_renew_executor_leases(
+            &s.inner, tenant, ids, expiry,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The lease is its own item: the task item never carries it, an unknown
+    /// id is never listed and leaves task reads unaffected, one listing
+    /// removes the orphan lease item, `None` deletes a lease, and no
+    /// task-item read returns or counts a lease item.
+    #[tokio::test]
+    async fn test_lease_is_a_separate_item_ignored_by_task_reads() {
+        skip_unless_dynamodb_env!(s);
+        let tenant = s.scoped_tenant("default");
+        s.inner
+            .create_task_with_events(
+                &tenant,
+                "owner",
+                Task::new("ddb-lease-1", TaskStatus::new(TaskState::Working))
+                    .with_context_id("ctx"),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let ids = ["ddb-lease-1".to_string(), "ddb-lease-missing".to_string()];
+        renew(&s, &tenant, &ids, Some(1234)).await;
+
+        let lease = lease_item(&s, &tenant, "ddb-lease-1").await.unwrap();
+        assert_eq!(lease["leaseExpiresAt"], AttributeValue::N("1234".into()));
+        assert_eq!(lease["tenant"], AttributeValue::S(tenant.clone()));
+        assert_eq!(lease["taskId"], AttributeValue::S("ddb-lease-1".into()));
+        assert!(!lease.contains_key("ttl"), "a lease item has no ttl");
+        assert!(
+            !get_task_item(&s, &tenant, "ddb-lease-1")
+                .await
+                .contains_key("leaseExpiresAt"),
+            "the task item carries no lease"
+        );
+        assert!(
+            s.inner
+                .get_task(&tenant, "ddb-lease-missing", "owner", None)
+                .await
+                .unwrap()
+                .is_none(),
+            "renewing an unknown id creates no task"
+        );
+
+        // Task-item reads never see the lease item.
+        let page = s
+            .inner
+            .list_tasks(TaskFilter {
+                tenant: Some(tenant.clone()),
+                owner: Some("owner".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.tasks.len(), 1);
+        assert_eq!(page.total_size, 1);
+        assert!(
+            s.inner
+                .get_task(&tenant, "ddb-lease-1", "owner", None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let count_with_lease = s.inner.task_count().await.unwrap();
+        let listed =
+            crate::storage::A2aCancellationSupervisor::supervisor_list_expired_executor_leases(
+                &s.inner,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|t| t.tenant == tenant && t.task_id == "ddb-lease-1")
+        );
+        assert!(
+            !listed
+                .iter()
+                .any(|t| t.tenant == tenant && t.task_id == "ddb-lease-missing"),
+            "an unknown id is never listed"
+        );
+        assert!(
+            lease_item(&s, &tenant, "ddb-lease-missing").await.is_none(),
+            "listing removes the orphan lease item"
+        );
+        renew(&s, &tenant, &ids[..1], None).await;
+        assert!(lease_item(&s, &tenant, "ddb-lease-1").await.is_none());
+        assert_eq!(
+            s.inner.task_count().await.unwrap(),
+            count_with_lease,
+            "a lease item is not counted as a task"
+        );
+        renew(&s, &tenant, &ids, None).await;
+    }
+
+    /// The listing deletes the lease of a task that is no longer
+    /// SUBMITTED or WORKING, and never lists it.
+    #[tokio::test]
+    async fn test_expired_lease_listing_deletes_lease_of_terminal_task() {
+        skip_unless_dynamodb_env!(s);
+        let tenant = s.scoped_tenant("default");
+        for (id, state) in [
+            ("ddb-lease-done", TaskState::Completed),
+            ("ddb-lease-held", TaskState::Working),
+        ] {
+            s.inner
+                .create_task(
+                    &tenant,
+                    "owner",
+                    Task::new(id, TaskStatus::new(state)).with_context_id("ctx"),
+                )
+                .await
+                .unwrap();
+            renew(&s, &tenant, &[id.to_string()], Some(1)).await;
+        }
+        let listed =
+            crate::storage::A2aCancellationSupervisor::supervisor_list_expired_executor_leases(
+                &s.inner,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+        assert!(
+            listed
+                .iter()
+                .all(|t| !(t.tenant == tenant && t.task_id == "ddb-lease-done"))
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|t| t.tenant == tenant && t.task_id == "ddb-lease-held")
+        );
+        assert!(
+            lease_item(&s, &tenant, "ddb-lease-done").await.is_none(),
+            "the lease of a terminal task is deleted"
+        );
+        assert!(
+            lease_item(&s, &tenant, "ddb-lease-held").await.is_some(),
+            "the lease of an executor-held task stays"
+        );
+        renew(&s, &tenant, &["ddb-lease-held".to_string()], None).await;
+    }
+
+    /// A stale lease is deleted only while its expiry is the one the scan
+    /// read; a lease renewed since is left alone.
+    #[tokio::test]
+    async fn test_stale_lease_delete_is_conditional_on_the_seen_expiry() {
+        skip_unless_dynamodb_env!(s);
+        let tenant = s.scoped_tenant("default");
+        let ids = ["ddb-lease-cond".to_string()];
+        renew(&s, &tenant, &ids, Some(2)).await;
+
+        s.inner
+            .delete_lease_item_if_expiry(&tenant, &ids[0], &AttributeValue::N("1".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            lease_item(&s, &tenant, &ids[0]).await.unwrap()["leaseExpiresAt"],
+            AttributeValue::N("2".into()),
+            "a lease whose expiry changed is kept"
+        );
+
+        s.inner
+            .delete_lease_item_if_expiry(&tenant, &ids[0], &AttributeValue::N("2".into()))
+            .await
+            .unwrap();
+        assert!(lease_item(&s, &tenant, &ids[0]).await.is_none());
+    }
+
+    /// Deleting a task removes its lease item with it.
+    #[tokio::test]
+    async fn test_delete_task_removes_lease_item() {
+        skip_unless_dynamodb_env!(s);
+        let tenant = s.scoped_tenant("default");
+        s.inner
+            .create_task(
+                &tenant,
+                "owner",
+                Task::new("ddb-lease-del", TaskStatus::new(TaskState::Working))
+                    .with_context_id("ctx"),
+            )
+            .await
+            .unwrap();
+        renew(&s, &tenant, &["ddb-lease-del".to_string()], Some(1)).await;
+        assert!(
+            s.inner
+                .delete_task(&tenant, "ddb-lease-del", "owner")
+                .await
+                .unwrap()
+        );
+        assert!(lease_item(&s, &tenant, "ddb-lease-del").await.is_none());
+    }
+
+    /// A renewal running while the task is written repeatedly is never
+    /// lost: the final lease equals the last renewal.
+    #[tokio::test]
+    async fn test_lease_renewal_concurrent_with_task_writes() {
+        skip_unless_dynamodb_env!(s);
+        let tenant = s.scoped_tenant("default");
+        s.inner
+            .create_task(
+                &tenant,
+                "owner",
+                Task::new("ddb-lease-race", TaskStatus::new(TaskState::Working))
+                    .with_context_id("ctx"),
+            )
+            .await
+            .unwrap();
+        let writer = {
+            let inner = s.inner.clone();
+            let tenant = tenant.clone();
+            tokio::spawn(async move {
+                for i in 0..40 {
+                    inner
+                        .append_artifact(
+                            &tenant,
+                            "ddb-lease-race",
+                            "owner",
+                            Artifact::new(
+                                format!("art-{i}"),
+                                vec![turul_a2a_types::Part::text("x")],
+                            ),
+                            false,
+                            true,
+                        )
+                        .await
+                        .unwrap();
+                }
+            })
+        };
+        let ids = ["ddb-lease-race".to_string()];
+        for expiry in 1..=40 {
+            renew(&s, &tenant, &ids, Some(expiry)).await;
+        }
+        writer.await.unwrap();
+        let lease = lease_item(&s, &tenant, "ddb-lease-race").await.unwrap();
+        assert_eq!(lease["leaseExpiresAt"], AttributeValue::N("40".into()));
+        assert_eq!(
+            s.inner
+                .get_task(&tenant, "ddb-lease-race", "owner", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_proto()
+                .artifacts
+                .len(),
+            40
+        );
+    }
+
+    /// Every path that commits a terminal state stamps the task's `ttl`
+    /// onto its existing artifact and push-config items.
+    #[tokio::test]
+    async fn test_every_terminal_path_stamps_child_ttl() {
+        skip_unless_dynamodb_env!(s);
+        let tenant = s.scoped_tenant("default");
+        for (task_id, path) in [
+            ("ddb-child-status", 0),
+            ("ddb-child-status-events", 1),
+            ("ddb-child-update", 2),
+            ("ddb-child-update-events", 3),
+        ] {
+            let mut task =
+                Task::new(task_id, TaskStatus::new(TaskState::Working)).with_context_id("ctx");
+            task.push_text_artifact("art", "Result", "body");
+            s.inner.create_task(&tenant, "owner", task).await.unwrap();
+            let config = create_push_config(&s, &tenant, task_id).await;
+            assert!(!config.contains_key("ttl"));
+            assert!(
+                !artifact_item(&s, &tenant, task_id, "art")
+                    .await
+                    .contains_key("ttl")
+            );
+
+            let mut done = s
+                .inner
+                .get_task(&tenant, task_id, "owner", None)
+                .await
+                .unwrap()
+                .unwrap();
+            let completed = TaskStatus::new(TaskState::Completed);
+            match path {
+                0 => {
+                    s.inner
+                        .update_task_status(&tenant, task_id, "owner", completed)
+                        .await
+                        .unwrap();
+                }
+                1 => {
+                    s.inner
+                        .update_task_status_with_events(
+                            &tenant,
+                            task_id,
+                            "owner",
+                            completed,
+                            vec![],
+                        )
+                        .await
+                        .unwrap();
+                }
+                _ => {
+                    done.set_status(completed);
+                    if path == 2 {
+                        s.inner.update_task(&tenant, "owner", done).await.unwrap();
+                    } else {
+                        s.inner
+                            .update_task_with_events(&tenant, "owner", done, vec![])
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+            let task_ttl = get_task_item(&s, &tenant, task_id).await["ttl"].clone();
+            assert_eq!(
+                artifact_item(&s, &tenant, task_id, "art").await["ttl"],
+                task_ttl,
+                "{task_id}: artifact ttl"
+            );
+            let config_item = s
+                .inner
+                .client
+                .get_item()
+                .consistent_read(true)
+                .table_name(&s.inner.config.push_configs_table)
+                .key("pk", config["pk"].clone())
+                .send()
+                .await
+                .unwrap()
+                .item
+                .unwrap();
+            assert_eq!(config_item["ttl"], task_ttl, "{task_id}: push config ttl");
+        }
+    }
+
+    /// Child items are stamped on the write that makes the task terminal;
+    /// a later write to the terminal task does not stamp them again.
+    #[tokio::test]
+    async fn test_child_ttl_is_stamped_only_on_the_terminal_transition() {
+        skip_unless_dynamodb_env!(s);
+        let tenant = s.scoped_tenant("default");
+        let task_id = "ddb-child-once";
+        let mut task =
+            Task::new(task_id, TaskStatus::new(TaskState::Working)).with_context_id("ctx");
+        task.push_text_artifact("art", "Result", "body");
+        s.inner.create_task(&tenant, "owner", task).await.unwrap();
+
+        let mut done = s
+            .inner
+            .get_task(&tenant, task_id, "owner", None)
+            .await
+            .unwrap()
+            .unwrap();
+        done.set_status(TaskStatus::new(TaskState::Completed));
+        s.inner
+            .update_task(&tenant, "owner", done.clone())
+            .await
+            .unwrap();
+        assert!(
+            artifact_item(&s, &tenant, task_id, "art")
+                .await
+                .contains_key("ttl"),
+            "the transition stamps the child"
+        );
+
+        s.inner
+            .client
+            .update_item()
+            .table_name(&s.inner.config.events_table)
+            .key(
+                "pk",
+                AttributeValue::S(DynamoDbA2aStorage::artifact_pk(&tenant, task_id)),
+            )
+            .key("sk", AttributeValue::S("art".into()))
+            .update_expression("REMOVE #ttl")
+            .expression_attribute_names("#ttl", "ttl")
+            .send()
+            .await
+            .unwrap();
+
+        s.inner.update_task(&tenant, "owner", done).await.unwrap();
+        assert!(
+            !artifact_item(&s, &tenant, task_id, "art")
+                .await
+                .contains_key("ttl"),
+            "a write to an already-terminal task does not stamp again"
         );
     }
 
@@ -5172,9 +6099,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_supervisor_list_executor_held_tasks_parity() {
+    async fn test_supervisor_executor_lease_parity() {
         skip_unless_dynamodb_env!(s);
-        parity_tests::test_supervisor_list_executor_held_tasks_parity(&s, &s, &s).await;
+        parity_tests::test_supervisor_executor_lease_parity(&s, &s, &s).await;
     }
 
     #[tokio::test]

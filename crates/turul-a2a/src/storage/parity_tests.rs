@@ -2548,20 +2548,16 @@ pub async fn test_supervisor_list_cancel_requested_parity(
     assert_eq!(result, vec!["cm-list-1".to_string()]);
 }
 
-/// Startup reconciliation listing: returns exactly the executor-held
-/// tasks (SUBMITTED, WORKING) across every tenant and owner, each with
-/// the tenant, owner and context id the reconciliation commit needs.
-/// Client-held (INPUT_REQUIRED, AUTH_REQUIRED) and terminal tasks are
-/// excluded. The listing is store-wide, so the assertion is restricted
-/// to this run's uniquely named tenants.
-pub async fn test_supervisor_list_executor_held_tasks_parity(
+/// Seed one task per state for `tenant`, ids `{prefix}-{index}`, owners
+/// alternating by `offset`. Returns `(task_id, state, owner, context_id)`.
+async fn seed_one_task_per_state(
     tasks: &dyn A2aTaskStorage,
     atomic: &dyn A2aAtomicStore,
-    supervisor: &dyn crate::storage::A2aCancellationSupervisor,
-) {
-    let run = uuid::Uuid::now_v7().simple().to_string();
-    let tenants = [format!("held-a-{run}"), format!("held-b-{run}")];
-    let owners = ["owner-held-1", "owner-held-2"];
+    tenant: &str,
+    prefix: &str,
+    offset: usize,
+) -> Vec<(String, TaskState, String, String)> {
+    let owners = ["owner-lease-1", "owner-lease-2"];
     let states = [
         TaskState::Submitted,
         TaskState::Working,
@@ -2572,58 +2568,314 @@ pub async fn test_supervisor_list_executor_held_tasks_parity(
         TaskState::Canceled,
         TaskState::Rejected,
     ];
-
-    let mut expected = Vec::new();
-    for (ti, tenant) in tenants.iter().enumerate() {
-        for (si, state) in states.iter().enumerate() {
-            let owner = owners[(ti + si) % owners.len()];
-            let task_id = format!("held-{ti}-{si}");
-            let context_id = format!("ctx-held-{ti}-{si}");
-            tasks
-                .create_task(tenant, owner, make_task(&task_id, &context_id))
+    let mut seeded = Vec::new();
+    for (si, state) in states.iter().enumerate() {
+        let owner = owners[(offset + si) % owners.len()];
+        let task_id = format!("{prefix}-{si}");
+        let context_id = format!("ctx-{prefix}-{si}");
+        tasks
+            .create_task(tenant, owner, make_task(&task_id, &context_id))
+            .await
+            .unwrap();
+        if *state != TaskState::Submitted {
+            atomic
+                .update_task_status_with_events(
+                    tenant,
+                    &task_id,
+                    owner,
+                    TaskStatus::new(TaskState::Working),
+                    vec![],
+                )
                 .await
                 .unwrap();
-            if *state != TaskState::Submitted {
-                atomic
-                    .update_task_status_with_events(
-                        tenant,
-                        &task_id,
-                        owner,
-                        TaskStatus::new(TaskState::Working),
-                        vec![],
-                    )
-                    .await
-                    .unwrap();
-            }
-            if !matches!(state, TaskState::Submitted | TaskState::Working) {
-                atomic
-                    .update_task_status_with_events(
-                        tenant,
-                        &task_id,
-                        owner,
-                        TaskStatus::new(*state),
-                        vec![],
-                    )
-                    .await
-                    .unwrap();
-            }
-            if matches!(state, TaskState::Submitted | TaskState::Working) {
-                expected.push((tenant.clone(), task_id, owner.to_string(), context_id));
-            }
         }
+        if !matches!(state, TaskState::Submitted | TaskState::Working) {
+            atomic
+                .update_task_status_with_events(
+                    tenant,
+                    &task_id,
+                    owner,
+                    TaskStatus::new(*state),
+                    vec![],
+                )
+                .await
+                .unwrap();
+        }
+        seeded.push((task_id, *state, owner.to_string(), context_id));
     }
+    seeded
+}
 
-    let mut listed: Vec<(String, String, String, String)> = supervisor
-        .supervisor_list_executor_held_tasks()
+/// Executor lease parity. Renewal is scoped to its tenant and never
+/// creates a task. The expired-lease listing returns exactly the
+/// SUBMITTED or WORKING tasks whose lease is earlier than `now`, across
+/// tenants and owners: not a task without a lease, not a live or
+/// boundary lease, and not a client-held or terminal task even with an
+/// expired lease. The listing is store-wide, so the assertion is
+/// restricted to this run's uniquely named tenants.
+pub async fn test_supervisor_executor_lease_parity(
+    tasks: &dyn A2aTaskStorage,
+    atomic: &dyn A2aAtomicStore,
+    supervisor: &dyn crate::storage::A2aCancellationSupervisor,
+) {
+    const NOW: i64 = 1_000;
+    let run = uuid::Uuid::now_v7().simple().to_string();
+    let tenants = [format!("lease-a-{run}"), format!("lease-b-{run}")];
+    let seeded_a = seed_one_task_per_state(tasks, atomic, &tenants[0], "lease-0", 0).await;
+    let seeded_b = seed_one_task_per_state(tasks, atomic, &tenants[1], "lease-1", 1).await;
+    let ids = |seeded: &[(String, TaskState, String, String)]| {
+        seeded.iter().map(|t| t.0.clone()).collect::<Vec<_>>()
+    };
+    let held = |state: &TaskState| matches!(state, TaskState::Submitted | TaskState::Working);
+    let list = || async {
+        let mut listed: Vec<(String, String, String, String)> = supervisor
+            .supervisor_list_expired_executor_leases(NOW)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|t| tenants.contains(&t.tenant))
+            .map(|t| (t.tenant, t.task_id, t.owner, t.context_id))
+            .collect();
+        listed.sort();
+        listed
+    };
+
+    // No task has a lease yet.
+    assert!(
+        list().await.is_empty(),
+        "a task without a lease is never listed"
+    );
+
+    // Tenant A's ids renewed against tenant B create nothing and lease
+    // nothing there: the ids exist only in A.
+    let mut foreign = ids(&seeded_a);
+    foreign.push("lease-missing".to_string());
+    supervisor
+        .supervisor_renew_executor_leases(&tenants[1], &foreign, Some(NOW - 1))
+        .await
+        .unwrap();
+    assert!(list().await.is_empty(), "renewal is scoped to its tenant");
+    assert!(
+        tasks
+            .get_task(&tenants[1], "lease-missing", "owner-lease-1", None)
+            .await
+            .unwrap()
+            .is_none(),
+        "renewing an unknown id must not create a task"
+    );
+
+    // Tenant A: every state gets an expired lease. Only the executor-held
+    // states are listed.
+    supervisor
+        .supervisor_renew_executor_leases(&tenants[0], &ids(&seeded_a), Some(NOW - 1))
+        .await
+        .unwrap();
+    let mut expected: Vec<(String, String, String, String)> = seeded_a
+        .iter()
+        .filter(|t| held(&t.1))
+        .map(|t| (tenants[0].clone(), t.0.clone(), t.2.clone(), t.3.clone()))
+        .collect();
+    expected.sort();
+    assert_eq!(expected.len(), 2);
+    assert_eq!(list().await, expected);
+
+    // Tenant B: a live lease and a lease exactly at `now` are not expired.
+    supervisor
+        .supervisor_renew_executor_leases(&tenants[1], &ids(&seeded_b), Some(NOW + 1_000_000))
+        .await
+        .unwrap();
+    supervisor
+        .supervisor_renew_executor_leases(&tenants[1], &[seeded_b[1].0.clone()], Some(NOW))
+        .await
+        .unwrap();
+    assert_eq!(
+        list().await,
+        expected,
+        "live and boundary leases are not expired"
+    );
+
+    // Renewal overwrites: expiring tenant B's leases lists its held tasks.
+    supervisor
+        .supervisor_renew_executor_leases(&tenants[1], &ids(&seeded_b), Some(NOW - 1))
+        .await
+        .unwrap();
+    expected.extend(
+        seeded_b
+            .iter()
+            .filter(|t| held(&t.1))
+            .map(|t| (tenants[1].clone(), t.0.clone(), t.2.clone(), t.3.clone())),
+    );
+    expected.sort();
+    assert_eq!(list().await, expected);
+
+    // Task writes leave a lease unchanged, and `None` clears it. A
+    // SUBMITTED task keeps its expired lease through a status write, an
+    // artifact write, a message append and a full task replacement.
+    let tenant = format!("lease-c-{run}");
+    let owner = "owner-lease-1";
+    tasks
+        .create_task(&tenant, owner, make_task("lease-w", "ctx-lease-w"))
+        .await
+        .unwrap();
+    supervisor
+        .supervisor_renew_executor_leases(&tenant, &["lease-w".to_string()], Some(NOW - 1))
+        .await
+        .unwrap();
+    let listed = || async {
+        supervisor
+            .supervisor_list_expired_executor_leases(NOW)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.tenant == tenant)
+            .map(|t| t.task_id)
+            .collect::<Vec<_>>()
+    };
+    let expected = vec!["lease-w".to_string()];
+    assert_eq!(listed().await, expected);
+    atomic
+        .update_task_status_with_events(
+            &tenant,
+            "lease-w",
+            owner,
+            TaskStatus::new(TaskState::Working),
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed().await, expected, "a status write keeps the lease");
+    tasks
+        .append_message(&tenant, "lease-w", owner, make_message("lease-m", "hi"))
+        .await
+        .unwrap();
+    assert_eq!(listed().await, expected, "a message append keeps the lease");
+    tasks
+        .append_artifact(
+            &tenant,
+            "lease-w",
+            owner,
+            turul_a2a_types::Artifact::new("lease-art", vec![turul_a2a_types::Part::text("x")]),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        listed().await,
+        expected,
+        "an artifact write keeps the lease"
+    );
+    let task = tasks
+        .get_task(&tenant, "lease-w", owner, None)
         .await
         .unwrap()
-        .into_iter()
-        .filter(|t| tenants.contains(&t.tenant))
-        .map(|t| (t.tenant, t.task_id, t.owner, t.context_id))
-        .collect();
-    listed.sort();
-    expected.sort();
-    assert_eq!(listed, expected);
+        .unwrap();
+    tasks.update_task(&tenant, owner, task).await.unwrap();
+    assert_eq!(listed().await, expected, "a full update keeps the lease");
+
+    supervisor
+        .supervisor_renew_executor_leases(&tenant, &["lease-w".to_string()], None)
+        .await
+        .unwrap();
+    assert!(listed().await.is_empty(), "a cleared lease is never listed");
+    supervisor
+        .supervisor_renew_executor_leases(&tenant, &["lease-missing".to_string()], None)
+        .await
+        .unwrap();
+}
+
+/// Terminal-only task retention. With every task past the task TTL,
+/// `cleanup_expired` deletes the terminal tasks and keeps the
+/// SUBMITTED, WORKING, INPUT_REQUIRED and AUTH_REQUIRED ones; expired
+/// events are deleted whatever their task's state.
+///
+/// Call with a store configured for a 1-second task and event TTL.
+pub async fn test_cleanup_reaps_only_terminal_tasks(
+    atomic: &dyn A2aAtomicStore,
+    tasks: &dyn A2aTaskStorage,
+    events: &dyn A2aEventStore,
+) {
+    let states = [
+        TaskState::Submitted,
+        TaskState::Working,
+        TaskState::InputRequired,
+        TaskState::AuthRequired,
+        TaskState::Completed,
+        TaskState::Failed,
+        TaskState::Canceled,
+        TaskState::Rejected,
+    ];
+    let mut ids = Vec::new();
+    for (i, state) in states.iter().enumerate() {
+        let id = format!("ttl-state-{i}");
+        let context_id = format!("ctx-ttl-state-{i}");
+        atomic
+            .create_task_with_events(
+                "default",
+                "owner-ttl",
+                make_task(&id, &context_id),
+                vec![make_status_event_for(
+                    &id,
+                    &context_id,
+                    "TASK_STATE_SUBMITTED",
+                )],
+            )
+            .await
+            .unwrap();
+        if *state != TaskState::Submitted {
+            atomic
+                .update_task_status_with_events(
+                    "default",
+                    &id,
+                    "owner-ttl",
+                    TaskStatus::new(TaskState::Working),
+                    vec![],
+                )
+                .await
+                .unwrap();
+        }
+        if !matches!(state, TaskState::Submitted | TaskState::Working) {
+            atomic
+                .update_task_status_with_events(
+                    "default",
+                    &id,
+                    "owner-ttl",
+                    TaskStatus::new(*state),
+                    vec![],
+                )
+                .await
+                .unwrap();
+        }
+        ids.push((id, *state));
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+
+    let deleted = events.cleanup_expired().await.unwrap();
+    assert_eq!(
+        deleted,
+        4 + states.len() as u64,
+        "four terminal tasks and every task's event are deleted"
+    );
+    for (id, state) in &ids {
+        let task = tasks
+            .get_task("default", id, "owner-ttl", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            task.is_some(),
+            !turul_a2a_types::state_machine::is_terminal(*state),
+            "{state:?} task retention"
+        );
+        assert!(
+            events
+                .get_events_after("default", id, 0)
+                .await
+                .unwrap()
+                .is_empty(),
+            "expired events of a {state:?} task are deleted"
+        );
+    }
 }
 
 /// AT-CAS-003: distinct error variants — `InvalidTransition` is NOT
@@ -2684,11 +2936,11 @@ pub async fn test_invalid_transition_distinct_from_terminal_already_set(
 //
 // `cleanup_expired` is the single idempotent maintenance entry point.
 // It reaps events and tasks by AGE against the store's configured TTLs
-// and returns the total count deleted. Reaping is state-independent: a
-// task older than its TTL is removed regardless of TaskState (terminal
-// or live), matching engine-native TTL semantics. The store carries its
-// own TTLs, so each backend wrapper constructs the store with the right
-// retention before calling these helpers.
+// and returns the total count deleted. An event is reaped by age alone;
+// a task only once it is terminal and older than its TTL, so a live task
+// survives however old. The store carries its own TTLs, so each backend
+// wrapper constructs the store with the right retention before calling
+// these helpers.
 //
 // DynamoDB exception: `cleanup_expired` returns 0 because expiry is
 // engine-native via the `ttl` attribute, not application-driven. The
@@ -2743,9 +2995,10 @@ pub async fn test_cleanup_survives_within_ttl(
     assert_eq!(stored.len(), 1, "fresh event must survive cleanup");
 }
 
-/// A task and an event written before their TTL elapsed are both reaped
-/// by `cleanup_expired`, and the returned count reflects both. Covers
-/// the combined event+task deletion path and the deleted-count contract.
+/// A terminal task and an event written before their TTL elapsed are both
+/// reaped by `cleanup_expired`, and the returned count reflects both.
+/// Covers the combined event+task deletion path and the deleted-count
+/// contract.
 ///
 /// Call with a store configured for a 1-second TTL on both events and
 /// tasks. The helper sleeps past the window before invoking cleanup.
@@ -2768,6 +3021,18 @@ pub async fn test_cleanup_reaps_events_and_tasks_past_ttl(
         )
         .await
         .unwrap();
+    for state in [TaskState::Working, TaskState::Completed] {
+        atomic
+            .update_task_status_with_events(
+                "default",
+                "ttl-reap-1",
+                "owner-ttl",
+                TaskStatus::new(state),
+                vec![],
+            )
+            .await
+            .unwrap();
+    }
 
     // Sleep past the 1-second TTL window. The margin clears the
     // whole-second timestamp granularity used by in-memory and SQLite.
@@ -2795,10 +3060,8 @@ pub async fn test_cleanup_reaps_events_and_tasks_past_ttl(
     assert_eq!(again, 0, "cleanup_expired is idempotent");
 }
 
-/// Age-based reaping is state-independent: a task that has reached a
-/// terminal state is still reaped once it is older than its TTL. This is
-/// the documented hazard — a non-zero task TTL can reap completed (and
-/// long-running live) tasks alike.
+/// A task that has reached a terminal state is reaped once it is older
+/// than its TTL.
 ///
 /// Call with a store configured for a 1-second task TTL.
 pub async fn test_cleanup_reaps_terminal_task_past_ttl(
@@ -2847,10 +3110,7 @@ pub async fn test_cleanup_reaps_terminal_task_past_ttl(
     tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
 
     let deleted = events.cleanup_expired().await.unwrap();
-    assert!(
-        deleted >= 1,
-        "terminal task older than TTL must be reaped despite its terminal state"
-    );
+    assert!(deleted >= 1, "terminal task older than TTL must be reaped");
 
     let fetched = tasks
         .get_task("default", "ttl-term-1", "owner-ttl", None)
@@ -2858,7 +3118,7 @@ pub async fn test_cleanup_reaps_terminal_task_past_ttl(
         .unwrap();
     assert!(
         fetched.is_none(),
-        "age-based reaping deletes a terminal task regardless of TaskState"
+        "a terminal task older than TTL must be gone"
     );
 }
 
@@ -2888,6 +3148,18 @@ pub async fn test_cleanup_batched_drains_beyond_batch_size(
             )
             .await
             .unwrap();
+        for state in [TaskState::Working, TaskState::Completed] {
+            atomic
+                .update_task_status_with_events(
+                    "default",
+                    &id,
+                    "owner-batch",
+                    TaskStatus::new(state),
+                    vec![],
+                )
+                .await
+                .unwrap();
+        }
     }
 
     // Sleep past the 1-second TTL window. The margin clears the

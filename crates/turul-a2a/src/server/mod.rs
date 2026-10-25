@@ -1,8 +1,8 @@
 //! A2aServer builder and runtime.
 
 pub mod in_flight;
+pub(crate) mod liveness;
 pub mod obs;
-pub(crate) mod orphans;
 pub mod spawn;
 
 use std::net::SocketAddr;
@@ -26,9 +26,10 @@ use crate::streaming::TaskEventBroker;
 ///
 /// Groups: blocking-send two-deadline timeouts
 /// (`blocking_task_timeout`, `timeout_abort_grace`); cancellation
-/// handler grace / poll intervals and cross-instance cancel-marker
-/// poll interval (`cancel_handler_*`,
-/// `cross_instance_cancel_poll_interval`); push delivery tuning
+/// handler grace / poll intervals, abort grace and cross-instance
+/// cancel-marker poll interval (`cancel_handler_*`, `cancel_abort_grace`,
+/// `cross_instance_cancel_poll_interval`); executor liveness
+/// (`executor_lease_ttl`, `executor_stall_timeout`); push delivery tuning
 /// (`push_*`, `allow_insecure_push_urls`).
 ///
 /// Exposed publicly so tests and advanced consumers can construct
@@ -44,7 +45,17 @@ pub struct RuntimeConfig {
     pub timeout_abort_grace: Duration,
     pub cancel_handler_grace: Duration,
     pub cancel_handler_poll_interval: Duration,
+    pub cancel_abort_grace: Duration,
     pub cross_instance_cancel_poll_interval: Duration,
+
+    /// Executor lease time-to-live, or `None` to disable the lease. See
+    /// [`A2aServerBuilder::executor_lease`].
+    pub executor_lease_ttl: Option<Duration>,
+
+    /// Longest an executor may go without progress before the stall
+    /// watchdog fails its task, or `None` to disable the watchdog. See
+    /// [`A2aServerBuilder::executor_stall_timeout`].
+    pub executor_stall_timeout: Option<Duration>,
 
     pub push_max_attempts: usize,
     pub push_backoff_base: Duration,
@@ -133,7 +144,10 @@ impl Default for RuntimeConfig {
             timeout_abort_grace: Duration::from_secs(5),
             cancel_handler_grace: Duration::from_secs(5),
             cancel_handler_poll_interval: Duration::from_millis(100),
+            cancel_abort_grace: Duration::from_secs(5),
             cross_instance_cancel_poll_interval: Duration::from_secs(1),
+            executor_lease_ttl: None,
+            executor_stall_timeout: None,
             push_max_attempts: push.max_attempts as usize,
             push_backoff_base: push.backoff_base,
             push_backoff_cap: push.backoff_cap,
@@ -167,7 +181,6 @@ pub struct A2aServerBuilder {
     middleware: Vec<Arc<dyn A2aMiddleware>>,
     runtime_config: RuntimeConfig,
     outbound_url_validator: Option<crate::push::ssrf::OutboundUrlValidator>,
-    fail_orphans_on_start: bool,
 }
 
 impl A2aServerBuilder {
@@ -184,7 +197,6 @@ impl A2aServerBuilder {
             middleware: vec![],
             runtime_config: RuntimeConfig::default(),
             outbound_url_validator: None,
-            fail_orphans_on_start: false,
         }
     }
 
@@ -211,11 +223,20 @@ impl A2aServerBuilder {
     }
 
     /// How long the `CancelTask` handler waits for cancellation to resolve
-    /// before force-committing CANCELED itself. It is also the abort
-    /// deadline: an executor that has not committed its own terminal by
-    /// then is aborted.
+    /// before force-committing CANCELED itself. It does not bound how long
+    /// the executor may keep running; see [`Self::cancel_abort_grace`].
     pub fn cancel_handler_grace(mut self, d: Duration) -> Self {
         self.runtime_config.cancel_handler_grace = d;
+        self
+    }
+
+    /// How long an executor may keep running after a cancel trips its
+    /// cancellation token, on this instance or through the cross-instance
+    /// poller, before it is aborted. An executor that has committed its
+    /// own terminal state by then is left to finish its cleanup. Default
+    /// 5 seconds. Independent of [`Self::cancel_handler_grace`].
+    pub fn cancel_abort_grace(mut self, d: Duration) -> Self {
+        self.runtime_config.cancel_abort_grace = d;
         self
     }
 
@@ -223,6 +244,52 @@ impl A2aServerBuilder {
     /// re-read task state from storage.
     pub fn cancel_handler_poll_interval(mut self, d: Duration) -> Self {
         self.runtime_config.cancel_handler_poll_interval = d;
+        self
+    }
+
+    /// Enable the executor lease: each task stamps an expiry of
+    /// `now + ttl` when its turn starts, this server renews the expiry
+    /// every `ttl / 3` while the executor is in flight, and every server
+    /// with the lease enabled fails tasks whose expiry has passed with
+    /// `FAILED`. A task whose server died is failed between `ttl` and
+    /// `2 * ttl` after its last renewal. Off by default; without it no
+    /// lease is written, renewed or reaped. `build()` rejects a zero
+    /// `ttl`, and rejects the lease when no tokio runtime is current.
+    ///
+    /// Operator contract:
+    ///
+    /// - Every instance that runs executors against one store must use
+    ///   the same `ttl`, or enable none. An instance without the lease
+    ///   writes none, so its tasks are never reaped.
+    /// - Instance clocks must agree to within `ttl / 3`: the expiry is
+    ///   written and compared in application time.
+    /// - An instance paused for longer than `ttl` loses its tasks: peers
+    ///   fail them and the resumed executors find their sinks closed.
+    ///   Choose `ttl` above the worst expected pause.
+    /// - The reaper is one store-wide query per `ttl` per instance: a
+    ///   consistent-read `Scan` on DynamoDB, a `SELECT` on SQL.
+    /// - SQL stores need the `lease_expires_at` column on `a2a_tasks`
+    ///   before the lease is enabled; stores are re-created, not
+    ///   migrated.
+    pub fn executor_lease(mut self, ttl: Duration) -> Self {
+        self.runtime_config.executor_lease_ttl = Some(ttl);
+        self
+    }
+
+    /// Enable the stall watchdog: an executor that makes no progress for
+    /// `timeout` has its task failed with `FAILED` and is then aborted
+    /// after [`Self::timeout_abort_grace`]. Progress is any event the
+    /// executor's sink commits and
+    /// [`EventSink::heartbeat`](crate::event_sink::EventSink::heartbeat),
+    /// so an executor doing long silent work must call `heartbeat` at
+    /// least once per `timeout`. An executor is not policed while its
+    /// latest committed status is `INPUT_REQUIRED` or `AUTH_REQUIRED`
+    /// (it is watched again once it returns to `WORKING`), or once its
+    /// cancellation token is tripped. Off by default. `build()` rejects a zero
+    /// `timeout`, and rejects the watchdog when no tokio runtime is
+    /// current.
+    pub fn executor_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.runtime_config.executor_stall_timeout = Some(timeout);
         self
     }
 
@@ -388,9 +455,8 @@ impl A2aServerBuilder {
     /// backend's reaper is invoked. A backend with no retention configured
     /// reaps nothing even when this loop runs.
     ///
-    /// Expiry is age-based and state-independent: a non-zero task TTL
-    /// can reap long-running live tasks. Choose `interval` and TTLs that
-    /// suit the deployment's task lifetimes.
+    /// Only terminal tasks expire: a task that is still `SUBMITTED`,
+    /// `WORKING` or client-held is never reaped, however old.
     pub fn maintenance(mut self, interval: Duration) -> Self {
         self.runtime_config.maintenance_interval = Some(interval);
         self
@@ -492,19 +558,6 @@ impl A2aServerBuilder {
         self
     }
 
-    /// Fail tasks left `SUBMITTED` or `WORKING` by a previous process
-    /// before the server serves: [`A2aServer::bind`] (and so `run`)
-    /// reconciles them first, and `into_router`, `into_routers` and
-    /// `into_tonic_router` panic unless
-    /// [`A2aServer::fail_orphaned_tasks`] has completed. Off by default.
-    ///
-    /// Enable only when exactly one server instance uses the storage;
-    /// see [`A2aServer::fail_orphaned_tasks`].
-    pub fn fail_orphaned_tasks_on_start(mut self) -> Self {
-        self.fail_orphans_on_start = true;
-        self
-    }
-
     /// Add auth middleware. Multiple calls stack (AND semantics).
     /// Use `AnyOfMiddleware` for OR semantics.
     pub fn middleware(mut self, mw: Arc<dyn A2aMiddleware>) -> Self {
@@ -516,6 +569,27 @@ impl A2aServerBuilder {
         let executor = self
             .executor
             .ok_or(A2aError::Internal("executor is required".into()))?;
+
+        let liveness = &self.runtime_config;
+        if liveness.executor_lease_ttl.is_some_and(|d| d.is_zero()) {
+            return Err(A2aError::Internal(
+                "executor_lease ttl must be greater than zero".into(),
+            ));
+        }
+        if liveness.executor_stall_timeout.is_some_and(|d| d.is_zero()) {
+            return Err(A2aError::Internal(
+                "executor_stall_timeout must be greater than zero".into(),
+            ));
+        }
+        if (liveness.executor_lease_ttl.is_some() || liveness.executor_stall_timeout.is_some())
+            && tokio::runtime::Handle::try_current().is_err()
+        {
+            return Err(A2aError::Internal(
+                "executor_lease and executor_stall_timeout start background tasks: \
+                 call build() from within a tokio runtime"
+                    .into(),
+            ));
+        }
 
         let default_storage = InMemoryA2aStorage::new();
         let task_storage = self
@@ -666,28 +740,29 @@ impl A2aServerBuilder {
             validate_card_security_references(&extended_materialized, "extended_agent_card")?;
         }
 
+        let state = AppState {
+            executor,
+            task_storage,
+            push_storage,
+            event_store,
+            atomic_store,
+            event_broker: TaskEventBroker::new(),
+            middleware_stack: Arc::new(MiddlewareStack::new(self.middleware)),
+            runtime_config: self.runtime_config,
+            in_flight: Arc::new(crate::server::in_flight::InFlightRegistry::new()),
+            cancellation_supervisor,
+            push_delivery_store,
+            push_dispatcher,
+            // long-lived binary server never enqueues;
+            // `tokio::spawn` is durable in this runtime.
+            durable_executor_queue: None,
+        };
+        crate::server::liveness::spawn_loops(&state);
+
         Ok(A2aServer {
-            state: AppState {
-                executor,
-                task_storage,
-                push_storage,
-                event_store,
-                atomic_store,
-                event_broker: TaskEventBroker::new(),
-                middleware_stack: Arc::new(MiddlewareStack::new(self.middleware)),
-                runtime_config: self.runtime_config,
-                in_flight: Arc::new(crate::server::in_flight::InFlightRegistry::new()),
-                cancellation_supervisor,
-                push_delivery_store,
-                push_dispatcher,
-                // long-lived binary server never enqueues;
-                // `tokio::spawn` is durable in this runtime.
-                durable_executor_queue: None,
-            },
+            state,
             merged_security: merged,
             bind_addr: self.bind_addr,
-            fail_orphans_on_start: self.fail_orphans_on_start,
-            orphans_failed: false,
         })
     }
 }
@@ -864,8 +939,6 @@ pub struct A2aServer {
     state: AppState,
     merged_security: SecurityContribution,
     bind_addr: SocketAddr,
-    fail_orphans_on_start: bool,
-    orphans_failed: bool,
 }
 
 impl A2aServer {
@@ -873,46 +946,8 @@ impl A2aServer {
         A2aServerBuilder::new()
     }
 
-    /// Commit `FAILED` (with a reason message) for every task left
-    /// `SUBMITTED` or `WORKING` in storage, across all tenants and
-    /// owners, and return how many were failed. `INPUT_REQUIRED`,
-    /// `AUTH_REQUIRED` and terminal tasks are untouched. Calling it again
-    /// returns 0.
-    ///
-    /// Operator contract: enable this only when exactly one server
-    /// instance uses the storage. The framework records no per-task
-    /// executor owner, so on a shared store it would fail tasks that a
-    /// live peer is still running. That includes the overlap of a rolling
-    /// or surge deploy, where the new instance starts while the old one
-    /// still runs executors (use a stop-first rollout), and any other
-    /// live writer of the same store, such as a Lambda handler.
-    ///
-    /// Serving consumes the server, so this runs before any request is
-    /// handled. It does not restart work: a client that wants the work
-    /// redone sends a new message.
-    pub async fn fail_orphaned_tasks(&mut self) -> Result<usize, A2aError> {
-        let failed = crate::server::orphans::fail_orphaned_tasks(&self.state).await?;
-        self.orphans_failed = true;
-        Ok(failed)
-    }
-
-    fn assert_orphans_reconciled(&self) {
-        if self.fail_orphans_on_start && !self.orphans_failed {
-            panic!(
-                "fail_orphaned_tasks_on_start is set but orphaned tasks were not reconciled: \
-                 await server.fail_orphaned_tasks() before into_router, into_routers or \
-                 into_tonic_router"
-            );
-        }
-    }
-
     /// Build the axum router — useful for testing.
     /// Augments the AgentCard with merged security contributions.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the builder set `fail_orphaned_tasks_on_start` and
-    /// [`A2aServer::fail_orphaned_tasks`] has not completed on this server.
     pub fn into_router(self) -> axum::Router {
         let (state, had_security) = self.into_augmented_state();
         if !had_security {
@@ -930,11 +965,6 @@ impl A2aServer {
     /// deliberately not exposed — returning the inner service would
     /// permit adopters to compose it into a custom tonic server
     /// without the auth layer and silently bypass authentication.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the builder set `fail_orphaned_tasks_on_start` and
-    /// [`A2aServer::fail_orphaned_tasks`] has not completed on this server.
     #[cfg(feature = "grpc")]
     pub fn into_tonic_router(self) -> crate::grpc::LayeredGrpcRouter {
         let (state, _) = self.into_augmented_state();
@@ -951,11 +981,6 @@ impl A2aServer {
     /// executor is still running is refused). Calling `into_router` and
     /// `into_tonic_router` on two separately built servers would give
     /// each transport its own registry and broker.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the builder set `fail_orphaned_tasks_on_start` and
-    /// [`A2aServer::fail_orphaned_tasks`] has not completed on this server.
     #[cfg(feature = "grpc")]
     pub fn into_routers(self) -> (axum::Router, crate::grpc::LayeredGrpcRouter) {
         let (state, _) = self.into_augmented_state();
@@ -971,7 +996,6 @@ impl A2aServer {
     /// `push_delivery_store` survives the auth rebuild) without going
     /// through an HTTP round-trip.
     pub(crate) fn into_augmented_state(self) -> (AppState, bool) {
-        self.assert_orphans_reconciled();
         if self.merged_security.is_empty() {
             return (self.state, false);
         }
@@ -1011,13 +1035,7 @@ impl A2aServer {
     /// including the OS-assigned port when the builder was given port 0 —
     /// before any request is served. Connections that arrive between
     /// `bind` and [`BoundA2aServer::run`] wait in the listen backlog.
-    ///
-    /// With `fail_orphaned_tasks_on_start` set, orphaned tasks are failed
-    /// before the socket is bound and an error aborts startup.
-    pub async fn bind(mut self) -> Result<BoundA2aServer, A2aError> {
-        if self.fail_orphans_on_start && !self.orphans_failed {
-            self.fail_orphaned_tasks().await?;
-        }
+    pub async fn bind(self) -> Result<BoundA2aServer, A2aError> {
         let listener = tokio::net::TcpListener::bind(self.bind_addr)
             .await
             .map_err(|e| A2aError::Internal(format!("Failed to bind: {e}")))?;
@@ -1050,7 +1068,7 @@ impl A2aServer {
             .state
             .runtime_config
             .cross_instance_cancel_poll_interval;
-        let poller_abort_grace = self.state.runtime_config.cancel_handler_grace;
+        let poller_abort_grace = self.state.runtime_config.cancel_abort_grace;
         let push_delivery_store_for_sweep = self.state.push_delivery_store.clone();
         let self_push_dispatcher_for_sweep = self.state.push_dispatcher.clone();
         let sweep_interval_for_task = self.state.runtime_config.push_reclaim_sweep_interval;

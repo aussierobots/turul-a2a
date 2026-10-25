@@ -4,6 +4,48 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.5] — 2026-10-25
+
+### Added
+
+- **Executor lease** (`A2aServerBuilder::executor_lease(ttl)`, opt-in). When a task's turn starts, the task gets a lease that expires `ttl` later. Every instance renews the leases of the executors it runs, every `ttl / 3`, and clears a task's lease when its executor finishes its turn. Every instance also fails, every `ttl`, the `SUBMITTED` or `WORKING` tasks whose lease has expired. Each such task becomes `FAILED` with a status message saying the server running its executor stopped renewing the lease. Safe with several instances sharing storage and during rolling deploys. A dead instance's tasks are failed between `ttl` and `2 × ttl` after it stopped. See ADR-029.
+  - Every instance sharing the store should run with the lease and the same `ttl`. Instance clocks must agree to within `ttl / 3`. An instance paused for longer than `ttl` loses its tasks to the other instances.
+  - Tasks written without a lease (by an earlier release, by the AWS Lambda adapter, or by an instance without the option) are never failed this way. The Lambda adapter ignores the lease and stall options.
+  - The renewal and reaper loops start in `build()`, so they run however the server is served, `into_router()` included. Build the server in the tokio runtime that serves it; `build()` returns an error when no runtime is running.
+  - On DynamoDB each instance's reaper is a consistent-read `Scan` of the tasks table every `ttl`, so its cost grows with table size.
+- **Stall detection** (`A2aServerBuilder::executor_stall_timeout(timeout)`, opt-in). An executor whose event sink commits nothing for `timeout` has its task `FAILED` with a "made no progress" message and is aborted after `timeout_abort_grace`. `EventSink::heartbeat()` counts as progress and writes nothing: an executor doing long silent work calls it at least once per `timeout`. Stall detection is paused while the executor's latest status is `INPUT_REQUIRED` or `AUTH_REQUIRED`, resumes if it goes back to `WORKING`, and ends once it commits a terminal state; a cancelled executor is left to the cancel.
+- `A2aServerBuilder::cancel_abort_grace(d)` (default 5s): how long a cancelled executor may keep running before it is aborted. In 0.2.4 that deadline was `cancel_handler_grace`, which now only sets how long `CancelTask` waits before committing `CANCELED`.
+
+### Changed
+
+- **Retention no longer deletes unfinished tasks.** With a task TTL set, only `COMPLETED`, `FAILED`, `CANCELED` and `REJECTED` tasks past the TTL are deleted. `SUBMITTED`, `WORKING`, `INPUT_REQUIRED` and `AUTH_REQUIRED` tasks are kept however old. On DynamoDB a task item, its artifact items and its push-notification configs get their `ttl` attribute only once the task finishes, so a long-running task no longer loses artifact bodies or push callbacks to the TTL. A task a client abandons in `INPUT_REQUIRED` or `AUTH_REQUIRED` is now kept until it is cancelled or deleted. Without the executor lease, a task left `SUBMITTED` or `WORKING` by a dead process is also kept; enable the lease when you set a task TTL. Event retention is unchanged.
+
+### Removed
+
+- `A2aServer::fail_orphaned_tasks()` and `A2aServerBuilder::fail_orphaned_tasks_on_start()` (added in 0.2.4), and the `into_router()` panic that went with them. The executor lease replaces them and is not limited to one instance: replace the call with `.executor_lease(ttl)` on the builder.
+
+### Fixed
+
+- A blocking `SendMessage` whose task is cancelled while it waits now returns the `CANCELED` task within about `cancel_handler_grace`, on the same instance or across instances. Before, it waited until `blocking_task_timeout` plus `timeout_abort_grace`. The same applies to a task failed by stall detection.
+
+### Compatibility
+
+- **Breaking storage step (SQLite and PostgreSQL):** table `a2a_tasks` gains a nullable column `lease_expires_at` (`BIGINT` on PostgreSQL, `INTEGER` on SQLite; epoch microseconds). No other table changes. A store created by an earlier release keeps working as long as `executor_lease` is off. Before enabling it, either re-create the store or add the column yourself:
+  - PostgreSQL: `ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS lease_expires_at BIGINT;`
+  - SQLite: `ALTER TABLE a2a_tasks ADD COLUMN lease_expires_at INTEGER;`
+
+  The framework never alters an existing table. Its table creation only creates what is missing (`CREATE TABLE IF NOT EXISTS`), is safe on an empty schema and changes nothing on a second run; `assume_schema_initialized = true` skips it.
+- DynamoDB: no table change. A lease is a separate item in the tasks table, which task reads ignore. Items written by an earlier release keep the `ttl` they were written with.
+- `A2aCancellationSupervisor` drops `supervisor_list_executor_held_tasks` and gains two required methods, `supervisor_renew_executor_leases` and `supervisor_list_expired_executor_leases`. The four built-in backends implement them; a storage backend written outside this workspace must too.
+- Adopters who set `cancel_handler_grace` to get a longer or shorter abort deadline in 0.2.4 now set `cancel_abort_grace` instead.
+- No wire format changes. The lease never appears on a task.
+
+### Verification
+
+- Lease and terminal-only retention parity tests passed on in-memory, SQLite, PostgreSQL and DynamoDB Local, including DynamoDB lease items ignored by task reads, renewals concurrent with task writes, and artifact/push-config TTL stamping.
+- Lease, stall, cancellation, executor-panic, end-to-end TCP, gRPC, spec-compliance and stream-contract suites passed; the full workspace suite, clippy on every storage feature and gRPC, rustdoc and `cargo package` passed.
+- Basic task operations passed on a PostgreSQL store created by 0.2.4 with the lease off.
+
 ## [0.2.4] — 2026-10-25
 
 ### Added

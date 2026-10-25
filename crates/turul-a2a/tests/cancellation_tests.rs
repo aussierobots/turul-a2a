@@ -16,6 +16,8 @@
 //! "returned before the grace window" is an exact statement about the
 //! code path taken, not a wall-clock race.
 
+mod common;
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -288,6 +290,7 @@ fn make_state() -> (AppState, InMemoryA2aStorage) {
 /// framework-forced-CANCELED path on the real clock.
 fn with_fast_grace(mut state: AppState) -> AppState {
     state.runtime_config.cancel_handler_grace = Duration::from_millis(200);
+    state.runtime_config.cancel_abort_grace = Duration::from_millis(200);
     state.runtime_config.cancel_handler_poll_interval = Duration::from_millis(10);
     state.runtime_config.cross_instance_cancel_poll_interval = Duration::from_millis(50);
     state
@@ -1417,10 +1420,23 @@ impl A2aCancellationSupervisor for CountingSupervisor {
             .supervisor_list_cancel_requested(tenant, task_ids)
             .await
     }
-    async fn supervisor_list_executor_held_tasks(
+    async fn supervisor_renew_executor_leases(
         &self,
+        tenant: &str,
+        task_ids: &[String],
+        expires_at_micros: Option<i64>,
+    ) -> Result<(), A2aStorageError> {
+        self.inner
+            .supervisor_renew_executor_leases(tenant, task_ids, expires_at_micros)
+            .await
+    }
+    async fn supervisor_list_expired_executor_leases(
+        &self,
+        now_micros: i64,
     ) -> Result<Vec<turul_a2a::storage::ExecutorHeldTask>, A2aStorageError> {
-        self.inner.supervisor_list_executor_held_tasks().await
+        self.inner
+            .supervisor_list_expired_executor_leases(now_micros)
+            .await
     }
 }
 
@@ -1670,3 +1686,263 @@ async fn streaming_subscriber_sees_terminal_canceled() {
 // `Arc<dyn A2aTaskStorage>`; the compile_fail doctest on
 // `A2aCancellationSupervisor` (crates/turul-a2a/src/storage/traits.rs)
 // enforces it.
+
+// ---------------------------------------------------------------------------
+// Abort deadline is its own setting: `cancel_abort_grace` is independent of
+// `cancel_handler_grace`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn abort_grace_longer_than_handler_grace_outlives_the_cancel_response() {
+    let storage = InMemoryA2aStorage::new();
+    let (executor, probe_tx) = IgnoresToken::new();
+    let mut state = state_on(storage.clone(), Arc::new(executor));
+    state.runtime_config.cancel_handler_grace = Duration::from_secs(1);
+    state.runtime_config.cancel_abort_grace = Duration::from_secs(4);
+    let task_id = start_non_blocking(&state, "owner-g").await;
+
+    let start = tokio::time::Instant::now();
+    let axum::Json(task) = core_cancel_task(state.clone(), "", "owner-g", &task_id)
+        .await
+        .expect("cancel OK");
+    assert_eq!(state_of(&task), "TASK_STATE_CANCELED");
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(
+        !probe_tx.is_closed(),
+        "the executor keeps running until the abort deadline"
+    );
+
+    await_dropped(probe_tx).await;
+    assert!(
+        start.elapsed() >= Duration::from_secs(4),
+        "aborted at the abort deadline, not before; took {:?}",
+        start.elapsed()
+    );
+    assert_eq!(terminal_events(&storage, "", &task_id).await.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn abort_grace_shorter_than_handler_grace_aborts_before_the_canceled_commit() {
+    let storage = InMemoryA2aStorage::new();
+    let (executor, probe_tx) = IgnoresToken::new();
+    let mut state = state_on(storage.clone(), Arc::new(executor));
+    state.runtime_config.cancel_handler_grace = Duration::from_secs(4);
+    state.runtime_config.cancel_abort_grace = Duration::from_secs(1);
+    let task_id = start_non_blocking(&state, "owner-s").await;
+
+    let cancel = tokio::spawn({
+        let state = state.clone();
+        let task_id = task_id.clone();
+        async move { core_cancel_task(state, "", "owner-s", &task_id).await }
+    });
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(probe_tx.is_closed(), "executor aborted at the abort grace");
+    let mid = storage
+        .get_task("", &task_id, "owner-s", Some(0))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        mid.status().and_then(|s| s.state().ok()),
+        Some(TaskState::Working),
+        "the handler has not committed yet"
+    );
+
+    let axum::Json(task) = cancel.await.unwrap().expect("cancel OK");
+    assert_eq!(state_of(&task), "TASK_STATE_CANCELED");
+    let terminals = terminal_events(&storage, "", &task_id).await;
+    assert_eq!(
+        terminals.iter().map(|(_, s)| *s).collect::<Vec<_>>(),
+        vec![TaskState::Canceled],
+        "the framework CANCELED is the only terminal"
+    );
+}
+
+// The cross-instance poller of a served server arms the abort at
+// `cancel_abort_grace`, not at the handler grace.
+#[tokio::test]
+async fn served_poller_aborts_at_the_abort_grace() {
+    let storage = InMemoryA2aStorage::new();
+    let (executor, probe_tx) = IgnoresToken::new();
+    let bound = turul_a2a::server::A2aServer::builder()
+        .executor(executor)
+        .storage(storage.clone())
+        .cross_instance_cancel_poll_interval(Duration::from_millis(50))
+        .cancel_abort_grace(Duration::from_millis(300))
+        .bind(([127, 0, 0, 1], 0u16))
+        .build()
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let base = format!("http://{}", bound.local_addr());
+    let serving = tokio::spawn(bound.run());
+    common::wait_http_ready(&base).await;
+
+    let sent: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/message:send"))
+        .header("A2A-Version", "1.0")
+        .json(&serde_json::json!({
+            "message": {
+                "messageId": "m-poller-abort",
+                "role": "ROLE_USER",
+                "parts": [{"text": "work"}],
+            },
+            "configuration": {"returnImmediately": true},
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = sent["task"]["id"].as_str().expect("task id").to_string();
+
+    // The cancel runs on another instance, so only A's poller can trip
+    // A's executor. The default handler grace is 5s; the abort must come
+    // far sooner.
+    let mut state_b = state_on(storage.clone(), Arc::new(NoopExecutor));
+    state_b.runtime_config.cancel_handler_grace = Duration::from_millis(100);
+    let _ = core_cancel_task(state_b, "", "anonymous", &task_id)
+        .await
+        .expect("cancel on B");
+
+    let mut probe_tx = probe_tx;
+    tokio::time::timeout(Duration::from_secs(2), probe_tx.closed())
+        .await
+        .expect("A's executor was not aborted at the abort grace");
+
+    serving.abort();
+    let _ = serving.await;
+}
+
+// ---------------------------------------------------------------------------
+// A blocking send returns a cancel promptly, even when the executor ignores
+// its token and nothing fires `yielded`.
+// ---------------------------------------------------------------------------
+
+/// Ignores the token and runs forever, reporting its task id.
+struct IgnoresTokenReportsId {
+    started: Mutex<Option<oneshot::Sender<String>>>,
+}
+
+#[async_trait]
+impl AgentExecutor for IgnoresTokenReportsId {
+    async fn execute(
+        &self,
+        task: &mut Task,
+        _msg: &Message,
+        _ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        if let Some(tx) = self.started.lock().unwrap().take() {
+            let _ = tx.send(task.id().to_string());
+        }
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        turul_a2a_proto::AgentCard::default()
+    }
+}
+
+fn spawn_blocking_send(
+    state: &AppState,
+    owner: &'static str,
+) -> tokio::task::JoinHandle<Result<axum::Json<serde_json::Value>, A2aError>> {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let body = serde_json::json!({
+            "message": {
+                "messageId": uuid::Uuid::now_v7().to_string(),
+                "role": "ROLE_USER",
+                "parts": [{"text": "block"}],
+            }
+        })
+        .to_string();
+        core_send_message(state, "", owner, None, &Default::default(), body).await
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocking_send_returns_the_cancel_within_grace_plus_a_poll() {
+    let storage = InMemoryA2aStorage::new();
+    let (tx, started) = oneshot::channel();
+    let mut state = state_on(
+        storage.clone(),
+        Arc::new(IgnoresTokenReportsId {
+            started: Mutex::new(Some(tx)),
+        }),
+    );
+    state.runtime_config.blocking_task_timeout = Duration::from_secs(120);
+    let send = spawn_blocking_send(&state, "owner-b");
+    let task_id = started.await.expect("executor started");
+
+    let cancel_start = tokio::time::Instant::now();
+    let cancel = tokio::spawn({
+        let state = state.clone();
+        let task_id = task_id.clone();
+        async move { core_cancel_task(state, "", "owner-b", &task_id).await }
+    });
+
+    let axum::Json(sent) = send.await.unwrap().expect("blocking send OK");
+    let elapsed = cancel_start.elapsed();
+    assert_eq!(state_of(&sent["task"]), "TASK_STATE_CANCELED");
+    assert!(
+        elapsed
+            <= state.runtime_config.cancel_handler_grace
+                + state.runtime_config.cancel_handler_poll_interval,
+        "send must return with the cancel, not at its own timeout; took {elapsed:?}"
+    );
+    let _ = cancel.await.unwrap().expect("cancel OK");
+    assert_eq!(terminal_events(&storage, "", &task_id).await.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocking_send_on_one_instance_returns_a_cancel_made_on_another() {
+    let storage = InMemoryA2aStorage::new();
+    let (tx, started) = oneshot::channel();
+    let mut state_a = state_on(
+        storage.clone(),
+        Arc::new(IgnoresTokenReportsId {
+            started: Mutex::new(Some(tx)),
+        }),
+    );
+    state_a.runtime_config.blocking_task_timeout = Duration::from_secs(120);
+    let mut state_b = state_on(storage.clone(), Arc::new(NoopExecutor));
+    state_b.runtime_config.cancel_handler_grace = Duration::from_secs(1);
+
+    let poll_interval = Duration::from_millis(50);
+    let shutdown = CancellationToken::new();
+    let poller = tokio::spawn(
+        turul_a2a::server::in_flight::run_cross_instance_cancel_poller(
+            state_a.in_flight.clone(),
+            state_a.cancellation_supervisor.clone(),
+            poll_interval,
+            state_a.runtime_config.cancel_abort_grace,
+            shutdown.clone(),
+        ),
+    );
+    let send = spawn_blocking_send(&state_a, "owner-b");
+    let task_id = started.await.expect("executor started on A");
+
+    let cancel_start = tokio::time::Instant::now();
+    let _ = core_cancel_task(state_b.clone(), "", "owner-b", &task_id)
+        .await
+        .expect("cancel on B");
+
+    let axum::Json(sent) = send.await.unwrap().expect("blocking send OK");
+    let elapsed = cancel_start.elapsed();
+    assert_eq!(state_of(&sent["task"]), "TASK_STATE_CANCELED");
+    assert!(
+        elapsed
+            <= poll_interval
+                + state_b.runtime_config.cancel_handler_grace
+                + state_a.runtime_config.cancel_handler_poll_interval
+                + Duration::from_millis(100),
+        "A's send must return with B's CANCELED, not at its own timeout; took {elapsed:?}"
+    );
+    shutdown.cancel();
+    poller.await.expect("poller exits on shutdown");
+    assert_eq!(terminal_events(&storage, "", &task_id).await.len(), 1);
+}
