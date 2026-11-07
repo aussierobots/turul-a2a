@@ -31,11 +31,12 @@ ADR-021 §1.2).
 | Symbol | Purpose |
 |---|---|
 | `SkillHandler` | Async trait. Adopter impls write `async fn run(&self, params, sink) -> Result<Value, SkillError>`. `#[async_trait]`. |
-| `SkillProgressSink` + `ProgressState` + `SinkError` | Trait the handler emits status updates and artifacts through during execution. `ProgressState` is `#[non_exhaustive]` and contains only **non-terminal** states (`Working`, `InputRequired`, `AuthRequired`) — terminal commits are framework-owned. `SinkError::{Closed, Backend(String)}` for best-effort failure semantics. `#[async_trait]`. |
+| `SkillProgressSink` + `ProgressState` + `SinkError` | Trait the handler emits status updates and artifacts through during execution. `ProgressState` is `#[non_exhaustive]` and contains only **non-terminal** states (`Working`, `InputRequired`, `AuthRequired`) — terminal commits are framework-owned. `SinkError::{Closed, Backend(String)}` for best-effort failure semantics. `heartbeat()` (provided no-op) records liveness without an event, for servers with a stall timeout. `#[async_trait]`. |
 | `SkillRegistry` + `InMemorySkillRegistry` | Maps `AgentSkill.id` → `SkillHandler`. In-memory impl is the default; alternative impls (e.g. dynamic discovery) are adopter-owned. |
 | `SkillCard` + `ExecutionHints` | SKILL.md manifest type built from Agent Skills frontmatter plus `a2a-*` metadata keys and a markdown body. Constructors (no `Deserialize`): `SkillCard::from_embedded(dir_name, skill_md, &[(asset_path, asset_text)])` for `include_str!`-embedded skills, and `SkillCard::from_skill(&Skill, reader)` / `SkillCard::try_from(&skill)` for skills loaded from disk. They reject unknown `a2a-*` keys, unsupported schema keywords and uncompilable schemas. `validate_input` / `validate_output` use [`validate_json`]. `to_agent_skill()` projects to the proto `AgentSkill`. |
 | `SkillDescriptor` | Introspection struct (`id`, `card`, `params_schema`). **Single source of truth** for the schema: for manifest-backed skills, derived from the manifest; for programmatic skills, supplied once at registration. Never adopter-fillable independently. |
-| `SkillError` | Two variants only: `InvalidRequest(String)` (maps to A2A `InvalidRequest`) and `Internal(String)` (maps to A2A `Internal`). |
+| `SkillError` | Three variants only: `InvalidRequest(String)` (maps to A2A `InvalidRequest`), `Internal(String)` (maps to A2A `Internal`) and `Rejected { gate, reason }` (a pre-terminal gate's veto; maps to A2A `Internal` and names the gate). |
+| `PreTerminalGate` + `GateContext` + `GatedHandler` | A gate checks a successful output (`GateContext { skill_id, params, output }`) before the executor makes the task terminal. `GatedHandler::new(id, handler).gate(g)` is itself a `SkillHandler`: gates run in order after the inner handler returns `Ok`, and the first error (`SkillError::Rejected` for a veto) becomes the result. Gates see the returned output only, not artifacts streamed through the sink. See ADR-030. |
 | `TerminalHook` + `SkillOutcome` | Post-execution observer fired by adopter dispatch code when `SkillHandler::run` returns. Best-effort (return type `()`). `SkillOutcome::{Success(&Value), Failure(&SkillError)}` (`#[non_exhaustive]`). Minimal generic variant only — richer extractor-registry / isolation semantics remain deferred (ADR-021 §9 Q5). `#[async_trait]`. |
 | `validate_json(schema, instance)` | Public free helper. JSON Schema 2020-12 validation; strict-reject of unsupported keywords. Returns first violation as a structured `ValidationError`. |
 
@@ -214,6 +215,7 @@ src/
 ├── error.rs        # SkillError, SinkError, ManifestError, RenderError, ValidationError
 ├── sink.rs         # SkillProgressSink, ProgressState
 ├── handler.rs      # SkillHandler trait
+├── gate.rs         # PreTerminalGate, GateContext, GatedHandler
 ├── registry.rs     # SkillRegistry, InMemorySkillRegistry, SkillDescriptor
 ├── manifest.rs     # SkillCard, ExecutionHints, SKILL.md loader + AgentSkill projection
 ├── template.rs     # prompt rendering

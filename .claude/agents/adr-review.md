@@ -152,7 +152,8 @@ Verify `.gitignore` covers each pattern.
 
 For every change to `crates/turul-a2a-patterns/src/*.rs` or to an `AgentExecutor` impl in `examples/`, verify that the public API and trait shapes match ADR-021's binding contracts in §2.2, §2.3, §9 Q5. Specifically:
 
-- `SkillError` has EXACTLY two variants: `InvalidRequest(String)` and `Internal(String)`. Adding/removing → **BLOCKER**.
+- `SkillError` has EXACTLY three variants: `InvalidRequest(String)`, `Internal(String)` and `Rejected { gate: String, reason: String }`. Adding/removing → **BLOCKER**.
+- `PreTerminalGate` / `GatedHandler` follow ADR-030: gates run only after the inner handler returns `Ok`, in the order added, the first `Err` is the result, and gates receive no sink. `SkillProgressSink::heartbeat` is a provided no-op.
 - `ProgressState` is `#[non_exhaustive]` and contains ONLY non-terminal states (Working, InputRequired, AuthRequired). Adding `Completed`/`Failed`/`Canceled`/`Rejected` → **BLOCKER**.
 - `SinkError` is `#[non_exhaustive]` with `Closed` + `Backend(String)` minimum. Adding new variants is acceptable (additive); removing is **BLOCKER**.
 - `SkillProgressSink`, `SkillHandler`, `TerminalHook` are `Send + Sync` and `#[async_trait]`.

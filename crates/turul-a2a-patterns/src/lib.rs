@@ -14,6 +14,8 @@
 //! - Progress sink: [`SkillProgressSink`] + [`ProgressState`]
 //!   (non-terminal states only; terminals come from the handler's
 //!   return value).
+//! - Pre-terminal gates: [`PreTerminalGate`] + [`GateContext`], run on a
+//!   handler's output by [`GatedHandler`]; a gate error replaces it.
 //! - Terminal hook: [`TerminalHook`] + [`SkillOutcome`].
 //! - SKILL.md projection: [`SkillCard`] (`from_embedded`, `from_skill`, `TryFrom<&Skill>`,
 //!   validate_input, validate_output, render_prompt, to_agent_skill) +
@@ -24,11 +26,12 @@
 //! - Schema validation: [`validate_json`] (JSON Schema 2020-12
 //!   strict-keyword check).
 //!
-//! Internal modules (`error`, `sink`, `handler`, `hook`, `manifest`,
+//! Internal modules (`error`, `sink`, `handler`, `gate`, `hook`, `manifest`,
 //! `template`, `schema`, `registry`) are implementation detail; use
 //! the flat re-exports above.
 
 mod error;
+mod gate;
 mod handler;
 mod hook;
 mod manifest;
@@ -38,6 +41,7 @@ mod sink;
 mod template;
 
 pub use error::{ManifestError, RenderError, SinkError, SkillError, ValidationError};
+pub use gate::{GateContext, GatedHandler, PreTerminalGate};
 pub use handler::SkillHandler;
 pub use hook::{SkillOutcome, TerminalHook};
 pub use manifest::{ExecutionHints, SkillCard};

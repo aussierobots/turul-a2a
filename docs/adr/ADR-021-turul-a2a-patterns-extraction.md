@@ -336,10 +336,12 @@ Ordered by certainty:
    helper sourced from the same manifest input schema, never a
    second source of truth.
 
-5. **`SkillError` enum.** Two variants only: `InvalidRequest(String)`
-   for client-shape errors that map to A2A `InvalidRequest`, and
+5. **`SkillError` enum.** Three variants only: `InvalidRequest(String)`
+   for client-shape errors that map to A2A `InvalidRequest`,
    `Internal(String)` for server-side failures that map to A2A
-   `Internal`. Adopters needing richer or application-specific error
+   `Internal`, and `Rejected { gate, reason }` for a pre-terminal gate's
+   veto of a successful output (ADR-030), which maps to A2A `Internal`
+   but names the gate. Adopters needing richer or application-specific error
    shapes wrap or extend in their own error type at the call site.
    *Clarified 2026-10-22:* the mapping is adopter code (the patterns
    crate cannot name `turul_a2a::A2aError`). When it runs inside an
@@ -453,7 +455,7 @@ Contract details:
   bounds. The previous explicit `'a` was incidental to the
   hand-rolled boxed-future shape and is no longer needed.
 - **Variant sets.** `ProgressState` (exactly the three non-terminal
-  states) and `SkillError` (exactly `InvalidRequest` / `Internal`) are
+  states) and `SkillError` (exactly `InvalidRequest` / `Internal` / `Rejected`) are
   fixed: wildcard-free matches in the crate's own `sink` and `error`
   module tests stop compiling if a variant is added. `SinkError` is
   not fixed: `Closed` and `Backend` are its guaranteed minimum, and it
@@ -644,7 +646,7 @@ The activation dispatch hook (parse, echo, reject) lives in
 | `SkillRegistry` + `InMemorySkillRegistry` | yes | when §4 gates clear | |
 | `SkillCard` + SKILL.md manifest helpers (parsing, AgentSkill generation, prompt rendering, schema validation) — supports both LLM-backed and non-LLM skills | yes | when §4 gates clear | Eight-field AgentSkill discovery (incl. `security_requirements` per ADR-015). Trust model and contracts in §2.2 item 3. Naming candidate in §9 Q2 — `SkillManifest` is the leading rename given the execution-model-agnostic scope. |
 | `SkillDescriptor` | yes | when §4 gates clear | Per §2.2(4): includes `params_schema` as Turul-local planning metadata, not on the wire. **Single source of truth (no drift)**: for manifest-backed skills, derived from the manifest input schema; for programmatic skills, supplied once at registration. Never a second adopter-fillable surface. |
-| `SkillError` (two variants) | yes | when §4 gates clear | per §2.2(5) |
+| `SkillError` (three variants) | yes | when §4 gates clear | per §2.2(5) |
 | Skill-invocation dispatcher | **no** | requires successor profile ADR per §2.4, §2.5 | Wire-affecting; not a pattern. |
 | `LlmClient` / vendor adapters | **no** | separate ADR per §2.4 | Orthogonal concern. |
 | Agent role idioms (planner, coordinator, critic, …) | **no, not initial** | future amendment | §9 Q3. Generic implementations only. |
@@ -1193,3 +1195,4 @@ Reports pass/fail. Does not modify source. Does not decide scope.
 - 2026-10-22 — §2.2 item 5 clarified: the `SkillError` → `A2aError` mapping is adopter code, and inside an `AgentExecutor` it yields a `FAILED` task carrying the error text, not a wire error.
 - 2026-10-22 — §2.3 contract details gain a "Variant sets" bullet stating what the code enforces: `ProgressState` and `SkillError` are guarded fixed sets; `SinkError` has a `Closed` / `Backend` minimum with no fixed-set guard, as the first entry above records. The patterns test that claimed a `SinkError` guard now says the same.
 - 2026-11-07 — §2.2 item 3: SKILL.md moves to the Agent Skills specification, owned by `turul-agent-skills` (its ADR-008 holds the field mapping). `SkillCard::parse` and its YAML frontmatter parser are deleted; `SkillCard` is projected from a loaded `Skill` through `from_skill` (caller-supplied asset reader), `TryFrom<&Skill>` (reads beside the loaded file) and `from_embedded` (`load_str`, diagnostics are errors). A2A fields move to `a2a-*` metadata keys (closed set) and `assets/*.json` files; the trust model admits only those asset files, by relative path inside the skill directory (resolved, for files read from disk, so symlinks cannot escape). Schema error locations become `metadata.a2a-input-schema` / `metadata.a2a-output-schema`. Wire ids are unchanged: `a2a-id` keeps ids a skill name cannot hold.
+- 2026-11-07 — §2.2 item 5: `SkillError` gains `Rejected { gate, reason }`, the typed veto of a pre-terminal gate, so a refused output is distinguishable from a handler fault. §2.3: `SkillProgressSink` gains a provided no-op `heartbeat()`. Both defined in ADR-030.

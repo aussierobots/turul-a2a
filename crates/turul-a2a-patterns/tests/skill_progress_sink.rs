@@ -59,6 +59,37 @@ async fn ok_sink_dispatches_through_dyn_reference() {
     let res = dyn_ref.set_status(ProgressState::InputRequired, None).await;
     assert!(res.is_ok());
     assert!(!dyn_ref.is_closed());
+    dyn_ref.heartbeat();
+}
+
+struct BeatingSink {
+    beats: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl SkillProgressSink for BeatingSink {
+    async fn set_status(&self, _: ProgressState, _: Option<Message>) -> Result<(), SinkError> {
+        Ok(())
+    }
+
+    async fn emit_artifact(&self, _: Artifact, _: bool, _: bool) -> Result<(), SinkError> {
+        Ok(())
+    }
+
+    fn heartbeat(&self) {
+        self.beats.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn heartbeat_override_is_reached_through_dyn_reference() {
+    let sink = BeatingSink {
+        beats: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let dyn_ref: &dyn SkillProgressSink = &sink;
+    dyn_ref.heartbeat();
+    dyn_ref.heartbeat();
+    assert_eq!(sink.beats.load(Ordering::SeqCst), 2);
 }
 
 // `ProgressState` and `SinkError` are `#[non_exhaustive]`, so matches in

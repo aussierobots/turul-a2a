@@ -42,6 +42,12 @@ pub trait SkillProgressSink: Send + Sync {
     fn is_closed(&self) -> bool {
         false
     }
+
+    /// Records that the skill is alive without emitting an event, so a
+    /// long silent step is not mistaken for a stalled executor. The
+    /// default does nothing; a sink backed by the server's event sink
+    /// delegates to its heartbeat.
+    fn heartbeat(&self) {}
 }
 
 // Compile-time object-safety assertion: `SkillProgressSink` must remain

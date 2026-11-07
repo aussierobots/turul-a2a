@@ -4,6 +4,23 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.8] — 2026-11-07
+
+### Added
+
+- **Pre-terminal gates** in `turul-a2a-patterns`. A `PreTerminalGate` checks a skill's successful output (`GateContext { skill_id, params, output }`) before the executor makes the task terminal, and can veto it. `GatedHandler::new(skill_id, handler).gate(..)` wraps any `SkillHandler`: gates run in the order added after the inner handler returns `Ok`, and the first error becomes the handler's result. Register the wrapper like any other handler. Gates check the returned output only, not artifacts streamed through the sink. See ADR-030.
+- `SkillError::Rejected { gate, reason }`: the typed veto. It maps to A2A `Internal` (the task ends `FAILED` with `rejected by <gate>: <reason>`), so a refused output is distinguishable from a handler fault.
+- `SkillProgressSink::heartbeat()`: a provided no-op that records liveness without emitting an event, so a skill in a long silent step is not failed by a server's `executor_stall_timeout`. A sink bridging the server's `EventSink` delegates to `EventSink::heartbeat()`.
+
+### Compatibility
+
+- Additive. Existing sinks and handlers compile unchanged. `SkillError` is `#[non_exhaustive]`; an executor that maps it should add an arm for `Rejected` (the example agents map it to `A2aError::Internal`).
+- The other crates are unchanged. No wire format or storage schema changes.
+
+### Verification
+
+- Patterns gate and sink tests passed.
+
 ## [0.2.7] — 2026-11-07
 
 ### Changed

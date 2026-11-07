@@ -109,6 +109,10 @@ impl SkillProgressSink for ExampleProgressSink {
     fn is_closed(&self) -> bool {
         self.event_sink.is_closed()
     }
+
+    fn heartbeat(&self) {
+        self.event_sink.heartbeat();
+    }
 }
 
 /// Maps `turul_a2a::A2aError` from the framework `EventSink` into
@@ -398,6 +402,7 @@ impl AgentExecutor for ManifestExecutor {
             }
             Err(SkillError::InvalidRequest(msg)) => Err(A2aError::InvalidRequest { message: msg }),
             Err(SkillError::Internal(msg)) => Err(A2aError::Internal(msg)),
+            Err(e @ SkillError::Rejected { .. }) => Err(A2aError::Internal(e.to_string())),
             // SkillError is #[non_exhaustive]; treat unknown variants as
             // Internal so the example keeps compiling across patterns
             // crate revisions.

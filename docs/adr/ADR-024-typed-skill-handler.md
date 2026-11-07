@@ -182,8 +182,9 @@ violates ADR-021 §7.
    closed-schema default. Workarounds exist
    (`#[serde(other)]`, custom `JsonSchema` impls) — but each is a
    small tax on adopter ergonomics.
-4. **Error-type generality.** `SkillError` has two variants
-   (`InvalidRequest`, `Internal`). A typed trait might want
+4. **Error-type generality.** `SkillError` has three variants
+   (`InvalidRequest`, `Internal`, and `Rejected` for a pre-terminal
+   gate's veto, added by ADR-030). A typed trait might want
    `SchemaViolation` or `Deserialise` as first-class — adding
    variants means revisiting ADR-021 §2.3 (the `SkillError`
    surface).
@@ -216,3 +217,7 @@ round-trip tests pinning them to the manifest.
 - `examples/skill-manifest-ollama-agent/src/main.rs` — the seed
   typed example carrying `GreetInput` / `GreetOutput` and the four
   round-trip tests that pin them to `SKILL.md`.
+
+## Revision log
+
+- 2026-11-07 — Open question 4: `SkillError` now has three variants; ADR-030 adds `Rejected` for a pre-terminal gate's veto.

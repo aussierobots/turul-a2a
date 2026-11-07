@@ -8,7 +8,7 @@
 
 use thiserror::Error;
 
-/// Skill error surface. Exactly two variants; richer error shapes are
+/// Skill error surface. Exactly three variants; richer error shapes are
 /// the adopter's concern at the call site.
 #[non_exhaustive]
 #[derive(Debug, Error)]
@@ -19,6 +19,11 @@ pub enum SkillError {
     /// Maps to A2A Internal.
     #[error("internal: {0}")]
     Internal(String),
+    /// A pre-terminal gate refused a successful output. Maps to A2A
+    /// Internal, like `Internal`, but names the gate so a veto is
+    /// distinguishable from a handler fault.
+    #[error("rejected by {gate}: {reason}")]
+    Rejected { gate: String, reason: String },
 }
 
 /// Sink-side error variants.
@@ -67,7 +72,7 @@ pub enum ValidationError {
 mod tests {
     use super::SkillError;
 
-    /// `SkillError` has exactly two variants. Inside the defining crate
+    /// `SkillError` has exactly three variants. Inside the defining crate
     /// `#[non_exhaustive]` does not force a wildcard arm, so this match
     /// has none: adding a variant fails to compile here until the
     /// binding contract is deliberately amended.
@@ -77,6 +82,7 @@ mod tests {
             match e {
                 SkillError::InvalidRequest(_) => "invalid-request",
                 SkillError::Internal(_) => "internal",
+                SkillError::Rejected { .. } => "rejected",
             }
         }
         assert_eq!(
@@ -84,5 +90,12 @@ mod tests {
             "invalid-request"
         );
         assert_eq!(label(&SkillError::Internal("x".into())), "internal");
+        assert_eq!(
+            label(&SkillError::Rejected {
+                gate: "g".into(),
+                reason: "r".into()
+            }),
+            "rejected"
+        );
     }
 }
