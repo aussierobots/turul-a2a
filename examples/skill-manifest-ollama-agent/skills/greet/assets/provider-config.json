@@ -1,0 +1,9 @@
+{
+  "vendor": "ollama",
+  "model": "llama3.1",
+  "endpoint": "/api/chat",
+  "format": "json",
+  "options": {
+    "num_ctx": 2048
+  }
+}

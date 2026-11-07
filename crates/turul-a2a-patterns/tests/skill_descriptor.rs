@@ -13,19 +13,19 @@ use turul_a2a_patterns::{
 };
 
 const MANIFEST_WITH_SCHEMA: &str = r#"---
-id: greet
-name: Greet
+name: greet
 description: hi
-inputModes: [text/plain]
-outputModes: [text/plain]
-inputSchema:
-  type: object
-  properties:
-    name: { type: string }
-  required: [name]
+metadata:
+  a2a-input-modes: '["text/plain"]'
+  a2a-input-schema: assets/input.schema.json
+  a2a-name: Greet
+  a2a-output-modes: '["text/plain"]'
 ---
 hello {{ name }}
 "#;
+
+const INPUT_SCHEMA: &str =
+    r#"{"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}"#;
 
 struct Noop;
 
@@ -44,7 +44,13 @@ impl SkillHandler for Noop {
 /// manifest's input schema — derived, not duplicated.
 #[tokio::test]
 async fn manifest_backed_descriptor_uses_manifest_input_schema() {
-    let card = SkillCard::parse(MANIFEST_WITH_SCHEMA).expect("manifest must parse");
+    let skill = turul_agent_skills::load_str("greet", MANIFEST_WITH_SCHEMA)
+        .expect("manifest must load")
+        .skill;
+    let card = SkillCard::from_skill(&skill, |path| {
+        (path == "assets/input.schema.json").then(|| INPUT_SCHEMA.to_string())
+    })
+    .expect("manifest must project");
     let expected_schema = card.input_schema.clone();
 
     let reg = InMemorySkillRegistry::new();

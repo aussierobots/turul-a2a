@@ -156,7 +156,7 @@ For every change to `crates/turul-a2a-patterns/src/*.rs` or to an `AgentExecutor
 - `ProgressState` is `#[non_exhaustive]` and contains ONLY non-terminal states (Working, InputRequired, AuthRequired). Adding `Completed`/`Failed`/`Canceled`/`Rejected` → **BLOCKER**.
 - `SinkError` is `#[non_exhaustive]` with `Closed` + `Backend(String)` minimum. Adding new variants is acceptable (additive); removing is **BLOCKER**.
 - `SkillProgressSink`, `SkillHandler`, `TerminalHook` are `Send + Sync` and `#[async_trait]`.
-- `SkillCard` is `#[non_exhaustive]`; only constructor is `SkillCard::parse(text)`.
+- `SkillCard` is `#[non_exhaustive]`; its only constructors are `SkillCard::from_skill`, `TryFrom<&Skill>` and `SkillCard::from_embedded`, all projecting a `turul_agent_skills::Skill`. No SKILL.md parsing (no YAML crate) in `turul-a2a-patterns`; unknown `a2a-*` metadata keys are rejected.
 - `SkillDescriptor.params_schema` is derived from the manifest's input schema for manifest-backed skills (single source of truth).
 
 ## 10. ADR sign-off freshness

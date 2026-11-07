@@ -1,25 +1,14 @@
 ---
-id: reverse
-name: Reverse
+name: reverse
 description: Reverse the input string character-by-character.
-tags: [demo, dispatch, profile]
-examples:
-  - "{\"text\": \"abc\"}  → {\"reversed\": \"cba\"}"
-inputModes: [application/json]
-outputModes: [application/json]
-securityRequirements: []
-inputSchema:
-  $schema: "https://json-schema.org/draft/2020-12/schema"
-  type: object
-  properties:
-    text: { type: string, minLength: 1 }
-  required: [text]
-outputSchema:
-  $schema: "https://json-schema.org/draft/2020-12/schema"
-  type: object
-  properties:
-    reversed: { type: string }
-  required: [reversed]
+metadata:
+  a2a-examples: '["{\"text\": \"abc\"}  \u2192 {\"reversed\": \"cba\"}"]'
+  a2a-input-modes: '["application/json"]'
+  a2a-input-schema: assets/input.schema.json
+  a2a-name: Reverse
+  a2a-output-modes: '["application/json"]'
+  a2a-output-schema: assets/output.schema.json
+  a2a-tags: '["demo","dispatch","profile"]'
 ---
 Returns the input string reversed.
 

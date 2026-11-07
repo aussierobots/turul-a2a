@@ -1,25 +1,14 @@
 ---
-id: count
-name: Count
+name: count
 description: Square the input integer.
-tags: [demo, hook-trigger]
-examples:
-  - '{"n": 3}'
-inputModes: [application/json]
-outputModes: [application/json]
-securityRequirements: []
-inputSchema:
-  $schema: "https://json-schema.org/draft/2020-12/schema"
-  type: object
-  properties:
-    n: { type: integer }
-  required: [n]
-outputSchema:
-  $schema: "https://json-schema.org/draft/2020-12/schema"
-  type: object
-  properties:
-    squared: { type: integer }
-  required: [squared]
+metadata:
+  a2a-examples: '["{\"n\": 3}"]'
+  a2a-input-modes: '["application/json"]'
+  a2a-input-schema: assets/input.schema.json
+  a2a-name: Count
+  a2a-output-modes: '["application/json"]'
+  a2a-output-schema: assets/output.schema.json
+  a2a-tags: '["demo","hook-trigger"]'
 ---
 Squares the supplied integer `n` and returns `{"squared": n*n}`.
 

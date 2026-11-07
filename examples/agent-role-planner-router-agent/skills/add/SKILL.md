@@ -1,27 +1,14 @@
 ---
-id: add
-name: Add
+name: add
 description: Sum two numbers.
-tags: [demo, arithmetic]
-examples:
-  - "add 3 5"
-  - "12 + 30"
-inputModes: [application/json]
-outputModes: [application/json]
-securityRequirements: []
-inputSchema:
-  $schema: "https://json-schema.org/draft/2020-12/schema"
-  type: object
-  properties:
-    a: { type: number }
-    b: { type: number }
-  required: [a, b]
-outputSchema:
-  $schema: "https://json-schema.org/draft/2020-12/schema"
-  type: object
-  properties:
-    result: { type: number }
-  required: [result]
+metadata:
+  a2a-examples: '["add 3 5","12 + 30"]'
+  a2a-input-modes: '["application/json"]'
+  a2a-input-schema: assets/input.schema.json
+  a2a-name: Add
+  a2a-output-modes: '["application/json"]'
+  a2a-output-schema: assets/output.schema.json
+  a2a-tags: '["demo","arithmetic"]'
 ---
 Adds the two numbers and returns the sum.
 

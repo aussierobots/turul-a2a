@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "user": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "style": {
+      "type": "string",
+      "enum": [
+        "formal",
+        "casual"
+      ],
+      "default": "casual"
+    }
+  },
+  "required": [
+    "user"
+  ]
+}

@@ -1,11 +1,16 @@
-//! `SkillCard` (SKILL.md) parsing and projection helpers.
+//! `SkillCard` projection of an Agent Skills `SKILL.md` and its helpers.
 //!
-//! Hosts the `SkillCard` struct, `ExecutionHints`, the YAML→JSON
-//! frontmatter shim, and the `to_agent_skill` / `render_prompt` /
-//! `validate_input` / `validate_output` methods.
+//! Hosts the `SkillCard` struct, `ExecutionHints`, the projection from a
+//! loaded [`Skill`] (its `a2a-*` metadata keys and `assets/*.json` files),
+//! and the `to_agent_skill` / `render_prompt` / `validate_input` /
+//! `validate_output` methods.
 
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use std::collections::BTreeMap;
+use std::path::{Component, Path};
+use std::str::FromStr;
+
+use serde_json::Value;
+use turul_agent_skills::{Skill, load_str};
 
 use turul_a2a_proto::AgentSkill;
 
@@ -13,17 +18,54 @@ use crate::error::{ManifestError, RenderError, ValidationError};
 use crate::schema::{compile_schema, validate_json};
 use crate::template::render_template;
 
-/// Parsed SKILL.md manifest.
+const ID: &str = "a2a-id";
+const NAME: &str = "a2a-name";
+const TAGS: &str = "a2a-tags";
+const EXAMPLES: &str = "a2a-examples";
+const INPUT_MODES: &str = "a2a-input-modes";
+const OUTPUT_MODES: &str = "a2a-output-modes";
+const SECURITY_REQUIREMENTS: &str = "a2a-security-requirements";
+const INPUT_SCHEMA: &str = "a2a-input-schema";
+const OUTPUT_SCHEMA: &str = "a2a-output-schema";
+const MAX_TOKENS: &str = "a2a-max-tokens";
+const TEMPERATURE: &str = "a2a-temperature";
+const TOP_P: &str = "a2a-top-p";
+const PROVIDER_CONFIG: &str = "a2a-provider-config";
+
+/// Every metadata key this crate reads. Any other key with the `a2a-`
+/// prefix is rejected, so a misspelt key fails instead of being ignored.
+const KEYS: [&str; 13] = [
+    ID,
+    NAME,
+    TAGS,
+    EXAMPLES,
+    INPUT_MODES,
+    OUTPUT_MODES,
+    SECURITY_REQUIREMENTS,
+    INPUT_SCHEMA,
+    OUTPUT_SCHEMA,
+    MAX_TOKENS,
+    TEMPERATURE,
+    TOP_P,
+    PROVIDER_CONFIG,
+];
+
+const PREFIX: &str = "a2a-";
+
+/// The A2A view of an Agent Skills `SKILL.md`.
 ///
-/// camelCase frontmatter only (no snake_case alias acceptance). LLM-backed
-/// skills supply execution metadata + provider_config; non-LLM skills omit
+/// The skill's spec `name` is its catalog identity; `metadata.a2a-id`, when
+/// present, is the wire id (`AgentSkill.id`) and otherwise the `name` is.
+/// The other A2A fields come from `a2a-*` metadata keys, and the schemas and
+/// provider config from JSON files under the skill directory. LLM-backed
+/// skills supply execution hints and provider config; non-LLM skills omit
 /// them. The Markdown body is the prompt template (used only by LLM-backed
 /// skills); template grammar is `{{ name }}` with dotted paths.
 ///
-/// [`SkillCard::parse`] is the only constructor: the struct is
-/// `#[non_exhaustive]` and deliberately implements neither `Deserialize`
-/// nor `Default`, so every card has passed the frontmatter,
-/// strict-keyword and schema-compilation checks.
+/// [`SkillCard::from_embedded`], [`SkillCard::from_skill`] and
+/// `TryFrom<&Skill>` are the only constructors: the struct is `#[non_exhaustive]` and deliberately
+/// implements neither `Deserialize` nor `Default`, so every card has passed
+/// the metadata, strict-keyword and schema-compilation checks.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct SkillCard {
@@ -50,149 +92,115 @@ pub struct SkillCard {
     pub body: String,
 }
 
-/// Serde shape of the SKILL.md frontmatter. Private so that
-/// [`SkillCard::parse`] stays the only way to obtain a `SkillCard`.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Frontmatter {
-    id: String,
-    name: String,
-    description: String,
-    #[serde(default)]
-    tags: Vec<String>,
-    #[serde(default)]
-    examples: Vec<String>,
-    #[serde(default)]
-    input_modes: Vec<String>,
-    #[serde(default)]
-    output_modes: Vec<String>,
-    #[serde(default)]
-    security_requirements: Vec<String>,
-    #[serde(default)]
-    input_schema: Option<Value>,
-    #[serde(default)]
-    output_schema: Option<Value>,
-    #[serde(default)]
-    execution_hints: Option<ExecutionHints>,
-    #[serde(default)]
-    provider_config: Option<Value>,
-}
-
 /// Provider-neutral execution hints.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ExecutionHints {
-    #[serde(default)]
     pub max_tokens: Option<u32>,
-    #[serde(default)]
     pub temperature: Option<f32>,
-    #[serde(default)]
     pub top_p: Option<f32>,
 }
 
-/// Translate a `serde_yaml::Value` (with arbitrary scalar keys) into a
-/// `serde_json::Value`. Frontmatter that resolves to non-string mapping
-/// keys (rare in well-formed YAML) is rejected.
-fn yaml_to_json(value: serde_yaml::Value) -> Result<Value, ManifestError> {
-    use serde_yaml::Value as Y;
-    Ok(match value {
-        Y::Null => Value::Null,
-        Y::Bool(b) => Value::Bool(b),
-        Y::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::from(i)
-            } else if let Some(u) = n.as_u64() {
-                Value::from(u)
-            } else if let Some(f) = n.as_f64() {
-                serde_json::Number::from_f64(f)
-                    .map(Value::Number)
-                    .unwrap_or(Value::Null)
-            } else {
-                Value::Null
-            }
-        }
-        Y::String(s) => Value::String(s),
-        Y::Sequence(seq) => Value::Array(
-            seq.into_iter()
-                .map(yaml_to_json)
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        Y::Mapping(map) => {
-            let mut obj = Map::new();
-            for (k, v) in map {
-                let key = match k {
-                    Y::String(s) => s,
-                    other => {
-                        return Err(ManifestError::Parse {
-                            location: "frontmatter".to_string(),
-                            reason: format!("non-string mapping key: {other:?}"),
-                        });
-                    }
-                };
-                obj.insert(key, yaml_to_json(v)?);
-            }
-            Value::Object(obj)
-        }
-        Y::Tagged(tagged) => yaml_to_json(tagged.value)?,
-    })
-}
-
 impl SkillCard {
-    /// Parse a SKILL.md document into a `SkillCard`.
+    /// Project a loaded skill onto a `SkillCard`, reading asset files
+    /// through `assets`.
     ///
-    /// Format: `---\n<frontmatter>\n---\n<body>`. Frontmatter is YAML
-    /// with camelCase keys (strict — no snake_case aliases); body is an
-    /// opaque template string consumed by `render_prompt`.
+    /// `assets` is called with the path a metadata key names, relative to
+    /// the skill directory (`assets/input.schema.json`), and returns the
+    /// file's text or `None` when it is absent. Use it for a skill embedded
+    /// in the binary; `SkillCard::try_from(&skill)` reads the files from the
+    /// directory the skill was loaded from.
     ///
-    /// Declared `inputSchema` / `outputSchema` must be usable: unknown
-    /// JSON Schema keywords and schemas the 2020-12 validator cannot
-    /// compile are rejected here as [`ManifestError::Schema`], never
+    /// List keys hold a JSON array of strings, the execution hints a
+    /// decimal string, and the schema and provider-config keys a relative
+    /// path to a JSON file. An unknown `a2a-*` key, a path that leaves the
+    /// skill directory, a missing asset, or a value that does not parse is
+    /// a [`ManifestError::Parse`] at that key. Declared schemas must be
+    /// usable: unknown JSON Schema keywords and schemas the 2020-12
+    /// validator cannot compile are a [`ManifestError::Schema`], never
     /// deferred to the first validate call.
-    pub fn parse(text: &str) -> Result<Self, ManifestError> {
-        let (frontmatter, body) = split_frontmatter(text).ok_or(ManifestError::Parse {
-            location: "document".to_string(),
-            reason: "missing `---` frontmatter delimiters".to_string(),
-        })?;
+    pub fn from_skill(
+        skill: &Skill,
+        assets: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, ManifestError> {
+        let metadata = &skill.properties.metadata;
+        if let Some(key) = metadata
+            .keys()
+            .find(|key| key.starts_with(PREFIX) && !KEYS.contains(&key.as_str()))
+        {
+            return Err(parse_error(key, "unknown metadata key"));
+        }
 
-        let yaml: serde_yaml::Value =
-            serde_yaml::from_str(frontmatter).map_err(|e| ManifestError::Parse {
-                location: "frontmatter".to_string(),
-                reason: e.to_string(),
-            })?;
-        let json = yaml_to_json(yaml)?;
-
-        let fm: Frontmatter = serde_json::from_value(json).map_err(|e| ManifestError::Parse {
-            location: "frontmatter".to_string(),
-            reason: e.to_string(),
-        })?;
-
-        for (schema, location) in [
-            (&fm.input_schema, "/inputSchema"),
-            (&fm.output_schema, "/outputSchema"),
+        let input_schema = asset(metadata, INPUT_SCHEMA, &assets)?;
+        let output_schema = asset(metadata, OUTPUT_SCHEMA, &assets)?;
+        for (schema, key) in [
+            (&input_schema, INPUT_SCHEMA),
+            (&output_schema, OUTPUT_SCHEMA),
         ] {
             if let Some(schema) = schema {
                 compile_schema(schema).map_err(|e| ManifestError::Schema {
-                    location: location.to_string(),
+                    location: location(key),
                     reason: e.to_string(),
                 })?;
             }
         }
 
+        let hints = ExecutionHints {
+            max_tokens: number(metadata, MAX_TOKENS)?,
+            temperature: number(metadata, TEMPERATURE)?,
+            top_p: number(metadata, TOP_P)?,
+        };
+        let execution_hints =
+            (hints.max_tokens.is_some() || hints.temperature.is_some() || hints.top_p.is_some())
+                .then_some(hints);
+
+        let name = skill.properties.name.as_str();
         Ok(SkillCard {
-            id: fm.id,
-            name: fm.name,
-            description: fm.description,
-            tags: fm.tags,
-            examples: fm.examples,
-            input_modes: fm.input_modes,
-            output_modes: fm.output_modes,
-            security_requirements: fm.security_requirements,
-            input_schema: fm.input_schema,
-            output_schema: fm.output_schema,
-            execution_hints: fm.execution_hints,
-            provider_config: fm.provider_config,
-            body: body.to_string(),
+            id: metadata.get(ID).map_or(name, String::as_str).to_string(),
+            name: metadata.get(NAME).map_or(name, String::as_str).to_string(),
+            description: skill.properties.description.clone(),
+            tags: list(metadata, TAGS)?,
+            examples: list(metadata, EXAMPLES)?,
+            input_modes: list(metadata, INPUT_MODES)?,
+            output_modes: list(metadata, OUTPUT_MODES)?,
+            security_requirements: list(metadata, SECURITY_REQUIREMENTS)?,
+            input_schema,
+            output_schema,
+            execution_hints,
+            provider_config: asset(metadata, PROVIDER_CONFIG, &assets)?,
+            body: skill.body.clone(),
+        })
+    }
+
+    /// Load a skill embedded in the binary and project it.
+    ///
+    /// `dir_name` is the skill's directory name, `skill_md` the text of its
+    /// `SKILL.md` and `assets` its asset files as `(relative path, text)`
+    /// pairs, typically all from `include_str!`. Embedded content is fixed at
+    /// build time, so any problem the loader reports — an unknown field, a
+    /// name that differs from `dir_name` — is an error here rather than a
+    /// diagnostic. Errors from loading are [`ManifestError::Parse`] at
+    /// `SKILL.md`; the rest are as for [`SkillCard::from_skill`].
+    pub fn from_embedded(
+        dir_name: &str,
+        skill_md: &str,
+        assets: &[(&str, &str)],
+    ) -> Result<Self, ManifestError> {
+        let loaded = load_str(dir_name, skill_md).map_err(|skip| ManifestError::Parse {
+            location: "SKILL.md".to_string(),
+            reason: skip.to_string(),
+        })?;
+        if let Some(problem) = loaded.diagnostics.first() {
+            return Err(ManifestError::Parse {
+                location: "SKILL.md".to_string(),
+                reason: problem.message().to_string(),
+            });
+        }
+        SkillCard::from_skill(&loaded.skill, |path| {
+            assets
+                .iter()
+                .find(|(asset, _)| *asset == path)
+                .map(|(_, text)| text.to_string())
         })
     }
 
@@ -260,16 +268,82 @@ impl SkillCard {
     }
 }
 
-fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
-    let rest = text.strip_prefix("---")?;
-    // The opening delimiter must be followed by a newline.
-    let after_open_nl = rest.find('\n')?;
-    let body_start = &rest[after_open_nl + 1..];
-    // Search for the closing `\n---\n` (or `\n---` at EOF).
-    let close = body_start.find("\n---")?;
-    let frontmatter = &body_start[..close];
-    let after_close = &body_start[close + 4..]; // skip "\n---"
-    // The closing delimiter may be followed by `\n` or EOF.
-    let body = after_close.strip_prefix('\n').unwrap_or(after_close);
-    Some((frontmatter, body))
+/// Reads asset files from the directory the skill was loaded from. The
+/// resolved file must lie inside that directory, so a symlink pointing out
+/// of it is refused. A file that is absent, refused or unreadable fails as
+/// not found; so does every asset of a skill with no location (one that was
+/// built, or loaded from text).
+impl TryFrom<&Skill> for SkillCard {
+    type Error = ManifestError;
+
+    fn try_from(skill: &Skill) -> Result<Self, ManifestError> {
+        let dir = skill.location().and_then(Path::parent);
+        SkillCard::from_skill(skill, |path| {
+            let dir = dir?;
+            let file = dir.join(path).canonicalize().ok()?;
+            if !file.starts_with(dir) {
+                return None;
+            }
+            std::fs::read_to_string(file).ok()
+        })
+    }
+}
+
+fn location(key: &str) -> String {
+    format!("metadata.{key}")
+}
+
+fn parse_error(key: &str, reason: impl Into<String>) -> ManifestError {
+    ManifestError::Parse {
+        location: location(key),
+        reason: reason.into(),
+    }
+}
+
+fn list(metadata: &BTreeMap<String, String>, key: &str) -> Result<Vec<String>, ManifestError> {
+    match metadata.get(key) {
+        Some(value) => serde_json::from_str(value)
+            .map_err(|e| parse_error(key, format!("expected a JSON array of strings: {e}"))),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn number<T: FromStr>(
+    metadata: &BTreeMap<String, String>,
+    key: &str,
+) -> Result<Option<T>, ManifestError>
+where
+    T::Err: std::fmt::Display,
+{
+    metadata
+        .get(key)
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|e| parse_error(key, format!("expected a number: {e}")))
+        })
+        .transpose()
+}
+
+fn asset(
+    metadata: &BTreeMap<String, String>,
+    key: &str,
+    assets: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<Value>, ManifestError> {
+    let Some(path) = metadata.get(key) else {
+        return Ok(None);
+    };
+    let inside = Path::new(path)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)));
+    if path.is_empty() || !inside {
+        return Err(parse_error(
+            key,
+            format!("`{path}` is not a relative path inside the skill directory"),
+        ));
+    }
+    let text = assets(path).ok_or_else(|| parse_error(key, format!("asset `{path}` not found")))?;
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|e| parse_error(key, format!("asset `{path}` is not JSON: {e}")))
 }

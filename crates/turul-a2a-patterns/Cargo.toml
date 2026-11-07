@@ -9,16 +9,15 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 readme = "README.md"
-description = "Reusable A2A skill-authoring patterns: SKILL.md manifest, SkillHandler / SkillRegistry / SkillProgressSink / TerminalHook."
+description = "Reusable A2A skill-authoring patterns: SKILL.md projection, SkillHandler / SkillRegistry / SkillProgressSink / TerminalHook."
 
 [dependencies]
 turul-a2a-proto = { workspace = true }
 turul-a2a-types = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
-serde_yaml = { workspace = true }
+turul-agent-skills = { workspace = true }
 jsonschema = { workspace = true }
 
 [dev-dependencies]

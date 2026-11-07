@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "a": {
+      "type": "number"
+    },
+    "b": {
+      "type": "number"
+    }
+  },
+  "required": [
+    "a",
+    "b"
+  ]
+}

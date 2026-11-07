@@ -146,60 +146,59 @@ Ordered by certainty:
 3. **`SkillCard` + SKILL.md manifest support.** SKILL.md is a
    portable skill manifest. The patterns crate's manifest support
    is **execution-model-agnostic**: LLM-backed skills are the most
-   common case (frontmatter declares schemas + provider config,
+   common case (the manifest declares schemas + provider config,
    body holds the prompt template), but **non-LLM skills**
    (Rust-native handlers, deterministic logic, MCP-tool-backed
    skills, etc.) are first-class — they use the manifest for
    discovery metadata and I/O schemas only and ignore the
    LLM-specific sections.
 
-   The format aligns with the broader industry SKILL.md convention
-   (YAML frontmatter + Markdown body). The frontmatter splits into
-   three sections with a deliberate boundary:
+   The file format is the Agent Skills specification, owned by the
+   `turul-agent-skills` crate (`load`, `load_str`, `validate`; its
+   ADR-008 maps every `SkillCard` field). This crate does not parse
+   YAML: it projects a loaded `turul_agent_skills::Skill` onto a
+   `SkillCard`. The frontmatter holds only the spec fields; the A2A
+   fields live in `metadata` under `a2a-*` keys and in JSON files
+   under the skill directory, in three sections with a deliberate
+   boundary:
 
    - **`AgentSkill` discovery fields** (always supported, all eight
-     proto fields). **Frontmatter casing: camelCase only**, matching
-     the A2A JSON serialization (`id`, `name`, `description`,
-     `tags`, `examples`, `inputModes`, `outputModes`,
-     **`securityRequirements`**). Rationale: SKILL.md is a portable
-     cross-tool artifact; camelCase round-trips with any A2A
-     consumer that reads JSON-shape AgentCard documents. The Rust
-     types use snake_case field names internally (standard Rust
-     convention) with `#[serde(rename_all = "camelCase")]` on the
-     struct, so the wire form is exactly one casing — camelCase.
-     Snake_case manifests are **NOT** silently accepted via
-     `#[serde(alias = …)]`. If a future need for snake_case
-     acceptance arises (e.g. human-edited manifests), it ships as
-     an explicit, documented opt-in with its own tests, not as a
-     serde alias accident. Skill-level `securityRequirements`
-     follow ADR-015 (declaration-only with truthfulness invariants
-     validated at server build).
+     proto fields). `AgentSkill.id` is `metadata.a2a-id` when present,
+     else the spec `name` (the directory name); `a2a-id` holds a wire
+     id a skill name cannot, such as one with `_`. `AgentSkill.name`
+     is `metadata.a2a-name`, else the spec `name`. `description` is
+     the spec `description`. `tags`, `examples`, `inputModes`,
+     `outputModes` and `securityRequirements` are `a2a-tags`,
+     `a2a-examples`, `a2a-input-modes`, `a2a-output-modes` and
+     `a2a-security-requirements`, each a JSON array of strings in one
+     metadata string; an empty list omits the key. Skill-level
+     `securityRequirements` follow ADR-015 (declaration-only with
+     truthfulness invariants validated at server build).
 
      **Shape of `securityRequirements` in SKILL.md (binding contract):**
      Each entry is a **scheme name string**, NOT the proto-shaped
      `SecurityRequirement { schemes: map<string, ScopesList> }`.
-     SKILL.md form: `securityRequirements: ["bearer", "apiKey"]`.
+     SKILL.md form: `a2a-security-requirements: '["bearer","apiKey"]'`.
      Mapping to the proto on AgentSkill generation: each scheme name
      becomes a `SecurityRequirement { schemes: { "<name>": [] } }`
      — an empty scopes list. Rationale: most SKILL.md authors don't
      need OAuth-style scopes per skill; the simpler list shape is
-     readable, round-trips losslessly through serde, and keeps the
-     manifest format close to A2A `AgentSkill.security_requirements`
-     semantics (scheme-name reference into the agent-level
-     `securitySchemes` catalogue, with scoping handled at the
-     agent level per ADR-015). A future amendment may add a richer
-     scope-aware manifest form
-     (`securityRequirements: [{"oauth2": ["read", "write"]}]`)
-     additively if adopter demand justifies it — that's a
-     non-breaking extension because the simple list form remains
+     readable and keeps the manifest close to A2A
+     `AgentSkill.security_requirements` semantics (scheme-name
+     reference into the agent-level `securitySchemes` catalogue, with
+     scoping handled at the agent level per ADR-015). A richer
+     scope-aware form may be added later; the simple list form stays
      valid.
    - **Provider-neutral execution metadata** (optional; meaningful
-     for LLM-backed skills): input/output JSON Schemas plus a small
-     fixed set of provider-neutral execution hints (e.g.
-     `max_tokens`, `temperature`, `top_p`). The patterns crate
-     defines and validates this contract. Non-LLM skills declare
-     schemas here and omit the hints.
-   - **Opaque `provider_config:` block** (optional; meaningful for
+     for LLM-backed skills): input/output JSON Schemas, in the files
+     `a2a-input-schema` / `a2a-output-schema` name
+     (`assets/input.schema.json`, `assets/output.schema.json`), plus
+     three provider-neutral execution hints as decimal strings
+     (`a2a-max-tokens`, `a2a-temperature`, `a2a-top-p`). The patterns
+     crate defines and validates this contract. Non-LLM skills declare
+     schemas and omit the hints.
+   - **Opaque provider config** (`a2a-provider-config`, a file such as
+     `assets/provider-config.json`; optional; meaningful for
      LLM-backed skills): provider-specific options (model identifier
      strings, vendor-specific tuning parameters, API endpoint
      hints). The patterns crate does **not** interpret this block —
@@ -208,8 +207,8 @@ Ordered by certainty:
 
    The patterns crate provides four generic helpers:
 
-   - **Manifest parsing** — SKILL.md text → typed `SkillCard`
-     (frontmatter + body + parsed schemas). Applies to all skills.
+   - **Manifest projection** — a loaded `Skill` → typed `SkillCard`
+     (metadata + body + parsed schemas). Applies to all skills.
    - **AgentSkill generation** — extract the wire-discoverable
      subset (all eight discovery fields including
      `security_requirements`) into a `turul_a2a_proto::AgentSkill`
@@ -225,18 +224,26 @@ Ordered by certainty:
    **Trust model — security boundary.** The patterns crate treats
    SKILL.md as a **trusted static manifest + static prompt template**.
    There is no dynamic interpretation of either section. Concretely
-   the parser MUST NOT:
+   the projection MUST NOT:
 
    - Execute shell commands or evaluate code in any field.
-   - Resolve `!include`-style directives or load arbitrary support
-     files referenced from the manifest.
+   - Resolve `!include`-style directives or load support files other
+     than the three the asset keys (`a2a-input-schema`,
+     `a2a-output-schema`, `a2a-provider-config`) name. Those paths
+     must be relative and stay inside the skill directory (only plain
+     path components; no `..`, no root), and they are read only
+     through the reader the caller supplies or, for `TryFrom<&Skill>`,
+     from the directory the skill was loaded from — where the resolved
+     file must also lie inside that directory, so a symlink pointing
+     out of it is refused. `TryFrom<&Skill>` reports any file it
+     cannot read (absent, refused, unreadable) as not found.
    - Interpret command-injection syntax (e.g. shell-backed context
      lines), MCP tool references, or any other dynamic semantics
      other manifest dialects may permit.
    - Make outbound network calls during parsing.
 
    Adopters needing richer manifest semantics (dynamic commands,
-   MCP tool references, support-file loading, multi-file manifests)
+   MCP tool references, support files beyond the three asset keys)
    extend the format under a successor ADR — not by side-channel
    features in the parser.
 
@@ -264,11 +271,24 @@ Ordered by certainty:
      time, never silently ignored. Adopters get an explicit error.
      A declared schema the 2020-12 validator cannot compile is
      likewise rejected at parse time (`ManifestError::Schema` with
-     location `/inputSchema` or `/outputSchema`).
-   - **Single constructor**: `SkillCard::parse` is the only way to
-     obtain a `SkillCard` — the struct is `#[non_exhaustive]` and
-     implements neither `Deserialize` nor `Default`, so no card
-     bypasses the checks above.
+     location `metadata.a2a-input-schema` or
+     `metadata.a2a-output-schema`).
+   - **Closed key set**: an `a2a-*` metadata key outside the thirteen
+     above is a `ManifestError::Parse` at `metadata.<key>`, so a
+     misspelt key fails instead of being ignored. Keys without the
+     prefix belong to other tools and are ignored.
+   - **Constructors**: a `SkillCard` comes only from a loaded `Skill`,
+     through one of three entrypoints that share one projection —
+     `SkillCard::from_skill(&Skill, reader)`, where the reader returns
+     an asset's text by its relative path; `TryFrom<&Skill>`, whose
+     reader reads from the directory the skill was loaded from (a
+     skill with no location has no asset files); and
+     `SkillCard::from_embedded(dir_name, skill_md, assets)`, for a
+     skill compiled into the binary, which loads with `load_str` and
+     treats every loader diagnostic as an error because embedded
+     content is fixed at build time. The struct is
+     `#[non_exhaustive]` and implements neither `Deserialize` nor
+     `Default`, so no card bypasses the checks above.
    - **Error reporting**: structured (location + reason) for both
      schema validation and template rendering. Tests assert against
      the structured form, not against message strings. Validation
@@ -284,7 +304,8 @@ Ordered by certainty:
    `SkillHandler` directly. A reference example wiring this to
    Ollama is a Phase C deliverable (§7.3 step 6); see §2.4.
 
-   The SKILL.md format itself is a Turul-local convention. See §9
+   The SKILL.md format itself is the Agent Skills specification; the
+   `a2a-*` keys and asset files are Turul's projection onto it. See §9
    Q2 — `SkillCard` carries a collision risk with A2A `AgentSkill`;
    `SkillManifest` is the leading rename candidate given the
    broader (non-LLM-inclusive) framing.
@@ -581,7 +602,7 @@ The following are deliberately not in `turul-a2a-patterns`:
   validation is authoritative; the Ollama adapter in the example may
   down-convert schemas to whatever subset its provider accepts. The patterns crate itself stays
   provider-neutral; Ollama-specific knobs live in the example's
-  `provider_config:` block per §2.2 item 3.
+  provider-config asset file (`a2a-provider-config`) per §2.2 item 3.
 - **Application-specific patterns.** Anything tied to a particular
   industry, dataset, vendor metadata namespace, message-bus topology,
   or downstream sink belongs in adopter code. The patterns crate is
@@ -897,17 +918,17 @@ Phase C deliverables — none is optional or follow-up.
    examples/skill-manifest-ollama-agent/
      Cargo.toml          # publish = false
      README.md           # how to run; OLLAMA_BASE_URL / RUN_OLLAMA_SMOKE docs
-     skills/demo/SKILL.md  # a real manifest file using the §2.2 item 3 shape
+     skills/greet/         # SKILL.md + assets/*.json using the §2.2 item 3 shape
      src/main.rs         # A2A agent binary; registers the skill via SkillRegistry
      tests/smoke.rs      # offline-by-default smoke test
    ```
 
    The example demonstrates the full pattern end-to-end:
 
-   - A real `SKILL.md` file using the §2.2 item 3 three-section
-     frontmatter (discovery fields, provider-neutral execution
-     metadata, opaque `provider_config:` block).
-   - Parsing the manifest via the patterns crate; generating the
+   - A real `SKILL.md` with its asset files using the §2.2 item 3
+     sections (discovery fields, provider-neutral execution
+     metadata, opaque provider config).
+   - Loading the manifest via the patterns crate; generating the
      `AgentSkill` for `AgentCard.skills`.
    - **The progress-sink bridge** lives in this example crate
      during Phase C (per §2.3). Because Rust orphan rules forbid
@@ -1171,3 +1192,4 @@ Reports pass/fail. Does not modify source. Does not decide scope.
 - 2026-10-22 — §2.1 amended from "internal path-only, `publish = false`" to the shipped state (published since 0.1.26, versioned workspace dep, licence symlinks, publish order after `turul-a2a-types`); §3 non-goal struck; §4.1 records that the `turul-a2a` → patterns dependency and the `EventSink` bridge were not delivered. §2.2 item 3 contracts tightened to what the code now enforces: `SkillCard::parse` is the only constructor (the public `Deserialize` derive that bypassed the strict-keyword check is removed), uncompilable schemas are rejected at parse with `ManifestError::Schema`, and validation error locations are `#`-rooted instance pointers for every validate entry point. The §2.3 fixed variant sets (`ProgressState` non-terminal only, `SkillError`) are now compile-time enforced by wildcard-free matches inside the crate; `SinkError` stays open to additive variants beyond its `Closed` / `Backend` minimum.
 - 2026-10-22 — §2.2 item 5 clarified: the `SkillError` → `A2aError` mapping is adopter code, and inside an `AgentExecutor` it yields a `FAILED` task carrying the error text, not a wire error.
 - 2026-10-22 — §2.3 contract details gain a "Variant sets" bullet stating what the code enforces: `ProgressState` and `SkillError` are guarded fixed sets; `SinkError` has a `Closed` / `Backend` minimum with no fixed-set guard, as the first entry above records. The patterns test that claimed a `SinkError` guard now says the same.
+- 2026-11-07 — §2.2 item 3: SKILL.md moves to the Agent Skills specification, owned by `turul-agent-skills` (its ADR-008 holds the field mapping). `SkillCard::parse` and its YAML frontmatter parser are deleted; `SkillCard` is projected from a loaded `Skill` through `from_skill` (caller-supplied asset reader), `TryFrom<&Skill>` (reads beside the loaded file) and `from_embedded` (`load_str`, diagnostics are errors). A2A fields move to `a2a-*` metadata keys (closed set) and `assets/*.json` files; the trust model admits only those asset files, by relative path inside the skill directory (resolved, for files read from disk, so symlinks cannot escape). Schema error locations become `metadata.a2a-input-schema` / `metadata.a2a-output-schema`. Wire ids are unchanged: `a2a-id` keeps ids a skill name cannot hold.

@@ -13,19 +13,19 @@ contract this repo implements lives in `proto/a2a.proto`.
 The agent shows the **planner + router** idiom in its simplest possible form:
 
 1. **Two manifest-backed skills** registered in an `InMemorySkillRegistry`
-   via `SkillCard::parse` + `SkillRegistry::register_manifest`:
+   via `SkillCard::from_embedded` + `SkillRegistry::register_manifest`:
    - `add` — input `{a, b}`, output `{result}` — defined by
-     `skills/add/SKILL.md`.
+     `skills/add/SKILL.md` and `skills/add/assets/`.
    - `concat` — input `{strings: [...]}`, output `{joined}` — defined by
-     `skills/concat/SKILL.md`.
+     `skills/concat/SKILL.md` and `skills/concat/assets/`.
 2. **A code-first planner** — a small Rust rules table inspects the inbound
    text and chooses one skill plus its parameters.
 3. **A router** — the `AgentExecutor` calls `registry.handler(skill_id)` and
    runs the returned `SkillHandler`, bridging the framework `EventSink`
    through a local newtype that implements `SkillProgressSink`.
 4. **Schema-validated dispatch** — each handler validates the planner's
-   parameters against the manifest's `inputSchema` before doing work, and
-   validates its output against `outputSchema` before emitting an artifact.
+   parameters against the manifest's input schema before doing work, and
+   validates its output against the output schema before emitting an artifact.
 
 The wire shape is identical to the previous programmatic version: the same
 `message:send` requests, the same `{"result": 8}` / `{"joined": "foo bar
@@ -39,7 +39,7 @@ SKILL.md, not by inline Rust literals.
                                          │ skills/add/SKILL.md     │
                                          │ skills/concat/SKILL.md  │
                                          └────────────┬────────────┘
-                                                      │ SkillCard::parse
+                                                      │ SkillCard::from_embedded
                                                       ▼
    client ──── POST /message:send ──▶ A2A agent (port 3012)
                                             │
@@ -185,7 +185,7 @@ Skills have an input/output JSON schema and a body that operates on inbound
 parameters. The planner has neither: its input is **raw user text** and its
 output is a **routing decision** (`(skill_id, params)`), not a structured
 result the agent ships on the wire. SKILL.md is the wrong shape for the
-planner — it would have no meaningful `inputSchema` or `outputSchema`.
+planner — it would have no meaningful input or output schema.
 
 Manifest backing is orthogonal to whether a component is the planner or a
 dispatch target. In this example the planner remains code-first while every
@@ -205,12 +205,14 @@ skill rather than a code block.
   confirm which rule matched.
 - **Schema validation failure** — if you call the agent with custom JSON
   payloads instead of the planner-friendly text shapes above, the handler
-  validates parameters against `inputSchema`. A failure surfaces as
+  validates parameters against the input schema. A failure surfaces as
   `SkillError::InvalidRequest` → A2A `InvalidRequest`. Check the manifest in
-  `skills/<id>/SKILL.md` for the required fields.
+  `skills/<name>/SKILL.md` for the required fields.
 - **`include_str!` panics at build time** — the SKILL.md paths are relative
   to `src/`. If you move the `skills/` directory, update the
-  `include_str!("../skills/<id>/SKILL.md")` lines in `src/main.rs` to match.
+  `include_str!("../skills/<name>/SKILL.md")` and
+  `include_str!("../skills/<name>/assets/*.schema.json")` lines in
+  `src/main.rs` to match.
 
 ## Smoke test
 
@@ -226,8 +228,8 @@ both planner routes and the no-match fallback. Hermetic — no network access.
 - [ADR-021 §9 Q3](../../docs/adr/ADR-021-turul-a2a-patterns-extraction.md) —
   agent role idioms (planner, router, critic, …) ship as examples, not as
   framework types, until a generic interface emerges.
-- [ADR-021 §2.2 item 3](../../docs/adr/ADR-021-turul-a2a-patterns-extraction.md) —
-  SKILL.md as the manifest format consumed by `SkillCard::parse` and
+- [ADR-021](../../docs/adr/ADR-021-turul-a2a-patterns-extraction.md) —
+  SKILL.md as the manifest format consumed by `SkillCard::from_embedded` and
   `SkillRegistry::register_manifest`.
 - `examples/skill-manifest-ollama-agent` — companion example that drives a
   single manifest-backed skill with an optional Ollama dispatch path. The

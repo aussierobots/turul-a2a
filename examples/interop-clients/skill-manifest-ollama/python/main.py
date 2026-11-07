@@ -7,7 +7,7 @@ Target agent
 - Crate    : `skill-manifest-ollama-agent`
 - Path     : `examples/skill-manifest-ollama-agent/`
 - Default  : `http://localhost:3010` (overridable via `A2A_BASE_URL`)
-- Skill    : `greet` (declared in `skills/demo/SKILL.md`)
+- Skill    : `greet` (declared in `skills/greet/SKILL.md`)
 
 Wire path
 ---------

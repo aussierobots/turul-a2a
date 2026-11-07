@@ -1,6 +1,6 @@
 //! A2A agent that exposes a manifest-backed skill end-to-end.
 //!
-//! - Parses `skills/demo/SKILL.md` at startup.
+//! - Loads `skills/greet/SKILL.md` and its schema assets at startup.
 //! - Registers a `SkillHandler` in an `InMemorySkillRegistry`.
 //! - Routes every inbound `execute()` call to that handler — this is the
 //!   **example-owned dispatcher**; the framework does not ship one.
@@ -36,9 +36,28 @@ use turul_llm_ollama::OllamaClient;
 const DEFAULT_BIND_PORT: u16 = 3010;
 
 /// SKILL.md shipped with the example. Embedded so the binary is
-/// self-contained; the source file under `skills/demo/SKILL.md` is the
+/// self-contained; the files under `skills/greet/` are the
 /// canonical reference for adopters.
-const SKILL_MANIFEST: &str = include_str!("../skills/demo/SKILL.md");
+fn skill_card() -> Result<SkillCard, turul_a2a_patterns::ManifestError> {
+    SkillCard::from_embedded(
+        "greet",
+        include_str!("../skills/greet/SKILL.md"),
+        &[
+            (
+                "assets/input.schema.json",
+                include_str!("../skills/greet/assets/input.schema.json"),
+            ),
+            (
+                "assets/output.schema.json",
+                include_str!("../skills/greet/assets/output.schema.json"),
+            ),
+            (
+                "assets/provider-config.json",
+                include_str!("../skills/greet/assets/provider-config.json"),
+            ),
+        ],
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Bridge: orphan-rule-safe newtype around the framework's EventSink so we
@@ -309,7 +328,7 @@ struct ManifestExecutor {
 
 impl ManifestExecutor {
     async fn build() -> Result<Self, Box<dyn std::error::Error>> {
-        let card = SkillCard::parse(SKILL_MANIFEST)?;
+        let card = skill_card()?;
         let skill_id = card.id.clone();
         let agent_skill = card.to_agent_skill();
 
@@ -409,7 +428,7 @@ fn extract_params(message: &Message) -> Value {
 
 /// Fill in manifest-declared defaults so plain-text inputs don't trip
 /// the template renderer on missing variables. Keeps the example
-/// permissive without weakening the inputSchema validator.
+/// permissive without weakening the input schema validator.
 fn fill_defaults(mut value: Value) -> Value {
     if let Some(obj) = value.as_object_mut()
         && !obj.contains_key("style")
@@ -496,7 +515,7 @@ mod unit {
 
     #[test]
     fn skill_manifest_parses() {
-        let card = SkillCard::parse(SKILL_MANIFEST).expect("manifest parses");
+        let card = skill_card().expect("manifest parses");
         assert_eq!(card.id, "greet");
         assert!(card.input_schema.is_some());
         assert!(card.output_schema.is_some());
@@ -504,7 +523,7 @@ mod unit {
 
     #[tokio::test]
     async fn offline_handler_produces_schema_valid_output() {
-        let card = SkillCard::parse(SKILL_MANIFEST).unwrap();
+        let card = skill_card().unwrap();
         let handler = GreetHandler::new(card.clone());
         let params = json!({"user": {"name": "Ada"}, "style": "formal"});
         let prompt = card.render_prompt(&params).unwrap();
@@ -512,7 +531,7 @@ mod unit {
         let output = handler.run_offline(&input, &prompt);
         let output_json = serde_json::to_value(&output).unwrap();
         card.validate_output(&output_json)
-            .expect("offline stub output must satisfy outputSchema");
+            .expect("offline stub output must satisfy the output schema");
         assert!(output.greeting.contains("Ada"));
     }
 
@@ -552,7 +571,7 @@ mod unit {
             serde_json::from_value::<GreetInput>(v).unwrap_or_else(|e| {
                 panic!(
                     "GreetInput failed to deserialise example payload `{raw}`: {e} \
-                     (the typed struct may have drifted from SKILL.md inputSchema)"
+                     (the typed struct may have drifted from the skill's input schema)"
                 )
             });
         }
@@ -560,45 +579,45 @@ mod unit {
 
     #[test]
     fn typed_input_serialises_to_schema_valid_json() {
-        let card = SkillCard::parse(SKILL_MANIFEST).unwrap();
+        let card = skill_card().unwrap();
         let sample = GreetInput {
             user: UserInput { name: "Ada".into() },
             style: GreetingStyle::Formal,
         };
         let v = serde_json::to_value(&sample).unwrap();
         card.validate_input(&v).expect(
-            "GreetInput must serialise to JSON that satisfies SKILL.md inputSchema \
+            "GreetInput must serialise to JSON that satisfies the skill's input schema \
              (struct ↔ schema drift?)",
         );
     }
 
     #[test]
     fn typed_output_serialises_to_schema_valid_json() {
-        let card = SkillCard::parse(SKILL_MANIFEST).unwrap();
+        let card = skill_card().unwrap();
         let sample = GreetOutput {
             greeting: "Hello, world!".into(),
         };
         let v = serde_json::to_value(&sample).unwrap();
         card.validate_output(&v).expect(
-            "GreetOutput must serialise to JSON that satisfies SKILL.md outputSchema \
+            "GreetOutput must serialise to JSON that satisfies the skill's output schema \
              (struct ↔ schema drift?)",
         );
     }
 
-    /// SKILL.md inputSchema enforces invariants that the typed struct
+    /// The skill's input schema enforces invariants that the typed struct
     /// alone cannot express (here: `user.name` `minLength: 1`). The
     /// handler must run `card.validate_input` BEFORE typed deserialise
     /// so this kind of constraint is caught at the manifest boundary,
     /// not silently accepted by serde.
     #[test]
     fn manifest_validates_before_struct_deserialises() {
-        let card = SkillCard::parse(SKILL_MANIFEST).unwrap();
+        let card = skill_card().unwrap();
         let invalid = json!({"user": {"name": ""}});
 
         // The manifest must reject empty name.
         assert!(
             card.validate_input(&invalid).is_err(),
-            "SKILL.md inputSchema must reject `user.name = \"\"` (minLength: 1); \
+            "the skill's input schema must reject `user.name = \"\"` (minLength: 1); \
              if this passes, the manifest is no longer enforcing real constraints"
         );
 

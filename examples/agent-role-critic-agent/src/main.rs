@@ -3,7 +3,7 @@
 //!
 //! Shape:
 //! 1. Two manifest-backed skills are registered in an `InMemorySkillRegistry`
-//!    from `skills/<id>/SKILL.md`:
+//!    from `skills/<name>/SKILL.md`:
 //!    - `validate_against_schema` — runs a JSON Schema 2020-12 validation
 //!      via the public `turul_a2a_patterns::validate_json` helper.
 //!    - `check_invariants` — runs a deterministic invariant table over a
@@ -38,9 +38,38 @@ use turul_a2a_types::{Artifact, Message, Part, Task};
 const DEFAULT_BIND_PORT: u16 = 3013;
 
 // Manifests embedded at build time so the binary is self-contained.
-const VALIDATE_AGAINST_SCHEMA_MANIFEST: &str =
-    include_str!("../skills/validate_against_schema/SKILL.md");
-const CHECK_INVARIANTS_MANIFEST: &str = include_str!("../skills/check_invariants/SKILL.md");
+fn validate_against_schema_card() -> Result<SkillCard, turul_a2a_patterns::ManifestError> {
+    SkillCard::from_embedded(
+        "validate-against-schema",
+        include_str!("../skills/validate-against-schema/SKILL.md"),
+        &[
+            (
+                "assets/input.schema.json",
+                include_str!("../skills/validate-against-schema/assets/input.schema.json"),
+            ),
+            (
+                "assets/output.schema.json",
+                include_str!("../skills/validate-against-schema/assets/output.schema.json"),
+            ),
+        ],
+    )
+}
+fn check_invariants_card() -> Result<SkillCard, turul_a2a_patterns::ManifestError> {
+    SkillCard::from_embedded(
+        "check-invariants",
+        include_str!("../skills/check-invariants/SKILL.md"),
+        &[
+            (
+                "assets/input.schema.json",
+                include_str!("../skills/check-invariants/assets/input.schema.json"),
+            ),
+            (
+                "assets/output.schema.json",
+                include_str!("../skills/check-invariants/assets/output.schema.json"),
+            ),
+        ],
+    )
+}
 
 // ---------------------------------------------------------------------------
 // EventSink bridge. Local newtype so we can `impl SkillProgressSink`
@@ -289,7 +318,7 @@ impl CriticExecutor {
 
         // Manifest-backed registration. The manifest is the single source of
         // truth for the AgentSkill projection and the params schema.
-        let validate_card = SkillCard::parse(VALIDATE_AGAINST_SCHEMA_MANIFEST)
+        let validate_card = validate_against_schema_card()
             .map_err(|e| format!("parse validate_against_schema SKILL.md: {e}"))?;
         let validate_skill = validate_card.to_agent_skill();
         let validate_handler: Arc<dyn SkillHandler> = Arc::new(ValidateAgainstSchemaSkill);
@@ -298,8 +327,8 @@ impl CriticExecutor {
             .await
             .map_err(|e| format!("register validate_against_schema: {e}"))?;
 
-        let invariants_card = SkillCard::parse(CHECK_INVARIANTS_MANIFEST)
-            .map_err(|e| format!("parse check_invariants SKILL.md: {e}"))?;
+        let invariants_card =
+            check_invariants_card().map_err(|e| format!("parse check_invariants SKILL.md: {e}"))?;
         let invariants_skill = invariants_card.to_agent_skill();
         let invariants_handler: Arc<dyn SkillHandler> = Arc::new(CheckInvariantsSkill);
         registry
@@ -540,14 +569,13 @@ mod unit {
         // Build-time guarantee: both bundled SKILL.md files parse and round-trip
         // through the registry. Failing this test means the manifest authoring
         // drifted from `SkillCard` schema (e.g. a strict-keyword regression).
-        let validate = SkillCard::parse(VALIDATE_AGAINST_SCHEMA_MANIFEST)
-            .expect("validate_against_schema SKILL.md parses");
+        let validate =
+            validate_against_schema_card().expect("validate_against_schema SKILL.md parses");
         assert_eq!(validate.id, "validate_against_schema");
         assert!(validate.input_schema.is_some());
         assert!(validate.output_schema.is_some());
 
-        let invariants =
-            SkillCard::parse(CHECK_INVARIANTS_MANIFEST).expect("check_invariants SKILL.md parses");
+        let invariants = check_invariants_card().expect("check_invariants SKILL.md parses");
         assert_eq!(invariants.id, "check_invariants");
         assert!(invariants.input_schema.is_some());
         assert!(invariants.output_schema.is_some());

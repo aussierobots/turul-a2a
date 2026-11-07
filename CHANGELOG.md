@@ -4,6 +4,28 @@ All notable changes to the `turul-a2a` workspace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.7] — 2026-11-07
+
+### Changed
+
+- **SKILL.md follows the [Agent Skills specification](https://agentskills.io/specification).** `turul-a2a-patterns` no longer parses SKILL.md itself: the external `turul-agent-skills` crate loads and validates it, and `SkillCard` is projected from the loaded `turul_agent_skills::Skill`. The frontmatter holds only `name` (equal to the skill's directory name), `description` and `metadata`. A2A fields move to `a2a-*` metadata keys: `a2a-id`, `a2a-name`, `a2a-tags`, `a2a-examples`, `a2a-input-modes`, `a2a-output-modes` and `a2a-security-requirements` (lists as JSON array strings), and `a2a-max-tokens`, `a2a-temperature` and `a2a-top-p`. Schemas and provider config move to JSON files named by `a2a-input-schema`, `a2a-output-schema` and `a2a-provider-config` (e.g. `assets/input.schema.json`). An unknown `a2a-*` key is an error. See ADR-021.
+- New constructors: `SkillCard::from_embedded(dir_name, skill_md, assets)` for skills compiled in with `include_str!` (loader diagnostics are errors); `SkillCard::from_skill(&skill, reader)`; and `SkillCard::try_from(&skill)`, which reads assets beside the loaded file. `to_agent_skill`, `render_prompt`, `validate_input` and `validate_output` are unchanged.
+- Example skill directories follow their spec names (`demo` → `greet`, `check_invariants` → `check-invariants`, `validate_against_schema` → `validate-against-schema`, `echo_loud` → `echo-loud`). Advertised skill ids are unchanged; `a2a-id` keeps the ids a skill name cannot hold.
+- `jsonschema` 0.59 → 0.60.
+
+### Removed
+
+- `SkillCard::parse` and the `serde_yaml` dependency. `ExecutionHints` no longer implements `Serialize` / `Deserialize`.
+
+### Compatibility
+
+- Breaking for `turul-a2a-patterns` users with their own SKILL.md files: migrate each file to the spec format above (`turul-skills validate <dir>` from `turul-agent-skills` checks the result) and replace `SkillCard::parse(text)` with `SkillCard::from_embedded(..)` or `SkillCard::try_from(&turul_agent_skills::load(dir)?.skill)`. Schema error locations are now `metadata.a2a-input-schema` / `metadata.a2a-output-schema`.
+- The other crates are unchanged apart from dependency updates. No wire format or storage schema changes.
+
+### Verification
+
+- Patterns projection tests passed; every example SKILL.md passed `turul-skills validate`; Rust and Go interop clients passed against the skill example agents with unchanged skill ids.
+
 ## [0.2.6] — 2026-10-25
 
 ### Added

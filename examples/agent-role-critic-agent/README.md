@@ -16,14 +16,14 @@ The agent shows the **critic** idiom in its simplest possible form: given an
 output and some criteria, return a verdict plus the reasons it passed or
 failed. Two **manifest-backed** skills are registered:
 
-1. **`validate_against_schema`** — `skills/validate_against_schema/SKILL.md`
+1. **`validate_against_schema`** — `skills/validate-against-schema/SKILL.md` (wire id kept via `a2a-id`)
    - Input: `{"value": <any>, "schema": <JSON Schema 2020-12>}`
    - Output: `{"valid": bool, "errors": [string]}`
    - Implementation: calls `turul_a2a_patterns::validate_json` and wraps the
      result. On `Ok` ⇒ `{"valid": true, "errors": []}`; on `Err` ⇒
      `{"valid": false, "errors": ["<first violation>"]}`.
 
-2. **`check_invariants`** — `skills/check_invariants/SKILL.md`
+2. **`check_invariants`** — `skills/check-invariants/SKILL.md` (wire id kept via `a2a-id`)
    - Input: `{"value": <any>, "invariants": [{"name": str, "check": str, "args"?: <any>}]}`
    - Output: `{"verdict": "pass" | "fail", "failures": [{"name": str, "reason": str}]}`
    - Implementation: pure Rust over four invariant kinds.
@@ -37,7 +37,7 @@ failed. Two **manifest-backed** skills are registered:
 
 Both manifests carry their own input/output JSON Schemas; the registry
 treats those as the single source of truth for the published `AgentSkill`
-projection and the runtime params schema (ADR-021 §2.2 items 3 + 4).
+projection and the runtime params schema (each skill's `assets/*.schema.json`).
 
 ## Architecture sketch
 
@@ -92,7 +92,7 @@ membership, JSON Schema 2020-12) is more concisely expressed as code than
 as a prompt. There is nothing for an LLM to add to a `len(s) >= 5` check.
 
 This split matches the planner-router sibling example: the framework
-provides the manifest plumbing (`SkillCard::parse`, `register_manifest`,
+provides the manifest plumbing (`SkillCard::from_embedded`, `register_manifest`,
 the registry / handler / sink contracts), and the example contributes the
 domain-specific *evaluator semantics* that an adopter would normally
 customise. The patterns crate stays neutral on which checks an adopter
@@ -266,8 +266,9 @@ auth dependency. The smoke test is hermetic.
 - `agent did not become ready` in the smoke test — the built binary did
   not start listening within 15s; run it by hand to see its startup error.
 - `Manifest parse: ...` startup error — the on-disk `SKILL.md` files
-  must round-trip through `SkillCard::parse`. The build-time embedded
-  manifests run a parse test (`cargo test -p agent-role-critic-agent`)
+  and `assets/` JSON must load through `SkillCard::from_embedded`
+  (`turul-skills validate skills/<name>` checks them standalone). The
+  embedded manifests run a load test (`cargo test -p agent-role-critic-agent`)
   so a regression is caught before the binary ships.
 
 ## Smoke test
@@ -282,7 +283,7 @@ four critic paths end-to-end. Hermetic — no network access.
 ## References
 
 - [ADR-021 §9 Q3](../../docs/adr/ADR-021-turul-a2a-patterns-extraction.md) — agent role patterns: generic-only, no vendor lock-in.
-- [ADR-021 §2.2 item 3](../../docs/adr/ADR-021-turul-a2a-patterns-extraction.md) — SKILL.md manifest authoring shape.
+- [ADR-021](../../docs/adr/ADR-021-turul-a2a-patterns-extraction.md) — SKILL.md manifest authoring shape.
 - `examples/agent-role-planner-router-agent` — sibling example showing the
   planner + router idiom with the same `SkillRegistry`/`SkillHandler`
   shape.

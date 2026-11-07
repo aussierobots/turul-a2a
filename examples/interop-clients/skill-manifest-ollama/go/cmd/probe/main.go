@@ -22,7 +22,7 @@ const (
 	expectedProtocolVersion = "1.0"
 
 	// greetPayload is the JSON the manifest's `greet` skill expects.
-	// Matches the SKILL.md inputSchema: {user:{name:string}, style:enum}.
+	// Matches the skill's input schema: {user:{name:string}, style:enum}.
 	greetPayload = `{"user":{"name":"Ada"},"style":"formal"}`
 )
 

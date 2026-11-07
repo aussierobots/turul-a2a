@@ -39,9 +39,39 @@ use turul_a2a_types::{Artifact, Message, Part, Task};
 const DEFAULT_BIND_PORT: u16 = 3015;
 
 // Manifests embedded so the binary is self-contained; the source files
-// under `skills/<id>/SKILL.md` are the canonical reference for adopters.
-const ECHO_LOUD_MANIFEST: &str = include_str!("../skills/echo_loud/SKILL.md");
-const REVERSE_MANIFEST: &str = include_str!("../skills/reverse/SKILL.md");
+// under `skills/<name>/` are the canonical reference for adopters.
+fn echo_loud_card() -> Result<SkillCard, turul_a2a_patterns::ManifestError> {
+    SkillCard::from_embedded(
+        "echo-loud",
+        include_str!("../skills/echo-loud/SKILL.md"),
+        &[
+            (
+                "assets/input.schema.json",
+                include_str!("../skills/echo-loud/assets/input.schema.json"),
+            ),
+            (
+                "assets/output.schema.json",
+                include_str!("../skills/echo-loud/assets/output.schema.json"),
+            ),
+        ],
+    )
+}
+fn reverse_card() -> Result<SkillCard, turul_a2a_patterns::ManifestError> {
+    SkillCard::from_embedded(
+        "reverse",
+        include_str!("../skills/reverse/SKILL.md"),
+        &[
+            (
+                "assets/input.schema.json",
+                include_str!("../skills/reverse/assets/input.schema.json"),
+            ),
+            (
+                "assets/output.schema.json",
+                include_str!("../skills/reverse/assets/output.schema.json"),
+            ),
+        ],
+    )
+}
 
 // ---------------------------------------------------------------------------
 // EventSink bridge. Local newtype so we can `impl SkillProgressSink`
@@ -182,10 +212,8 @@ struct DispatcherExecutor {
 
 impl DispatcherExecutor {
     async fn build() -> Result<Self, Box<dyn std::error::Error>> {
-        let echo_card = SkillCard::parse(ECHO_LOUD_MANIFEST)
-            .map_err(|e| format!("parse echo_loud SKILL.md: {e}"))?;
-        let reverse_card = SkillCard::parse(REVERSE_MANIFEST)
-            .map_err(|e| format!("parse reverse SKILL.md: {e}"))?;
+        let echo_card = echo_loud_card().map_err(|e| format!("parse echo_loud SKILL.md: {e}"))?;
+        let reverse_card = reverse_card().map_err(|e| format!("parse reverse SKILL.md: {e}"))?;
 
         let echo_agent_skill = echo_card.to_agent_skill();
         let reverse_agent_skill = reverse_card.to_agent_skill();
@@ -449,7 +477,7 @@ mod unit {
 
     #[test]
     fn echo_loud_manifest_parses() {
-        let card = SkillCard::parse(ECHO_LOUD_MANIFEST).expect("echo_loud SKILL.md parses");
+        let card = echo_loud_card().expect("echo_loud SKILL.md parses");
         assert_eq!(card.id, "echo_loud");
         assert!(card.input_schema.is_some());
         assert!(card.output_schema.is_some());
@@ -457,7 +485,7 @@ mod unit {
 
     #[test]
     fn reverse_manifest_parses() {
-        let card = SkillCard::parse(REVERSE_MANIFEST).expect("reverse SKILL.md parses");
+        let card = reverse_card().expect("reverse SKILL.md parses");
         assert_eq!(card.id, "reverse");
         assert!(card.input_schema.is_some());
         assert!(card.output_schema.is_some());

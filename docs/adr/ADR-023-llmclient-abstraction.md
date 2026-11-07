@@ -374,7 +374,7 @@ pub type LlmFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 ///   supports; it MUST NOT loosen what the caller's schema declares.
 ///
 /// The caller's `provider_config` is the opaque `serde_json::Value`
-/// from the `SkillCard` manifest's `provider_config:` frontmatter block
+/// from the JSON file the skill's `a2a-provider-config` metadata names
 /// (ADR-021 §2.2 item 3). The adapter reads vendor-specific keys from
 /// this value (model identifier, endpoint URL, format hints). Callers
 /// that do not use `SkillCard` manifests may supply any `Value::Object`
@@ -529,7 +529,7 @@ ADR-021 §2.4 was written to prevent. Rejected without reopening ADR-021.
   `turul-llm-*`; only the example does. Versioned crates.io migration
   was gated on `turul-llm`'s first stable release — see rev 4 below.
 
-- **rev 4 (2026-05-23, current)** — `turul-llm-core`, `turul-llm-ollama`,
+- **rev 4 (2026-05-23)** — `turul-llm-core`, `turul-llm-ollama`,
   and `turul-llm-openai` published to crates.io at v0.1.0. The
   workspace dep declarations in `Cargo.toml` swapped from
   `{ git = "...", rev = "..." }` to versioned `"0.1"` requirements.
@@ -538,3 +538,4 @@ ADR-021 §2.4 was written to prevent. Rejected without reopening ADR-021.
   without requiring a sibling checkout on disk. The provider-neutral
   invariant is unchanged: only `examples/skill-manifest-ollama-agent`
   consumes `turul-llm-*`; no publishable `turul-a2a` crate does.
+- **rev 5 (2026-11-07, current)** — `provider_config` now comes from the JSON file named by the skill's `a2a-provider-config` metadata key (ADR-021 SKILL.md amendment); the adapter contract is unchanged.

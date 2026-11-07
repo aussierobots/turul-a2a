@@ -3,7 +3,7 @@
 //!
 //! Shape:
 //! 1. Two manifest-backed skills are registered in an
-//!    `InMemorySkillRegistry` via `SkillCard::parse` + `register_manifest`:
+//!    `InMemorySkillRegistry` via `SkillCard::from_embedded` + `register_manifest`:
 //!    - `add` — sums two numbers (`skills/add/SKILL.md`).
 //!    - `concat` — joins an array of strings (`skills/concat/SKILL.md`).
 //! 2. A small **planner** inspects inbound text and decomposes it into a
@@ -39,10 +39,40 @@ use turul_a2a_types::{Artifact, Message, Part, Task};
 const DEFAULT_BIND_PORT: u16 = 3012;
 
 // SKILL.md manifests shipped with the example. Embedded so the binary is
-// self-contained; the source files under `skills/<id>/SKILL.md` are the
+// self-contained; the source files under `skills/<name>/` are the
 // canonical reference for adopters.
-const ADD_MANIFEST: &str = include_str!("../skills/add/SKILL.md");
-const CONCAT_MANIFEST: &str = include_str!("../skills/concat/SKILL.md");
+fn add_card() -> Result<SkillCard, turul_a2a_patterns::ManifestError> {
+    SkillCard::from_embedded(
+        "add",
+        include_str!("../skills/add/SKILL.md"),
+        &[
+            (
+                "assets/input.schema.json",
+                include_str!("../skills/add/assets/input.schema.json"),
+            ),
+            (
+                "assets/output.schema.json",
+                include_str!("../skills/add/assets/output.schema.json"),
+            ),
+        ],
+    )
+}
+fn concat_card() -> Result<SkillCard, turul_a2a_patterns::ManifestError> {
+    SkillCard::from_embedded(
+        "concat",
+        include_str!("../skills/concat/SKILL.md"),
+        &[
+            (
+                "assets/input.schema.json",
+                include_str!("../skills/concat/assets/input.schema.json"),
+            ),
+            (
+                "assets/output.schema.json",
+                include_str!("../skills/concat/assets/output.schema.json"),
+            ),
+        ],
+    )
+}
 
 // ---------------------------------------------------------------------------
 // EventSink bridge. Local newtype so we can `impl SkillProgressSink`
@@ -298,10 +328,8 @@ struct PlannerRouterExecutor {
 
 impl PlannerRouterExecutor {
     async fn build() -> Result<Self, Box<dyn std::error::Error>> {
-        let add_card =
-            SkillCard::parse(ADD_MANIFEST).map_err(|e| format!("parse add SKILL.md: {e}"))?;
-        let concat_card =
-            SkillCard::parse(CONCAT_MANIFEST).map_err(|e| format!("parse concat SKILL.md: {e}"))?;
+        let add_card = add_card().map_err(|e| format!("parse add SKILL.md: {e}"))?;
+        let concat_card = concat_card().map_err(|e| format!("parse concat SKILL.md: {e}"))?;
 
         // Project the discovery surfaces (eight AgentSkill fields) BEFORE
         // registration consumes the cards.
@@ -498,7 +526,7 @@ mod unit {
 
     #[test]
     fn add_manifest_parses() {
-        let card = SkillCard::parse(ADD_MANIFEST).expect("add SKILL.md parses");
+        let card = add_card().expect("add SKILL.md parses");
         assert_eq!(card.id, "add");
         assert!(card.input_schema.is_some());
         assert!(card.output_schema.is_some());
@@ -508,7 +536,7 @@ mod unit {
 
     #[test]
     fn concat_manifest_parses() {
-        let card = SkillCard::parse(CONCAT_MANIFEST).expect("concat SKILL.md parses");
+        let card = concat_card().expect("concat SKILL.md parses");
         assert_eq!(card.id, "concat");
         assert!(card.input_schema.is_some());
         assert!(card.output_schema.is_some());

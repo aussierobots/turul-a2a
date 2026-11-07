@@ -1,27 +1,14 @@
 ---
-id: concat
-name: Concat
+name: concat
 description: Join an array of strings with single spaces.
-tags: [demo, strings]
-examples:
-  - "concat: foo bar baz"
-inputModes: [application/json]
-outputModes: [application/json]
-securityRequirements: []
-inputSchema:
-  $schema: "https://json-schema.org/draft/2020-12/schema"
-  type: object
-  properties:
-    strings:
-      type: array
-      items: { type: string }
-  required: [strings]
-outputSchema:
-  $schema: "https://json-schema.org/draft/2020-12/schema"
-  type: object
-  properties:
-    joined: { type: string }
-  required: [joined]
+metadata:
+  a2a-examples: '["concat: foo bar baz"]'
+  a2a-input-modes: '["application/json"]'
+  a2a-input-schema: assets/input.schema.json
+  a2a-name: Concat
+  a2a-output-modes: '["application/json"]'
+  a2a-output-schema: assets/output.schema.json
+  a2a-tags: '["demo","strings"]'
 ---
 Joins the provided strings with single spaces and returns the result.
 

@@ -19,7 +19,8 @@ The agent exposes two **manifest-backed** skills:
    - Input: `{"n": <integer>}`
    - Output: `{"squared": <integer>}`
    - Implementation: pure Rust (`n * n`). The SKILL.md drives both the
-     advertised `AgentSkill` and the input/output JSON Schema validation.
+     advertised `AgentSkill` and the input/output JSON Schema validation
+     (schemas in `skills/count/assets/`).
 
 2. **`metrics`** — `skills/metrics/SKILL.md`
    - Input: `{}` (no input)
@@ -271,9 +272,10 @@ auth dependency. The smoke test is hermetic.
 - **Concurrent counter reads under heavy load** — `AtomicU64` is
   `Relaxed`, so reads may observe slightly stale values. That is fine for
   a demo counter and is documented as a known trade-off.
-- **Manifest parse error at startup** — the embedded `SKILL.md` files must
-  round-trip through `SkillCard::parse`. The build-time embedded
-  manifests run a parse test (`cargo test -p post-task-hook-agent`) so a
+- **Manifest load error at startup** — the embedded `SKILL.md` files and
+  their `assets/` JSON must load through `SkillCard::from_embedded`
+  (`turul-skills validate skills/<name>` checks them standalone). The
+  embedded manifests run a load test (`cargo test -p post-task-hook-agent`) so a
   regression is caught before the binary ships.
 
 ## Troubleshooting
@@ -298,7 +300,7 @@ network access.
 ## References
 
 - [ADR-021 §9 Q5](../../docs/adr/ADR-021-turul-a2a-patterns-extraction.md) — TerminalHook minimal-generic variant (no extractor-registry, no framework-side isolation in v1).
-- [ADR-021 §2.2 item 3](../../docs/adr/ADR-021-turul-a2a-patterns-extraction.md) — SKILL.md manifest authoring shape.
+- [ADR-021](../../docs/adr/ADR-021-turul-a2a-patterns-extraction.md) — SKILL.md manifest authoring shape.
 - [ADR-022](../../docs/adr/ADR-022-skill-invocation-dispatcher-profile.md) — Skill-invocation dispatcher profile; owns the deeper isolation / extractor-registry questions parked from ADR-021.
 - `crates/turul-a2a-patterns/src/hook.rs` — the `TerminalHook` /
   `SkillOutcome` trait surface.

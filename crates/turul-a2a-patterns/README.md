@@ -1,7 +1,7 @@
 # turul-a2a-patterns
 
 Reusable abstractions for **A2A skill authoring** — handler trait,
-registry, SKILL.md manifest parser, progress sink, terminal hook,
+registry, SKILL.md manifest loader, progress sink, terminal hook,
 JSON Schema validation helper.
 
 > **Status:** published on crates.io alongside the other `turul-a2a-*`
@@ -33,7 +33,7 @@ ADR-021 §1.2).
 | `SkillHandler` | Async trait. Adopter impls write `async fn run(&self, params, sink) -> Result<Value, SkillError>`. `#[async_trait]`. |
 | `SkillProgressSink` + `ProgressState` + `SinkError` | Trait the handler emits status updates and artifacts through during execution. `ProgressState` is `#[non_exhaustive]` and contains only **non-terminal** states (`Working`, `InputRequired`, `AuthRequired`) — terminal commits are framework-owned. `SinkError::{Closed, Backend(String)}` for best-effort failure semantics. `#[async_trait]`. |
 | `SkillRegistry` + `InMemorySkillRegistry` | Maps `AgentSkill.id` → `SkillHandler`. In-memory impl is the default; alternative impls (e.g. dynamic discovery) are adopter-owned. |
-| `SkillCard` + `ExecutionHints` | SKILL.md manifest type: three-section frontmatter (AgentSkill discovery fields / provider-neutral execution metadata / opaque `providerConfig`) plus markdown body. `SkillCard::parse(text)` is the only constructor (no `Deserialize`); it rejects unsupported keywords and uncompilable schemas. `validate_input` / `validate_output` use [`validate_json`]. `to_agent_skill()` projects to the proto `AgentSkill`. |
+| `SkillCard` + `ExecutionHints` | SKILL.md manifest type built from Agent Skills frontmatter plus `a2a-*` metadata keys and a markdown body. Constructors (no `Deserialize`): `SkillCard::from_embedded(dir_name, skill_md, &[(asset_path, asset_text)])` for `include_str!`-embedded skills, and `SkillCard::from_skill(&Skill, reader)` / `SkillCard::try_from(&skill)` for skills loaded from disk. They reject unknown `a2a-*` keys, unsupported schema keywords and uncompilable schemas. `validate_input` / `validate_output` use [`validate_json`]. `to_agent_skill()` projects to the proto `AgentSkill`. |
 | `SkillDescriptor` | Introspection struct (`id`, `card`, `params_schema`). **Single source of truth** for the schema: for manifest-backed skills, derived from the manifest; for programmatic skills, supplied once at registration. Never adopter-fillable independently. |
 | `SkillError` | Two variants only: `InvalidRequest(String)` (maps to A2A `InvalidRequest`) and `Internal(String)` (maps to A2A `Internal`). |
 | `TerminalHook` + `SkillOutcome` | Post-execution observer fired by adopter dispatch code when `SkillHandler::run` returns. Best-effort (return type `()`). `SkillOutcome::{Success(&Value), Failure(&SkillError)}` (`#[non_exhaustive]`). Minimal generic variant only — richer extractor-registry / isolation semantics remain deferred (ADR-021 §9 Q5). `#[async_trait]`. |
@@ -41,65 +41,70 @@ ADR-021 §1.2).
 
 ## SKILL.md format
 
-A portable, LLM-friendly skill manifest. The three-section frontmatter
-is camelCase (`#[serde(rename_all = "camelCase")]`, no snake_case
-aliases). Body is an opaque template string consumed by prompt
-rendering (or human-readable instructions, for non-LLM skills).
+SKILL.md follows the [Agent Skills](https://agentskills.io) spec. The
+format and its loader are owned by the external `turul-agent-skills`
+crate (`load(dir)`, `load_str(dir_name, text)`, and the
+`turul-skills validate <dir>` CLI). The frontmatter has only `name`
+(must equal the directory name, lowercase-hyphen), `description` and
+`metadata` (string to string). The body is an opaque template string
+consumed by prompt rendering (or human-readable instructions, for
+non-LLM skills). A2A fields live in `metadata` under `a2a-*` keys:
 
-```yaml
-# Section 1: AgentSkill discovery fields (always required)
-id: greet
-name: Greet
+```markdown
+---
+name: greet
 description: Greet a named user in a chosen style.
-tags: [demo, greeting]
-examples: ["Greet Ada formally"]
-inputModes: [application/json]
-outputModes: [application/json]
-securityRequirements: []        # scheme-name strings; ADR-021 §2.2 item 3
+metadata:
+  a2a-examples: '["Greet Ada in a formal tone","Casually greet Grace"]'
+  a2a-input-modes: '["text/plain","application/json"]'
+  a2a-input-schema: assets/input.schema.json
+  a2a-max-tokens: '128'
+  a2a-name: Greet
+  a2a-output-modes: '["application/json"]'
+  a2a-output-schema: assets/output.schema.json
+  a2a-provider-config: assets/provider-config.json
+  a2a-tags: '["demo","greeting","ollama"]'
+  a2a-temperature: '0.2'
+  a2a-top-p: '0.9'
+---
+You are a courteous assistant. Greet the user named "{{ user.name }}" in a {{ style }} tone.
 
-# Section 2: provider-neutral execution metadata (optional — LLM-backed)
-inputSchema:                    # JSON Schema 2020-12
-  type: object
-  properties:
-    user: { type: object, properties: { name: { type: string } }, required: [name] }
-    style: { type: string, enum: [formal, casual], default: casual }
-  required: [user]
-outputSchema:
-  type: object
-  properties:
-    greeting: { type: string, minLength: 1 }
-  required: [greeting]
-executionHints:                 # optional, only meaningful for LLM-backed
-  maxTokens: 128
-  temperature: 0.2
-  topP: 0.9
-
-# Section 3: opaque provider_config block (optional — vendor-specific)
-providerConfig:
-  vendor: ollama
-  model: "llama3.1"
-  endpoint: "/api/chat"
-  format: json
+Respond with a single JSON object matching the output schema, e.g. `{"greeting": "..."}`.
 ```
 
-The patterns crate **does not interpret** `providerConfig`. Adopter
+| `metadata` key | Value | Maps to |
+|---|---|---|
+| `a2a-id` | string | wire skill id when it differs from `name` |
+| `a2a-name` | string | display name |
+| `a2a-tags`, `a2a-examples`, `a2a-input-modes`, `a2a-output-modes`, `a2a-security-requirements` | compact JSON array string; empty list = key omitted | matching `AgentSkill` fields |
+| `a2a-max-tokens`, `a2a-temperature`, `a2a-top-p` | decimal string | `ExecutionHints` |
+| `a2a-input-schema`, `a2a-output-schema`, `a2a-provider-config` | relative path to a JSON file under `assets/` | JSON Schema 2020-12 input / output schema; opaque provider config |
+
+Unknown `a2a-*` keys are rejected; other metadata keys are ignored.
+Errors are `ManifestError::Parse { location: "metadata.<key>" | "SKILL.md", .. }`
+and `ManifestError::Schema { location: "metadata.a2a-input-schema" | "metadata.a2a-output-schema", .. }`.
+
+The patterns crate **does not interpret** the provider config. Adopter
 code reads it to drive the actual model call. For non-LLM skills
-(Rust-native handlers, MCP-tool-backed, deterministic logic), omit
-sections 2 and 3 entirely and use the manifest only for discovery
+(Rust-native handlers, MCP-tool-backed, deterministic logic), omit the
+execution and provider keys and use the manifest only for discovery
 metadata + I/O schemas.
 
 ## Trust model — security boundary
 
-The parser treats SKILL.md as a **trusted static manifest + static
+The loader treats SKILL.md as a **trusted static manifest + static
 prompt template**. Concretely it MUST NOT:
 
 - Execute shell commands or evaluate code in any field.
 - Resolve `!include`-style directives or load arbitrary support files.
+  Asset paths must be relative and inside the skill directory (no `..`,
+  no absolute paths), and nothing is read other than the files named by
+  `a2a-input-schema`, `a2a-output-schema` and `a2a-provider-config`.
 - Interpret command-injection syntax or MCP tool references.
 - Make outbound network calls during parsing.
 
 Adopters that need richer manifest semantics extend the format under
-a successor ADR — not by side-channel features in the parser.
+a successor ADR — not by side-channel features in the loader.
 
 ## Contracts (load-bearing for stable tests)
 
@@ -109,7 +114,7 @@ a successor ADR — not by side-channel features in the parser.
 - **Variable resolution**: missing variables produce a structured
   `RenderError`. Never silent empty substitution.
 - **JSON Schema dialect**: JSON Schema 2020-12 (strict).
-- **Unsupported JSON Schema keywords**: rejected at parse time, not
+- **Unsupported JSON Schema keywords**: rejected at load time, not
   silently ignored.
 - **Error reporting**: structured (`location`, `reason`) for both
   schema validation and template rendering.
@@ -154,7 +159,15 @@ impl SkillHandler for Greet {
 }
 
 async fn build_agent() -> Result<Arc<dyn SkillRegistry>, Box<dyn std::error::Error>> {
-    let card = SkillCard::parse(include_str!("../skills/demo/SKILL.md"))?;
+    let card = SkillCard::from_embedded(
+        "greet",
+        include_str!("../skills/greet/SKILL.md"),
+        &[
+            ("assets/input.schema.json", include_str!("../skills/greet/assets/input.schema.json")),
+            ("assets/output.schema.json", include_str!("../skills/greet/assets/output.schema.json")),
+            ("assets/provider-config.json", include_str!("../skills/greet/assets/provider-config.json")),
+        ],
+    )?;
     let handler = Arc::new(Greet { card: card.clone() });
 
     let registry = Arc::new(InMemorySkillRegistry::default());
@@ -202,7 +215,7 @@ src/
 ├── sink.rs         # SkillProgressSink, ProgressState
 ├── handler.rs      # SkillHandler trait
 ├── registry.rs     # SkillRegistry, InMemorySkillRegistry, SkillDescriptor
-├── manifest.rs     # SkillCard, ExecutionHints, SKILL.md parser + AgentSkill projection
+├── manifest.rs     # SkillCard, ExecutionHints, SKILL.md loader + AgentSkill projection
 ├── template.rs     # prompt rendering
 ├── schema.rs       # validate_json, Draft-2020-12 strict-keyword check
 └── hook.rs         # TerminalHook, SkillOutcome
@@ -211,7 +224,7 @@ src/
 ## Testing
 
 ```bash
-cargo test -p turul-a2a-patterns      # 26 tests across 8 test files
+cargo test -p turul-a2a-patterns      # projection, registry, sink and hook tests
 ```
 
 ## Not in scope

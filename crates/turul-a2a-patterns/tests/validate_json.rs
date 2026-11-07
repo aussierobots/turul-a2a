@@ -1,6 +1,6 @@
 //! Public `validate_json` free function.
 //!
-//! `SkillCard::parse` is the only way to obtain a `SkillCard`, so
+//! A `SkillCard` is only obtained from a loaded SKILL.md, so
 //! validating an arbitrary `(schema, instance)` pair through the card
 //! would need a SKILL.md document. The free function exposes the same
 //! JSON Schema 2020-12 validator, with the same strict-keyword check,

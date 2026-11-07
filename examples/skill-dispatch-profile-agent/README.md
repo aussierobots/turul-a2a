@@ -123,7 +123,7 @@ A2A-Extensions: https://turul.dev/a2a/extensions/skill-invocation/v1
 ```
 
 The artifact's text part is a JSON object that satisfies the skill's
-`outputSchema` (see `skills/<id>/SKILL.md`).
+output schema (see `skills/<name>/assets/output.schema.json`).
 
 ## How the profile activates
 
@@ -247,7 +247,7 @@ Working end-to-end at
 | Activation header missing and extension is `required = true` | Transport returns `ExtensionSupportRequiredError` (HTTP 400 / JSON-RPC `-32008` / gRPC `FAILED_PRECONDITION`). |
 | Activation header set but `a2a.skillId` metadata absent (or not a string) | The framework rejects the request with `InvalidParamsError` (HTTP 400 / JSON-RPC `-32602`) before the executor runs. |
 | `a2a.skillId` references an unregistered skill | The executor errors; the task ends `Failed` with a status message citing the unknown id. |
-| `a2a.skillParams` violates the skill's `inputSchema` | `SkillHandler` returns `SkillError::InvalidRequest`; the task ends `Failed` with the validation reason. |
+| `a2a.skillParams` violates the skill's input schema | `SkillHandler` returns `SkillError::InvalidRequest`; the task ends `Failed` with the validation reason. |
 
 ## Layout
 
@@ -257,8 +257,12 @@ examples/skill-dispatch-profile-agent/
 ├── README.md
 ├── src/main.rs               # executor + dispatcher
 ├── skills/
-│   ├── echo_loud/SKILL.md    # uppercases input
-│   └── reverse/SKILL.md      # reverses input
+│   ├── echo-loud/            # wire id `echo_loud` (metadata a2a-id)
+│   │   ├── SKILL.md          # uppercases input
+│   │   └── assets/           # input/output JSON Schemas
+│   └── reverse/
+│       ├── SKILL.md          # reverses input
+│       └── assets/
 └── tests/
     └── smoke.rs              # offline end-to-end smoke
 ```

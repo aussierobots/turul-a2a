@@ -15,9 +15,10 @@
 //!   (non-terminal states only; terminals come from the handler's
 //!   return value).
 //! - Terminal hook: [`TerminalHook`] + [`SkillOutcome`].
-//! - SKILL.md manifest: [`SkillCard`] (parse, validate_input,
-//!   validate_output, render_prompt, to_agent_skill) +
-//!   [`ExecutionHints`].
+//! - SKILL.md projection: [`SkillCard`] (`from_embedded`, `from_skill`, `TryFrom<&Skill>`,
+//!   validate_input, validate_output, render_prompt, to_agent_skill) +
+//!   [`ExecutionHints`]. `turul-agent-skills` loads and validates the
+//!   `SKILL.md`; this crate reads its `a2a-*` metadata and asset files.
 //! - Registry: [`SkillRegistry`] trait + [`InMemorySkillRegistry`] +
 //!   [`SkillDescriptor`].
 //! - Schema validation: [`validate_json`] (JSON Schema 2020-12

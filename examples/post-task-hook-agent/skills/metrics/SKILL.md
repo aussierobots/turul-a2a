@@ -1,26 +1,14 @@
 ---
-id: metrics
-name: Metrics
+name: metrics
 description: Report the running TerminalHook counter state (read-only).
-tags: [demo, observability]
-examples:
-  - "metrics"
-inputModes: [application/json]
-outputModes: [application/json]
-securityRequirements: []
-inputSchema:
-  $schema: "https://json-schema.org/draft/2020-12/schema"
-  type: object
-  properties: {}
-outputSchema:
-  $schema: "https://json-schema.org/draft/2020-12/schema"
-  type: object
-  properties:
-    success: { type: integer }
-    failure: { type: integer }
-    last:
-      type: [string, "null"]
-  required: [success, failure, last]
+metadata:
+  a2a-examples: '["metrics"]'
+  a2a-input-modes: '["application/json"]'
+  a2a-input-schema: assets/input.schema.json
+  a2a-name: Metrics
+  a2a-output-modes: '["application/json"]'
+  a2a-output-schema: assets/output.schema.json
+  a2a-tags: '["demo","observability"]'
 ---
 Returns the running outcome counter populated by the example's
 `RecordingHook`: `{"success": <n>, "failure": <m>, "last": <string|null>}`.

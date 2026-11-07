@@ -18,9 +18,9 @@ surface.
 ## What this example demonstrates
 
 ```
-SKILL.md (frontmatter + body)
+SKILL.md (Agent Skills frontmatter + a2a-* metadata + body)
    │
-   │  SkillCard::parse                                (turul-a2a-patterns)
+   │  SkillCard::from_embedded                        (turul-a2a-patterns)
    ▼
 SkillCard ──► to_agent_skill ──► AgentSkill (eight discovery fields)
    │                                  │
@@ -74,7 +74,7 @@ Agent card: http://localhost:3010/.well-known/agent-card.json
 ```
 
 In another shell, send a JSON-shaped greeting. Replace the message-body
-text with a JSON string the manifest's `inputSchema` accepts:
+text with a JSON string the manifest's input schema accepts:
 
 ```sh
 curl -s -X POST http://localhost:3010/message:send \
@@ -90,7 +90,7 @@ curl -s -X POST http://localhost:3010/message:send \
 ```
 
 The response contains an artifact whose text part is a JSON object
-matching the manifest's `outputSchema`:
+matching the manifest's output schema:
 
 ```json
 {"greeting": "Good day, Ada! (offline stub)"}
@@ -107,7 +107,7 @@ client, then either start this example on `A2A_PORT=3000` (after killing
 
 Live mode flips on when either `OLLAMA_BASE_URL` is set or
 `RUN_OLLAMA_SMOKE=1` is set. The handler POSTs the rendered prompt
-plus the manifest's `outputSchema` (as Ollama's `format` field) to
+plus the manifest's output schema (as Ollama's `format` field) to
 `/api/chat` on the configured Ollama server, then validates the
 returned JSON against the manifest's output schema before it leaves
 the agent.
@@ -163,10 +163,10 @@ location + reason — by design (§2.2 item 3 of ADR-021).
 | ---------------------------------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | `address already in use` on startup                  | Another process bound `:3010`                        | Stop it, or `A2A_PORT=3011 cargo run -p skill-manifest-ollama-agent`                         |
 | `LLM call failed: LLM transport error: …`            | Live mode, but Ollama not running / wrong URL        | Start `ollama serve`, confirm `curl http://localhost:11434/api/tags` works                   |
-| `LLM call failed: LLM provider error: …`             | Ollama reached but returned non-2xx (e.g. model not pulled, bad payload) | Confirm the model is pulled (`ollama list`), check the `model` in `skills/demo/SKILL.md`'s `providerConfig` |
+| `LLM call failed: LLM provider error: …`             | Ollama reached but returned non-2xx (e.g. model not pulled, bad payload) | Confirm the model is pulled (`ollama list`), check the `model` in `skills/greet/assets/provider-config.json` |
 | `LLM call failed: LLM response did not satisfy output schema: …` | Model returned non-JSON despite `format`             | Try a different model (`llama3.1:8b-instruct`, etc.), or fall back to the offline mode       |
-| `manifest parse error …`                             | `skills/demo/SKILL.md` edited into an invalid shape  | Re-read [the three-section frontmatter](#the-skillmd-manifest); restore the camelCase keys   |
-| `inputSchema violation` on `/message:send`           | Sent JSON does not satisfy the manifest input schema | Match the schema, e.g. `{"user":{"name":"Ada"}}`                                             |
+| `manifest parse error …`                             | `skills/greet/SKILL.md` edited into an invalid shape | Re-read [the SKILL.md manifest](#the-skillmd-manifest); run `turul-skills validate skills/greet` |
+| input schema violation on `/message:send`           | Sent JSON does not satisfy the manifest input schema | Match the schema, e.g. `{"user":{"name":"Ada"}}`                                             |
 
 ## The `ExampleProgressSink` bridge
 
@@ -223,9 +223,9 @@ caught at `cargo test` time:
   `examples` block must `serde_json::from_value::<GreetInput>(_)`.
 - `typed_input_serialises_to_schema_valid_json` — a sample
   `GreetInput` must serialise to JSON that satisfies the manifest's
-  `inputSchema`.
+  input schema.
 - `typed_output_serialises_to_schema_valid_json` — same for
-  `GreetOutput` and `outputSchema`.
+  `GreetOutput` and the output schema.
 - `manifest_validates_before_struct_deserialises` — proves the
   manifest catches constraints the typed struct alone cannot (e.g.
   `user.name` `minLength: 1`, which serde happily accepts as `""`).
@@ -235,45 +235,43 @@ If you add a new example payload anywhere in this crate, add it to
 
 ## The SKILL.md manifest
 
-The canonical file is [`skills/demo/SKILL.md`](skills/demo/SKILL.md).
-The frontmatter has three sections (ADR-021 §2.2 item 3):
+The canonical file is [`skills/greet/SKILL.md`](skills/greet/SKILL.md),
+with its JSON files under `skills/greet/assets/`. Frontmatter is the
+Agent Skills spec (`name`, `description`, `metadata`); every A2A field
+is a `metadata` key prefixed `a2a-`:
 
-1. **A2A discovery fields** — `id`, `name`, `description`, `tags`,
-   `examples`, `inputModes`, `outputModes`, `securityRequirements`.
-   All camelCase. These project onto an `AgentSkill` (eight fields) and
-   appear on the agent card unchanged.
+1. **A2A discovery fields** — `a2a-name`, `a2a-tags`, `a2a-examples`,
+   `a2a-input-modes`, `a2a-output-modes`, `a2a-security-requirements`
+   (each a compact JSON array string; `a2a-id` only when the wire id
+   differs from `name`). These project onto an `AgentSkill` and appear
+   on the agent card unchanged.
 
-   **`securityRequirements` — reduced expressivity in v1 manifests
-   (per ADR-021 §2.2 item 3).** In SKILL.md, this field is a list of
-   scheme-name strings: `securityRequirements: ["bearer", "apiKey"]`.
-   The A2A proto's `AgentSkill.security_requirements` is richer —
-   each entry is a `SecurityRequirement { schemes: { name: [scopes] } }`
-   permitting per-scheme OAuth-style scopes. The SKILL.md form
-   collapses each entry to scheme-name-only; the patterns crate maps
-   each name to `SecurityRequirement { schemes: { "<name>": [] } }`
-   (empty scopes) when generating the AgentSkill. **What you lose:**
-   per-skill OAuth scopes — if your skill needs `["read", "write"]`
-   on an `oauth2` scheme, that doesn't fit the SKILL.md form yet and
-   must be configured at the agent level (per ADR-015) or
-   programmatically via `AgentSkillBuilder::security_requirements()`
-   instead of through SKILL.md. **What you keep:** scheme-name
-   *reference* into the agent-level `securitySchemes` catalogue,
-   which is the common case. A richer SKILL.md form
-   (`securityRequirements: [{"oauth2": ["read", "write"]}]`) can be
-   added as a non-breaking extension if adopter demand justifies it
-   — the simple list form remains valid.
+   **`a2a-security-requirements` — reduced expressivity.** The value is
+   a list of scheme-name strings: `'["bearer","apiKey"]'`. The A2A
+   proto's `AgentSkill.security_requirements` is richer — each entry is
+   a `SecurityRequirement { schemes: { name: [scopes] } }` permitting
+   per-scheme OAuth-style scopes. The manifest form collapses each entry
+   to scheme-name-only; the patterns crate maps each name to
+   `SecurityRequirement { schemes: { "<name>": [] } }` (empty scopes).
+   **What you lose:** per-skill OAuth scopes — configure those at the
+   agent level or programmatically via
+   `AgentSkillBuilder::security_requirements()`. **What you keep:**
+   scheme-name *reference* into the agent-level `securitySchemes`
+   catalogue, which is the common case.
 
-2. **Provider-neutral execution metadata** — `inputSchema` and
-   `outputSchema` (JSON Schema 2020-12), `executionHints` with
-   `maxTokens` / `temperature` / `topP`. The schemas are Turul-local
-   planning metadata: they are not on the A2A wire, but `turul-a2a-patterns`
-   uses them to validate every invocation's input and output.
+2. **Provider-neutral execution metadata** — `a2a-input-schema` and
+   `a2a-output-schema` (paths to JSON Schema 2020-12 files under
+   `assets/`), plus `a2a-max-tokens` / `a2a-temperature` / `a2a-top-p`
+   (decimal strings). The schemas are Turul-local planning metadata:
+   they are not on the A2A wire, but `turul-a2a-patterns` uses them to
+   validate every invocation's input and output.
 
-3. **Opaque `providerConfig:` block** — anything the patterns crate
-   should NOT interpret. This example puts Ollama-specific keys here
-   (`model`, `endpoint`, `format`, `options`). The handler reads from
-   `card.provider_config` directly; the patterns crate treats the
-   block as an opaque `serde_json::Value`.
+3. **Opaque provider config** — `a2a-provider-config` points at
+   `assets/provider-config.json`, which the patterns crate does NOT
+   interpret. This example puts Ollama-specific keys there (`model`,
+   `endpoint`, `format`, `options`). The handler reads
+   `card.provider_config` directly; the patterns crate treats it as an
+   opaque `serde_json::Value`.
 
 ## Tests
 

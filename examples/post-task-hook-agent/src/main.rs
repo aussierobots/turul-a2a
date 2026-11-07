@@ -48,11 +48,41 @@ use turul_a2a_types::{Artifact, Message, Part, Task};
 const DEFAULT_BIND_PORT: u16 = 3014;
 
 /// `count` SKILL.md, embedded so the binary is self-contained. The source
-/// file under `skills/count/SKILL.md` is the canonical reference.
-const COUNT_MANIFEST: &str = include_str!("../skills/count/SKILL.md");
+/// files under `skills/count/` are the canonical reference.
+fn count_card() -> Result<SkillCard, turul_a2a_patterns::ManifestError> {
+    SkillCard::from_embedded(
+        "count",
+        include_str!("../skills/count/SKILL.md"),
+        &[
+            (
+                "assets/input.schema.json",
+                include_str!("../skills/count/assets/input.schema.json"),
+            ),
+            (
+                "assets/output.schema.json",
+                include_str!("../skills/count/assets/output.schema.json"),
+            ),
+        ],
+    )
+}
 
 /// `metrics` SKILL.md, embedded for the same reason.
-const METRICS_MANIFEST: &str = include_str!("../skills/metrics/SKILL.md");
+fn metrics_card() -> Result<SkillCard, turul_a2a_patterns::ManifestError> {
+    SkillCard::from_embedded(
+        "metrics",
+        include_str!("../skills/metrics/SKILL.md"),
+        &[
+            (
+                "assets/input.schema.json",
+                include_str!("../skills/metrics/assets/input.schema.json"),
+            ),
+            (
+                "assets/output.schema.json",
+                include_str!("../skills/metrics/assets/output.schema.json"),
+            ),
+        ],
+    )
+}
 
 // ---------------------------------------------------------------------------
 // EventSink bridge. Local newtype so we can `impl SkillProgressSink`
@@ -262,7 +292,7 @@ fn plan(text: &str) -> PlanStep {
     let trimmed = text.trim();
 
     // "metrics" (any case) → metrics skill, no params (empty object
-    // matches the manifest's empty inputSchema).
+    // matches the skill's empty input schema).
     if trimmed.eq_ignore_ascii_case("metrics") {
         return PlanStep {
             skill_id: "metrics".to_string(),
@@ -308,8 +338,8 @@ impl HookAgent {
     async fn build() -> Result<Self, Box<dyn std::error::Error>> {
         let counter = Arc::new(OutcomeCounter::new());
 
-        let count_card = SkillCard::parse(COUNT_MANIFEST)?;
-        let metrics_card = SkillCard::parse(METRICS_MANIFEST)?;
+        let count_card = count_card()?;
+        let metrics_card = metrics_card()?;
         let count_agent_skill = count_card.to_agent_skill();
         let metrics_agent_skill = metrics_card.to_agent_skill();
 
@@ -497,7 +527,7 @@ mod unit {
 
     #[test]
     fn count_manifest_parses() {
-        let card = SkillCard::parse(COUNT_MANIFEST).expect("count manifest parses");
+        let card = count_card().expect("count manifest parses");
         assert_eq!(card.id, "count");
         assert!(card.input_schema.is_some());
         assert!(card.output_schema.is_some());
@@ -505,7 +535,7 @@ mod unit {
 
     #[test]
     fn metrics_manifest_parses() {
-        let card = SkillCard::parse(METRICS_MANIFEST).expect("metrics manifest parses");
+        let card = metrics_card().expect("metrics manifest parses");
         assert_eq!(card.id, "metrics");
         assert!(card.input_schema.is_some());
         assert!(card.output_schema.is_some());
