@@ -21,9 +21,9 @@ Item 5 has additional context that came in during the 0.1.20 cycle: downstream c
 
 Conducted across three first-party consumer repos for the 0.1.20 release planning:
 
-- **sw-authoriser / sw-station-monitor / sw-device-monitor** — auth delegated to APIGW Lambda authoriser; `BearerMiddleware` is not mounted; `InboundCredentialMiddleware` implements `A2aMiddleware` for credential forwarding per ADR-0005 / ADR-0035.
-- **sv-receiver-server** — uses `LambdaAuthorizerMiddleware`; implements custom `A2aMiddleware`; `MiddlewareError` used as opaque return type only.
-- **Agentic RAG / KG (ASX A2A)** — depends on `turul-a2a = "0.1"` for executor/storage/client surfaces only; no middleware wiring.
+- **Consumer A (three services)** — auth delegated to an API Gateway Lambda authoriser; `BearerMiddleware` is not mounted; a custom `A2aMiddleware` forwards inbound credentials.
+- **Consumer B** — uses `LambdaAuthorizerMiddleware`; implements custom `A2aMiddleware`; `MiddlewareError` used as opaque return type only.
+- **Consumer C** — depends on `turul-a2a = "0.1"` for executor/storage/client surfaces only; no middleware wiring.
 
 Per-item impact:
 
@@ -32,8 +32,8 @@ Per-item impact:
 | #1 Drop `bearer_token` field | none | yes |
 | #2 Drop `extensions` field | none | yes |
 | #3 Reshape `Internal` variant | none | yes |
-| #4 Rename `A2aMiddleware` | sw-station-monitor, sw-device-monitor, sv-receiver-server (all implement the trait) | **no — defer indefinitely** |
-| #5 `compat-v03` feature → runtime config | sw-* and sv-receiver-server depend on the feature flag | **no — off the table** |
+| #4 Rename `A2aMiddleware` | Consumer A (two of its services) and Consumer B (all implement the trait) | **no — defer indefinitely** |
+| #5 `compat-v03` feature → runtime config | Consumers A and B depend on the feature flag | **no — off the table** |
 
 ## Decision
 
@@ -45,7 +45,7 @@ Per-item impact:
 
 ### Explicitly deferred or off the table
 
-4. **`A2aMiddleware` trait rename.** Deferred indefinitely. The trait is implemented by ADR-mandated patterns in downstream repos (`InboundCredentialMiddleware` for credential forwarding); a rename would break load-bearing infrastructure across multiple consumers. Revisit only if a concrete non-auth middleware adopter appears whose use case the current name actively misleads. The 0.1.20 documentation tightening on the trait and module satisfies the truth-in-naming concern for now.
+4. **`A2aMiddleware` trait rename.** Deferred indefinitely. The trait is implemented by ADR-mandated patterns in downstream repos (a custom `A2aMiddleware` that forwards inbound credentials); a rename would break load-bearing infrastructure across multiple consumers. Revisit only if a concrete non-auth middleware adopter appears whose use case the current name actively misleads. The 0.1.20 documentation tightening on the trait and module satisfies the truth-in-naming concern for now.
 5. **`compat-v03` feature → runtime config.** Off the table. Downstream deployment-contract dependency on the feature flag (compile-time guarantee, Python `a2a-sdk` / Strands interop) outweighs the runtime-flexibility benefit. The feature stays as a Cargo feature for the foreseeable future.
 
 ### Migration guidance for 0.2.0
@@ -95,3 +95,4 @@ Until then 0.1.x continues with non-breaking adds and runtime alignment fixes.
 ## Revision log
 
 - 2026-10-23 — Wire references restated: auth failures now carry the kind as an `ErrorInfo.reason` (`INTERNAL_ERROR` for `Internal`), per ADR-016.
+- 2026-11-07 — Downstream impact survey: consumer repositories are no longer named.

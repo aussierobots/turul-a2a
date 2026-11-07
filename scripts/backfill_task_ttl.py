@@ -19,12 +19,12 @@ For every row missing `ttl` it sets:
 
 Usage:
   # dry run (default): report counts, write nothing
-  python3 scripts/backfill_task_ttl.py --tables sw-a2a-tasks sv-a2a-tasks
+  python3 scripts/backfill_task_ttl.py --tables my-a2a-tasks other-a2a-tasks
 
   # apply
-  python3 scripts/backfill_task_ttl.py --tables sw-a2a-tasks sv-a2a-tasks --apply
+  python3 scripts/backfill_task_ttl.py --tables my-a2a-tasks other-a2a-tasks --apply
 
-  python3 scripts/backfill_task_ttl.py --tables sw-a2a-tasks --ttl-days 1 --apply
+  python3 scripts/backfill_task_ttl.py --tables my-a2a-tasks --ttl-days 1 --apply
 """
 
 import argparse
