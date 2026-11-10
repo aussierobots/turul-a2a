@@ -1,5 +1,11 @@
 # turul-a2a
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/turul/logo-dark.png">
+  <img src="docs/assets/turul/logo-light.png" alt="Turul A2A" width="600">
+</picture>
+
+
 [![crates.io](https://img.shields.io/crates/v/turul-a2a.svg)](https://crates.io/crates/turul-a2a)
 [![docs.rs](https://docs.rs/turul-a2a/badge.svg)](https://docs.rs/turul-a2a)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
@@ -142,3 +148,8 @@ Architecture rationale lives under `docs/adr/`. Per-crate READMEs cover crate-lo
 ## License
 
 MIT OR Apache-2.0
+
+## Brand artwork
+
+Turul brand artwork is © 2026 Toast Technology Pty Ltd, all rights reserved,
+and is excluded from the software licence. See the [artwork notice](docs/assets/turul/ARTWORK-NOTICE.md) and [master assets](https://github.com/aussierobots/turul-brand).
