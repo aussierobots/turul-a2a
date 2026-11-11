@@ -10,6 +10,8 @@ categories.workspace = true
 rust-version.workspace = true
 readme = "README.md"
 description = "Reusable A2A skill-authoring patterns: SKILL.md projection, SkillHandler / SkillRegistry / SkillProgressSink / TerminalHook."
+documentation = "https://docs.rs/turul-a2a-patterns"
+homepage.workspace = true
 
 [dependencies]
 turul-a2a-proto = { workspace = true }

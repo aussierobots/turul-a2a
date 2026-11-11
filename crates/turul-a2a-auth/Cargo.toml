@@ -10,6 +10,8 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 readme = "README.md"
+documentation = "https://docs.rs/turul-a2a-auth"
+homepage.workspace = true
 
 [dependencies]
 turul-a2a = { workspace = true }
