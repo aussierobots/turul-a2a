@@ -45,6 +45,7 @@ repository = "https://github.com/aussierobots/turul-a2a"
 keywords = ["a2a", "agent", "protocol", "async", "tokio"]
 categories = ["network-programming", "asynchronous", "web-programming::http-server", "api-bindings"]
 rust-version = "1.94"
+homepage = "https://aussierobots.com.au/turul-a2a.html"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
