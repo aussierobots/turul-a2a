@@ -1,54 +1,82 @@
-//! A2A Protocol v1.0 server framework.
+//! Server framework for the [A2A Protocol](https://a2a-protocol.org/) v1.0:
+//! implement one [`AgentExecutor`](executor::AgentExecutor) and
+//! [`A2aServer`] serves it over HTTP+JSON, JSON-RPC and Server-Sent Events,
+//! with task state and streaming events kept in a pluggable store.
 //!
-//! `turul-a2a` provides the server side of the [A2A
-//! Protocol](https://github.com/a2aproject/A2A): a typed
-//! [`executor::AgentExecutor`] trait, HTTP + JSON-RPC transports, Server-Sent
-//! Events streaming, and a storage abstraction with four backends
-//! (in-memory, SQLite, PostgreSQL, DynamoDB) — all proto-normative per
-//! `proto/a2a.proto`.
+//! This is the main crate for building an A2A agent. Task and message types
+//! come from [`turul-a2a-types`](https://docs.rs/turul-a2a-types); callers
+//! use [`turul-a2a-client`](https://docs.rs/turul-a2a-client).
 //!
-//! # Quick start
+//! # Example
 //!
-//! See the `examples/echo-agent` crate for a runnable end-to-end example.
-//! A minimal executor implements [`executor::AgentExecutor`] and is passed to
-//! [`A2aServer::builder()`]:
-//!
-//! ```text
-//! let server = A2aServer::builder()
-//!     .executor(MyExecutor)
-//!     .bind(([0, 0, 0, 0], 3000))
-//!     .build()?;
-//! server.run().await?;
+//! ```toml
+//! [dependencies]
+//! turul-a2a = "0.2"
+//! turul-a2a-proto = "0.2"
+//! async-trait = "0.1"
+//! tokio = { version = "1", features = ["full"] }
 //! ```
 //!
-//! # Feature flags
+//! ```rust,no_run
+//! use turul_a2a::prelude::*;
 //!
-//! - `in-memory` (default) — volatile in-process storage
-//! - `sqlite` — SQLx SQLite backend (atomic task+event writes)
-//! - `postgres` — SQLx PostgreSQL backend
-//! - `dynamodb` — AWS DynamoDB backend with TTL
-//! - `compat-v03` — opt-in compatibility shim for a2a-sdk 0.3.x clients
-//!   (method name normalization, root POST route, optional `A2A-Version`
-//!   header). Canonical builds are v1.0 strict.
+//! struct Echo;
 //!
-//! # Durable event coordination
+//! #[async_trait::async_trait]
+//! impl AgentExecutor for Echo {
+//!     async fn execute(&self, task: &mut Task, message: &Message, _ctx: &ExecutionContext)
+//!         -> Result<(), A2aError>
+//!     {
+//!         task.push_text_artifact("echo", "Echo", message.joined_text());
+//!         task.complete();
+//!         Ok(())
+//!     }
 //!
-//! Task state and streaming events are written atomically via
-//! [`storage::A2aAtomicStore`]. The in-process event broker is a local
-//! wake-up signal; the storage backend is the source of truth. Both
-//! streaming RPCs open with the `Task` snapshot and then deliver only events
-//! committed after it, across instances when the same backend is used
-//! (e.g., shared DynamoDB or PostgreSQL). A client that loses its stream
-//! subscribes again and receives a fresh snapshot. Subscribing to an already-terminal task returns
-//! `UnsupportedOperationError` per A2A v1.0 §3.1.6 — use [`storage`] or
-//! `GetTask` to retrieve the final state.
+//!     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+//!         AgentCardBuilder::new("Echo", "0.1.0")
+//!             .description("Echoes messages back")
+//!             .url("http://localhost:3000/jsonrpc", "JSONRPC", "1.0")
+//!             .default_input_modes(vec!["text/plain"])
+//!             .default_output_modes(vec!["text/plain"])
+//!             .build()
+//!             .expect("valid agent card")
+//!     }
+//! }
 //!
-//! # Multi-instance streaming
+//! # async fn run() -> Result<(), A2aError> {
+//! A2aServer::builder().executor(Echo).bind(([0, 0, 0, 0], 3000)).build()?.run().await
+//! # }
+//! ```
 //!
-//! The in-process [`streaming`] broker fans out to clients on the same
-//! process only. Cross-instance streaming relies on the shared durable event
-//! store. For horizontally scaled deployments, configure all
-//! instances against the same backend.
+//! # Storage
+//!
+//! Task state and events are committed together through
+//! [`storage::A2aAtomicStore`]; the [`streaming`] broker only wakes local
+//! subscribers, so instances sharing one backend see each other's tasks and
+//! events. Subscribing to an already-terminal task returns
+//! `UnsupportedOperationError` (A2A v1.0 section 3.1.6); use `GetTask`.
+//!
+//! # Features
+//!
+//! | Feature | Enables |
+//! |---|---|
+//! | `in-memory` (default) | volatile in-process storage |
+//! | `sqlite` | SQLite backend |
+//! | `postgres` | PostgreSQL backend |
+//! | `dynamodb` | DynamoDB backend with TTL |
+//! | `grpc` | gRPC transport (`grpc-reflection` and `grpc-health` build on it) |
+//! | `compat-v03` | a2a-sdk 0.3.x wire shim: method-name normalisation, root `POST` route, optional `A2A-Version` header |
+//!
+//! # Where next
+//!
+//! - [`executor::ExecutionContext`] for caller identity, cancellation and
+//!   the durable event sink
+//! - [`middleware`] to add authentication, with
+//!   [`turul-a2a-auth`](https://docs.rs/turul-a2a-auth)
+//! - [`turul-a2a-aws-lambda`](https://docs.rs/turul-a2a-aws-lambda) to run
+//!   the same executor on AWS Lambda
+//! - [Examples](https://github.com/aussierobots/turul-a2a/tree/main/examples)
+//!   on GitHub
 
 mod capability;
 pub mod card_builder;

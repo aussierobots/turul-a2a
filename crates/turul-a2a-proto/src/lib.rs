@@ -1,3 +1,53 @@
+//! Generated Rust types for the A2A Protocol v1.0 (`lf.a2a.v1`), built from
+//! the normative `a2a.proto` with `prost` and `pbjson`, so every message
+//! serialises to the protocol's camelCase JSON.
+//!
+//! Application code usually wants the wrappers in
+//! [`turul-a2a-types`](https://docs.rs/turul-a2a-types) instead; this crate
+//! is for code that needs the raw messages, for example to build an
+//! `AgentCard` or to cross a gRPC boundary.
+//!
+//! # Example
+//!
+//! ```toml
+//! [dependencies]
+//! turul-a2a-proto = "0.2"
+//! serde_json = "1"
+//! ```
+//!
+//! ```rust
+//! use turul_a2a_proto::{part, Message, Part, Role};
+//!
+//! let message = Message {
+//!     message_id: "m-1".into(),
+//!     role: Role::User.into(),
+//!     parts: vec![Part {
+//!         content: Some(part::Content::Text("hello".into())),
+//!         ..Default::default()
+//!     }],
+//!     ..Default::default()
+//! };
+//!
+//! let json = serde_json::to_value(&message)?;
+//! assert_eq!(json["messageId"], "m-1");
+//! assert_eq!(json["role"], "ROLE_USER");
+//! # Ok::<(), serde_json::Error>(())
+//! ```
+//!
+//! # Features
+//!
+//! | Feature | Enables |
+//! |---|---|
+//! | `grpc` | tonic service and client stubs for `A2AService` in the `grpc` module |
+//!
+//! # Where next
+//!
+//! - [`turul-a2a-types`](https://docs.rs/turul-a2a-types) for ergonomic
+//!   wrappers over these messages
+//! - [`turul-a2a`](https://docs.rs/turul-a2a) to serve an agent
+//! - The [`a2a.proto`](https://github.com/aussierobots/turul-a2a/blob/main/crates/turul-a2a-proto/proto/a2a.proto)
+//!   definition this crate is generated from
+
 /// Raw prost-generated types for the A2A Protocol v1.0 (package lf.a2a.v1).
 ///
 /// These types are generated from the normative `a2a.proto` definition.

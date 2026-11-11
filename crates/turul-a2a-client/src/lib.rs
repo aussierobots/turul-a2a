@@ -1,6 +1,46 @@
-//! A2A Protocol v1.0 client library.
+//! HTTP client for [A2A Protocol](https://a2a-protocol.org/) v1.0 agents:
+//! discover an agent card, send messages, stream and subscribe to task
+//! events, cancel and list tasks, and manage push notification configs.
 //!
-//! Independent of the server crate — depends only on turul-a2a-types and turul-a2a-proto.
+//! Use it to call any A2A agent, whether it is built with
+//! [`turul-a2a`](https://docs.rs/turul-a2a) or not. The crate depends only
+//! on [`turul-a2a-types`](https://docs.rs/turul-a2a-types) and
+//! [`turul-a2a-proto`](https://docs.rs/turul-a2a-proto), not on the server.
+//!
+//! # Example
+//!
+//! ```toml
+//! [dependencies]
+//! turul-a2a-client = "0.2"
+//! tokio = { version = "1", features = ["full"] }
+//! ```
+//!
+//! ```rust,no_run
+//! use turul_a2a_client::prelude::*;
+//!
+//! # async fn run() -> Result<(), A2aClientError> {
+//! let client = A2aClient::discover("http://localhost:3000").await?;
+//!
+//! let reply = client.send_message(MessageBuilder::new().text("hello")).await?;
+//! if let Some(task) = reply.task() {
+//!     println!("{}", artifact_text(task));
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Features
+//!
+//! | Feature | Enables |
+//! |---|---|
+//! | `grpc` | `A2aGrpcClient` over the gRPC transport |
+//!
+//! # Where next
+//!
+//! - [`A2aClient::send_streaming_message`] and [`A2aClient::subscribe_to_task`]
+//!   for typed [`StreamEvent`] streams
+//! - [`ClientAuth`] for bearer and API key credentials
+//! - [`turul-a2a`](https://docs.rs/turul-a2a) to build the agent being called
 
 pub mod builders;
 mod error;

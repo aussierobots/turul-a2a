@@ -1,192 +1,82 @@
-//! AWS Lambda adapter for turul-a2a.
+//! AWS Lambda adapter for [`turul-a2a`](https://docs.rs/turul-a2a): it feeds
+//! Lambda events to the same axum router the binary server uses, so one
+//! [`AgentExecutor`] runs unchanged
+//! behind a Function URL, API Gateway, ALB or SQS.
+//!
+//! Use it to deploy an A2A agent as a Lambda function; executor, storage and
+//! middleware come from `turul-a2a`.
+//!
+//! # Example
+//!
+//! ```toml
+//! [dependencies]
+//! turul-a2a = "0.2"
+//! turul-a2a-proto = "0.2"
+//! turul-a2a-aws-lambda = "0.2"
+//! async-trait = "0.1"
+//! lambda_runtime = "1"
+//! tokio = { version = "1", features = ["full"] }
+//! ```
+//!
+//! ```rust,no_run
+//! use turul_a2a::storage::InMemoryA2aStorage;
+//! use turul_a2a_aws_lambda::LambdaA2aServerBuilder;
+//! # use turul_a2a::prelude::*;
+//! # struct Echo;
+//! # #[async_trait::async_trait]
+//! # impl AgentExecutor for Echo {
+//! #     async fn execute(&self, _: &mut Task, _: &Message, _: &ExecutionContext)
+//! #         -> Result<(), A2aError> { Ok(()) }
+//! #     fn agent_card(&self) -> turul_a2a_proto::AgentCard { Default::default() }
+//! # }
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), lambda_runtime::Error> {
+//!     // In-memory storage suits a demo; use a shared backend in production.
+//!     LambdaA2aServerBuilder::new()
+//!         .executor(Echo)
+//!         .storage(InMemoryA2aStorage::new())
+//!         .run()
+//!         .await
+//! }
+//! ```
 //!
 //! # Choosing a runner
 //!
-//! A Lambda binary receives raw event JSON; the adapter owns
-//! classifying that JSON and dispatching to the right A2A handler
-//! method. Adopters pick the runner whose name matches the Lambda's
-//! AWS trigger topology and end `main.rs` with one `.await?` call —
-//! `lambda_runtime` / `lambda_http` / event parsing never appear in
-//! adopter code.
+//! `LambdaA2aServerBuilder::run` is the default entry point. Without the
+//! `sqs` feature it is `run_http_only`; with it, `run_http_and_sqs`, which
+//! accepts either event shape. The named runners are strict and fail on any
+//! other shape: `run_http_only` (Function URL / API Gateway),
+//! `run_sqs_only` and `run_http_and_sqs` (both `sqs`). For a third trigger,
+//! match on [`classify_event`] yourself and pass HTTP events to
+//! [`LambdaA2aHandler::handle_http_event_value`].
+//! Behind a REST API Gateway stage, set
+//! [`LambdaA2aServerBuilder::strip_path_prefix`] so the router sees root-rooted paths.
 //!
-//! | Lambda triggers                   | Runner                                         |
-//! |-----------------------------------|------------------------------------------------|
-//! | HTTP only (Function URL / APIGW)  | [`LambdaA2aHandler::run_http_only`]            |
-//! | SQS only (event source mapping)   | `LambdaA2aHandler::run_sqs_only` *(`sqs`)*   |
-//! | HTTP **and** SQS on one function  | `LambdaA2aHandler::run_http_and_sqs` *(`sqs`)* |
-//! | not sure / just run it            | [`LambdaA2aHandler::run`]                      |
+//! # Lambda behaviour
 //!
-//! [`LambdaA2aHandler::run`] is the default "it just works" entry
-//! point: without the `sqs` feature it aliases `run_http_only`; with
-//! `sqs` it aliases `run_http_and_sqs` (permissive, handles either
-//! shape). The explicit runners are **strict** — a non-matching
-//! event shape fails loudly, which is what hardened deployments
-//! and tests want.
+//! - SSE responses are buffered: the task runs, its events are collected, and
+//!   one response is returned. `GET /tasks/{id}:subscribe` serves tasks that
+//!   are not yet terminal and closes on a terminal state or `INPUT_REQUIRED`.
+//! - Push-notification delivery cannot rely on work continuing after the
+//!   response. Recovery is carried by [`LambdaScheduledRecoveryHandler`]
+//!   (required on every backend) and, on DynamoDB, [`LambdaStreamRecoveryHandler`].
+//! - No cross-instance cancel poller runs. `CancelTask` writes its marker to the
+//!   shared backend, but a live executor on a different invocation does not
+//!   observe it.
 //!
-//! The one-call shortcut is [`LambdaA2aServerBuilder::run`] — it
-//! build-then-runs in a single fluent call. Use `.build()` + a
-//! handler method when the handler is needed for unit tests or
-//! custom middleware.
+//! # Features
 //!
-//! ## Composing with non-framework triggers
+//! | Feature | Enables |
+//! |---|---|
+//! | `sqs` | SQS-backed durable executor and the SQS runners |
+//! | `dynamodb` | `turul-a2a`'s DynamoDB backend |
 //!
-//! Lambdas wired to HTTP **plus** a third trigger the framework does
-//! not know about (EventBridge scheduler, DynamoDB stream, custom
-//! invoke) can't use a named runner directly — the Unknown branch
-//! is adopter-owned. Reach for the public classifier + the HTTP
-//! envelope primitive instead:
+//! # Where next
 //!
-//! ```ignore
-//! lambda_runtime::run(lambda_runtime::service_fn(
-//!     move |event: lambda_runtime::LambdaEvent<serde_json::Value>| {
-//!         let handler = handler.clone();
-//!         async move {
-//!             let (value, _ctx) = event.into_parts();
-//!             match turul_a2a_aws_lambda::classify_event(&value) {
-//!                 turul_a2a_aws_lambda::LambdaEvent::Http => {
-//!                     handler.handle_http_event_value(value).await
-//!                 }
-//!                 turul_a2a_aws_lambda::LambdaEvent::Sqs => {
-//!                     let sqs = serde_json::from_value(value)?;
-//!                     Ok(serde_json::to_value(handler.handle_sqs(sqs).await)?)
-//!                 }
-//!                 turul_a2a_aws_lambda::LambdaEvent::Unknown => {
-//!                     // Adopter-owned: run your scheduled sweep,
-//!                     // DynamoDB stream consumer, etc.
-//!                     run_adopter_specific_path(value).await
-//!                 }
-//!             }
-//!         }
-//!     }
-//! )).await
-//! ```
-//!
-//! [`LambdaA2aHandler::handle_http_event_value`] is available without
-//! the `sqs` feature; `handle_sqs` is gated on `sqs`. `classify_event`
-//! + `LambdaEvent` are always available.
-//!
-//! ## API Gateway path prefix
-//!
-//! When Lambda sits behind a REST API Gateway with `AWS_PROXY`
-//! integration, the event carries the full stage + resource tree in
-//! the path (e.g. `/stage/agent/message:send`),
-//! which the root-rooted A2A router would 404. Configure the prefix
-//! to strip via [`LambdaA2aServerBuilder::strip_path_prefix`]:
-//!
-//! ```ignore
-//! LambdaA2aServerBuilder::new()
-//!     .executor(my_executor)
-//!     .storage(my_storage)
-//!     .strip_path_prefix("/stage/agent")  // API GW prefix
-//!     .run()
-//!     .await
-//! ```
-//!
-//! The strip applies to `run_http_only` and `run_http_and_sqs`.
-//! SQS events are unaffected. Non-matching paths pass through
-//! unchanged (router still 404s on genuinely unknown paths —
-//! that's the correct failure mode).
-//!
-//! ```ignore
-//! // HTTP-only Lambda (request Lambda in two-Lambda topology):
-//! LambdaA2aServerBuilder::new()
-//!     .executor(my_executor)
-//!     .storage(my_storage)
-//!     .with_sqs_return_immediately(queue_url, sqs)  // enqueues durable jobs
-//!     .build()?
-//!     .run_http_only()
-//!     .await
-//!
-//! // Single-function HTTP+SQS demo:
-//! LambdaA2aServerBuilder::new()
-//!     .executor(my_executor)
-//!     .storage(my_storage)
-//!     .with_sqs_return_immediately(queue_url, sqs)
-//!     .run()            // builder shortcut; dispatches HTTP + SQS
-//!     .await
-//!
-//! // Pure SQS worker — no with_sqs_return_immediately(...) needed
-//! // (it consumes the queue, never enqueues):
-//! LambdaA2aServerBuilder::new()
-//!     .executor(my_executor)
-//!     .storage(my_storage)
-//!     .build()?
-//!     .run_sqs_only()
-//!     .await
-//! ```
-//!
-//! # Adapter internals
-//!
-//! Thin wrapper: converts Lambda events to axum requests, delegates to
-//! the same Router, converts responses back. Adapter contract:
-//! - Authorizer context mapped via synthetic headers with anti-spoofing.
-//! - SSE responses are buffered: task executes, events are collected,
-//!   returned as one response.
-//! - `POST /message:stream` executes the task within the Lambda
-//!   invocation and returns all events.
-//! - `GET /tasks/{id}:subscribe` is for tasks that are **not** in a
-//!   terminal state. Within one invocation it emits the initial `Task`
-//!   snapshot, delivers events committed after it, and closes when the
-//!   task reaches a terminal state or INPUT_REQUIRED. Subscribing to an
-//!   already-terminal task returns `UnsupportedOperationError` per
-//!   A2A v1.0 §3.1.6. For retrieving a terminal task's final state
-//!   use `GetTask`.
-//!
-//! # Push-notification delivery — external triggers are mandatory
-//!
-//! Push delivery on Lambda is architecturally different from the
-//! binary server. The request Lambda installed via
-//! [`LambdaA2aServerBuilder`] still constructs a `PushDispatcher`
-//! when `push_delivery_store` is wired, but any `tokio::spawn`
-//! continuation it emits post-return is **opportunistic only** — the
-//! Lambda execution environment may be frozen indefinitely between
-//! invocations, so nothing can depend on that continuation completing.
-//!
-//! Correctness for push delivery on Lambda is carried by:
-//!
-//! 1. The atomic pending-dispatch marker written inside the request
-//!    Lambda's commit transaction (opt in via
-//!    `StorageImpl::with_push_dispatch_enabled(true)`).
-//! 2. [`LambdaStreamRecoveryHandler`] — DynamoDB Streams trigger on
-//!    `a2a_push_pending_dispatches`. DynamoDB backends only.
-//! 3. [`LambdaScheduledRecoveryHandler`] — EventBridge Scheduler
-//!    backstop. **Required for all backends**; it is the sole
-//!    recovery path for SQLite / PostgreSQL / in-memory deployments.
-//!
-//! Without at least the scheduled worker, push delivery on Lambda is
-//! not durable — a marker written on a cold invocation may never be
-//! consumed. The example wiring lives in
-//! `examples/lambda-stream-worker` and
-//! `examples/lambda-scheduled-worker`.
-//!
-//! Lambda streaming is request-scoped (not persistent SSE connections). The durable
-//! event store ensures events survive across invocations. A client that loses
-//! its stream subscribes again and receives a fresh `Task` snapshot.
-//!
-//! # Cross-instance cancellation
-//!
-//! Lambda invocations are stateless and short-lived, so the Lambda
-//! adapter does **not** run the persistent cross-instance cancel
-//! poller that `A2aServer::run()` spawns. Cancellation behaviour on
-//! the Lambda adapter:
-//!
-//! - **Marker writes** — `CancelTask` on a Lambda invocation writes
-//!   the cancel marker to the shared backend (DynamoDB / PostgreSQL).
-//!   This works.
-//! - **Propagation to a live executor on the SAME Lambda invocation** —
-//!   works via the same-instance token-trip path in `core_cancel_task`.
-//! - **Propagation to a live executor on a DIFFERENT Lambda invocation
-//!   (warm container)** — **not currently supported**. There is no
-//!   persistent poller to observe markers written by other
-//!   invocations. A subsequent invocation whose handler reads the
-//!   marker directly may act on it, but that is not a substitute for
-//!   the server runtime's live propagation.
-//!
-//! The builder still **requires** an `A2aCancellationSupervisor`
-//! implementation on the same backend so that marker writes reach
-//! the correct backend and a future polling-adapter variant can
-//! consume them. If a deployment passes a non-matching supervisor,
-//! `build()` rejects the configuration.
+//! - [`LambdaAuthorizerMiddleware`] to map an API Gateway authorizer to a caller identity
+//! - [`lambda-agent`](https://github.com/aussierobots/turul-a2a/tree/main/examples/lambda-agent)
+//!   and the worker examples on GitHub
 
 mod adapter;
 mod auth;

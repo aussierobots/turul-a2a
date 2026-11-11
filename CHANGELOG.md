@@ -6,8 +6,11 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.9] — 2026-11-11
+
 ### Changed
 
+- Rewrite the crate-level rustdoc front page of every published crate: a one-line summary, a compiling example, feature tables and onward links.
 - Point package homepages and project links to Aussie Robots; add explicit API documentation links and review discovery metadata.
 
 
