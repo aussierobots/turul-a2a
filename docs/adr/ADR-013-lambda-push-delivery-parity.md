@@ -89,6 +89,16 @@
   Signature expired`, and the failure surfaced on the next request.
   The HTTP, SQS and idle-sweep entrypoints now settle detached work
   before they return. Correctness still does not depend on the fan-out completing.
+- **2026-11-16 (later)** — §4.4, the §7 flow and §7 build steps
+  revised: waiting for the fan-out billed the request Lambda for
+  webhook latency. A Lambda invocation now starts no fan-out at all:
+  `LambdaA2aServerBuilder` installs no dispatcher, so the marker
+  committed with the terminal is delivered only by the stream and
+  scheduled workers. An executor still running when an HTTP response
+  is ready is aborted, without waiting. The builder's
+  `outbound_url_validator` and retry-horizon check are removed with
+  the dispatcher; a recovery worker's `PushDeliveryWorker` takes the
+  validator.
 
 ## 1. Context
 
@@ -231,18 +241,18 @@ store — never one without the other.
 
 ### 4.4 `tokio::spawn` is not a correctness primitive under Lambda
 
-Correctness does not depend on a spawned fan-out completing: it is
-carried by the atomically-written marker + stream trigger + scheduler
-backstop.
+Delivery is carried by the atomically-written marker + stream trigger
++ scheduler backstop, never by work spawned inside the request Lambda.
 
-A spawned fan-out, or an executor still running after it yielded, must
-not outlive its invocation either. A storage request signed before the
-environment freezes and sent after the thaw is rejected as expired. So
-before `LambdaA2aHandler::handle`, `handle_sqs` and `cancel_idle_tasks`
-(the scheduled idle-task sweep) return, `AppState::settle_detached_work`
-gives that work `timeout_abort_grace` to finish, then aborts and awaits
-what remains. An aborted fan-out
-leaves its marker, so the stream or scheduler worker redelivers it.
+No work may outlive its invocation: a storage request signed before the
+environment freezes and sent after the thaw is rejected as expired. So a
+Lambda invocation (HTTP request, SQS job, scheduled idle-task sweep)
+starts no push fan-out: `LambdaA2aServerBuilder` installs no
+`PushDispatcher`, and a terminal commit only writes its marker. An
+executor still running when `LambdaA2aHandler::handle` has its response
+(work after it reported its result) is aborted, and the handler returns
+once it has stopped. Nothing is waited for, so the request Lambda is not
+billed for webhook latency.
 
 ### 4.5 Late-config prevention — causal event-sequence floor
 
@@ -345,11 +355,9 @@ message:send / message:stream / :cancel / force-commit paths
         └── insert a2a_push_pending_dispatches   /   transaction
             (ONLY when push_dispatch_enabled() && event is terminal
              StatusUpdate; otherwise omitted)
-  → dispatcher.dispatch spawned
-  → response built; the fan-out is awaited for up to
-    timeout_abort_grace, then aborted (§4.4); correctness does NOT
-    depend on it completing
+  → response built; any executor still running is aborted (§4.4)
   → handler returns response to client
+  → stream worker (or scheduler) reads the marker and fans out
 ```
 
 The `A2aAtomicStore::update_task_status_with_events` trait signature
@@ -408,9 +416,8 @@ payload)`, which calls `claim_delivery`. Three cases, all safe:
 3. **Terminal claim exists** — `ClaimAlreadyHeld` (terminal rows
    frozen per ADR-011 §10); no POST.
 
-Duplicate stream records, stream × scheduler races, request-Lambda
-fan-out (bounded by §4.4) colliding with stream-worker fan-out — all safe
-by construction. `delete_pending_dispatch` is idempotent.
+Duplicate stream records and stream × scheduler races are safe by
+construction. `delete_pending_dispatch` is idempotent.
 
 ### 5.5 Late-config invariant
 
@@ -568,17 +575,15 @@ impl LambdaA2aServerBuilder {
 ```
 
 On build, if `push_delivery_store` is present:
-- Construct `PushDeliveryWorker` + `PushDispatcher`.
 - Run the same-backend check including the delivery store.
-- Run the retry-horizon validation the main server already does.
 - **Run the new `push_dispatch_enabled()` consistency check** — if
   the atomic store reports `false`, return a build error.
-- Install the dispatcher in the Lambda `AppState.push_dispatcher`.
+- Install no dispatcher: `AppState.push_dispatcher` stays `None`
+  (§4.4).
 
-The commit-hook call sites fire the dispatcher as on the main server;
-on Lambda, the dispatcher's main responsibility becomes marker
-deletion and a POST bounded by the invocation (§4.4) — correctness is carried by the
-atomic marker + stream/scheduler.
+The commit-hook call sites find no dispatcher, so a Lambda invocation
+only writes the marker; the stream and scheduled workers, each with its
+own `PushDispatcher`, deliver it and delete the marker.
 
 ## 8. New crate surface — `turul-a2a-aws-lambda`
 

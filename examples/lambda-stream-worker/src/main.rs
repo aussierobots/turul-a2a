@@ -10,11 +10,9 @@
 //!
 //! ## Why two Lambdas (stream + scheduled)?
 //!
-//! Push fan-out inside a Lambda invocation gets a bounded wait before
-//! the invocation returns and is aborted after it, because the
-//! execution environment may be frozen indefinitely between
-//! invocations; correctness cannot depend on it completing. External
-//! triggers are mandatory:
+//! The request Lambda starts no push fan-out, because the execution
+//! environment may be frozen indefinitely between invocations; it only
+//! writes the pending-dispatch marker. External triggers deliver it:
 //!
 //! - **DynamoDB Stream (this worker)** — fast path: every atomic
 //!   marker commit in the request Lambda produces an INSERT record

@@ -8,9 +8,9 @@
 //! - Non-DynamoDB backends have no equivalent stream. For SQLite /
 //!   PostgreSQL / in-memory deployments this scheduler IS the
 //!   recovery path.
-//! - A dispatch fan-out started inside a Lambda invocation gets a
-//!   bounded wait before the invocation returns and is aborted after
-//!   it, so correctness cannot depend on it completing.
+//! - Request, SQS and idle-sweep invocations start no push fan-out:
+//!   the execution environment can freeze once an invocation returns.
+//!   They only write the pending-dispatch marker.
 //!
 //! On every tick the handler:
 //!

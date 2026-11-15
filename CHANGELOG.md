@@ -6,6 +6,28 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.11] — 2026-11-16
+
+### Changed
+
+- **Lambda invocations start no push fan-out.** 0.2.10 made each Lambda response wait for its push fan-out, webhook POSTs included, and that wait was billed. Now `LambdaA2aServerBuilder` installs no push dispatcher: a terminal commit writes its pending-dispatch marker atomically and the invocation returns. Delivery belongs to the DynamoDB Stream worker (`LambdaStreamRecoveryHandler`) and the scheduled worker (`LambdaScheduledRecoveryHandler`). This applies to HTTP requests, SQS executor jobs and the scheduled idle-task sweep. On non-DynamoDB backends the scheduled worker is the only delivery path, so pushes arrive on its schedule. See ADR-013.
+- An executor still running when `LambdaA2aHandler::handle` has its response (work after it reported its result, such as a `TerminalHook`) is aborted at once, with no grace wait. This keeps the 0.2.10 guarantee that no storage request outlives its invocation.
+
+### Removed
+
+- `LambdaA2aServerBuilder::outbound_url_validator`. The request Lambda no longer delivers; pass the validator to the `PushDeliveryWorker::new` of your stream and scheduled workers instead. The builder's claim-expiry vs retry-horizon check is gone with it; `PushDeliveryWorker::new` does not run that check, so keep the workers' `claim_expiry` above `max_attempts × backoff_cap`.
+- `AppState::settle_detached_work()` (added in 0.2.10). Nothing waits any more.
+
+### Compatibility
+
+- **Source break** for callers of `LambdaA2aServerBuilder::outbound_url_validator` or `AppState::settle_detached_work`: those calls no longer compile (see Removed).
+- No wire format or storage schema changes. The long-lived server behaves as in 0.2.9; `InFlightRegistry` gains `wait_empty()` and `abort_all()`.
+- A Lambda deployment with push enabled must run the stream or scheduled recovery worker, as ADR-013 already required; without one, pushes are never delivered.
+
+### Verification
+
+- New Lambda adapter tests prove that the HTTP, SQS and idle-sweep paths start no fan-out and leave the marker, that the stream worker then delivers the webhook POST and deletes the marker, and that an executor tail is aborted at return without waiting. All four failed against 0.2.10.
+
 ## [0.2.10] — 2026-11-16
 
 ### Fixed

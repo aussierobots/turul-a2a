@@ -144,7 +144,6 @@ pub struct LambdaA2aServerBuilder {
     runtime_config: RuntimeConfig,
     durable_executor_queue: Option<Arc<dyn turul_a2a::durable_executor::DurableExecutorQueue>>,
     path_prefix: Option<String>,
-    outbound_url_validator: Option<turul_a2a::push::ssrf::OutboundUrlValidator>,
 }
 
 impl LambdaA2aServerBuilder {
@@ -161,7 +160,6 @@ impl LambdaA2aServerBuilder {
             runtime_config: RuntimeConfig::default(),
             durable_executor_queue: None,
             path_prefix: None,
-            outbound_url_validator: None,
         }
     }
 
@@ -307,10 +305,10 @@ impl LambdaA2aServerBuilder {
         self
     }
 
-    /// Override the runtime configuration (timeouts, retry budgets,
-    /// push tuning). Defaults to [`RuntimeConfig::default()`]. The
-    /// builder validates push settings (claim expiry vs retry horizon,
-    /// ) when `.push_delivery_store(...)` is wired.
+    /// Override the runtime configuration (timeouts, retry budgets).
+    /// Defaults to [`RuntimeConfig::default()`]. The `push_*` delivery
+    /// fields have no effect here: a Lambda invocation delivers no push,
+    /// and each recovery worker takes its own `PushDeliveryConfig`.
     pub fn runtime_config(mut self, cfg: RuntimeConfig) -> Self {
         self.runtime_config = cfg;
         self
@@ -318,23 +316,6 @@ impl LambdaA2aServerBuilder {
 
     pub fn middleware(mut self, mw: Arc<dyn A2aMiddleware>) -> Self {
         self.middleware.push(mw);
-        self
-    }
-
-    /// Operator allowlist for push webhook URLs.
-    ///
-    /// Called with each webhook URL on every delivery attempt, before
-    /// DNS resolution. Returning `Err` refuses the delivery: nothing is
-    /// resolved or POSTed, and the delivery is recorded as a failed
-    /// delivery with error class `SSRFBlocked`. The reason string is
-    /// not persisted. Runs in addition to the built-in scheme and
-    /// private-address checks, not instead of them. Takes effect only
-    /// when push delivery is wired (`push_delivery_store`).
-    pub fn outbound_url_validator(
-        mut self,
-        validator: turul_a2a::push::ssrf::OutboundUrlValidator,
-    ) -> Self {
-        self.outbound_url_validator = Some(validator);
         self
     }
 
@@ -456,15 +437,13 @@ impl LambdaA2aServerBuilder {
             ));
         }
 
-        // Push dispatcher wiring. When
-        // `push_delivery_store` is present, validate its backend matches,
-        // validate the retry-horizon invariant, and construct the
-        // `PushDispatcher`. Each invocation waits a bounded time for its
-        // fan-out before returning; correctness comes from the atomic
-        // marker + stream/scheduler recovery.
-        let push_dispatcher: Option<Arc<turul_a2a::push::PushDispatcher>> = if let Some(delivery) =
-            push_delivery_store.as_ref()
-        {
+        // No push fan-out runs in a Lambda invocation: the execution
+        // environment can freeze once the invocation returns, and a
+        // storage request signed before the freeze and sent after it is
+        // rejected as expired. A terminal commit writes its
+        // pending-dispatch marker atomically; the stream and scheduled
+        // recovery workers deliver it.
+        if let Some(delivery) = push_delivery_store.as_ref() {
             let push_delivery_backend = delivery.backend_name();
             if task_backend != push_delivery_backend {
                 return Err(A2aError::Internal(format!(
@@ -473,45 +452,7 @@ impl LambdaA2aServerBuilder {
                          All storage traits must share the same backend."
                 )));
             }
-
-            // claim expiry must exceed the worst-case
-            // retry horizon so a live claim is not mis-classified as
-            // stale mid-retry.
-            let retry_horizon = runtime_config
-                .push_backoff_cap
-                .saturating_mul(runtime_config.push_max_attempts as u32);
-            if runtime_config.push_claim_expiry <= retry_horizon {
-                return Err(A2aError::Internal(format!(
-                    "push_claim_expiry ({:?}) must be greater than retry horizon \
-                         (push_max_attempts={} * push_backoff_cap={:?} = {:?}). \
-                         Raise push_claim_expiry or lower push_max_attempts/push_backoff_cap.",
-                    runtime_config.push_claim_expiry,
-                    runtime_config.push_max_attempts,
-                    runtime_config.push_backoff_cap,
-                    retry_horizon
-                )));
-            }
-
-            let delivery_cfg =
-                turul_a2a::push::delivery::PushDeliveryConfig::from_runtime_config(&runtime_config);
-
-            let instance_id = format!("a2a-lambda-{}", uuid::Uuid::now_v7());
-            let worker = turul_a2a::push::delivery::PushDeliveryWorker::new(
-                delivery.clone(),
-                delivery_cfg,
-                self.outbound_url_validator.clone(),
-                instance_id,
-            )
-            .map_err(|e| A2aError::Internal(format!("push worker build failed: {e}")))?;
-
-            Some(Arc::new(turul_a2a::push::PushDispatcher::new(
-                Arc::new(worker),
-                push_storage.clone(),
-                task_storage.clone(),
-            )))
-        } else {
-            None
-        };
+        }
 
         let state = AppState {
             executor,
@@ -525,7 +466,7 @@ impl LambdaA2aServerBuilder {
             in_flight: Arc::new(turul_a2a::server::in_flight::InFlightRegistry::new()),
             cancellation_supervisor,
             push_delivery_store,
-            push_dispatcher,
+            push_dispatcher: None,
             durable_executor_queue: self.durable_executor_queue,
         };
 
@@ -589,19 +530,8 @@ impl LambdaA2aHandler {
     /// runtime configuration's `idle_task_timeout`; see
     /// [`turul_a2a::server::A2aServerBuilder::idle_task_timeout`]. With no
     /// timeout set this does nothing. Run by
-    /// [`LambdaScheduledRecoveryHandler::with_idle_task_sweep`]. Returns
-    /// once the push fan-outs of the cancellations have finished or been
-    /// aborted; see [`AppState::settle_detached_work`].
+    /// [`LambdaScheduledRecoveryHandler::with_idle_task_sweep`].
     pub async fn cancel_idle_tasks(
-        &self,
-    ) -> Result<turul_a2a::server::IdleSweep, turul_a2a::storage::A2aStorageError> {
-        let swept = self.sweep_idle_tasks().await;
-        // The environment can freeze once this returns.
-        self.state.settle_detached_work().await;
-        swept
-    }
-
-    async fn sweep_idle_tasks(
         &self,
     ) -> Result<turul_a2a::server::IdleSweep, turul_a2a::storage::A2aStorageError> {
         match self.state.runtime_config.idle_task_timeout {
@@ -617,9 +547,10 @@ impl LambdaA2aHandler {
         }
     }
 
-    /// Handle a Lambda HTTP request. Returns once the work the request
-    /// left running has finished or been aborted; see
-    /// [`AppState::settle_detached_work`].
+    /// Handle a Lambda HTTP request. An executor still running when the
+    /// response is ready (work after it reported its result) is aborted
+    /// before this returns, so no storage request it started outlives the
+    /// invocation.
     pub async fn handle(
         &self,
         event: lambda_http::Request,
@@ -635,7 +566,8 @@ impl LambdaA2aHandler {
             .map_err(|e| lambda_http::Error::from(format!("Router error: {e}")))?;
         let resp = axum_to_lambda_response(axum_resp).await;
         // The environment can freeze once this returns.
-        self.state.settle_detached_work().await;
+        self.state.in_flight.abort_all();
+        self.state.in_flight.wait_empty().await;
         resp
     }
 
@@ -817,10 +749,7 @@ impl LambdaA2aHandler {
         &self,
         event: aws_lambda_events::event::sqs::SqsEvent,
     ) -> aws_lambda_events::event::sqs::SqsBatchResponse {
-        let resp = durable::drive_sqs_batch(&self.state, event).await;
-        // The environment can freeze once this returns.
-        self.state.settle_detached_work().await;
-        resp
+        durable::drive_sqs_batch(&self.state, event).await
     }
 
     /// Run this handler as a pure HTTP Lambda. Strict: any non-HTTP

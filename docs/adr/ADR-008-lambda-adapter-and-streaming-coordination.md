@@ -4,9 +4,8 @@
 - **Date:** 2026-04-11
 - **Superseded / refined by:** [ADR-013](ADR-013-lambda-push-delivery-parity.md)
   for push-notification delivery. ADR-013 §4.4 makes the
-  correctness-critical statement that push correctness cannot depend on
-  `tokio::spawn` continuations created inside a Lambda invocation, which
-  get a bounded wait and are then aborted before it returns; push
+  correctness-critical statement that a Lambda invocation starts no
+  push fan-out; push
   recovery requires external triggers (DynamoDB Stream +
   EventBridge Scheduler) implemented by the
   `LambdaStreamRecoveryHandler` and `LambdaScheduledRecoveryHandler`
@@ -116,4 +115,4 @@ D3 gets its own ADR when prioritized.
 
 - 2026-10-22 — `Last-Event-ID` replay removed (ADR-014 §2.3 item 3).
 - 2026-10-22 — Trust boundary: recorded which authorizer sources are mapped and the tests that pin the strip-then-inject order.
-- 2026-11-16 — Header: spawned work inside an invocation is now waited for, then aborted, before the invocation returns (ADR-013 §4.4).
+- 2026-11-16 — Header: a Lambda invocation starts no push fan-out (ADR-013 §4.4).
