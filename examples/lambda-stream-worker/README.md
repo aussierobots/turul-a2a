@@ -13,9 +13,9 @@ Part of a three-Lambda deployment:
 
 ## Why this Lambda exists
 
-`tokio::spawn` continuations inside the request Lambda are **opportunistic** —
-between invocations the execution environment can be frozen, so post-return
-work may never run (ADR-013 §4.4). Push fan-out therefore has to be driven by
+Push fan-out inside the request Lambda gets a bounded wait before the
+invocation returns and is aborted after it, because the execution environment
+can be frozen between invocations (ADR-013 §4.4), so it may never complete. Push fan-out therefore has to be driven by
 an external trigger. The DynamoDB Stream is the low-latency path; the
 scheduled worker is the backstop for poison records and stream outages.
 

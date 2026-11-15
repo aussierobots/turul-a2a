@@ -5114,11 +5114,11 @@ pub async fn test_config_registered_at_or_after_event_not_eligible(
         .expect("list eligible");
     let ids: Vec<_> = eligible.configs.iter().map(|c| c.id.clone()).collect();
     assert!(
-        ids.contains(&"cfg-pef-c1".to_string()),
+        ids.iter().any(|i| i == "cfg-pef-c1"),
         "C1 must be eligible for seq 3 (registered at seq 2); got {ids:?}"
     );
     assert!(
-        !ids.contains(&"cfg-pef-c2".to_string()),
+        !ids.iter().any(|i| i == "cfg-pef-c2"),
         "C2 must NOT be eligible for seq 3 (registered at seq 3); got {ids:?}"
     );
 
@@ -5129,7 +5129,7 @@ pub async fn test_config_registered_at_or_after_event_not_eligible(
         .expect("list all");
     let all_ids: Vec<_> = all.configs.iter().map(|c| c.id.clone()).collect();
     assert!(
-        all_ids.contains(&"cfg-pef-c1".to_string()) && all_ids.contains(&"cfg-pef-c2".to_string()),
+        all_ids.iter().any(|i| i == "cfg-pef-c1") && all_ids.iter().any(|i| i == "cfg-pef-c2"),
         "list_configs must still return both configs; got {all_ids:?}"
     );
 }

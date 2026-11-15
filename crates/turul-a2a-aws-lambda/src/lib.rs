@@ -422,8 +422,9 @@ impl LambdaA2aServerBuilder {
         }
 
         // The Lambda execution environment can freeze once the HTTP
-        // response is flushed, so a `tokio::spawn`'d executor
-        // continuation is opportunistic only. Refuse
+        // response is flushed, and work still running then is aborted
+        // before the invocation returns, so an executor cannot keep
+        // running after a non-blocking send's response. Refuse
         // `SendMessageConfiguration.return_immediately = true` at the
         // `core_send_message` entry point (UnsupportedOperationError —
         // an aspect of SendMessage this runtime cannot honour, A2A
@@ -458,9 +459,9 @@ impl LambdaA2aServerBuilder {
         // Push dispatcher wiring. When
         // `push_delivery_store` is present, validate its backend matches,
         // validate the retry-horizon invariant, and construct the
-        // `PushDispatcher`. Under Lambda the dispatcher runs
-        // opportunistically post-return; correctness
-        // comes from the atomic marker + stream/scheduler recovery.
+        // `PushDispatcher`. Each invocation waits a bounded time for its
+        // fan-out before returning; correctness comes from the atomic
+        // marker + stream/scheduler recovery.
         let push_dispatcher: Option<Arc<turul_a2a::push::PushDispatcher>> = if let Some(delivery) =
             push_delivery_store.as_ref()
         {
@@ -588,8 +589,19 @@ impl LambdaA2aHandler {
     /// runtime configuration's `idle_task_timeout`; see
     /// [`turul_a2a::server::A2aServerBuilder::idle_task_timeout`]. With no
     /// timeout set this does nothing. Run by
-    /// [`LambdaScheduledRecoveryHandler::with_idle_task_sweep`].
+    /// [`LambdaScheduledRecoveryHandler::with_idle_task_sweep`]. Returns
+    /// once the push fan-outs of the cancellations have finished or been
+    /// aborted; see [`AppState::settle_detached_work`].
     pub async fn cancel_idle_tasks(
+        &self,
+    ) -> Result<turul_a2a::server::IdleSweep, turul_a2a::storage::A2aStorageError> {
+        let swept = self.sweep_idle_tasks().await;
+        // The environment can freeze once this returns.
+        self.state.settle_detached_work().await;
+        swept
+    }
+
+    async fn sweep_idle_tasks(
         &self,
     ) -> Result<turul_a2a::server::IdleSweep, turul_a2a::storage::A2aStorageError> {
         match self.state.runtime_config.idle_task_timeout {
@@ -605,7 +617,9 @@ impl LambdaA2aHandler {
         }
     }
 
-    /// Handle a Lambda HTTP request.
+    /// Handle a Lambda HTTP request. Returns once the work the request
+    /// left running has finished or been aborted; see
+    /// [`AppState::settle_detached_work`].
     pub async fn handle(
         &self,
         event: lambda_http::Request,
@@ -619,8 +633,10 @@ impl LambdaA2aHandler {
         let axum_resp = tower::ServiceExt::oneshot(self.router.clone(), axum_req)
             .await
             .map_err(|e| lambda_http::Error::from(format!("Router error: {e}")))?;
-
-        axum_to_lambda_response(axum_resp).await
+        let resp = axum_to_lambda_response(axum_resp).await;
+        // The environment can freeze once this returns.
+        self.state.settle_detached_work().await;
+        resp
     }
 
     /// Handle a raw Lambda HTTP event delivered as `serde_json::Value`
@@ -801,7 +817,10 @@ impl LambdaA2aHandler {
         &self,
         event: aws_lambda_events::event::sqs::SqsEvent,
     ) -> aws_lambda_events::event::sqs::SqsBatchResponse {
-        durable::drive_sqs_batch(&self.state, event).await
+        let resp = durable::drive_sqs_batch(&self.state, event).await;
+        // The environment can freeze once this returns.
+        self.state.settle_detached_work().await;
+        resp
     }
 
     /// Run this handler as a pure HTTP Lambda. Strict: any non-HTTP

@@ -46,9 +46,9 @@ available for adopters who prefer to be explicit.
 ## Push-notification recovery
 
 Push-notification delivery on Lambda requires **external triggers**.
-`tokio::spawn` continuations created inside a Lambda invocation are
-opportunistic only: the execution environment may be frozen
-indefinitely between invocations, so the in-process
+The execution environment may be frozen indefinitely between
+invocations, so before an invocation returns its push fan-out gets
+`timeout_abort_grace` to finish and is then aborted, and the in-process
 `PushDeliveryWorker` reclaim loop the binary server uses has no
 equivalent. Correctness is carried by an atomic pending-dispatch
 marker written inside the request Lambda's commit transaction, plus

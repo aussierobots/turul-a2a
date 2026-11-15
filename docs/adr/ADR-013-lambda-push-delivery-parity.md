@@ -83,6 +83,12 @@
   scan drops its `attribute_not_exists(registeredAfterEventSequence)`
   branch; the §12 "legacy configs are permissive" risk and the §13
   pre-migration-default question are removed with it.
+- **2026-11-16** — §4.4 and the §7 flow: a fan-out must not outlive its
+  invocation. A DynamoDB request signed before the environment froze
+  and sent after the thaw failed with `InvalidSignatureException:
+  Signature expired`, and the failure surfaced on the next request.
+  The HTTP, SQS and idle-sweep entrypoints now settle detached work
+  before they return. Correctness still does not depend on the fan-out completing.
 
 ## 1. Context
 
@@ -225,9 +231,18 @@ store — never one without the other.
 
 ### 4.4 `tokio::spawn` is not a correctness primitive under Lambda
 
-The framework treats post-return spawns as opportunistic latency
-optimisation only. Correctness is carried by the atomically-written
-marker + stream trigger + scheduler backstop.
+Correctness does not depend on a spawned fan-out completing: it is
+carried by the atomically-written marker + stream trigger + scheduler
+backstop.
+
+A spawned fan-out, or an executor still running after it yielded, must
+not outlive its invocation either. A storage request signed before the
+environment freezes and sent after the thaw is rejected as expired. So
+before `LambdaA2aHandler::handle`, `handle_sqs` and `cancel_idle_tasks`
+(the scheduled idle-task sweep) return, `AppState::settle_detached_work`
+gives that work `timeout_abort_grace` to finish, then aborts and awaits
+what remains. An aborted fan-out
+leaves its marker, so the stream or scheduler worker redelivers it.
 
 ### 4.5 Late-config prevention — causal event-sequence floor
 
@@ -330,9 +345,11 @@ message:send / message:stream / :cancel / force-commit paths
         └── insert a2a_push_pending_dispatches   /   transaction
             (ONLY when push_dispatch_enabled() && event is terminal
              StatusUpdate; otherwise omitted)
+  → dispatcher.dispatch spawned
+  → response built; the fan-out is awaited for up to
+    timeout_abort_grace, then aborted (§4.4); correctness does NOT
+    depend on it completing
   → handler returns response to client
-  → [opportunistic] dispatcher.dispatch spawned; may run or be
-    frozen; correctness does NOT depend on it completing
 ```
 
 The `A2aAtomicStore::update_task_status_with_events` trait signature
@@ -392,7 +409,7 @@ payload)`, which calls `claim_delivery`. Three cases, all safe:
    frozen per ADR-011 §10); no POST.
 
 Duplicate stream records, stream × scheduler races, request-Lambda
-opportunistic fan-out colliding with stream-worker fan-out — all safe
+fan-out (bounded by §4.4) colliding with stream-worker fan-out — all safe
 by construction. `delete_pending_dispatch` is idempotent.
 
 ### 5.5 Late-config invariant
@@ -560,7 +577,7 @@ On build, if `push_delivery_store` is present:
 
 The commit-hook call sites fire the dispatcher as on the main server;
 on Lambda, the dispatcher's main responsibility becomes marker
-deletion and opportunistic POST — correctness is carried by the
+deletion and a POST bounded by the invocation (§4.4) — correctness is carried by the
 atomic marker + stream/scheduler.
 
 ## 8. New crate surface — `turul-a2a-aws-lambda`
@@ -785,8 +802,8 @@ amendments across four coordinated changes:
 
 **Non-goals:**
 
-- In-Lambda periodic background tasks. `tokio::spawn` post-return is
-  opportunistic only.
+- In-Lambda periodic background tasks. No spawned task outlives its
+  invocation (§4.4).
 - Automatic provisioning of AWS resources. Framework ships handler
   code and example IaC snippets only.
 - Non-DynamoDB Lambda backends: scheduler-only recovery; scheduler-

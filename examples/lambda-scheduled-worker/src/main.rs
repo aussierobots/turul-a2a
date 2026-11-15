@@ -15,8 +15,8 @@
 //!
 //! ## Why this Lambda is mandatory
 //!
-//! `tokio::spawn` continuations created inside the request Lambda
-//! are opportunistic. For non-DynamoDB backends (SQLite, Postgres,
+//! Push fan-out inside the request Lambda may be aborted before it
+//! completes. For non-DynamoDB backends (SQLite, Postgres,
 //! in-memory) there is no event stream — the scheduled worker IS the
 //! recovery path. For DynamoDB it runs alongside the stream worker as
 //! belt-and-braces: the stream has 24h retention and can be stalled

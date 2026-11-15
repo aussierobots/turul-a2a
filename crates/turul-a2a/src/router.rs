@@ -84,6 +84,35 @@ pub struct AppState {
     pub durable_executor_queue: Option<Arc<dyn crate::durable_executor::DurableExecutorQueue>>,
 }
 
+impl AppState {
+    /// Wait for the work requests on this state left running after their
+    /// responses: executors still running after they yielded, and push
+    /// fan-outs. Together they get `timeout_abort_grace` to finish; what
+    /// is still running then is aborted and awaited, so no storage or push
+    /// request is pending when this returns. Work started while this runs
+    /// is waited for only if it is an executor. The wait for aborted
+    /// executors is unbounded: it ends when their supervisors exit.
+    ///
+    /// For runtimes that can freeze the process once a response is
+    /// returned (AWS Lambda): a request signed before the freeze and sent
+    /// after it is rejected as expired.
+    pub async fn settle_detached_work(&self) {
+        let deadline = tokio::time::Instant::now() + self.runtime_config.timeout_abort_grace;
+        if tokio::time::timeout_at(deadline, self.in_flight.wait_empty())
+            .await
+            .is_err()
+        {
+            self.in_flight.abort_all();
+            self.in_flight.wait_empty().await;
+        }
+        if let Some(dispatcher) = &self.push_dispatcher {
+            dispatcher
+                .settle(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                .await;
+        }
+    }
+}
+
 /// Build the axum router with all proto-defined routes.
 pub fn build_router(state: AppState) -> Router {
     let router = Router::new()

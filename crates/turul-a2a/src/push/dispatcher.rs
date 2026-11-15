@@ -62,6 +62,8 @@ pub struct PushDispatcher {
     worker: Arc<PushDeliveryWorker>,
     push_storage: Arc<dyn A2aPushNotificationStorage>,
     task_storage: Arc<dyn A2aTaskStorage>,
+    /// Fan-outs started by [`Self::dispatch`] that have not been reaped.
+    fanouts: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
 }
 
 impl PushDispatcher {
@@ -92,6 +94,28 @@ impl PushDispatcher {
             worker,
             push_storage,
             task_storage,
+            fanouts: Arc::default(),
+        }
+    }
+
+    /// Wait up to `grace` for every fan-out started by [`Self::dispatch`]
+    /// to finish, then abort the rest and wait for them to stop. An
+    /// aborted fan-out leaves its pending-dispatch marker in place, so a
+    /// recovery path redelivers it. Fan-outs dispatched while this runs
+    /// are not covered.
+    pub async fn settle(&self, grace: std::time::Duration) {
+        let mut fanouts = std::mem::take(
+            &mut *self
+                .fanouts
+                .lock()
+                .expect("push fan-out set mutex poisoned"),
+        );
+        let drained = tokio::time::timeout(grace, async {
+            while fanouts.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            fanouts.shutdown().await;
         }
     }
 
@@ -108,7 +132,8 @@ impl PushDispatcher {
     /// re-load the task via the owner-scoped `A2aTaskStorage::get_task`
     /// without opening a new unscoped read path.
     ///
-    /// This call never awaits; it returns after spawning. Failures
+    /// This call never awaits; it returns after spawning. [`Self::settle`]
+    /// waits for the spawned fan-outs. Failures
     /// inside deliveries land in the push-delivery store's
     /// failed-delivery ledger; callers do not see per-delivery errors.
     pub fn dispatch(
@@ -135,7 +160,12 @@ impl PushDispatcher {
         };
 
         let self_clone = self.clone();
-        tokio::spawn(async move {
+        let mut fanouts = self
+            .fanouts
+            .lock()
+            .expect("push fan-out set mutex poisoned");
+        while fanouts.try_join_next().is_some() {}
+        fanouts.spawn(async move {
             let _ = self_clone
                 .run_fanout(tenant, owner, task_id, task, terminal_seqs)
                 .await;
@@ -276,7 +306,8 @@ impl PushDispatcher {
 
             // Fan out per config, awaiting each task so the marker
             // isn't deleted until every per-config deliver has returned.
-            let mut join_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+            // A `JoinSet` aborts the deliveries if this fan-out is dropped.
+            let mut deliveries = tokio::task::JoinSet::new();
             for cfg in &configs {
                 let Some(target) = PushTarget::from_config(&tenant, &owner, &task_id, *seq, cfg)
                 else {
@@ -288,7 +319,7 @@ impl PushDispatcher {
                 let log_task = target.task_id.clone();
                 let log_cfg = target.config_id.clone();
                 let log_seq = target.event_sequence;
-                join_handles.push(tokio::spawn(async move {
+                deliveries.spawn(async move {
                     let report = worker.deliver(&target, &payload).await;
                     if matches!(report, DeliveryReport::TransientStoreError) {
                         tracing::warn!(
@@ -301,11 +332,9 @@ impl PushDispatcher {
                              did not persist; row remains non-terminal"
                         );
                     }
-                }));
+                });
             }
-            for h in join_handles {
-                let _ = h.await;
-            }
+            while deliveries.join_next().await.is_some() {}
 
             let _ = self
                 .push_delivery_store_handle()

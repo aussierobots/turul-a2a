@@ -10,10 +10,11 @@
 //!
 //! ## Why two Lambdas (stream + scheduled)?
 //!
-//! `tokio::spawn` continuations created inside a Lambda invocation are
-//! **opportunistic**. Between invocations the execution environment
-//! may be frozen indefinitely; correctness cannot depend on
-//! post-return completion. External triggers are mandatory:
+//! Push fan-out inside a Lambda invocation gets a bounded wait before
+//! the invocation returns and is aborted after it, because the
+//! execution environment may be frozen indefinitely between
+//! invocations; correctness cannot depend on it completing. External
+//! triggers are mandatory:
 //!
 //! - **DynamoDB Stream (this worker)** — fast path: every atomic
 //!   marker commit in the request Lambda produces an INSERT record

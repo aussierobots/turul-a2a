@@ -332,6 +332,8 @@ impl InFlightHandle {
 #[derive(Default)]
 pub struct InFlightRegistry {
     map: RwLock<HashMap<InFlightKey, Arc<InFlightHandle>>>,
+    /// Woken whenever an entry is removed.
+    removed: tokio::sync::Notify,
 }
 
 impl InFlightRegistry {
@@ -388,6 +390,8 @@ impl InFlightRegistry {
         match map.get(key) {
             Some(existing) if Arc::ptr_eq(existing, handle) => {
                 map.remove(key);
+                drop(map);
+                self.removed.notify_waiters();
                 true
             }
             _ => false,
@@ -405,6 +409,37 @@ impl InFlightRegistry {
     /// True if the registry is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Resolves once no executor is registered. An entry is removed when
+    /// its executor has finished and its supervisor has committed any
+    /// panic terminal; the supervisor's lease clear, when a lease is
+    /// configured, may still follow.
+    pub async fn wait_empty(&self) {
+        loop {
+            let removed = self.removed.notified();
+            tokio::pin!(removed);
+            removed.as_mut().enable();
+            if self.is_empty() {
+                return;
+            }
+            removed.await;
+        }
+    }
+
+    /// Abort every registered executor. Their supervisors then exit and
+    /// remove the entries.
+    pub fn abort_all(&self) {
+        let handles: Vec<_> = self
+            .map
+            .read()
+            .expect("InFlightRegistry RwLock poisoned")
+            .values()
+            .cloned()
+            .collect();
+        for handle in handles {
+            handle.abort();
+        }
     }
 
     /// Snapshot of in-flight `(tenant → [task_id, ...])` groups for the

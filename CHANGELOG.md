@@ -6,6 +6,23 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.10] — 2026-11-16
+
+### Fixed
+
+- **Lambda: no storage or push request outlives its invocation.** Work a request left running after its response (the push fan-out, and an executor still running after it yielded) could be frozen with the execution environment. A DynamoDB request signed before the freeze was then sent after the thaw and rejected with `InvalidSignatureException: Signature expired`, failing the next request with a 500. `LambdaA2aHandler::handle` (and `handle_http_event_value`) and `handle_sqs`, and the scheduled idle-task sweep (`cancel_idle_tasks`), now give that work `timeout_abort_grace` (default 5 s) to finish before returning, then abort and await what remains. An aborted push fan-out keeps its pending-dispatch marker, so the stream or scheduled recovery worker redelivers it. See ADR-013.
+- New `AppState::settle_detached_work()` in `turul-a2a` performs the wait, for adopters who drive the router directly from their own Lambda entrypoint.
+
+### Compatibility
+
+- Lambda responses can take longer: they now wait for the request's push fan-out, which includes webhook POSTs, for up to `timeout_abort_grace` in total.
+- The wait covers every executor and push fan-out in the process. On Lambda, where an execution environment runs one invocation at a time, that is the invocation's own work.
+- No wire format or storage schema changes. The long-lived server is unchanged apart from one detail: a push fan-out that is dropped now aborts its per-config deliveries.
+
+### Verification
+
+- New Lambda adapter tests prove that nothing a request started is still pending when `handle` returns, whether the work finishes within the grace or is aborted at it (push fan-out, executor tail, and the idle-task sweep's push fan-out). These tests failed before the fix.
+
 ## [0.2.9] — 2026-11-11
 
 ### Changed
