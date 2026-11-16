@@ -6,6 +6,20 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.12] — 2026-11-16
+
+### Fixed
+
+- **DynamoDB: artifact items of a terminal task now get their `ttl` even when the push-config lookup fails.** The terminal write stamps the task's `ttl` onto its artifact and push-config items; a failed push-config scan (for example, on a deployment without push whose push-config table does not exist or is not granted) aborted the stamp before any item was written, so artifact items were never expired. The two lookups are now independent. The WARN `turul_a2a::retention_child_ttl_error` is still logged for the failed lookup. Artifact items left unstamped by earlier versions are not back-filled.
+
+### Compatibility
+
+- No API, wire format or storage schema changes.
+
+### Verification
+
+- New DynamoDB Local test (missing push-config table, artifact still stamped) failed before the fix; the DynamoDB storage suite passes.
+
 ## [0.2.11] — 2026-11-16
 
 ### Changed

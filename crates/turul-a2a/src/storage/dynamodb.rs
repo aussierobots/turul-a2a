@@ -375,8 +375,11 @@ impl DynamoDbA2aStorage {
         ttl: &AttributeValue,
     ) -> Result<(), A2aStorageError> {
         let db_err = |e: &dyn std::fmt::Debug| A2aStorageError::DatabaseError(format!("{e:?}"));
-        // (table, key) of every child item.
+        // (table, key) of every child item. A failed lookup is reported but
+        // does not stop the items found by the other lookup from being
+        // stamped (a deployment without push may have no push-config table).
         let mut targets: Vec<(&str, HashMap<String, AttributeValue>)> = Vec::new();
+        let mut first_error = None;
 
         let art_pk = Self::artifact_pk(tenant, task_id);
         let mut start_key = None;
@@ -390,8 +393,14 @@ impl DynamoDbA2aStorage {
                 .projection_expression("pk, sk")
                 .set_exclusive_start_key(start_key)
                 .send()
-                .await
-                .map_err(|e| db_err(&e))?;
+                .await;
+            let out = match out {
+                Ok(out) => out,
+                Err(e) => {
+                    first_error = Some(db_err(&e));
+                    break;
+                }
+            };
             targets.extend(
                 out.items
                     .unwrap_or_default()
@@ -416,8 +425,14 @@ impl DynamoDbA2aStorage {
                 .projection_expression("pk")
                 .set_exclusive_start_key(start_key)
                 .send()
-                .await
-                .map_err(|e| db_err(&e))?;
+                .await;
+            let out = match out {
+                Ok(out) => out,
+                Err(e) => {
+                    first_error.get_or_insert(db_err(&e));
+                    break;
+                }
+            };
             targets.extend(
                 out.items
                     .unwrap_or_default()
@@ -432,7 +447,6 @@ impl DynamoDbA2aStorage {
 
         // The existence condition keeps an item deleted since the query
         // from being recreated as a stub.
-        let mut first_error = None;
         for chunk in targets.chunks(32) {
             let results = futures::future::join_all(chunk.iter().map(|(table, key)| {
                 self.client
@@ -5606,6 +5620,73 @@ mod tests {
                 .artifacts
                 .len(),
             40
+        );
+    }
+
+    /// A failing push-config lookup (here, a table that does not exist,
+    /// as on a deployment without push) does not stop the terminal write
+    /// from stamping the task's `ttl` onto its artifact items.
+    #[tokio::test]
+    async fn test_artifact_ttl_is_stamped_when_push_config_lookup_fails() {
+        skip_unless_dynamodb_env!(s);
+        let s = TestStorage {
+            inner: DynamoDbA2aStorage::from_client(
+                s.inner.client.clone(),
+                DynamoDbConfig {
+                    push_configs_table: "test_a2a_push_configs_absent".into(),
+                    ..s.inner.config.clone()
+                },
+            ),
+            tenant_prefix: s.tenant_prefix,
+        };
+        let tenant = s.scoped_tenant("default");
+        s.inner
+            .create_task(
+                &tenant,
+                "owner",
+                Task::new("ddb-nopush-1", TaskStatus::new(TaskState::Submitted))
+                    .with_context_id("ctx"),
+            )
+            .await
+            .unwrap();
+        s.inner
+            .update_task_status(
+                &tenant,
+                "ddb-nopush-1",
+                "owner",
+                TaskStatus::new(TaskState::Working),
+            )
+            .await
+            .unwrap();
+        s.inner
+            .append_artifact(
+                &tenant,
+                "ddb-nopush-1",
+                "owner",
+                Artifact::new("art-1", vec![turul_a2a_types::Part::text("body")]),
+                false,
+                true,
+            )
+            .await
+            .unwrap();
+        s.inner
+            .update_task_status(
+                &tenant,
+                "ddb-nopush-1",
+                "owner",
+                TaskStatus::new(TaskState::Completed),
+            )
+            .await
+            .unwrap();
+
+        let task_item = get_task_item(&s, &tenant, "ddb-nopush-1").await;
+        assert!(task_item.contains_key("ttl"), "terminal task has a ttl");
+        assert_eq!(
+            task_item.get("ttl"),
+            artifact_item(&s, &tenant, "ddb-nopush-1", "art-1")
+                .await
+                .get("ttl"),
+            "the artifact is stamped although the push-config lookup failed"
         );
     }
 
