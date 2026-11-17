@@ -249,9 +249,9 @@ Tests are written from the A2A proto/spec FIRST, then implementation follows. If
 - Subscribe: `GET` or `POST /tasks/{id=*}:subscribe` (proto annotation says GET, spec text says POST)
 - Version: `A2A-Version` header or `?A2A-Version=` query; gRPC `a2a-version` metadata (required)
 - Request Content-Type: `application/json` or `application/a2a+json`
-- Response Content-Type: HTTP+JSON (including the well-known agent card) is `application/a2a+json` when `Accept` names it (or `Accept` is absent/wildcard and the request was `application/a2a+json`), otherwise `application/json`, with `Vary: Accept` (`Accept, A2A-Version` under `compat-v03`); JSON-RPC is always `application/json` (spec §9.1)
+- Response Content-Type: HTTP+JSON (including the well-known agent card, which also has the card type below) is `application/a2a+json` when `Accept` names it (or `Accept` is absent/wildcard and the request was `application/a2a+json`), otherwise `application/json`, with `Vary: Accept` (`Accept, A2A-Version` under `compat-v03`); JSON-RPC is always `application/json` (spec §9.1)
 - Extended card: `GET /extendedAgentCard`
-- Discovery: `GET /.well-known/agent-card.json`
+- Discovery: `GET /.well-known/agent-card.json`; the well-known card is `application/a2a-agent-card+json` when `Accept` names that type. Both card endpoints send `Cache-Control: max-age` (`private` on the extended card) and a weak content-hash `ETag`, and answer a matching `If-None-Match` with 304 (spec §8.6.1, ADR-032)
 - JSON-RPC: `POST /jsonrpc` (all 11 methods, PascalCase)
 - TaskState: `TASK_STATE_SUBMITTED`, `TASK_STATE_WORKING`, etc.
 - Error (A2A v1.0.1 §5.4): TaskNotFoundError → 404/-32001, InvalidAgentResponseError → 500/-32006, every other A2A error → 400 (-32002..-32009); gRPC: NOT_FOUND / INVALID_ARGUMENT (ContentType) / INTERNAL (InvalidAgentResponse) / FAILED_PRECONDITION for the rest. `ErrorInfo.reason` is the discriminator

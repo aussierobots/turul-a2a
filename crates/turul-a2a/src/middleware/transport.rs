@@ -137,7 +137,13 @@ where
             let path = req.uri().path();
             let jsonrpc = crate::jsonrpc::is_jsonrpc_path(path);
             let discovery = super::is_bypass_path(path);
-            let a2a_json = (discovery || !is_legacy_request(&req)) && accepts_a2a_json(&req);
+            let content_type = if discovery && names_media_type(&req, AGENT_CARD_MEDIA_TYPE) {
+                Some(AGENT_CARD_MEDIA_TYPE)
+            } else if (discovery || !is_legacy_request(&req)) && accepts_a2a_json(&req) {
+                Some(protocol::MEDIA_TYPE_A2A_JSON)
+            } else {
+                None
+            };
             // Under `compat-v03` the version header also selects the type
             // (a v0.3 request keeps `application/json`), except on the
             // version-independent discovery card.
@@ -154,7 +160,7 @@ where
             Ok(if jsonrpc {
                 response
             } else {
-                label_json_response(response, a2a_json, vary)
+                label_json_response(response, content_type, vary)
             })
         })
     }
@@ -182,6 +188,25 @@ fn refuses(range: &str) -> bool {
             key.trim().eq_ignore_ascii_case("q") && q.trim().parse::<f32>() == Ok(0.0)
         })
     })
+}
+
+/// The agent card media type of the Linux Foundation AI Catalog. A2A
+/// itself registers only `application/a2a+json`; the well-known card is
+/// served with this type only to a client whose `Accept` names it.
+const AGENT_CARD_MEDIA_TYPE: &str = "application/a2a-agent-card+json";
+
+/// Whether the client's `Accept` names `media_type` itself (wildcards do
+/// not count) without refusing it with `q=0`.
+fn names_media_type<B>(req: &Request<B>, media_type: &str) -> bool {
+    let ranges: Vec<&str> = req
+        .headers()
+        .get_all(http::header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter(|range| essence(range).eq_ignore_ascii_case(media_type))
+        .collect();
+    !ranges.is_empty() && !ranges.iter().any(|range| refuses(range))
 }
 
 /// Whether the client takes `application/a2a+json` responses: its `Accept`
@@ -228,15 +253,16 @@ fn accepts_a2a_json<B>(req: &Request<B>) -> bool {
 
 /// Label an HTTP+JSON JSON response with the type negotiated for it:
 /// `application/a2a+json` when the client accepts it (spec Section 11.1:
-/// it SHOULD be used for requests and responses), otherwise the
-/// `application/json` it already carries. Either way the response names
-/// the request headers that chose the type in `Vary`, so a shared cache
-/// never serves a client a type it did not accept (RFC 9110 Section
-/// 12.5.5).
+/// it SHOULD be used for requests and responses), the agent card type on
+/// the well-known card when the client names it, otherwise the
+/// `application/json` it already carries. Either way the response (and a
+/// `304 Not Modified` standing in for one) names the request headers that
+/// chose the type in `Vary`, so a shared cache never serves a client a
+/// type it did not accept (RFC 9110 Section 12.5.5).
 /// Event streams and other media types are left alone.
 fn label_json_response(
     mut response: Response<Body>,
-    a2a_json: bool,
+    content_type: Option<&'static str>,
     vary: &'static str,
 ) -> Response<Body> {
     let is_json = response
@@ -244,13 +270,17 @@ fn label_json_response(
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| essence(v).eq_ignore_ascii_case(protocol::MEDIA_TYPE_JSON));
-    if is_json {
+    let not_modified = response.status() == http::StatusCode::NOT_MODIFIED;
+    let success = response.status().is_success();
+    if is_json || not_modified {
         let headers = response.headers_mut();
         headers.append(http::header::VARY, http::HeaderValue::from_static(vary));
-        if a2a_json {
+        // The agent card type labels a card, never an error on the card URL.
+        let content_type = content_type.filter(|t| *t != AGENT_CARD_MEDIA_TYPE || success);
+        if let (true, Some(content_type)) = (is_json, content_type) {
             headers.insert(
                 http::header::CONTENT_TYPE,
-                http::HeaderValue::from_static(protocol::MEDIA_TYPE_A2A_JSON),
+                http::HeaderValue::from_static(content_type),
             );
         }
     }

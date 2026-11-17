@@ -6,6 +6,26 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.14] — 2026-11-17
+
+### Added
+
+- **Agent card caching headers.** `GET /.well-known/agent-card.json` and `GET /extendedAgentCard` now send `Cache-Control: max-age=<n>` (the extended card adds `private`) and a weak `ETag` hashed from the card. A request whose `If-None-Match` matches gets `304 Not Modified` with no body (A2A v1.0.1 caching guidance). Set `max-age` with `A2aServerBuilder::agent_card_max_age` or `RuntimeConfig::agent_card_max_age`; the default is 5 minutes. See ADR-032.
+- **`application/a2a-agent-card+json` on the well-known card.** A client whose `Accept` names this type (the agent card type of the Linux Foundation AI Catalog) gets it as the `Content-Type`. Other clients and other endpoints keep `application/a2a+json` / `application/json` negotiation unchanged.
+
+### Changed
+
+- `sha2` is now a default dependency of `turul-a2a`. Previously it was pulled in only by the SQL and DynamoDB backends.
+
+### Compatibility
+
+- No API removals and no wire or storage schema changes. `RuntimeConfig` gains `agent_card_max_age`. It is `#[non_exhaustive]`, so construction from `RuntimeConfig::default()` is unaffected.
+- Card responses are now cacheable for 5 minutes by default. An agent whose card changes often should lower `agent_card_max_age`.
+
+### Verification
+
+- Agent card HTTP tests (caching headers, 304 revalidation, configurable max-age, media type by `Accept`, private extended card) passed.
+
 ## [0.2.13] — 2026-11-17
 
 ### Added

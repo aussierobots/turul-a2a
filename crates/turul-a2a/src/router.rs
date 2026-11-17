@@ -383,22 +383,88 @@ async fn dispatch_task_delete(
 // Handlers — agent card (no tenant scoping)
 // =========================================================
 
-async fn agent_card_handler(State(state): State<AppState>) -> impl IntoResponse {
+async fn agent_card_handler(
+    State(state): State<AppState>,
+    headers: http::HeaderMap,
+) -> axum::response::Response {
     let card = serde_json::to_value(state.executor.agent_card()).unwrap_or_default();
     #[cfg(feature = "compat-v03")]
     let card = crate::compat_v03::inject_agent_card_compat(card);
-    Json(card)
+    card_response(
+        &card,
+        &headers,
+        state.runtime_config.agent_card_max_age,
+        false,
+    )
 }
 
 async fn extended_agent_card_handler(
     State(state): State<AppState>,
+    headers: http::HeaderMap,
     axum::Extension(ctx): axum::Extension<crate::middleware::RequestContext>,
-) -> Result<impl IntoResponse, A2aError> {
+) -> Result<axum::response::Response, A2aError> {
     let card = serde_json::to_value(core_get_extended_agent_card(&state, ctx.identity.claims())?)
         .unwrap_or_default();
     #[cfg(feature = "compat-v03")]
     let card = crate::compat_v03::inject_agent_card_compat(card);
-    Ok(Json(card))
+    Ok(card_response(
+        &card,
+        &headers,
+        state.runtime_config.agent_card_max_age,
+        true,
+    ))
+}
+
+/// An agent card response with the caching headers A2A v1.0.1 Section
+/// 8.6.1 asks for: `Cache-Control` with `max-age`, and an `ETag` hashed
+/// from the card body. A request whose `If-None-Match` names that tag
+/// gets `304 Not Modified` with no body. The tag is weak because the same
+/// card is served under more than one media type. A `private` card (the
+/// extended card, which depends on the caller) must not be stored by a
+/// shared cache.
+fn card_response(
+    card: &serde_json::Value,
+    headers: &http::HeaderMap,
+    max_age: std::time::Duration,
+    private: bool,
+) -> axum::response::Response {
+    use sha2::{Digest, Sha256};
+    let body = serde_json::to_vec(card).unwrap_or_default();
+    let digest = Sha256::digest(&body);
+    let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    let etag = format!("W/\"{hex}\"");
+    let cache_control = format!(
+        "{}max-age={}",
+        if private { "private, " } else { "" },
+        max_age.as_secs()
+    );
+    let not_modified = headers
+        .get_all(http::header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .any(|tag| tag == "*" || tag.trim_start_matches("W/") == etag.trim_start_matches("W/"));
+    let mut response = if not_modified {
+        http::StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        (
+            [(
+                http::header::CONTENT_TYPE,
+                turul_a2a_types::wire::protocol::MEDIA_TYPE_JSON,
+            )],
+            body,
+        )
+            .into_response()
+    };
+    let out = response.headers_mut();
+    if let Ok(v) = http::HeaderValue::from_str(&etag) {
+        out.insert(http::header::ETAG, v);
+    }
+    if let Ok(v) = http::HeaderValue::from_str(&cache_control) {
+        out.insert(http::header::CACHE_CONTROL, v);
+    }
+    response
 }
 
 /// `GetExtendedAgentCard` for every transport. `UnsupportedOperation`

@@ -20,9 +20,9 @@ in-memory = []
 # a2a-sdk >=0.3,<0.4. Opt-in: enables method normalization, root POST
 # route, optional A2A-Version header.
 compat-v03 = []
-sqlite = ["sqlx", "dep:sha2"]
-postgres = ["sqlx", "dep:sha2"]
-dynamodb = ["aws-config", "aws-sdk-dynamodb", "dep:sha2"]
+sqlite = ["sqlx"]
+postgres = ["sqlx"]
+dynamodb = ["aws-config", "aws-sdk-dynamodb"]
 # gRPC transport. Off by default — HTTP+JSON adopters pay zero
 # tonic weight. Enabling this transitively activates turul-a2a-proto/grpc
 # and pulls in the tonic runtime + ErrorInfo support.
@@ -44,7 +44,7 @@ uuid = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true, optional = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }

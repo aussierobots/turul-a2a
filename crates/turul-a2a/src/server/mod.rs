@@ -140,6 +140,10 @@ pub struct RuntimeConfig {
     /// flag as a side effect. Even then, the flag SHOULD NOT be flipped
     /// directly — reach for the builder method.
     pub supports_return_immediately: bool,
+    /// `max-age` of the `Cache-Control` header on agent card responses
+    /// (the well-known card and the extended card). Set it to how long a
+    /// client may reuse the card before revalidating with its `ETag`.
+    pub agent_card_max_age: Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -157,6 +161,7 @@ impl Default for RuntimeConfig {
             executor_lease_ttl: None,
             executor_stall_timeout: None,
             idle_task_timeout: None,
+            agent_card_max_age: Duration::from_secs(300),
             push_max_attempts: push.max_attempts as usize,
             push_backoff_base: push.backoff_base,
             push_backoff_cap: push.backoff_cap,
@@ -319,6 +324,14 @@ impl A2aServerBuilder {
     /// tokio runtime is current.
     pub fn idle_task_timeout(mut self, timeout: Duration) -> Self {
         self.runtime_config.idle_task_timeout = Some(timeout);
+        self
+    }
+
+    /// How long a client may reuse an agent card before revalidating:
+    /// the `max-age` of the card responses' `Cache-Control`. Default
+    /// 5 minutes.
+    pub fn agent_card_max_age(mut self, max_age: Duration) -> Self {
+        self.runtime_config.agent_card_max_age = max_age;
         self
     }
 
