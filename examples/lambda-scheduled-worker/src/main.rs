@@ -99,15 +99,12 @@ fn build_handler() -> Result<LambdaScheduledRecoveryHandler, Error> {
     let task_storage: Arc<dyn A2aTaskStorage> = storage.clone();
 
     let delivery_cfg = PushDeliveryConfig::default();
-    let worker = Arc::new(
-        PushDeliveryWorker::new(
-            delivery.clone(),
-            delivery_cfg,
-            None,
-            format!("scheduled-worker-{}", instance_tag()),
-        )
-        .map_err(|e| Error::from(format!("worker build failed: {e}")))?,
-    );
+    let worker = Arc::new(PushDeliveryWorker::new(
+        delivery.clone(),
+        delivery_cfg,
+        None,
+        format!("scheduled-worker-{}", instance_tag()),
+    ));
     let dispatcher = Arc::new(PushDispatcher::new(worker, push_storage, task_storage));
 
     Ok(

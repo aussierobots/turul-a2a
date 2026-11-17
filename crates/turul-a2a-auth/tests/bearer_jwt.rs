@@ -109,6 +109,12 @@ fn claims(sub: &str, extra: Value) -> Value {
     c
 }
 
+/// `claims` with `key` removed.
+fn without(mut claims: Value, key: &str) -> Value {
+    claims.as_object_mut().unwrap().remove(key);
+    claims
+}
+
 fn ctx_with_token(token: &str) -> RequestContext {
     let mut headers = http::HeaderMap::new();
     headers.insert(
@@ -185,6 +191,14 @@ async fn every_validator_failure_is_invalid_token() {
         (
             "signed by another key",
             sign_with(&foreign_key, &claims("alice", json!({}))),
+        ),
+        (
+            "missing audience",
+            issuer.sign(&without(claims("alice", json!({})), "aud")),
+        ),
+        (
+            "missing issuer",
+            issuer.sign(&without(claims("alice", json!({})), "iss")),
         ),
     ];
     for (case, token) in cases {

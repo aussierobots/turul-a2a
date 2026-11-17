@@ -9,7 +9,7 @@
 //!   as JSON into `SendMessage.body`.
 //! - [`LambdaA2aHandler::handle_sqs`] — SQS event-source handler.
 //!   Per-record: terminal-no-op check, cancel-marker direct-CANCELED
-//!   commit, then [`turul_a2a::server::spawn::run_executor_for_existing_task`].
+//!   commit, then [`turul_a2a::server::spawn::run_queued_executor_job`].
 //!   Returns `SqsBatchResponse` so one poison record does not block
 //!   the batch.
 //! - [`LambdaA2aHandler::run_sqs_only`] and
@@ -49,6 +49,7 @@ pub struct SqsDurableExecutorQueue {
 }
 
 impl SqsDurableExecutorQueue {
+    /// Creates a queue that sends jobs to `queue_url` through `client`.
     pub fn new(queue_url: impl Into<String>, client: Arc<SqsClient>) -> Self {
         Self {
             client,
@@ -87,7 +88,7 @@ impl DurableExecutorQueue for SqsDurableExecutorQueue {
     }
 }
 
-/// Drive one SQS batch through the durable-continuation path.
+/// Drives one SQS batch through the durable-continuation path.
 ///
 /// Public so `LambdaA2aHandler::handle_sqs` can delegate; adopters
 /// should not call this directly — use the handler wrapper.
@@ -99,8 +100,9 @@ impl DurableExecutorQueue for SqsDurableExecutorQueue {
 /// 3. Already terminal → success (idempotent no-op).
 /// 4. Cancel marker set → commit CANCELED directly via atomic store
 ///    (executor never invoked); `TerminalStateAlreadySet` → success.
-/// 5. Run executor via `run_executor_for_existing_task`.
-/// 6. Executor error → batch-item failure.
+/// 5. Run the executor via `run_queued_executor_job`; an executor
+///    failure is committed as FAILED through the sink and the record
+///    counts as processed.
 pub async fn drive_sqs_batch(state: &AppState, event: SqsEvent) -> SqsBatchResponse {
     let mut failures = Vec::new();
     for record in event.records {
@@ -275,7 +277,7 @@ async fn drive_sqs_record(state: &AppState, record: SqsMessage) -> Result<(), St
 /// runners are strict: a non-matching event shape fails loudly, which
 /// is what you want on hardened deployments or in tests.
 impl LambdaA2aHandler {
-    /// Run this handler as a pure SQS consumer. Strict: any non-SQS
+    /// Runs this handler as a pure SQS consumer. Strict: any non-SQS
     /// event shape fails to deserialize and the Lambda invocation
     /// errors.
     ///
@@ -284,6 +286,10 @@ impl LambdaA2aHandler {
     /// `LambdaA2aServerBuilder::with_sqs_return_immediately(...)` (the
     /// worker never enqueues; it only consumes from the SQS event
     /// source mapping).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Lambda runtime fails.
     pub async fn run_sqs_only(self) -> Result<(), lambda_runtime::Error> {
         let handler = Arc::new(self);
         lambda_runtime::run(lambda_runtime::service_fn(
@@ -299,7 +305,7 @@ impl LambdaA2aHandler {
         .await
     }
 
-    /// Run this handler as a dual HTTP+SQS Lambda. Routes each event
+    /// Runs this handler as a dual HTTP+SQS Lambda. Routes each event
     /// via [`classify_event`] — HTTP events go through
     /// [`LambdaA2aHandler::handle`] with envelope conversion; SQS
     /// events go through [`LambdaA2aHandler::handle_sqs`]. Any other
@@ -309,6 +315,10 @@ impl LambdaA2aHandler {
     /// (e.g. `ReservedConcurrency=1` demos where the same container
     /// handles the HTTP request that enqueues and the SQS trigger
     /// that consumes).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Lambda runtime fails.
     pub async fn run_http_and_sqs(self) -> Result<(), lambda_runtime::Error> {
         let handler = Arc::new(self);
         lambda_runtime::run(lambda_runtime::service_fn(
@@ -340,9 +350,13 @@ impl LambdaA2aHandler {
         .await
     }
 
-    /// Default Lambda runner (with `sqs` feature on). Same dispatch
+    /// Runs the default Lambda runner (with `sqs` feature on). Same dispatch
     /// as [`Self::run_http_and_sqs`] — routes HTTP and SQS events via
     /// the classifier. Safe for Lambdas that receive either or both.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Lambda runtime fails.
     pub async fn run(self) -> Result<(), lambda_runtime::Error> {
         self.run_http_and_sqs().await
     }

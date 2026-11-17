@@ -64,10 +64,15 @@ use crate::streaming::TaskEventBroker;
 /// [`run_queued_executor_job`].
 #[derive(Clone)]
 pub struct SpawnDeps {
+    /// Executor that runs the spawned turn.
     pub executor: Arc<dyn AgentExecutor>,
+    /// Task persistence the turn reads and writes.
     pub task_storage: Arc<dyn A2aTaskStorage>,
+    /// Commits the turn's task, status and event writes atomically.
     pub atomic_store: Arc<dyn A2aAtomicStore>,
+    /// Same-instance fanout that the turn's events are published to.
     pub event_broker: TaskEventBroker,
+    /// Registry of executors running on this instance, used for cancellation and lookup.
     pub in_flight: Arc<InFlightRegistry>,
     /// Push-delivery dispatcher. Threaded into every
     /// sink constructed here so executor-emitted terminal status
@@ -80,8 +85,8 @@ pub struct SpawnDeps {
 ///
 /// `claims` carries the authenticated JWT claims from the transport
 /// layer through to the executor's `ExecutionContext`. All three
-/// transports (HTTP, JSON-RPC, gRPC) populate this where they have
-/// claims; gRPC passes `None` until gRPC auth is wired.
+/// transports (HTTP, JSON-RPC, gRPC) populate this from the request's
+/// authenticated identity; it is `None` when middleware supplied no claims.
 ///
 /// `accepted_output_modes`, `request_metadata` and
 /// `activated_extensions` carry
@@ -94,22 +99,35 @@ pub struct SpawnDeps {
 /// builds one with [`Self::from_queued_job`].
 #[non_exhaustive]
 pub struct SpawnScope {
+    /// Tenant the task belongs to; empty for the default tenant.
     pub tenant: String,
+    /// Owner of the task, as established by authentication.
     pub owner: String,
+    /// Identifier of the task the executor works on.
     pub task_id: String,
+    /// Identifier of the context the task belongs to.
     pub context_id: String,
+    /// Message that triggered this executor run.
     pub message: Message,
+    /// Authenticated claims passed to the executor, or `None` when middleware supplied none.
     pub claims: Option<serde_json::Value>,
+    /// Output media types the client accepted for this request.
     pub accepted_output_modes: Vec<String>,
+    /// Metadata the client supplied on the send request.
     pub request_metadata: Option<serde_json::Value>,
+    /// URIs of the extensions activated for this request.
     pub activated_extensions: Vec<String>,
 }
 
 impl SpawnScope {
     /// The scope a durable-queue consumer runs a dequeued job under: the
     /// job's tenant, owner, task, context, message, claims and request
-    /// inputs, as the enqueuing request recorded them. Fails when the
-    /// job's message is not a valid [`Message`].
+    /// inputs, as the enqueuing request recorded them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the conversion error when the job's message is not a valid
+    /// [`Message`].
     pub fn from_queued_job(
         job: &crate::durable_executor::QueuedExecutorJob,
     ) -> Result<Self, turul_a2a_types::A2aTypeError> {
@@ -405,7 +423,8 @@ pub(crate) async fn run_executor_for_existing_task(
     commit_post_execute(&sink, &task, &start_artifact_sigs, result).await;
 }
 
-/// detection rule.
+/// Commits the state the executor left once `execute` returns: the
+/// post-execute detection rule.
 ///
 /// Routes direct-task-mutation executors through the CAS-guarded
 /// atomic-store paths so every terminal transition is observable

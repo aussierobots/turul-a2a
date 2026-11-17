@@ -305,7 +305,7 @@ impl SkillHandler for GreetHandler {
             .validate_output(&output)
             .map_err(|e| SkillError::Internal(format!("outputSchema violation: {e}")))?;
 
-        // 6. Emit as an artifact. The executor below handles task terminal.
+        // 7. Emit as an artifact. The executor below handles task terminal.
         let artifact_id = uuid::Uuid::now_v7().to_string();
         let payload = serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string());
         let artifact =

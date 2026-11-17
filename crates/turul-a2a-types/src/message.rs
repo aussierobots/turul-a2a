@@ -1,3 +1,5 @@
+//! Message, part and role wrappers.
+
 use serde::{Deserialize, Serialize};
 use turul_a2a_proto as pb;
 
@@ -9,6 +11,7 @@ pub struct Part {
 }
 
 impl Part {
+    /// Creates a text part with media type `text/plain`.
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             inner: pb::Part {
@@ -20,6 +23,7 @@ impl Part {
         }
     }
 
+    /// Creates a part that references content at `url` with the given media type.
     pub fn url(url: impl Into<String>, media_type: impl Into<String>) -> Self {
         Self {
             inner: pb::Part {
@@ -31,6 +35,7 @@ impl Part {
         }
     }
 
+    /// Creates a part that carries `data` bytes with the given media type.
     pub fn raw(data: Vec<u8>, media_type: impl Into<String>) -> Self {
         Self {
             inner: pb::Part {
@@ -42,6 +47,7 @@ impl Part {
         }
     }
 
+    /// Creates a structured-data part with media type `application/json`.
     pub fn data(value: serde_json::Value) -> Self {
         Self {
             inner: pb::Part {
@@ -53,11 +59,13 @@ impl Part {
         }
     }
 
+    /// Sets the part filename.
     pub fn with_filename(mut self, filename: impl Into<String>) -> Self {
         self.inner.filename = filename.into();
         self
     }
 
+    /// Sets the part media type.
     pub fn with_media_type(mut self, media_type: impl Into<String>) -> Self {
         self.inner.media_type = media_type.into();
         self
@@ -114,10 +122,12 @@ impl Part {
         )
     }
 
+    /// Returns a reference to the underlying generated proto message.
     pub fn as_proto(&self) -> &pb::Part {
         &self.inner
     }
 
+    /// Consumes the wrapper and returns the underlying generated proto message.
     pub fn into_proto(self) -> pb::Part {
         self.inner
     }
@@ -160,7 +170,9 @@ pub struct Message {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Role {
+    /// The message was sent by the client or end user.
     User,
+    /// The message was produced by the agent.
     Agent,
 }
 
@@ -186,6 +198,7 @@ impl TryFrom<pb::Role> for Role {
 }
 
 impl Message {
+    /// Creates a message with `message_id`, `role` and `parts`, with no context or task id.
     pub fn new(message_id: impl Into<String>, role: Role, parts: Vec<Part>) -> Self {
         Self {
             inner: pb::Message {
@@ -201,16 +214,19 @@ impl Message {
         }
     }
 
+    /// Sets the context id.
     pub fn with_context_id(mut self, context_id: impl Into<String>) -> Self {
         self.inner.context_id = context_id.into();
         self
     }
 
+    /// Sets the task id the message is bound to.
     pub fn with_task_id(mut self, task_id: impl Into<String>) -> Self {
         self.inner.task_id = task_id.into();
         self
     }
 
+    /// Returns the message id.
     pub fn message_id(&self) -> &str {
         &self.inner.message_id
     }
@@ -344,10 +360,12 @@ impl Message {
         None
     }
 
+    /// Returns a reference to the underlying generated proto message.
     pub fn as_proto(&self) -> &pb::Message {
         &self.inner
     }
 
+    /// Consumes the wrapper and returns the underlying generated proto message.
     pub fn into_proto(self) -> pb::Message {
         self.inner
     }

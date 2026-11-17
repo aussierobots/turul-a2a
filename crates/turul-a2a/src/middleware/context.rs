@@ -14,12 +14,15 @@ pub enum AuthIdentity {
     Anonymous,
     /// Authenticated principal with owner and optional claims.
     Authenticated {
+        /// Identifier of the authenticated principal; storage scopes task ownership by it.
         owner: String,
+        /// Verified token claims, when the authenticating middleware supplies them.
         claims: Option<serde_json::Value>,
     },
 }
 
 impl AuthIdentity {
+    /// Returns `true` for the `Authenticated` variant.
     pub fn is_authenticated(&self) -> bool {
         matches!(self, Self::Authenticated { .. })
     }
@@ -66,13 +69,18 @@ impl fmt::Debug for AuthIdentity {
 /// Request context threaded through middleware and handlers.
 #[derive(Clone)]
 pub struct RequestContext {
+    /// Token taken from a well-formed `Authorization: Bearer` header, if the request carried one.
     pub bearer_token: Option<String>,
+    /// Headers of the inbound request.
     pub headers: http::HeaderMap,
+    /// Principal established by middleware; `Anonymous` until one authenticates the request.
     pub identity: AuthIdentity,
+    /// Named values attached by middleware or transport code for later stages, such as handlers, to read.
     pub extensions: HashMap<String, serde_json::Value>,
 }
 
 impl RequestContext {
+    /// Creates an unauthenticated context with no credentials or extensions.
     pub fn new() -> Self {
         Self {
             bearer_token: None,

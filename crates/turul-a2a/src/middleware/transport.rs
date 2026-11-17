@@ -105,6 +105,7 @@ impl<S> Layer<S> for TransportComplianceLayer {
     }
 }
 
+/// Service produced by [`TransportComplianceLayer`]; wraps an inner service with the A2A transport checks.
 #[derive(Clone)]
 pub struct TransportComplianceService<S> {
     inner: S,

@@ -73,18 +73,27 @@ pub const MAX_FAILED_DELIVERY_RETENTION: Duration = Duration::from_secs(1000 * 3
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct PushDeliveryConfig {
+    /// Total POST attempts per delivery, the first included.
     pub max_attempts: u32,
+    /// Wait before the second attempt; each later wait doubles it.
     pub backoff_base: Duration,
+    /// Longest wait between two attempts, before jitter.
     pub backoff_cap: Duration,
+    /// Largest fraction of each wait added or subtracted at random; `0.25` varies a wait by up to ±25%.
     pub backoff_jitter: f32,
     /// Bound on the whole POST: connect, send and the full response.
     pub request_timeout: Duration,
+    /// Longest the POST waits to establish the connection.
     pub connect_timeout: Duration,
     /// Longest the POST waits for the receiver's response with nothing
     /// arriving (status line and headers, then each body read).
     pub read_timeout: Duration,
+    /// How long a delivery claim is held before another instance may re-claim it.
     pub claim_expiry: Duration,
+    /// Largest request body in bytes that is POSTed; a larger one is given up without a POST.
     pub max_payload_bytes: usize,
+    /// Whether `http://` URLs and private or loopback addresses are allowed; `false` abandons
+    /// `http://` deliveries and gives up on blocked addresses. For local development only.
     pub allow_insecure_urls: bool,
     /// How long a push config confirmed present by the pre-attempt
     /// check is trusted without re-reading storage. Default `ZERO`:
@@ -144,14 +153,25 @@ impl PushDeliveryConfig {
 /// `Secret`, so formatting paths inside the worker cannot leak.
 #[derive(Clone)]
 pub struct PushTarget {
+    /// Tenant the task belongs to.
     pub tenant: String,
+    /// Owner of the task.
     pub owner: String,
+    /// Task whose event is being delivered.
     pub task_id: String,
+    /// Sequence number of the task event being delivered.
     pub event_sequence: u64,
+    /// Identifier of the push config this target was built from.
     pub config_id: String,
+    /// Receiver URL the task is POSTed to.
     pub url: Url,
+    /// Scheme placed before `auth_credentials` in the `Authorization` header, such as `Bearer`;
+    /// empty omits the header.
     pub auth_scheme: String,
+    /// Credentials sent with `auth_scheme`.
     pub auth_credentials: Secret,
+    /// Config token sent in the `X-Turul-Push-Token` header so the receiver can verify the
+    /// notification; `None` omits the header.
     pub token: Option<Secret>,
 }
 
@@ -161,6 +181,11 @@ pub struct PushTarget {
 /// MUST perform a single resolution per call (no intermediate
 /// caching across calls that the worker could re-resolve against).
 pub trait PushDnsResolver: Send + Sync {
+    /// Resolves `host` and `port` into the IP addresses to connect to.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message describing why the host could not be resolved.
     fn resolve(
         &self,
         host: &str,
@@ -203,7 +228,9 @@ impl PushDnsResolver for TokioDnsResolver {
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct DeliveryTargetLookup {
+    /// Store the push config is re-read from.
     pub push_storage: Arc<dyn A2aPushNotificationStorage>,
+    /// Store the task is re-read from.
     pub task_storage: Arc<dyn A2aTaskStorage>,
 }
 
@@ -325,10 +352,16 @@ impl PushConfigCache {
 /// per-delivery task.
 #[derive(Clone)]
 pub struct PushDeliveryWorker {
+    /// Store that holds the delivery claims and records outcomes.
     pub push_delivery_store: Arc<dyn A2aPushDeliveryStore>,
+    /// Resolver for the target host; its answer is checked against the IP blocklist and the
+    /// POST connects to the address it picks.
     pub dns_resolver: Arc<dyn PushDnsResolver>,
+    /// Delivery parameters the worker applies.
     pub config: PushDeliveryConfig,
+    /// Operator hook run on each target URL before DNS resolution; `None` applies only the scheme and IP-blocklist checks.
     pub outbound_validator: Option<OutboundUrlValidator>,
+    /// Identifier this worker presents as claimant on delivery claims.
     pub instance_id: String,
     /// Pre-attempt existence checks. `None` skips them (a worker
     /// driven directly, without a dispatcher, has no stores to read).
@@ -355,8 +388,8 @@ impl PushDeliveryWorker {
         config: PushDeliveryConfig,
         outbound_validator: Option<OutboundUrlValidator>,
         instance_id: String,
-    ) -> Result<Self, String> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             push_delivery_store,
             dns_resolver: Arc::new(TokioDnsResolver),
             config,
@@ -364,7 +397,7 @@ impl PushDeliveryWorker {
             instance_id,
             target_lookup: None,
             config_cache: Arc::default(),
-        })
+        }
     }
 
     /// Forget the cached presence of every push config of a task, so
@@ -701,22 +734,16 @@ impl PushDeliveryWorker {
             DeliveryOutcome::Retry { .. } => return DeliveryReport::TransientStoreError,
         };
 
-        // Backoff schedule: 50ms, 150ms, 500ms between attempts.
+        // One attempt, then one retry after each sleep: 150ms, then 500ms.
         // Short enough to stay well inside claim_expiry and to avoid
         // holding the delivery task open for long; bounded so a
         // permanently-down store does surface the error.
-        const TERMINAL_PERSIST_MAX_ATTEMPTS: u32 = 3;
-        let backoffs = [
-            Duration::from_millis(50),
-            Duration::from_millis(150),
-            Duration::from_millis(500),
-        ];
+        const RETRY_SLEEPS: [Duration; 2] =
+            [Duration::from_millis(150), Duration::from_millis(500)];
 
-        let mut last_error: Option<A2aStorageError> = None;
-        for attempt in 0..TERMINAL_PERSIST_MAX_ATTEMPTS {
-            if attempt > 0 {
-                // Index is safe: loop bound == slice length.
-                tokio::time::sleep(backoffs[(attempt as usize).min(backoffs.len() - 1)]).await;
+        for attempt in 0..=RETRY_SLEEPS.len() {
+            if let Some(sleep) = attempt.checked_sub(1).map(|i| RETRY_SLEEPS[i]) {
+                tokio::time::sleep(sleep).await;
             }
             match self
                 .push_delivery_store
@@ -737,12 +764,9 @@ impl PushDeliveryWorker {
                     // retryable — another writer holds the row now.
                     return DeliveryReport::ClaimLostOrFinal;
                 }
-                Err(e) => {
-                    last_error = Some(e);
-                }
+                Err(_) => {}
             }
         }
-        let _ = last_error; // Reserved for future tracing plumbing.
         DeliveryReport::TransientStoreError
     }
 
@@ -842,12 +866,11 @@ impl PushDeliveryWorker {
                 format!("turul-a2a/{}", env!("CARGO_PKG_VERSION")),
             )
             .header("X-Turul-Event-Sequence", target.event_sequence.to_string());
-        // omit the `Authorization` header entirely when
-        // the config has no authentication. Emitting an empty
-        // `"{scheme} {creds}"` value — as the earlier implementation
-        // did — can be rejected by hardened receivers that refuse
-        // malformed auth headers, and it muddies the semantics of
-        // "this config is unauthenticated".
+        // Omit the `Authorization` header entirely when the config has
+        // no authentication. An empty `"{scheme} {creds}"` value can be
+        // rejected by hardened receivers that refuse malformed auth
+        // headers, and it muddies the semantics of "this config is
+        // unauthenticated".
         if !target.auth_scheme.is_empty() {
             req = req.header(
                 "Authorization",
@@ -923,8 +946,12 @@ enum ClaimFailure {
 /// already records the definitive outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryReport {
+    /// Delivery was confirmed; carries the receiver's HTTP status.
     Succeeded(u16),
+    /// Delivery failed for good for the given reason.
     GaveUp(GaveUpReason),
+    /// Delivery stopped without a further POST, for the given reason (config or task deleted,
+    /// or an `http://` URL refused); not recorded as a failure.
     Abandoned(AbandonedReason),
     /// The claim was not held by this instance (lost race, or the
     /// row had already reached a terminal state by the time we
@@ -949,7 +976,6 @@ mod tests {
         cfg: PushDeliveryConfig,
     ) -> PushDeliveryWorker {
         PushDeliveryWorker::new(store, cfg, None, format!("worker-{}", uuid::Uuid::now_v7()))
-            .expect("build")
     }
 
     fn target(url: &str) -> PushTarget {

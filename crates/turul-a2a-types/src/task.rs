@@ -1,3 +1,5 @@
+//! Task, task status and task state wrappers.
+
 use serde::{Deserialize, Serialize};
 use turul_a2a_proto as pb;
 
@@ -11,13 +13,21 @@ use crate::message::Message;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum TaskState {
+    /// The task was accepted but work has not started.
     Submitted,
+    /// The task is being processed.
     Working,
+    /// The task finished successfully; a terminal state.
     Completed,
+    /// The task ended in error; a terminal state.
     Failed,
+    /// The task was canceled before completing; a terminal state.
     Canceled,
+    /// The task is paused waiting for further input from the client.
     InputRequired,
+    /// The agent declined to perform the task; a terminal state.
     Rejected,
+    /// The task is paused waiting for the client to supply credentials.
     AuthRequired,
 }
 
@@ -96,6 +106,7 @@ pub struct TaskStatus {
 }
 
 impl TaskStatus {
+    /// Creates a status in `state` with no message and no timestamp.
     pub fn new(state: TaskState) -> Self {
         Self {
             inner: pb::TaskStatus {
@@ -106,21 +117,29 @@ impl TaskStatus {
         }
     }
 
+    /// Sets the message attached to this status.
     pub fn with_message(mut self, message: Message) -> Self {
         self.inner.message = Some(message.into_proto());
         self
     }
 
+    /// Returns the status state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aTypeError::InvalidState`] if the stored value is unknown or `UNSPECIFIED`.
     pub fn state(&self) -> Result<TaskState, A2aTypeError> {
         let proto_state =
             pb::TaskState::try_from(self.inner.state).map_err(|_| A2aTypeError::InvalidState)?;
         TaskState::try_from(proto_state)
     }
 
+    /// Returns a reference to the underlying generated proto message.
     pub fn as_proto(&self) -> &pb::TaskStatus {
         &self.inner
     }
 
+    /// Consumes the wrapper and returns the underlying generated proto message.
     pub fn into_proto(self) -> pb::TaskStatus {
         self.inner
     }
@@ -167,6 +186,7 @@ pub struct Task {
 }
 
 impl Task {
+    /// Creates a task with `id`, `status`, an empty context id, and no history or artifacts.
     pub fn new(id: impl Into<String>, status: TaskStatus) -> Self {
         Self {
             inner: pb::Task {
@@ -180,19 +200,23 @@ impl Task {
         }
     }
 
+    /// Sets the context id the task belongs to.
     pub fn with_context_id(mut self, context_id: impl Into<String>) -> Self {
         self.inner.context_id = context_id.into();
         self
     }
 
+    /// Returns the task id.
     pub fn id(&self) -> &str {
         &self.inner.id
     }
 
+    /// Returns the context id, or an empty string if unset.
     pub fn context_id(&self) -> &str {
         &self.inner.context_id
     }
 
+    /// Returns the current status, or `None` if it is unset or holds an invalid state.
     pub fn status(&self) -> Option<TaskStatus> {
         self.inner
             .status
@@ -200,18 +224,22 @@ impl Task {
             .and_then(|s| TaskStatus::try_from(s).ok())
     }
 
+    /// Returns the task message history.
     pub fn history(&self) -> &[pb::Message] {
         &self.inner.history
     }
 
+    /// Returns the task artifacts.
     pub fn artifacts(&self) -> &[pb::Artifact] {
         &self.inner.artifacts
     }
 
+    /// Appends `message` to the task history.
     pub fn append_message(&mut self, message: Message) {
         self.inner.history.push(message.into_proto());
     }
 
+    /// Appends `artifact` to the task artifacts unconditionally.
     pub fn append_artifact(&mut self, artifact: Artifact) {
         self.inner.artifacts.push(artifact.into_proto());
     }
@@ -282,14 +310,17 @@ impl Task {
         self.append_artifact(artifact);
     }
 
+    /// Returns a reference to the underlying generated proto message.
     pub fn as_proto(&self) -> &pb::Task {
         &self.inner
     }
 
+    /// Returns a mutable reference to the underlying generated proto message.
     pub fn as_proto_mut(&mut self) -> &mut pb::Task {
         &mut self.inner
     }
 
+    /// Consumes the wrapper and returns the underlying generated proto message.
     pub fn into_proto(self) -> pb::Task {
         self.inner
     }

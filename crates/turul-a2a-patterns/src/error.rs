@@ -23,7 +23,12 @@ pub enum SkillError {
     /// Internal, like `Internal`, but names the gate so a veto is
     /// distinguishable from a handler fault.
     #[error("rejected by {gate}: {reason}")]
-    Rejected { gate: String, reason: String },
+    Rejected {
+        /// Name of the gate that vetoed the output.
+        gate: String,
+        /// Why the gate refused the output.
+        reason: String,
+    },
 }
 
 /// Sink-side error variants.
@@ -42,30 +47,64 @@ pub enum SinkError {
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ManifestError {
+    /// The manifest is malformed or violates its metadata rules.
     #[error("manifest parse error at {location}: {reason}")]
-    Parse { location: String, reason: String },
+    Parse {
+        /// `metadata.<key>` of the offending entry, or `SKILL.md` when the skill fails to load.
+        location: String,
+        /// What is wrong at that location.
+        reason: String,
+    },
+    /// A declared input or output schema is unsupported or does not compile.
     #[error("schema validation error at {location}: {reason}")]
-    Schema { location: String, reason: String },
+    Schema {
+        /// `metadata.<key>` naming the offending schema asset.
+        location: String,
+        /// Why the schema was refused.
+        reason: String,
+    },
 }
 
 /// Structured template render error.
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum RenderError {
+    /// A placeholder names a parameter that the params do not contain.
     #[error("missing template variable `{path}` at offset {offset}")]
-    MissingVariable { path: String, offset: usize },
+    MissingVariable {
+        /// Dotted path of the missing variable.
+        path: String,
+        /// Byte offset of the placeholder in the template.
+        offset: usize,
+    },
+    /// The template has a malformed placeholder: an unclosed `{{` or an empty expression.
     #[error("template syntax error at offset {offset}: {reason}")]
-    Syntax { offset: usize, reason: String },
+    Syntax {
+        /// Byte offset of the malformed placeholder in the template.
+        offset: usize,
+        /// What is malformed.
+        reason: String,
+    },
 }
 
 /// Structured I/O schema validation error.
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ValidationError {
+    /// A schema does not compile, or a value does not satisfy its schema.
     #[error("schema validation failed at {location}: {reason}")]
-    Invalid { location: String, reason: String },
+    Invalid {
+        /// JSON pointer into the instance rooted at `#`; `#` when the schema itself does not compile.
+        location: String,
+        /// Why validation failed.
+        reason: String,
+    },
+    /// A schema uses a keyword outside the supported JSON Schema subset.
     #[error("unsupported JSON Schema keyword `{keyword}`")]
-    UnsupportedKeyword { keyword: String },
+    UnsupportedKeyword {
+        /// The unsupported keyword.
+        keyword: String,
+    },
 }
 
 #[cfg(test)]

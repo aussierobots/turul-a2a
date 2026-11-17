@@ -44,11 +44,17 @@ use crate::streaming::TaskEventBroker;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RuntimeConfig {
+    /// Soft deadline of a blocking send: how long it waits for the executor to reach a terminal or interrupted state before tripping its cancellation token. Default 30 seconds.
     pub blocking_task_timeout: Duration,
+    /// Time an executor gets to exit after a blocking send's soft deadline or the stall watchdog trips its token, before it is aborted. Default 5 seconds.
     pub timeout_abort_grace: Duration,
+    /// Longest the cancel handler waits for the executor to commit its own terminal before it commits CANCELED itself. Default 5 seconds.
     pub cancel_handler_grace: Duration,
+    /// How often the cancel handler, and a blocking send whose executor was cancelled, re-read the task while waiting for a terminal. Default 100 milliseconds.
     pub cancel_handler_poll_interval: Duration,
+    /// Delay between a cancel tripping an executor's token and aborting the executor if it has committed no terminal. Default 5 seconds.
     pub cancel_abort_grace: Duration,
+    /// How often an instance polls the store for cancel markers that other instances wrote for its in-flight executors. Default 1 second.
     pub cross_instance_cancel_poll_interval: Duration,
 
     /// Executor lease time-to-live, or `None` to disable the lease. See
@@ -65,17 +71,29 @@ pub struct RuntimeConfig {
     /// cancels it. See [`A2aServerBuilder::idle_task_timeout`].
     pub idle_task_timeout: Option<Duration>,
 
+    /// Total delivery attempts per push config and event, the first included. Default 8.
     pub push_max_attempts: usize,
+    /// Retry delay after the first failed attempt; each later delay doubles, up to `push_backoff_cap`. Default 2 seconds.
     pub push_backoff_base: Duration,
+    /// Upper bound on a single retry delay before jitter. Default 60 seconds.
     pub push_backoff_cap: Duration,
+    /// Fraction of each retry delay randomly added or subtracted. Default 0.25.
     pub push_backoff_jitter: f32,
+    /// Bound on a whole delivery request: connect, send and full response. Default 30 seconds.
     pub push_request_timeout: Duration,
+    /// Bound on establishing the connection to the receiver. Default 5 seconds.
     pub push_connect_timeout: Duration,
+    /// Longest a delivery request waits on the receiver while nothing arrives. Default 30 seconds.
     pub push_read_timeout: Duration,
+    /// How long a delivery claim holds an event and config pair before another instance may reclaim it. Default 600 seconds.
     pub push_claim_expiry: Duration,
+    /// How long a push config confirmed present is trusted before storage is read again. Default zero, which re-reads before every attempt.
     pub push_config_cache_ttl: Duration,
+    /// How long a failed-delivery record is kept after delivery gives up. Default 7 days.
     pub push_failed_delivery_retention: Duration,
+    /// Largest request body in bytes that is delivered; a larger one is given up without a POST. Default 1 MiB.
     pub push_max_payload_bytes: usize,
+    /// Whether `http://` push URLs and private or loopback addresses are allowed; for local development only. Default `false`.
     pub allow_insecure_push_urls: bool,
 
     /// Interval between reclaim-and-redispatch sweeps.
@@ -125,20 +143,11 @@ pub struct RuntimeConfig {
     /// runtime that cannot actually guarantee post-return execution —
     /// the guard exists to prevent silent executor orphaning.
     ///
-    /// Adopters who need fire-and-forget-style work on Lambda today
-    /// should invoke their durable mechanism (Step Functions, SQS,
-    /// EventBridge, etc.) from inside their `AgentExecutor::execute`
-    /// body. The executor returns synchronously once the workflow is
-    /// accepted; the A2A task is Completed for "workflow accepted /
-    /// started", not "workflow finished". If the A2A task is meant to
-    /// track the full workflow lifecycle, the workflow itself must
-    /// later call back into turul-a2a storage to update task state.
-    ///
-    /// A future capability-taking `LambdaA2aServerBuilder` method
-    /// (shape: `with_durable_return_immediately(handler)`) will accept
-    /// a durable continuation mechanism as an argument and flip this
-    /// flag as a side effect. Even then, the flag SHOULD NOT be flipped
-    /// directly — reach for the builder method.
+    /// On Lambda, wire a durable executor queue with
+    /// `LambdaA2aServerBuilder::with_durable_executor` (or
+    /// `with_sqs_return_immediately`) in `turul-a2a-aws-lambda`; supplying
+    /// the queue is what turns this flag back on. Do not flip the flag
+    /// directly.
     pub supports_return_immediately: bool,
     /// `max-age` of the `Cache-Control` header on agent card responses
     /// (the well-known card and the extended card). Set it to how long a
@@ -198,6 +207,7 @@ pub struct A2aServerBuilder {
 }
 
 impl A2aServerBuilder {
+    /// Creates a builder with default settings, bound to `0.0.0.0:3000`.
     pub fn new() -> Self {
         Self {
             executor: None,
@@ -230,7 +240,6 @@ impl A2aServerBuilder {
     }
 
     /// Grace window between soft cancellation and hard `JoinHandle::abort()`.
-    ///
     pub fn timeout_abort_grace(mut self, d: Duration) -> Self {
         self.runtime_config.timeout_abort_grace = d;
         self
@@ -337,14 +346,12 @@ impl A2aServerBuilder {
 
     /// How often the in-flight supervisor batch-polls the cancel marker
     /// across in-flight tasks for cross-instance cancel propagation.
-    ///
     pub fn cross_instance_cancel_poll_interval(mut self, d: Duration) -> Self {
         self.runtime_config.cross_instance_cancel_poll_interval = d;
         self
     }
 
     /// Maximum retry attempts (including first) per push delivery.
-    ///
     pub fn push_max_attempts(mut self, n: usize) -> Self {
         self.runtime_config.push_max_attempts = n;
         self
@@ -504,6 +511,7 @@ impl A2aServerBuilder {
         self
     }
 
+    /// Sets the executor that handles incoming messages; `build` requires one.
     pub fn executor(mut self, executor: impl AgentExecutor + 'static) -> Self {
         self.executor = Some(Arc::new(executor));
         self
@@ -516,7 +524,7 @@ impl A2aServerBuilder {
     /// backend: `InMemoryA2aStorage`, `SqliteA2aStorage`, `PostgresA2aStorage`,
     /// `DynamoDbA2aStorage`, etc.
     ///
-    /// errata: `.storage()` wires storage traits only. It does
+    /// Note: `.storage()` wires storage traits only. It does
     /// **not** auto-register the storage as a push-delivery store, even if the
     /// backend happens to implement [`crate::push::A2aPushDeliveryStore`]. To
     /// opt in to push delivery, call [`Self::push_delivery_store`] explicitly
@@ -582,11 +590,10 @@ impl A2aServerBuilder {
     /// Set the push delivery claim store individually.
     ///
     /// Required when push-notification delivery is enabled in the
-    /// deployment. `.storage()` wires this automatically from a unified
-    /// backend; use this setter only for mixed-backend tests or when
-    /// running against an external push-coordination service. The
-    /// builder rejects split configurations where the atomic store and
-    /// the push delivery store come from different concrete instances.
+    /// deployment: `.storage()` does not register it, so pass the
+    /// backend here explicitly. The builder rejects configurations where
+    /// the atomic store and the push delivery store come from different
+    /// backends.
     pub fn push_delivery_store(
         mut self,
         store: impl crate::push::A2aPushDeliveryStore + 'static,
@@ -595,6 +602,7 @@ impl A2aServerBuilder {
         self
     }
 
+    /// Sets the address `run` and `bind` listen on. Defaults to `0.0.0.0:3000`.
     pub fn bind(mut self, addr: impl Into<SocketAddr>) -> Self {
         self.bind_addr = addr.into();
         self
@@ -607,6 +615,20 @@ impl A2aServerBuilder {
         self
     }
 
+    /// Validates the configuration and builds the server.
+    ///
+    /// Omitted storage defaults to a shared in-memory backend. Starts the
+    /// background loops the runtime configuration enables.
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aError::Internal` when no executor is set, a lease, stall or
+    /// idle timeout is zero or is enabled outside a tokio runtime, the storage
+    /// backends differ, push delivery and the atomic store's push dispatch
+    /// disagree, `push_claim_expiry` does not exceed the push retry horizon, or
+    /// middleware contributions define the same security scheme differently.
+    /// Returns `A2aError::InvalidRequest` when the agent card references a
+    /// security scheme it does not declare.
     pub fn build(self) -> Result<A2aServer, A2aError> {
         let executor = self
             .executor
@@ -721,7 +743,7 @@ impl A2aServerBuilder {
                     )));
                 }
 
-                // claim expiry must exceed the worst-case
+                // Claim expiry must exceed the worst-case
                 // retry horizon so a claim held by a healthy worker is
                 // never mis-classified as stale mid-retry. Upper bound
                 // for the horizon is `max_attempts * backoff_cap`
@@ -758,8 +780,7 @@ impl A2aServerBuilder {
                     delivery_cfg,
                     self.outbound_url_validator.clone(),
                     instance_id,
-                )
-                .map_err(|e| A2aError::Internal(format!("push worker build failed: {e}")))?;
+                );
 
                 Some(Arc::new(crate::push::PushDispatcher::new(
                     Arc::new(worker),
@@ -778,7 +799,7 @@ impl A2aServerBuilder {
             .collect();
         let merged = merge_stacked_contributions(&contributions)?;
 
-        // validate scheme references in every
+        // Validate scheme references in every
         // build-materializable advertised card surface. The merge
         // applied here mirrors `SecurityAugmentedExecutor::agent_card()`
         // so validation sees the exact surface clients will receive.
@@ -802,7 +823,7 @@ impl A2aServerBuilder {
             cancellation_supervisor,
             push_delivery_store,
             push_dispatcher,
-            // long-lived binary server never enqueues;
+            // A long-lived binary server never enqueues:
             // `tokio::spawn` is durable in this runtime.
             durable_executor_queue: None,
         };
@@ -921,8 +942,8 @@ fn apply_security_merge(
     card
 }
 
-/// every scheme name referenced by a `SecurityRequirement`
-/// on the card MUST appear in `card.security_schemes`. Runs post-merge
+/// Checks that every scheme name referenced by a `SecurityRequirement`
+/// on the card appears in `card.security_schemes`. Runs post-merge
 /// against the final advertised card (public or extended).
 ///
 /// `surface` is the human-readable surface label (`agent_card` or
@@ -991,6 +1012,7 @@ pub struct A2aServer {
 }
 
 impl A2aServer {
+    /// Returns a builder for configuring a server.
     pub fn builder() -> A2aServerBuilder {
         A2aServerBuilder::new()
     }
@@ -998,10 +1020,7 @@ impl A2aServer {
     /// Build the axum router — useful for testing.
     /// Augments the AgentCard with merged security contributions.
     pub fn into_router(self) -> axum::Router {
-        let (state, had_security) = self.into_augmented_state();
-        if !had_security {
-            return build_router(state);
-        }
+        let (state, _) = self.into_augmented_state();
         build_router(state)
     }
 
@@ -1084,6 +1103,10 @@ impl A2aServer {
     /// including the OS-assigned port when the builder was given port 0 —
     /// before any request is served. Connections that arrive between
     /// `bind` and [`BoundA2aServer::run`] wait in the listen backlog.
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aError::Internal` when the address cannot be bound.
     pub async fn bind(self) -> Result<BoundA2aServer, A2aError> {
         let listener = tokio::net::TcpListener::bind(self.bind_addr)
             .await
@@ -1100,6 +1123,11 @@ impl A2aServer {
     }
 
     /// Bind the configured address and serve until the server exits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aError::Internal` when the address cannot be bound or serving
+    /// fails.
     pub async fn run(self) -> Result<(), A2aError> {
         self.bind().await?.run().await
     }
@@ -1129,10 +1157,9 @@ impl A2aServer {
         let app = self.into_router();
 
         // Spawn the supervisor poll loop. A shutdown token lets us stop
-        // the poller when the server exits; for now axum::serve runs to
-        // completion so the token is never tripped (server shutdown is
-        // driven by process exit). Later: wire the token to a graceful
-        // shutdown signal.
+        // the poller when the server exits; axum::serve runs to
+        // completion, so the token is tripped only if it returns
+        // (server shutdown is driven by process exit).
         let shutdown = tokio_util::sync::CancellationToken::new();
         let poller_shutdown = shutdown.clone();
         let poller_handle =
@@ -1311,6 +1338,10 @@ impl BoundA2aServer {
     }
 
     /// Serve on the bound socket until the server exits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aError::Internal` when serving fails.
     pub async fn run(self) -> Result<(), A2aError> {
         self.server.serve(self.listener).await
     }

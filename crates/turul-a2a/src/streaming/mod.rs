@@ -21,11 +21,13 @@ use turul_a2a_types::{TaskState, TaskStatus};
 pub enum StreamEvent {
     /// Task status changed.
     StatusUpdate {
+        /// Payload of the status change.
         #[serde(rename = "statusUpdate")]
         status_update: StatusUpdatePayload,
     },
     /// Artifact produced or updated.
     ArtifactUpdate {
+        /// Payload of the artifact chunk.
         #[serde(rename = "artifactUpdate")]
         artifact_update: ArtifactUpdatePayload,
     },
@@ -53,23 +55,36 @@ impl StreamEvent {
     }
 }
 
+/// Payload of [`StreamEvent::StatusUpdate`]: the task's new status as proto JSON.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StatusUpdatePayload {
+    /// Task whose status changed.
     #[serde(rename = "taskId")]
     pub task_id: String,
+    /// Context the task belongs to.
     #[serde(rename = "contextId")]
     pub context_id: String,
+    /// The new `TaskStatus` as proto JSON.
     pub status: serde_json::Value,
 }
 
+/// Payload of [`StreamEvent::ArtifactUpdate`]: an artifact chunk as proto JSON.
+///
+/// `append` extends an existing artifact's parts instead of replacing it, and
+/// `last_chunk` marks the final chunk.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ArtifactUpdatePayload {
+    /// Task the artifact belongs to.
     #[serde(rename = "taskId")]
     pub task_id: String,
+    /// Context the task belongs to.
     #[serde(rename = "contextId")]
     pub context_id: String,
+    /// The `Artifact` chunk as proto JSON.
     pub artifact: serde_json::Value,
+    /// Whether the chunk extends the existing artifact's parts instead of replacing it.
     pub append: bool,
+    /// Whether this is the final chunk of the artifact.
     #[serde(rename = "lastChunk")]
     pub last_chunk: bool,
 }
@@ -91,6 +106,7 @@ pub struct TaskEventBroker {
 }
 
 impl TaskEventBroker {
+    /// Creates a broker with no subscribers.
     pub fn new() -> Self {
         Self {
             channels: Arc::new(RwLock::new(HashMap::new())),

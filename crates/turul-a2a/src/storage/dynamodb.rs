@@ -38,9 +38,13 @@ use crate::streaming::StreamEvent;
 /// DynamoDB storage configuration.
 #[derive(Debug, Clone)]
 pub struct DynamoDbConfig {
+    /// Table holding task items.
     pub tasks_table: String,
+    /// Table holding push notification config items.
     pub push_configs_table: String,
+    /// Table holding the per-task event log.
     pub events_table: String,
+    /// Table holding push delivery claim and outcome items.
     pub push_deliveries_table: String,
     /// Pending-dispatch marker table. See
     /// [`crate::push::A2aPushDeliveryStore::record_pending_dispatch`].
@@ -249,6 +253,7 @@ pub struct DynamoDbA2aStorage {
 }
 
 impl DynamoDbA2aStorage {
+    /// Creates a store using a DynamoDB client built from the default AWS configuration chain.
     pub async fn new(config: DynamoDbConfig) -> Result<Self, A2aStorageError> {
         let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = Client::new(&aws_config);
@@ -259,6 +264,7 @@ impl DynamoDbA2aStorage {
         })
     }
 
+    /// Creates a store from an existing DynamoDB client.
     pub fn from_client(client: Client, config: DynamoDbConfig) -> Self {
         Self {
             client,

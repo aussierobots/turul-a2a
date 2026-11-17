@@ -135,6 +135,11 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     /// (derived from `push_max_attempts` + `push_backoff_cap`) MUST
     /// be shorter than `claim_expiry` so live retries never race
     /// re-claim; the server builder validates this constraint.
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aStorageError::ClaimAlreadyHeld` when the claim is held or
+    /// terminal, and a storage error when the backend fails.
     // `claim_delivery` takes 8 args because it's the canonical
     // primary-key + identity + expiry tuple the atomic claim table
     // needs. Bundling into a struct would force every call site to
@@ -194,6 +199,12 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     /// This is the same signal a genuinely stale claimant receives,
     /// which is appropriate: in both cases the worker no longer
     /// owns an active attempt-start opportunity.
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aStorageError::StaleDeliveryClaim` when the claim identity no
+    /// longer matches or the row is terminal, and a storage error when the
+    /// backend fails.
     async fn record_attempt_started(
         &self,
         tenant: &str,
@@ -257,6 +268,12 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     /// `Retry` against a non-terminal row (the normal case) keeps
     /// the claim open; `Retry` against a terminal row is also a
     /// silent no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aStorageError::StaleDeliveryClaim` when `claimant` and
+    /// `claim_generation` do not match the stored claim, and a storage error
+    /// when the backend fails.
     #[allow(clippy::too_many_arguments)]
     async fn record_delivery_outcome(
         &self,
@@ -291,6 +308,10 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     /// metric for it). The return value is the eligibility count
     /// only; no first-party backend deletes terminal claims here.
     /// Terminal-status rows are never counted regardless of age.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the backend fails.
     async fn sweep_expired_claims(&self) -> Result<u64, A2aStorageError>;
 
     /// Enumerate expired-but-non-terminal claim rows so the server's
@@ -316,6 +337,10 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     /// `A2aTaskStorage::get_task` and `A2aPushNotificationStorage::get_config`
     /// to reassemble the delivery target without opening an
     /// unscoped read path on the task store.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the backend fails.
     async fn list_reclaimable_claims(
         &self,
         limit: usize,
@@ -337,6 +362,10 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     /// one is a no-op (or refreshes `recorded_at` — backends choose,
     /// as long as repeated calls do not fail). The dispatcher may
     /// call this on every dispatch attempt for defence in depth.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the backend fails.
     async fn record_pending_dispatch(
         &self,
         tenant: &str,
@@ -354,6 +383,10 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     /// *something* survives `list_configs` failure is done.
     ///
     /// Idempotent: deleting a non-existent marker is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the backend fails.
     async fn delete_pending_dispatch(
         &self,
         tenant: &str,
@@ -370,6 +403,10 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     /// prematurely "redispatched". The server's reclaim sweep
     /// uses this to recover events whose initial fan-out died
     /// before producing any claim rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the backend fails.
     async fn list_stale_pending_dispatches(
         &self,
         older_than_recorded_at: SystemTime,
@@ -388,6 +425,10 @@ pub trait A2aPushDeliveryStore: Send + Sync {
     /// values. Adopters use this to surface failed-delivery state
     /// via their own admin APIs; the framework does not expose an
     /// HTTP endpoint for inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the backend fails.
     async fn list_failed_deliveries(
         &self,
         tenant: &str,
@@ -464,10 +505,16 @@ pub struct DeliveryClaim {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ClaimStatus {
+    /// Claim acquired and no POST has started yet.
     Pending,
+    /// A POST is in flight or a retry is scheduled.
     Attempting,
+    /// The receiver confirmed delivery with a 2xx or 3xx response.
     Succeeded,
+    /// Delivery failed for good and the row is kept for operator inspection.
     GaveUp,
+    /// Delivery ended without a failure (config or task deleted, or an `http://` URL refused);
+    /// not listed by `list_failed_deliveries`.
     Abandoned,
 }
 
@@ -483,7 +530,10 @@ pub enum DeliveryOutcome {
     /// Delivery confirmed. `http_status` is typically 2xx or 3xx
     /// (3xx is treated as success; redirects are NOT
     /// followed).
-    Succeeded { http_status: u16 },
+    Succeeded {
+        /// Status code of the confirming response.
+        http_status: u16,
+    },
 
     /// Transient failure; retry scheduled at `next_attempt_at`. Only
     /// updates diagnostics (`last_http_status`, `last_error_class`);
@@ -496,8 +546,11 @@ pub enum DeliveryOutcome {
     /// timeout). `error_class` is the classified failure reason —
     /// enum-only by construction.
     Retry {
+        /// Time at which the next attempt becomes due.
         next_attempt_at: SystemTime,
+        /// Status code of the failed response; `None` when no response arrived.
         http_status: Option<u16>,
+        /// Classification of the failure that triggered the retry.
         error_class: DeliveryErrorClass,
     },
 
@@ -508,8 +561,11 @@ pub enum DeliveryOutcome {
     /// no POST was attempted). The store persists all three on the
     /// resulting [`FailedDelivery`] row.
     GaveUp {
+        /// Framework-level cause of the final failure.
         reason: GaveUpReason,
+        /// Classification of the final failure.
         last_error_class: DeliveryErrorClass,
+        /// Status code of the final response; `None` when no response arrived.
         last_http_status: Option<u16>,
         /// When the failed-delivery record may be removed: the
         /// time of giving up plus the deployment's failed-delivery
@@ -521,7 +577,10 @@ pub enum DeliveryOutcome {
     /// POST attempt. Used for "config deleted", "task deleted",
     /// "non-HTTPS URL in production mode". `list_failed_deliveries`
     /// does NOT surface `Abandoned` rows.
-    Abandoned { reason: AbandonedReason },
+    Abandoned {
+        /// Why the delivery was stopped.
+        reason: AbandonedReason,
+    },
 }
 
 /// Framework-controlled reasons a delivery was given up.
@@ -595,9 +654,15 @@ pub enum DeliveryErrorClass {
     /// Connect, read, or total request timeout exceeded.
     Timeout,
     /// HTTP 4xx response other than 408 / 429. Permanent; no retry.
-    HttpError4xx { status: u16 },
+    HttpError4xx {
+        /// HTTP status code returned by the receiver.
+        status: u16,
+    },
     /// HTTP 5xx response. Transient; retried until the horizon.
-    HttpError5xx { status: u16 },
+    HttpError5xx {
+        /// HTTP status code returned by the receiver.
+        status: u16,
+    },
     /// HTTP 429 Too Many Requests. Retried on the normal backoff
     /// schedule; a `Retry-After` header is not consulted.
     HttpError429,
@@ -622,15 +687,23 @@ pub enum DeliveryErrorClass {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct FailedDelivery {
+    /// Task whose state change was being delivered.
     pub task_id: String,
+    /// Push config the delivery targeted.
     pub config_id: String,
+    /// Sequence number of the task event the delivery was for.
     pub event_sequence: u64,
+    /// When the first POST attempt started, or the give-up time when no POST was made.
     pub first_attempted_at: SystemTime,
+    /// When the most recent POST attempt started.
     pub last_attempted_at: SystemTime,
+    /// When the delivery was given up.
     pub gave_up_at: SystemTime,
     /// Cluster-wide POST-attempt count at the time of giveup.
     pub delivery_attempt_count: u32,
+    /// Status code of the final response; `None` when no response arrived.
     pub last_http_status: Option<u16>,
+    /// Classification of the final failure.
     pub last_error_class: DeliveryErrorClass,
 }
 
@@ -645,10 +718,15 @@ pub struct FailedDelivery {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ReclaimableClaim {
+    /// Tenant the task belongs to.
     pub tenant: String,
+    /// Owner recorded on the claim row.
     pub owner: String,
+    /// Task whose event is being delivered.
     pub task_id: String,
+    /// Sequence number of the task event being delivered.
     pub event_sequence: u64,
+    /// Push config the delivery targets.
     pub config_id: String,
 }
 
@@ -660,10 +738,15 @@ pub struct ReclaimableClaim {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct PendingDispatch {
+    /// Tenant the task belongs to.
     pub tenant: String,
+    /// Owner of the task.
     pub owner: String,
+    /// Task whose committed event awaits fan-out.
     pub task_id: String,
+    /// Sequence number of the committed event awaiting fan-out.
     pub event_sequence: u64,
+    /// When the pending-dispatch marker was written.
     pub recorded_at: SystemTime,
 }
 

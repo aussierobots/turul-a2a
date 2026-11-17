@@ -116,6 +116,7 @@ impl LambdaScheduledRecoveryHandler {
     /// megabytes of stringified errors under a persistent outage.
     pub const ERROR_SAMPLE_LIMIT: usize = 8;
 
+    /// Creates a handler with the default [`LambdaScheduledRecoveryConfig`].
     pub fn new(
         dispatcher: Arc<PushDispatcher>,
         delivery_store: Arc<dyn A2aPushDeliveryStore>,
@@ -128,7 +129,7 @@ impl LambdaScheduledRecoveryHandler {
         }
     }
 
-    /// Also cancel, on every tick, the tasks of `handler`'s store left
+    /// Also cancels, on every tick, the tasks of `handler`'s store left
     /// waiting on their client for longer than its runtime configuration's
     /// `idle_task_timeout`. With no timeout set the stage does nothing.
     pub fn with_idle_task_sweep(mut self, handler: LambdaA2aHandler) -> Self {
@@ -136,12 +137,13 @@ impl LambdaScheduledRecoveryHandler {
         self
     }
 
+    /// Replaces the sweep limits and stale-marker cutoff.
     pub fn with_config(mut self, config: LambdaScheduledRecoveryConfig) -> Self {
         self.config = config;
         self
     }
 
-    /// Run one recovery sweep. The `_event` argument is accepted so
+    /// Runs one recovery sweep. The `_event` argument is accepted so
     /// the signature matches `lambda_runtime::service_fn`; the
     /// EventBridge payload is not inspected — each invocation is one
     /// tick regardless of cron metadata.
@@ -248,7 +250,7 @@ impl LambdaScheduledRecoveryHandler {
     }
 }
 
-/// Run one retention-maintenance sweep, invoked by an EventBridge
+/// Runs one retention-maintenance sweep, invoked by an EventBridge
 /// Scheduler rule.
 ///
 /// Lambda has no persistent process to host the server's background
@@ -269,6 +271,10 @@ impl LambdaScheduledRecoveryHandler {
 /// The `event` payload is not inspected — each invocation is one sweep
 /// regardless of cron metadata. Returns
 /// `{ "deleted": <count>, "timestamp": <RFC3339 now> }`.
+///
+/// # Errors
+///
+/// Returns the storage error if `cleanup_expired` fails.
 pub async fn handle_maintenance_trigger(
     event: serde_json::Value,
     event_store: Arc<dyn A2aEventStore>,

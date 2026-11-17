@@ -70,22 +70,34 @@ const PREFIX: &str = "a2a-";
 #[non_exhaustive]
 pub struct SkillCard {
     // AgentSkill discovery fields (all eight).
+    /// Wire id (`AgentSkill.id`): `metadata.a2a-id`, or the skill's spec `name` when absent.
     pub id: String,
+    /// Display name: `metadata.a2a-name`, or the skill's spec `name` when absent.
     pub name: String,
+    /// Skill description from the `SKILL.md` frontmatter.
     pub description: String,
+    /// Keywords from `metadata.a2a-tags`; empty when absent.
     pub tags: Vec<String>,
+    /// Example prompts from `metadata.a2a-examples`; empty when absent.
     pub examples: Vec<String>,
+    /// Accepted input media types from `metadata.a2a-input-modes`; empty when absent.
     pub input_modes: Vec<String>,
+    /// Produced output media types from `metadata.a2a-output-modes`; empty when absent.
     pub output_modes: Vec<String>,
+    /// Security requirements from `metadata.a2a-security-requirements`, advertised only and not enforced here.
     pub security_requirements: Vec<String>,
 
     // Provider-neutral execution metadata (optional).
+    /// JSON Schema 2020-12 from the `a2a-input-schema` asset, checked by `validate_input`.
     pub input_schema: Option<Value>,
+    /// JSON Schema 2020-12 from the `a2a-output-schema` asset, checked by `validate_output`.
     pub output_schema: Option<Value>,
+    /// Generation hints for LLM-backed skills; `None` when no hint key is set.
     pub execution_hints: Option<ExecutionHints>,
 
     // Opaque to this crate — the patterns layer does not interpret
     // provider-specific configuration; that is the adopter's concern.
+    /// Provider-specific configuration loaded from the skill's asset file, passed through uninterpreted.
     pub provider_config: Option<Value>,
 
     /// Markdown body (prompt template for LLM-backed skills).
@@ -96,8 +108,11 @@ pub struct SkillCard {
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ExecutionHints {
+    /// Maximum number of tokens to generate, from `metadata.a2a-max-tokens`.
     pub max_tokens: Option<u32>,
+    /// Sampling temperature, from `metadata.a2a-temperature`.
     pub temperature: Option<f32>,
+    /// Nucleus-sampling probability mass, from `metadata.a2a-top-p`.
     pub top_p: Option<f32>,
 }
 
@@ -241,6 +256,10 @@ impl SkillCard {
     /// Grammar: `{{ path }}` with dotted access (`{{ user.name }}`).
     /// Literal `{{` escaped as `\{{`. Missing variable -> structured
     /// `RenderError::MissingVariable` (no silent empty substitution).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError`] if the template has a syntax error or references a variable missing from `params`.
     pub fn render_prompt(&self, params: &Value) -> Result<String, RenderError> {
         render_template(&self.body, params)
     }
@@ -249,6 +268,10 @@ impl SkillCard {
     /// without an input schema accepts any input. Error locations are
     /// JSON pointers into the instance rooted at `#`, as in
     /// [`validate_json`](crate::validate_json).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] if `input` does not satisfy the schema.
     pub fn validate_input(&self, input: &Value) -> Result<(), ValidationError> {
         match &self.input_schema {
             Some(schema) => validate_json(schema, input),
@@ -260,6 +283,10 @@ impl SkillCard {
     /// without an output schema accepts any output. Error locations are
     /// JSON pointers into the instance rooted at `#`, as in
     /// [`validate_json`](crate::validate_json).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] if `output` does not satisfy the schema.
     pub fn validate_output(&self, output: &Value) -> Result<(), ValidationError> {
         match &self.output_schema {
             Some(schema) => validate_json(schema, output),

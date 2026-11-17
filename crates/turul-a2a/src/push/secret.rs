@@ -41,6 +41,7 @@ pub struct Secret<T: Clone = String> {
 }
 
 impl<T: Clone> Secret<T> {
+    /// Wraps `v` as a secret.
     pub fn new(v: T) -> Self {
         Self { inner: v }
     }

@@ -1,3 +1,5 @@
+//! Artifact wrapper over the generated proto `Artifact`.
+
 use serde::{Deserialize, Serialize};
 use turul_a2a_proto as pb;
 
@@ -11,6 +13,7 @@ pub struct Artifact {
 }
 
 impl Artifact {
+    /// Creates an artifact with `artifact_id` and `parts`, with no name or description.
     pub fn new(artifact_id: impl Into<String>, parts: Vec<Part>) -> Self {
         Self {
             inner: pb::Artifact {
@@ -24,24 +27,29 @@ impl Artifact {
         }
     }
 
+    /// Sets the human-readable artifact name.
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.inner.name = name.into();
         self
     }
 
+    /// Sets the artifact description.
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.inner.description = description.into();
         self
     }
 
+    /// Returns the artifact id.
     pub fn artifact_id(&self) -> &str {
         &self.inner.artifact_id
     }
 
+    /// Returns a reference to the underlying generated proto message.
     pub fn as_proto(&self) -> &pb::Artifact {
         &self.inner
     }
 
+    /// Consumes the wrapper and returns the underlying generated proto message.
     pub fn into_proto(self) -> pb::Artifact {
         self.inner
     }

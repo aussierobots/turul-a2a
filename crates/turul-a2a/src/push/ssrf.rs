@@ -54,8 +54,11 @@ pub enum SsrfDecision {
     /// Allowed. `resolved_ip` is the IP the worker should connect
     /// to directly (bypassing re-resolution on the reqwest side so
     /// a DNS rebind cannot swap destinations).
-    Allow { resolved_ip: IpAddr },
-    /// Rejected. `reason_token` is a fixed identifier (not
+    Allow {
+        /// Address that passed the blocklist checks.
+        resolved_ip: IpAddr,
+    },
+    /// Rejected. The reason is a fixed classification (not
     /// operator-visible reason text — that goes to logs).
     Block(SsrfBlockReason),
 }
@@ -166,6 +169,11 @@ fn is_blocked_ipv6(v6: Ipv6Addr) -> bool {
 /// - `http://` is allowed only when `allow_insecure` is true
 ///   (dev-only `allow_insecure_push_urls` flag).
 /// - All other schemes (`file://`, `gopher://`, etc.) are rejected.
+///
+/// # Errors
+///
+/// Returns `SsrfBlockReason::InsecureScheme` for any scheme the policy
+/// refuses.
 pub fn validate_scheme(url: &Url, allow_insecure: bool) -> Result<(), SsrfBlockReason> {
     match url.scheme() {
         "https" => Ok(()),
@@ -179,6 +187,12 @@ pub fn validate_scheme(url: &Url, allow_insecure: bool) -> Result<(), SsrfBlockR
 /// accepts it. The delivery worker runs these BEFORE resolving the
 /// hostname, so a URL the deployment refuses never causes a DNS
 /// query either.
+///
+/// # Errors
+///
+/// Returns `SsrfBlockReason::InvalidUrl` when the URL has no host,
+/// `SsrfBlockReason::InsecureScheme` when the scheme is refused, and
+/// `SsrfBlockReason::ValidatorDenied` when the operator validator rejects it.
 pub fn check_url(
     url: &Url,
     allow_insecure: bool,

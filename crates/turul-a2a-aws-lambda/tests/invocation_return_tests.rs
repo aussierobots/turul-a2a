@@ -289,7 +289,7 @@ async fn request_starts_no_push_fan_out_and_the_stream_worker_delivers_its_marke
     cfg.max_attempts = 1;
     cfg.allow_insecure_urls = true;
     let delivery: Arc<dyn A2aPushDeliveryStore> = Arc::new(storage.clone());
-    let worker = PushDeliveryWorker::new(delivery, cfg, None, "stream-worker".into()).unwrap();
+    let worker = PushDeliveryWorker::new(delivery, cfg, None, "stream-worker".into());
     let dispatcher = Arc::new(PushDispatcher::new(
         Arc::new(worker),
         Arc::new(storage.clone()),

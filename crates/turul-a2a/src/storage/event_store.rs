@@ -17,10 +17,15 @@ use crate::streaming::StreamEvent;
 /// Events are tenant-scoped and monotonically ordered per task.
 #[async_trait]
 pub trait A2aEventStore: Send + Sync {
+    /// Returns the backend's name; the server builder requires every store it is given to report the same one.
     fn backend_name(&self) -> &'static str;
 
-    /// Append an event for a task. Returns the assigned sequence number.
+    /// Appends an event for a task and returns the assigned sequence number.
     /// The store assigns the sequence atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails to persist the event.
     async fn append_event(
         &self,
         tenant: &str,
@@ -28,8 +33,12 @@ pub trait A2aEventStore: Send + Sync {
         event: StreamEvent,
     ) -> Result<u64, A2aStorageError>;
 
-    /// Get all events for a task after a given sequence number.
-    /// Returns events in sequence order. Tenant-scoped.
+    /// Returns all events for a task after a given sequence number, in
+    /// sequence order. Tenant-scoped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails to read the events.
     async fn get_events_after(
         &self,
         tenant: &str,
@@ -37,11 +46,15 @@ pub trait A2aEventStore: Send + Sync {
         after_sequence: u64,
     ) -> Result<Vec<(u64, StreamEvent)>, A2aStorageError>;
 
-    /// Get the latest event sequence number for a task.
-    /// Returns 0 if no events exist. Tenant-scoped.
+    /// Returns the latest event sequence number for a task, or 0 if no
+    /// events exist. Tenant-scoped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails to read the sequence.
     async fn latest_sequence(&self, tenant: &str, task_id: &str) -> Result<u64, A2aStorageError>;
 
-    /// Delete all expired events and tasks based on the configured TTL.
+    /// Deletes all expired events and tasks based on the configured TTL.
     ///
     /// Age-based expiry: events older than the configured event TTL
     /// (measured from each event's `created_at`) are deleted. Tasks are
@@ -60,5 +73,9 @@ pub trait A2aEventStore: Send + Sync {
     ///
     /// DynamoDB returns `Ok(0)`: it reaps expired items via native TTL
     /// attributes, so application-level cleanup is bypassed there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails during cleanup.
     async fn cleanup_expired(&self) -> Result<u64, A2aStorageError>;
 }

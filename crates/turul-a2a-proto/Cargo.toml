@@ -13,6 +13,11 @@ readme = "README.md"
 documentation = "https://docs.rs/turul-a2a-proto"
 homepage.workspace = true
 
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 # gRPC transport. Off by default — HTTP+JSON adopters pay
 # zero tonic weight. Enabling this activates optional runtime and

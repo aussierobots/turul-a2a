@@ -148,6 +148,12 @@ pub trait AgentExecutor: Send + Sync {
     ///
     /// `ctx` provides auth identity, tenant, and cancellation support.
     /// Executors that don't need context can ignore it with `_ctx`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the executor could not process the message; the
+    /// framework then commits the task as `FAILED` with the error message,
+    /// unless the executor already committed a terminal through its sink.
     async fn execute(
         &self,
         task: &mut Task,
@@ -168,6 +174,11 @@ pub trait AgentExecutor: Send + Sync {
     /// Keep it cheap and free of side effects: it runs on the request
     /// path, and a request it passes may still be refused afterwards.
     /// The default accepts every message.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error to refuse the message with; nothing has been written
+    /// at that point.
     async fn validate_message(
         &self,
         _message: &Message,

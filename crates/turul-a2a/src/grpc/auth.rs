@@ -43,6 +43,7 @@ pub struct GrpcAuthLayer {
 }
 
 impl GrpcAuthLayer {
+    /// Creates a layer that authenticates each request through `stack`.
     pub fn new(stack: Arc<MiddlewareStack>) -> Self {
         Self { stack }
     }

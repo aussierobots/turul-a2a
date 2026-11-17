@@ -4,7 +4,7 @@
 //! events. Every call routes through [`crate::storage::A2aAtomicStore`]:
 //!
 //! - Status transitions (working / interrupted / terminal) go through
-//!   [`A2aAtomicStore::update_task_status_with_events`] — CAS-guarded per
+//!   [`A2aAtomicStore::update_task_status_with_events`] — CAS-guarded,
 //!   so concurrent terminal writes resolve to exactly one
 //!   winner.
 //! - Artifact emits go through [`A2aAtomicStore::update_task_with_events`].
@@ -173,6 +173,12 @@ impl EventSink {
     /// [`Self::cancelled`], or [`Self::reject`] instead. Use this method
     /// for non-terminal transitions including `WORKING`, `INPUT_REQUIRED`,
     /// and `AUTH_REQUIRED`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aError::InvalidRequest` when `state` is terminal or the sink is
+    /// closed, `A2aError::Internal` when the sink is detached, and the mapped
+    /// storage error when the commit fails.
     pub async fn set_status(
         &self,
         state: TaskState,
@@ -192,6 +198,12 @@ impl EventSink {
     /// parts; `append=false` creates or replaces. `last_chunk=true` signals
     /// the final chunk for streaming transports (transport-level metadata —
     /// storage does not persist completion state).
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aError::InvalidRequest` when the sink is closed or another writer has
+    /// already committed a terminal, `A2aError::Internal` when
+    /// the sink is detached, and the mapped storage error when the commit fails.
     pub async fn emit_artifact(
         &self,
         artifact: Artifact,
@@ -204,6 +216,12 @@ impl EventSink {
     }
 
     /// Emit terminal `COMPLETED` and close the sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aError::InvalidRequest` when the sink is closed or another writer has
+    /// already committed a terminal, `A2aError::Internal` when
+    /// the sink is detached, and the mapped storage error when the commit fails.
     pub async fn complete(&self, final_message: Option<Message>) -> Result<u64, A2aError> {
         self.inner()?
             .commit_status(TaskState::Completed, final_message)
@@ -215,6 +233,12 @@ impl EventSink {
     /// distinct from framework-forced FAILED on timeout (which writes
     /// `message = None` so consumers can tell agent-authored failure from
     /// framework telemetry).
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aError::InvalidRequest` when the sink is closed or another writer has
+    /// already committed a terminal, `A2aError::Internal` when
+    /// the sink is detached, and the mapped storage error when the commit fails.
     pub async fn fail(&self, reason: Option<String>) -> Result<u64, A2aError> {
         let message = reason.map(text_message_from_agent);
         self.inner()?
@@ -224,6 +248,12 @@ impl EventSink {
 
     /// Emit terminal `CANCELED` with an optional reason. Usually called by
     /// executors that cooperatively observe `ctx.cancellation.is_cancelled()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aError::InvalidRequest` when the sink is closed or another writer has
+    /// already committed a terminal, `A2aError::Internal` when
+    /// the sink is detached, and the mapped storage error when the commit fails.
     pub async fn cancelled(&self, reason: Option<String>) -> Result<u64, A2aError> {
         let message = reason.map(text_message_from_agent);
         self.inner()?
@@ -232,7 +262,13 @@ impl EventSink {
     }
 
     /// Emit terminal `REJECTED` (policy refusal / guardrail) with a reason.
-    /// Distinct from `FAILED` on the wire
+    /// Distinct from `FAILED` on the wire.
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aError::InvalidRequest` when the sink is closed or another writer has
+    /// already committed a terminal, `A2aError::Internal` when
+    /// the sink is detached, and the mapped storage error when the commit fails.
     pub async fn reject(&self, reason: Option<String>) -> Result<u64, A2aError> {
         let message = reason.map(text_message_from_agent);
         self.inner()?
@@ -242,6 +278,12 @@ impl EventSink {
 
     /// Emit interrupted `INPUT_REQUIRED`. The sink stays open; the client
     /// supplies another message on the same task to resume.
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aError::InvalidRequest` when the sink is closed or another writer has
+    /// already committed a terminal, `A2aError::Internal` when
+    /// the sink is detached, and the mapped storage error when the commit fails.
     pub async fn require_input(&self, prompt: Option<Message>) -> Result<u64, A2aError> {
         self.inner()?
             .commit_status(TaskState::InputRequired, prompt)
@@ -249,6 +291,12 @@ impl EventSink {
     }
 
     /// Emit interrupted `AUTH_REQUIRED`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aError::InvalidRequest` when the sink is closed or another writer has
+    /// already committed a terminal, `A2aError::Internal` when
+    /// the sink is detached, and the mapped storage error when the commit fails.
     pub async fn require_auth(&self, challenge: Option<Message>) -> Result<u64, A2aError> {
         self.inner()?
             .commit_status(TaskState::AuthRequired, challenge)

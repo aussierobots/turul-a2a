@@ -13,8 +13,11 @@ use crate::error::SinkError;
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressState {
+    /// The skill is actively working on the task.
     Working,
+    /// The skill needs further input from the client to continue.
     InputRequired,
+    /// The skill needs the client to authenticate before it can continue.
     AuthRequired,
 }
 
@@ -26,12 +29,22 @@ pub enum ProgressState {
 /// assertion at the bottom of this module.
 #[async_trait]
 pub trait SkillProgressSink: Send + Sync {
+    /// Emits a non-terminal status update, with an optional message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinkError`] if the sink is closed or its backend fails.
     async fn set_status(
         &self,
         state: ProgressState,
         message: Option<Message>,
     ) -> Result<(), SinkError>;
 
+    /// Emits an artifact; `append` and `last_chunk` carry the streaming-chunk semantics of an artifact update.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinkError`] if the sink is closed or its backend fails.
     async fn emit_artifact(
         &self,
         artifact: Artifact,
@@ -39,6 +52,7 @@ pub trait SkillProgressSink: Send + Sync {
         last_chunk: bool,
     ) -> Result<(), SinkError>;
 
+    /// Returns `true` once the underlying task no longer accepts events. The default is `false`.
     fn is_closed(&self) -> bool {
         false
     }

@@ -42,6 +42,8 @@
 //! - [`ClientAuth`] for bearer and API key credentials
 //! - [`turul-a2a`](https://docs.rs/turul-a2a) to build the agent being called
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 pub mod builders;
 mod error;
 #[cfg(feature = "grpc")]
@@ -61,11 +63,16 @@ pub use sse::{SseEvent, SseStream, StreamEvent, TypedSseEvent, TypedSseStream};
 /// Auth configuration for the client.
 #[derive(Debug, Clone, Default)]
 pub enum ClientAuth {
+    /// Sends no credentials.
     #[default]
     None,
+    /// Sends the token in an `Authorization: Bearer` header.
     Bearer(String),
+    /// Sends an API key in a custom request header.
     ApiKey {
+        /// Name of the request header that carries the key.
         header: String,
+        /// API key value sent as the header value.
         key: String,
     },
 }
@@ -94,11 +101,13 @@ impl A2aClient {
         }
     }
 
+    /// Sets the credentials sent with every request.
     pub fn with_auth(mut self, auth: ClientAuth) -> Self {
         self.auth = auth;
         self
     }
 
+    /// Routes requests under `tenant` by prefixing the path with it.
     pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
         self.tenant = Some(tenant.into());
         self
@@ -118,6 +127,10 @@ impl A2aClient {
     }
 
     /// Discover the agent by fetching `/.well-known/agent-card.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the agent card cannot be fetched; see [`A2aClient::fetch_agent_card`].
     pub async fn discover(base_url: impl Into<String>) -> Result<Self, A2aClientError> {
         let mut client = Self::new(base_url);
         let card = client.fetch_agent_card().await?;
@@ -126,6 +139,11 @@ impl A2aClient {
     }
 
     /// Fetch the agent card from the well-known endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Http` if the endpoint answers with a non-success status, and `Request` if the
+    /// request fails or the body is not a valid agent card.
     pub async fn fetch_agent_card(&self) -> Result<pb::AgentCard, A2aClientError> {
         let url = format!("{}{}", self.base_url, wire::http::WELL_KNOWN_AGENT_CARD);
         let resp = self.request(reqwest::Method::GET, &url).send().await?;
@@ -190,6 +208,13 @@ impl A2aClient {
     /// Send a message to the agent. Returns a wrapper `SendResponse`.
     ///
     /// Accepts `MessageBuilder` directly (no `.build()` needed) or a raw proto request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent, the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`), or the response
+    /// body cannot be decoded. A wrapper that cannot be built from the response yields
+    /// `Conversion`.
     pub async fn send_message(
         &self,
         request: impl Into<pb::SendMessageRequest>,
@@ -199,6 +224,13 @@ impl A2aClient {
     }
 
     /// Get a task by ID. Returns a wrapper `Task`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent, the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`), or the response
+    /// body cannot be decoded. A wrapper that cannot be built from the response yields
+    /// `Conversion`.
     pub async fn get_task(
         &self,
         task_id: &str,
@@ -210,6 +242,13 @@ impl A2aClient {
     }
 
     /// Cancel a task. Returns a wrapper `Task`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent, the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`), or the response
+    /// body cannot be decoded. A wrapper that cannot be built from the response yields
+    /// `Conversion`.
     pub async fn cancel_task(
         &self,
         task_id: &str,
@@ -220,6 +259,13 @@ impl A2aClient {
     }
 
     /// List tasks. Returns a wrapper `ListResponse` with wrapper `Task`s.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent, the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`), or the response
+    /// body cannot be decoded. A wrapper that cannot be built from the response yields
+    /// `Conversion`.
     pub async fn list_tasks(
         &self,
         params: &ListTasksParams,
@@ -233,6 +279,12 @@ impl A2aClient {
     // =========================================================
 
     /// Send a message, returning the raw proto response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent, the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`), or the response
+    /// body cannot be decoded.
     pub async fn send_message_proto(
         &self,
         request: pb::SendMessageRequest,
@@ -253,6 +305,12 @@ impl A2aClient {
     }
 
     /// Get a task by ID, returning the raw proto Task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent, the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`), or the response
+    /// body cannot be decoded.
     pub async fn get_task_proto(
         &self,
         task_id: &str,
@@ -273,6 +331,12 @@ impl A2aClient {
     }
 
     /// Cancel a task, returning the raw proto Task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent, the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`), or the response
+    /// body cannot be decoded.
     pub async fn cancel_task_proto(&self, task_id: &str) -> Result<pb::Task, A2aClientError> {
         let url = self.task_url(task_id, ":cancel");
         let resp = self.request(reqwest::Method::POST, &url).send().await?;
@@ -285,6 +349,12 @@ impl A2aClient {
     }
 
     /// List tasks, returning the raw proto response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent, the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`), or the response
+    /// body cannot be decoded.
     pub async fn list_tasks_proto(
         &self,
         params: &ListTasksParams,
@@ -329,6 +399,11 @@ impl A2aClient {
     /// A turul-a2a server opens the stream with a `Task` snapshot (spec §3.1.2) and
     /// closes it on a terminal state or INPUT_REQUIRED; continue an INPUT_REQUIRED
     /// task by streaming a new message that carries its `task_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent or the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`).
     pub async fn send_streaming_message(
         &self,
         request: impl Into<pb::SendMessageRequest>,
@@ -343,12 +418,22 @@ impl A2aClient {
     /// Subsequent events are `StatusUpdate` / `ArtifactUpdate` committed after it.
     /// To recover from a dropped stream, subscribe again: the new stream opens
     /// with a fresh snapshot of the full task state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent or the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`).
     pub async fn subscribe_to_task(&self, task_id: &str) -> Result<TypedSseStream, A2aClientError> {
         let raw = self.subscribe_to_task_raw(task_id).await?;
         Ok(TypedSseStream::from_raw(raw))
     }
 
     /// Send a streaming message, returning raw SSE events (untyped JSON).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent or the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`).
     pub async fn send_streaming_message_raw(
         &self,
         request: impl Into<pb::SendMessageRequest>,
@@ -370,6 +455,11 @@ impl A2aClient {
     }
 
     /// Subscribe to task events, returning raw SSE events (untyped JSON).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent or the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`).
     pub async fn subscribe_to_task_raw(&self, task_id: &str) -> Result<SseStream, A2aClientError> {
         let url = self.task_url(task_id, ":subscribe");
         let resp = self
@@ -393,6 +483,12 @@ impl A2aClient {
     /// a [`turul_a2a_types::PushConfig`] via
     /// [`turul_a2a_types::PushConfigBuilder`] and call
     /// [`Self::create_push_config_with`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent, the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`), or the response
+    /// body cannot be decoded.
     pub async fn create_push_config(
         &self,
         task_id: &str,
@@ -409,6 +505,12 @@ impl A2aClient {
     /// [`turul_a2a_types::PushConfig`] — use this when you need
     /// `authentication`, a custom `tenant`, or any other field beyond
     /// `url` + `token`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent, the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`), or the response
+    /// body cannot be decoded.
     pub async fn create_push_config_with(
         &self,
         task_id: &str,
@@ -430,6 +532,12 @@ impl A2aClient {
     }
 
     /// Get a push notification config by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent, the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`), or the response
+    /// body cannot be decoded.
     pub async fn get_push_config(
         &self,
         task_id: &str,
@@ -449,6 +557,12 @@ impl A2aClient {
     }
 
     /// List push notification configs for a task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent, the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`), or the response
+    /// body cannot be decoded.
     pub async fn list_push_configs(
         &self,
         task_id: &str,
@@ -476,6 +590,11 @@ impl A2aClient {
     }
 
     /// Delete a push notification config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent or the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`).
     pub async fn delete_push_config(
         &self,
         task_id: &str,
@@ -498,6 +617,12 @@ impl A2aClient {
     // =========================================================
 
     /// Fetch the extended agent card (requires authentication).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be sent, the server answers with a non-success
+    /// status (`A2aError` when the body carries an A2A error, otherwise `Http`), or the response
+    /// body cannot be decoded.
     pub async fn fetch_extended_agent_card(&self) -> Result<pb::AgentCard, A2aClientError> {
         let url = self.url("/extendedAgentCard");
         let resp = self.request(reqwest::Method::GET, &url).send().await?;
@@ -570,10 +695,13 @@ fn path_segment(segment: &str) -> String {
 /// camelCase query parameters.
 #[derive(Debug, Clone, Default)]
 pub struct ListTasksParams {
+    /// Restricts the listing to tasks in this context.
     pub context_id: Option<String>,
     /// Task state wire name, e.g. `TASK_STATE_WORKING`.
     pub status: Option<String>,
+    /// Maximum number of tasks per page.
     pub page_size: Option<i32>,
+    /// Opaque cursor from a previous response's `next_page_token`.
     pub page_token: Option<String>,
     /// Maximum number of history messages per returned task.
     pub history_length: Option<i32>,

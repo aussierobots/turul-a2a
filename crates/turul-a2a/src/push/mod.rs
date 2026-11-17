@@ -7,10 +7,10 @@
 //!
 //! The storage contract — [`A2aPushDeliveryStore`] — is additive to
 //! [`crate::storage::A2aPushNotificationStorage`]: configs are still
-//! CRUD'd through the push-notification-storage trait; this new trait
+//! CRUD'd through the push-notification-storage trait; this trait
 //! handles only the per-delivery claim bookkeeping that multi-instance
 //! deployments need. Adopters that do not wire a delivery worker do
-//! not need to implement the new trait — configs remain stored, just
+//! not need to implement this trait — configs remain stored, just
 //! not delivered (the current framework behaviour).
 //!
 //! The trait docstrings carry the normative contract; backend parity

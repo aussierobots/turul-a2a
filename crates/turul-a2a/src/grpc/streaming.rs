@@ -17,6 +17,11 @@ use crate::grpc::service::BoxedStreamResponseStream;
 use crate::router::{self, AppState};
 use crate::streaming::task_stream::{StreamItem, TaskEventStream};
 
+/// Opens the response stream for a `SendStreamingMessage` RPC.
+///
+/// # Errors
+///
+/// Returns the gRPC status mapped from the A2A error when the send is refused.
 pub async fn handle_send_streaming_message(
     state: AppState,
     tenant: String,
@@ -32,6 +37,11 @@ pub async fn handle_send_streaming_message(
     Ok(grpc_stream(stream))
 }
 
+/// Opens the response stream for a `SubscribeToTask` RPC.
+///
+/// # Errors
+///
+/// Returns the gRPC status mapped from the A2A error when the subscription is refused.
 pub async fn handle_subscribe_to_task(
     state: AppState,
     tenant: String,

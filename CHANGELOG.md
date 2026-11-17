@@ -6,6 +6,30 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.15] — 2026-11-18
+
+### Security
+
+- **`turul-a2a-auth` now requires `turul-jwt-validator` 0.3.5 or later.** Through 0.3.4, `JwtValidator` accepted a validly signed, unexpired token that had no `aud` claim, or no `iss` claim when an issuer was configured. `BearerMiddleware` therefore authenticated such tokens. They are now rejected (401 `invalid_token`). Tokens that previously passed without `aud`/`iss` will fail; issue tokens with both claims. A test now covers both cases.
+
+### Changed
+
+- **Breaking (source):** `PushDeliveryWorker::new` returns `Self` instead of `Result<Self, String>`. It could never fail. Remove the `?`, `.expect(..)` or `.map_err(..)` at the call site.
+- docs.rs now builds every feature (gRPC, SQLite, PostgreSQL, DynamoDB, SQS, `compat-v03`) and marks feature-gated items. Previously only default features were documented.
+- Rustdoc for every public item across the published crates: summary lines, `# Errors` sections and module headers. Comments that no longer matched the code are corrected.
+
+### Fixed
+
+- The gRPC service module doc gave the wrong tenant precedence. The proto `tenant` field wins over `x-tenant-id` metadata, as the code and ADR-014 already said.
+
+### Compatibility
+
+- No wire or storage schema changes. Callers of `PushDeliveryWorker::new` need the one-line change above.
+
+### Verification
+
+- `turul-a2a-auth` tests include tokens missing `aud` and `iss`; both are accepted on 0.3.4 and rejected on 0.3.5. The workspace suite passed, and docs.rs-style builds (nightly, `--cfg docsrs`, all features) produced no warnings.
+
 ## [0.2.14] — 2026-11-17
 
 ### Added

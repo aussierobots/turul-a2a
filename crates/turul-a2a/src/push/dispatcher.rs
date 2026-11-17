@@ -157,12 +157,12 @@ impl PushDispatcher {
         task: Task,
         terminal_seqs: Vec<u64>,
     ) -> Result<(), crate::storage::A2aStorageError> {
-        // fresh-dispatch markers are written atomically
-        // with the task + event commit when the backend opts in to
+        // Fresh-dispatch markers are written atomically with the task +
+        // event commit when the backend opts in to
         // `push_dispatch_enabled`. The redispatch path refreshes
         // `recorded_at` before calling us (see `redispatch_pending`),
-        // so this path no longer performs `record_pending_dispatch` —
-        // it would be either redundant (fresh-dispatch) or already
+        // so this path does not call `record_pending_dispatch`: it
+        // would be either redundant (fresh-dispatch) or already
         // handled by the caller (reclaim).
 
         // Serialise the payload once — every config receives the same
@@ -431,6 +431,12 @@ impl PushDispatcher {
     ///   retry budget → `Err(_)` — marker retained.
     /// - per-config delivery failures → logged + left for claim-row
     ///   reclaim; do NOT bubble up here.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the task load, the payload encoding, the
+    /// marker delete or the config listing fails; the marker is retained in
+    /// every case.
     pub async fn try_redispatch_pending(
         &self,
         pending: crate::push::claim::PendingDispatch,
@@ -450,7 +456,7 @@ impl PushDispatcher {
         {
             Ok(Some(task)) => task,
             Ok(None) => {
-                // deleted task is a permanent signal —
+                // A deleted task is a permanent signal:
                 // delete the marker, return Ok so the caller
                 // acknowledges (no BatchItemFailure).
                 self.push_delivery_store_handle()
@@ -563,9 +569,7 @@ impl PushDispatcher {
                     // these so this is effectively unreachable. We
                     // can't POST and can't classify under any
                     // existing AbandonedReason, so we leave the row
-                    // for the next sweep — a future URL-validation
-                    // follow-up can promote this to a terminal
-                    // outcome.
+                    // for the next sweep.
                     return;
                 };
                 let payload = match push_payload(&task) {

@@ -22,6 +22,7 @@ pub struct BearerMiddleware {
 }
 
 impl BearerMiddleware {
+    /// Creates a middleware that validates tokens with `validator`, takes the owner from the `sub` claim and requires no scopes.
     pub fn new(validator: Arc<JwtValidator>) -> Self {
         Self {
             validator,
@@ -30,11 +31,13 @@ impl BearerMiddleware {
         }
     }
 
+    /// Takes the owner from `claim` instead of `sub`.
     pub fn with_principal_claim(mut self, claim: impl Into<String>) -> Self {
         self.principal_claim = claim.into();
         self
     }
 
+    /// Requires every scope in `scopes` to be present in the token.
     pub fn with_required_scopes(mut self, scopes: Vec<String>) -> Self {
         self.required_scopes = scopes;
         self

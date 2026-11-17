@@ -1,3 +1,5 @@
+//! Filter and page types for task and push-config listings.
+
 use chrono::{DateTime, Utc};
 use turul_a2a_types::{Task, TaskState};
 
@@ -26,13 +28,18 @@ pub(crate) fn push_config_page_size(requested: Option<i32>) -> i32 {
 /// Filtering and pagination parameters for task listing.
 #[derive(Debug, Clone, Default)]
 pub struct TaskFilter {
+    /// Tenant to list within, empty for the default tenant; the handlers always set it.
     pub tenant: Option<String>,
+    /// Owner whose tasks are listed; the handlers always set it.
     pub owner: Option<String>,
+    /// Restricts the listing to tasks in this context when set.
     pub context_id: Option<String>,
+    /// Restricts the listing to tasks in this state when set.
     pub status: Option<TaskState>,
     /// 1..=100; `None` means the default of 50. Out-of-range values are
     /// rejected, see [`TaskFilter::resolved_page_size`].
     pub page_size: Option<i32>,
+    /// Opaque cursor from a previous page's `next_page_token`; `None` starts at the first page.
     pub page_token: Option<String>,
     /// 0 = omit history, None = no limit, Some(n) = last n messages.
     pub history_length: Option<i32>,
@@ -43,9 +50,14 @@ pub struct TaskFilter {
 }
 
 impl TaskFilter {
-    /// The page size this listing uses: the requested value, or the
+    /// Returns the page size this listing uses: the requested value, or the
     /// default when unset. A value outside `1..=100` is an invalid
     /// request, not something to clamp silently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError::InvalidListRequest`] when `page_size` is
+    /// outside `1..=100`.
     pub fn resolved_page_size(&self) -> Result<i32, A2aStorageError> {
         match self.page_size {
             None => Ok(DEFAULT_PAGE_SIZE),
@@ -70,9 +82,11 @@ impl TaskFilter {
 /// All fields are REQUIRED per proto ListTasksResponse.
 #[derive(Debug, Clone)]
 pub struct TaskListPage {
+    /// Tasks on this page.
     pub tasks: Vec<Task>,
     /// Always present; empty string = no more pages.
     pub next_page_token: String,
+    /// Page size the listing applied: the requested size, or 50 when none was given.
     pub page_size: i32,
     /// Total matching tasks before pagination.
     pub total_size: i32,
@@ -81,6 +95,8 @@ pub struct TaskListPage {
 /// Paginated result for push notification config listing.
 #[derive(Debug, Clone)]
 pub struct PushConfigListPage {
+    /// Configs on this page.
     pub configs: Vec<turul_a2a_proto::TaskPushNotificationConfig>,
+    /// Cursor for the next page; empty on the final page.
     pub next_page_token: String,
 }

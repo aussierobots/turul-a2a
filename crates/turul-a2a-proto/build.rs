@@ -13,14 +13,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let descriptor_path = PathBuf::from(env::var("OUT_DIR")?).join("a2a_descriptor.bin");
 
-    // Step 1: generate prost message types (+ tonic service stubs when grpc).
+    // Generate prost message types (+ tonic service stubs when grpc).
     // Well-known types come from `pbjson_types`, except Timestamp: its
     // serde impl there writes a "+00:00" offset, and the proto3 JSON
     // mapping requires "Z", so `crate::Timestamp` (src/timestamp.rs)
     // stands in. The more specific extern path wins.
     compile_protos(proto_file, proto_includes, &descriptor_path)?;
 
-    // Step 2: pbjson serde impls (camelCase JSON matching proto JSON mapping).
+    // pbjson serde impls (camelCase JSON matching proto JSON mapping).
     // ignore_unknown_fields: allows v1.0 clients to deserialize agent cards
     // that include additive v0.3 compat fields without rejecting them.
     let descriptor_bytes = std::fs::read(&descriptor_path)?;

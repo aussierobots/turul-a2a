@@ -1,3 +1,5 @@
+//! In-memory storage backend, the default for tests and single-process servers.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -31,7 +33,7 @@ struct StoredTask {
     /// Executor-lease expiry, epoch microseconds. Storage-internal;
     /// written only by `supervisor_renew_executor_leases`, never on wire.
     lease_expires_at: Option<i64>,
-    /// causal floor: monotonic per-task event sequence
+    /// Causal floor: monotonic per-task event sequence
     /// maintained UNCONDITIONALLY on every atomic commit (regardless
     /// of `push_dispatch_enabled`). `create_config` reads this value
     /// to stamp the config's `registered_after_event_sequence`; the
@@ -116,7 +118,8 @@ type PendingDispatchKey = (String, String, u64);
 /// before events are returned over the trait surface.
 type EventLog = Vec<(u64, StreamEvent, std::time::SystemTime)>;
 
-/// In-memory A2A storage backend.
+/// An in-memory A2A storage backend.
+///
 /// Implements A2aTaskStorage, A2aPushNotificationStorage, A2aEventStore,
 /// and A2aPushDeliveryStore on the same struct — every storage trait
 /// the server consumes is backed by one concrete instance.
@@ -170,6 +173,7 @@ struct StoredPushConfig {
 }
 
 impl InMemoryA2aStorage {
+    /// Creates an empty store with retention and push-dispatch markers disabled.
     pub fn new() -> Self {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
@@ -185,14 +189,14 @@ impl InMemoryA2aStorage {
         }
     }
 
-    /// Set the age-based retention window consulted by
+    /// Sets the age-based retention window consulted by
     /// `cleanup_expired`. Defaults to no expiry.
     pub fn with_retention(mut self, retention: RetentionConfig) -> Self {
         self.retention = retention;
         self
     }
 
-    /// Opt in to atomic pending-dispatch marker writes.
+    /// Opts in to atomic pending-dispatch marker writes.
     ///
     /// Set to `true` when the deployment wires `push_delivery_store`; the
     /// server builder rejects any configuration where the flag and the
@@ -736,7 +740,7 @@ impl A2aPushNotificationStorage for InMemoryA2aStorage {
             config.id.clone(),
         );
 
-        // -floor CAS. Two-phase:
+        // Causal-floor CAS in two reads:
         //   1. Read `latest_event_sequence` (brief `tasks` read guard).
         //   2. Re-read under a held `tasks` read guard and compare; if
         //      unchanged, insert the config + stamp under a `push_configs`
@@ -744,9 +748,8 @@ impl A2aPushNotificationStorage for InMemoryA2aStorage {
         //      If the re-read disagrees, a concurrent atomic commit
         //      advanced the floor — retry with bounded backoff.
         //
-        // The two-phase structure leaves an observable window between
-        // phase 1 and phase 2 that the test hook instruments; in
-        // production the window is nanoseconds.
+        // The two reads leave an observable window between them that the
+        // test hook instruments; in production the window is nanoseconds.
         const MAX_ATTEMPTS: u32 = 5;
         let backoffs_ms: [u64; 4] = [10, 50, 250, 1000];
         for attempt in 0..MAX_ATTEMPTS {
@@ -770,7 +773,7 @@ impl A2aPushNotificationStorage for InMemoryA2aStorage {
                 }
             }
 
-            // Phase 2: re-acquire tasks read guard. While we hold it,
+            // Second read: re-acquire tasks read guard. While we hold it,
             // no `update_task_*_with_events` can acquire tasks.write().
             // Re-read under the guard; if it matches `seq_read`, the
             // CAS has succeeded and we insert while the guard is held.
@@ -1278,11 +1281,10 @@ impl A2aAtomicStore for InMemoryA2aStorage {
                 && event.is_terminal()
                 && matches!(event, StreamEvent::StatusUpdate { .. })
             {
-                // §Pending-dispatch optimization: skip the
-                // marker write if no push configs exist for the
-                // task. Configs registered after terminal are not
-                // eligible for that terminal event anyway
-                //, so skipping costs zero correctness
+                // Skip the marker write if no push configs exist for
+                // the task. Configs registered after terminal are not
+                // eligible for that terminal event anyway, so skipping
+                // costs zero correctness
                 // and avoids steady-state row accumulation for
                 // deployments that terminate tasks without ever
                 // registering a webhook.

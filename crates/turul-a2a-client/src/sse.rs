@@ -196,16 +196,24 @@ pub enum StreamEvent {
     Message(Message),
     /// Task status changed.
     StatusUpdate {
+        /// Identifier of the task whose status changed.
         task_id: String,
+        /// Identifier of the context the task belongs to.
         context_id: String,
+        /// The new `TaskStatus` as raw proto JSON; `null` when the event omits it.
         status: serde_json::Value,
     },
     /// Artifact produced or updated.
     ArtifactUpdate {
+        /// Identifier of the task that owns the artifact.
         task_id: String,
+        /// Identifier of the context the task belongs to.
         context_id: String,
+        /// The artifact (or artifact chunk) as raw proto JSON; `null` when the event omits it.
         artifact: serde_json::Value,
+        /// Whether the parts extend the previously sent artifact with the same id; `false` when absent.
         append: bool,
+        /// Whether this is the final chunk of the artifact; `false` when absent.
         last_chunk: bool,
     },
 }

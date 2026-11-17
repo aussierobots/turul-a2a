@@ -24,12 +24,19 @@ use turul_a2a_types::{Message, Task, TaskState, TaskStatus};
 /// Shared server state.
 #[derive(Clone)]
 pub struct AppState {
+    /// Agent executor that runs accepted messages.
     pub executor: Arc<dyn AgentExecutor>,
+    /// Task persistence.
     pub task_storage: Arc<dyn A2aTaskStorage>,
+    /// Push notification config persistence.
     pub push_storage: Arc<dyn A2aPushNotificationStorage>,
+    /// Durable per-task event log that stream subscribers read.
     pub event_store: Arc<dyn crate::storage::A2aEventStore>,
+    /// Commits task, status and event writes together as one atomic step.
     pub atomic_store: Arc<dyn A2aAtomicStore>,
+    /// Same-instance fanout that wakes local stream subscribers ahead of the event-store poll.
     pub event_broker: crate::streaming::TaskEventBroker,
+    /// Middleware run on each request before it reaches a handler.
     pub middleware_stack: Arc<crate::middleware::MiddlewareStack>,
     /// Runtime configuration carried from [`crate::server::A2aServerBuilder`].
     /// Consumers read fields via `state.runtime_config` — cancellation
@@ -1798,7 +1805,7 @@ pub async fn core_cancel_task(
     owner: &str,
     task_id: &str,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    // Step 1: validate existence + ownership. `get_task` is owner-scoped —
+    // Validate existence + ownership. `get_task` is owner-scoped —
     // wrong owner returns None (TaskNotFound) as anti-enumeration.
     let initial_task = state
         .task_storage
@@ -1809,7 +1816,7 @@ pub async fn core_cancel_task(
             task_id: task_id.to_string(),
         })?;
 
-    // Step 2: reject terminal tasks up-front with TaskNotCancelable.
+    // Reject terminal tasks up-front with TaskNotCancelable.
     if let Some(status) = initial_task.status()
         && let Ok(s) = status.state()
         && turul_a2a_types::state_machine::is_terminal(s)
@@ -1821,7 +1828,7 @@ pub async fn core_cancel_task(
 
     let context_id = initial_task.context_id().to_string();
 
-    // Step 3: write the cancel-requested marker. Idempotent; errors map
+    // Write the cancel-requested marker. Idempotent; errors map
     // to the usual wire responses.
     match state
         .task_storage
@@ -1844,7 +1851,7 @@ pub async fn core_cancel_task(
         Err(other) => return Err(A2aError::from(other)),
     }
 
-    // Step 4: fast-path token trip if this instance owns the in-flight
+    // Fast-path token trip if this instance owns the in-flight
     // executor for this task. Cross-instance cases rely on the supervisor
     // poll loop (see `server::in_flight::run_cross_instance_cancel_poller`).
     let in_flight_key = (tenant.to_string(), task_id.to_string());
@@ -1874,7 +1881,7 @@ async fn cancel_grace_then_commit(
     task_id: &str,
     context_id: &str,
 ) -> Result<Json<serde_json::Value>, A2aError> {
-    // Step 5: grace-wait with poll. Return early if the task reaches
+    // Grace-wait with poll. Return early if the task reaches
     // a terminal state via the executor's cooperative response.
     let deadline = tokio::time::Instant::now() + state.runtime_config.cancel_handler_grace;
     let poll_interval = state.runtime_config.cancel_handler_poll_interval;
@@ -1925,7 +1932,7 @@ async fn cancel_grace_then_commit(
         tokio::time::sleep(sleep_for).await;
     }
 
-    // Step 6: grace expired. Force-commit CANCELED via atomic store.
+    // Grace expired. Force-commit CANCELED via atomic store.
     // Framework-committed terminals use `message = None` so history /
     // SSE consumers can distinguish them from executor-authored cancels
     // without conflating framework telemetry with agent output.

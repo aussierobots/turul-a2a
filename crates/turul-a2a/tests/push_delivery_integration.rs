@@ -90,7 +90,6 @@ fn fast_worker(store: Arc<InMemoryA2aStorage>, max_attempts: u32) -> PushDeliver
         None,
         format!("instance-{}", uuid::Uuid::now_v7()),
     )
-    .expect("worker build must succeed")
 }
 
 /// Poll `condition` until it holds or `deadline` passes.
@@ -804,8 +803,7 @@ async fn terminal_persist_failure_becomes_transient_not_succeeded() {
     cfg.claim_expiry = Duration::from_secs(60);
     cfg.max_payload_bytes = 64 * 1024;
     cfg.allow_insecure_urls = true;
-    let worker =
-        PushDeliveryWorker::new(store, cfg, None, "instance-fail".into()).expect("worker build");
+    let worker = PushDeliveryWorker::new(store, cfg, None, "instance-fail".into());
 
     let target = sentinel_target(&server.uri());
 
@@ -892,10 +890,12 @@ async fn reclaim_sweep_redispatches_after_persistent_terminal_failure() {
     cfg.claim_expiry = Duration::from_millis(100);
     cfg.max_payload_bytes = 64 * 1024;
     cfg.allow_insecure_urls = true;
-    let worker = Arc::new(
-        PushDeliveryWorker::new(delivery_store.clone(), cfg, None, "instance-A".into())
-            .expect("worker build"),
-    );
+    let worker = Arc::new(PushDeliveryWorker::new(
+        delivery_store.clone(),
+        cfg,
+        None,
+        "instance-A".into(),
+    ));
 
     let push_storage: Arc<dyn turul_a2a::storage::A2aPushNotificationStorage> = inner.clone();
     let task_storage: Arc<dyn turul_a2a::storage::A2aTaskStorage> = inner.clone();
@@ -1044,8 +1044,7 @@ async fn terminal_persist_recovers_after_transient_blip() {
     cfg.claim_expiry = Duration::from_secs(60);
     cfg.max_payload_bytes = 64 * 1024;
     cfg.allow_insecure_urls = true;
-    let worker =
-        PushDeliveryWorker::new(store, cfg, None, "instance-blip".into()).expect("worker build");
+    let worker = PushDeliveryWorker::new(store, cfg, None, "instance-blip".into());
     let target = sentinel_target(&server.uri());
 
     let report = worker.deliver(&target, b"{}").await;
@@ -1093,8 +1092,7 @@ async fn stale_claim_on_terminal_write_becomes_claim_lost() {
     cfg.claim_expiry = Duration::from_secs(60);
     cfg.max_payload_bytes = 64 * 1024;
     cfg.allow_insecure_urls = true;
-    let worker =
-        PushDeliveryWorker::new(store, cfg, None, "instance-stale".into()).expect("worker build");
+    let worker = PushDeliveryWorker::new(store, cfg, None, "instance-stale".into());
     let target = sentinel_target(&server.uri());
 
     let report = worker.deliver(&target, b"{}").await;
@@ -1347,10 +1345,12 @@ async fn redispatch_read_error_leaves_row_reclaimable() {
     cfg.claim_expiry = Duration::from_millis(50);
     cfg.max_payload_bytes = 64 * 1024;
     cfg.allow_insecure_urls = true;
-    let worker = Arc::new(
-        PushDeliveryWorker::new(delivery_store.clone(), cfg, None, "instance-rd".into())
-            .expect("worker build"),
-    );
+    let worker = Arc::new(PushDeliveryWorker::new(
+        delivery_store.clone(),
+        cfg,
+        None,
+        "instance-rd".into(),
+    ));
 
     let task_storage: Arc<dyn turul_a2a::storage::A2aTaskStorage> = inner.clone();
     let push_storage_trait: Arc<dyn turul_a2a::storage::A2aPushNotificationStorage> =
@@ -1488,10 +1488,12 @@ async fn pending_dispatch_marker_recovers_persistent_list_configs_outage() {
     cfg.claim_expiry = Duration::from_millis(50);
     cfg.max_payload_bytes = 64 * 1024;
     cfg.allow_insecure_urls = true;
-    let worker = Arc::new(
-        PushDeliveryWorker::new(delivery_store.clone(), cfg, None, "instance-pd".into())
-            .expect("worker build"),
-    );
+    let worker = Arc::new(PushDeliveryWorker::new(
+        delivery_store.clone(),
+        cfg,
+        None,
+        "instance-pd".into(),
+    ));
 
     let task_storage: Arc<dyn turul_a2a::storage::A2aTaskStorage> = inner.clone();
     let push_storage_trait: Arc<dyn turul_a2a::storage::A2aPushNotificationStorage> =
@@ -1631,10 +1633,12 @@ async fn initial_dispatch_retries_list_configs_on_transient_failure() {
     cfg.claim_expiry = Duration::from_secs(60);
     cfg.max_payload_bytes = 64 * 1024;
     cfg.allow_insecure_urls = true;
-    let worker = Arc::new(
-        PushDeliveryWorker::new(delivery_store, cfg, None, "instance-ld".into())
-            .expect("worker build"),
-    );
+    let worker = Arc::new(PushDeliveryWorker::new(
+        delivery_store,
+        cfg,
+        None,
+        "instance-ld".into(),
+    ));
 
     let task_storage: Arc<dyn turul_a2a::storage::A2aTaskStorage> = inner.clone();
     let push_storage_trait: Arc<dyn turul_a2a::storage::A2aPushNotificationStorage> =
@@ -1819,7 +1823,6 @@ fn live_worker_with_cache(
     });
     Arc::new(
         PushDeliveryWorker::new(store.clone(), cfg, None, "instance-live".into())
-            .expect("worker")
             .with_target_lookup(DeliveryTargetLookup::new(store.clone(), store.clone())),
     )
 }
@@ -2100,15 +2103,13 @@ async fn failed_delivery_is_removed_by_cleanup_once_retention_ends() {
         }),
         None,
         "instance-kept".into(),
-    )
-    .expect("worker");
+    );
     let expiring = PushDeliveryWorker::new(
         store.clone(),
         test_config(3, |c| c.failed_delivery_retention = Duration::ZERO),
         None,
         "instance-expiring".into(),
-    )
-    .expect("worker");
+    );
     let kept_target = sentinel_target(&server.uri());
     let expiring_target = sentinel_target(&server.uri());
 
@@ -2162,8 +2163,7 @@ async fn read_timeout_bounds_a_silent_receiver() {
         }),
         None,
         "instance-read-timeout".into(),
-    )
-    .expect("worker");
+    );
     let target = sentinel_target(&server.uri());
 
     let started = std::time::Instant::now();
@@ -2252,7 +2252,6 @@ async fn ssrf_blocked_destinations_are_never_posted() {
             None,
             "instance-ssrf".into(),
         )
-        .expect("worker")
         .with_dns_resolver(Arc::new(PinResolver {
             ip: ip.parse().unwrap(),
             call_count: calls.clone(),
@@ -2295,7 +2294,6 @@ async fn outbound_allowlist_refuses_before_dns() {
         Some(validator),
         "instance-allowlist".into(),
     )
-    .expect("worker")
     .with_dns_resolver(Arc::new(PinResolver {
         ip: "203.0.113.10".parse().unwrap(),
         call_count: calls.clone(),

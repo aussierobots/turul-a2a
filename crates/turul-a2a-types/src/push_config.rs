@@ -22,18 +22,22 @@ impl PushAuth {
         }
     }
 
+    /// Returns the authentication scheme.
     pub fn scheme(&self) -> &str {
         &self.inner.scheme
     }
 
+    /// Returns the scheme-specific credentials.
     pub fn credentials(&self) -> &str {
         &self.inner.credentials
     }
 
+    /// Returns a reference to the underlying generated proto message.
     pub fn as_proto(&self) -> &pb::AuthenticationInfo {
         &self.inner
     }
 
+    /// Consumes the wrapper and returns the underlying generated proto message.
     pub fn into_proto(self) -> pb::AuthenticationInfo {
         self.inner
     }
@@ -81,14 +85,17 @@ impl PushConfig {
         self.inner.authentication.clone().map(PushAuth::from)
     }
 
+    /// Returns the tenant, or an empty string if unset.
     pub fn tenant(&self) -> &str {
         &self.inner.tenant
     }
 
+    /// Returns a reference to the underlying generated proto message.
     pub fn as_proto(&self) -> &pb::TaskPushNotificationConfig {
         &self.inner
     }
 
+    /// Consumes the wrapper and returns the underlying generated proto message.
     pub fn into_proto(self) -> pb::TaskPushNotificationConfig {
         self.inner
     }
@@ -104,12 +111,14 @@ impl From<pb::TaskPushNotificationConfig> for PushConfig {
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct PushConfigPage {
+    /// The configs in this page, in listing order.
     pub configs: Vec<PushConfig>,
     /// `None` once the listing is exhausted.
     pub next_page_token: Option<String>,
 }
 
 impl PushConfigPage {
+    /// Creates a page from `configs` and an optional continuation token.
     pub fn new(configs: Vec<PushConfig>, next_page_token: Option<String>) -> Self {
         Self {
             configs,
@@ -164,6 +173,7 @@ impl PushConfigBuilder {
         self
     }
 
+    /// Builds the [`PushConfig`] with an empty id.
     pub fn build(self) -> PushConfig {
         PushConfig {
             inner: pb::TaskPushNotificationConfig {

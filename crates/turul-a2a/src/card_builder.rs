@@ -18,6 +18,7 @@ pub struct AgentSkillBuilder {
 }
 
 impl AgentSkillBuilder {
+    /// Creates a skill builder from the required id, name and description.
     pub fn new(
         id: impl Into<String>,
         name: impl Into<String>,
@@ -35,21 +36,25 @@ impl AgentSkillBuilder {
         }
     }
 
+    /// Sets the skill's tags, replacing any previous value.
     pub fn tags(mut self, tags: Vec<impl Into<String>>) -> Self {
         self.tags = tags.into_iter().map(Into::into).collect();
         self
     }
 
+    /// Sets example prompts for the skill, replacing any previous value.
     pub fn examples(mut self, examples: Vec<impl Into<String>>) -> Self {
         self.examples = examples.into_iter().map(Into::into).collect();
         self
     }
 
+    /// Sets the skill's input media types, replacing any previous value.
     pub fn input_modes(mut self, modes: Vec<impl Into<String>>) -> Self {
         self.input_modes = modes.into_iter().map(Into::into).collect();
         self
     }
 
+    /// Sets the skill's output media types, replacing any previous value.
     pub fn output_modes(mut self, modes: Vec<impl Into<String>>) -> Self {
         self.output_modes = modes.into_iter().map(Into::into).collect();
         self
@@ -71,6 +76,7 @@ impl AgentSkillBuilder {
         self
     }
 
+    /// Builds the `AgentSkill`.
     pub fn build(self) -> turul_a2a_proto::AgentSkill {
         turul_a2a_proto::AgentSkill {
             id: self.id,
@@ -110,6 +116,7 @@ pub struct AgentCardBuilder {
 }
 
 impl AgentCardBuilder {
+    /// Creates an agent card builder from the required name and version.
     pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -131,6 +138,7 @@ impl AgentCardBuilder {
         }
     }
 
+    /// Sets the agent description, which `build` requires.
     pub fn description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
         self
@@ -152,6 +160,7 @@ impl AgentCardBuilder {
         self
     }
 
+    /// Sets the agent's provider organization and URL.
     pub fn provider(mut self, organization: impl Into<String>, url: impl Into<String>) -> Self {
         self.provider = Some(turul_a2a_proto::AgentProvider {
             organization: organization.into(),
@@ -160,6 +169,7 @@ impl AgentCardBuilder {
         self
     }
 
+    /// Sets the URL of the agent's documentation.
     pub fn documentation_url(mut self, url: impl Into<String>) -> Self {
         self.documentation_url = Some(url.into());
         self
@@ -192,21 +202,25 @@ impl AgentCardBuilder {
         self
     }
 
+    /// Sets the media types the agent accepts by default, replacing any previous value.
     pub fn default_input_modes(mut self, modes: Vec<impl Into<String>>) -> Self {
         self.default_input_modes = modes.into_iter().map(Into::into).collect();
         self
     }
 
+    /// Sets the media types the agent produces by default, replacing any previous value.
     pub fn default_output_modes(mut self, modes: Vec<impl Into<String>>) -> Self {
         self.default_output_modes = modes.into_iter().map(Into::into).collect();
         self
     }
 
+    /// Adds a skill to the card.
     pub fn skill(mut self, skill: turul_a2a_proto::AgentSkill) -> Self {
         self.skills.push(skill);
         self
     }
 
+    /// Sets the URL of the agent's icon.
     pub fn icon_url(mut self, url: impl Into<String>) -> Self {
         self.icon_url = Some(url.into());
         self
@@ -260,6 +274,12 @@ impl AgentCardBuilder {
     /// default_input_modes, default_output_modes.
     ///
     /// `skills` may be empty — no non-empty invariant is imposed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aError::InvalidRequest` when the description is unset, no
+    /// interface was added via `url`, or the default input or output modes are
+    /// empty.
     pub fn build(self) -> Result<turul_a2a_proto::AgentCard, A2aError> {
         let description = self.description.ok_or(A2aError::InvalidRequest {
             message: "AgentCard requires description".into(),

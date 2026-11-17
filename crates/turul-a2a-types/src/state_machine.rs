@@ -1,24 +1,30 @@
+//! A2A TaskState transition validation.
+//!
+//! Validates transitions per the A2A v1.0 task lifecycle. `REJECTED`
+//! may be emitted from any non-terminal state, reflecting the proto
+//! spec language that an agent "may be done during initial task
+//! creation or later once an agent has determined it can't or won't
+//! proceed" (a2a.proto TASK_STATE_REJECTED doc comment).
+//!
+//! ```text
+//! Submitted     -> Working | Rejected | Failed | Canceled
+//! Working       -> Completed | Failed | Canceled | Rejected
+//!                  | InputRequired | AuthRequired
+//! InputRequired -> Working | Completed | Failed | Canceled | Rejected
+//! AuthRequired  -> Working | Failed | Canceled | Rejected
+//! Completed/Failed/Canceled/Rejected -> ERROR (terminal)
+//! Unspecified -> ERROR (not a valid application state)
+//! ```
+
 use crate::TaskState;
-/// A2A TaskState transition validation.
-///
-/// Validates transitions per the A2A v1.0 task lifecycle. `REJECTED`
-/// may be emitted from any non-terminal state, reflecting the proto
-/// spec language that an agent "may be done during initial task
-/// creation or later once an agent has determined it can't or won't
-/// proceed" (a2a.proto TASK_STATE_REJECTED doc comment).
-///
-/// ```text
-/// Submitted     -> Working | Rejected | Failed | Canceled
-/// Working       -> Completed | Failed | Canceled | Rejected
-///                  | InputRequired | AuthRequired
-/// InputRequired -> Working | Completed | Failed | Canceled | Rejected
-/// AuthRequired  -> Working | Failed | Canceled | Rejected
-/// Completed/Failed/Canceled/Rejected -> ERROR (terminal)
-/// Unspecified -> ERROR (not a valid application state)
-/// ```
 use crate::error::A2aTypeError;
 
 /// Validate a task state transition per A2A v1.0 lifecycle rules.
+///
+/// # Errors
+///
+/// Returns [`A2aTypeError::TerminalState`] if `from` is terminal, and
+/// [`A2aTypeError::InvalidTransition`] if the lifecycle does not allow `from` to move to `to`.
 pub fn validate_transition(from: TaskState, to: TaskState) -> Result<(), A2aTypeError> {
     match from {
         TaskState::Submitted => match to {

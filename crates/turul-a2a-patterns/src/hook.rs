@@ -32,6 +32,7 @@ pub enum SkillOutcome<'a> {
 /// at the bottom of this module.
 #[async_trait]
 pub trait TerminalHook: Send + Sync {
+    /// Observes how the skill `skill_id` ended.
     async fn on_terminal<'a>(&self, skill_id: &'a str, outcome: SkillOutcome<'a>);
 }
 

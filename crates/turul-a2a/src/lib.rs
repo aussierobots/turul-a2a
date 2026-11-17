@@ -78,6 +78,8 @@
 //! - [Examples](https://github.com/aussierobots/turul-a2a/tree/main/examples)
 //!   on GitHub
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 mod capability;
 pub mod card_builder;
 #[cfg(feature = "compat-v03")]

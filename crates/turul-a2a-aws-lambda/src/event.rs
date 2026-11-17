@@ -36,7 +36,7 @@ pub enum LambdaEvent {
     Unknown,
 }
 
-/// Classify a raw Lambda event JSON shape.
+/// Classifies a raw Lambda event JSON shape.
 ///
 /// Heuristic:
 /// - SQS event JSON has a top-level `"Records"` array whose entries

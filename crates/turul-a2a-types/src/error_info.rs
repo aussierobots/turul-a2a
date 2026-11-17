@@ -29,7 +29,7 @@ pub struct ErrorInfo {
 }
 
 impl ErrorInfo {
-    /// An `ErrorInfo` with no metadata.
+    /// Creates an `ErrorInfo` with no metadata.
     pub fn new(reason: impl Into<String>, domain: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),

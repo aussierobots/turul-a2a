@@ -12,7 +12,9 @@ use crate::A2aClientError;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum SendResponse {
+    /// The server created or continued a task.
     Task(Task),
+    /// The server replied directly with a message and no task.
     Message(Message),
 }
 
@@ -81,9 +83,13 @@ impl TryFrom<pb::SendMessageResponse> for SendResponse {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ListResponse {
+    /// Tasks on this page.
     pub tasks: Vec<Task>,
+    /// Cursor for the next page; empty on the final page.
     pub next_page_token: String,
+    /// Total number of matching tasks before pagination.
     pub total_size: i32,
+    /// Page size the server applied to this response.
     pub page_size: i32,
 }
 

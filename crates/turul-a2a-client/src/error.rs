@@ -1,17 +1,26 @@
 //! Client error types.
 
+/// Errors returned by the A2A client.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum A2aClientError {
     /// HTTP-level error with status and body.
     #[error("HTTP {status}: {message}")]
-    Http { status: u16, message: String },
+    Http {
+        /// HTTP status code of the response.
+        status: u16,
+        /// Raw response body, kept when it is not a structured A2A error.
+        message: String,
+    },
 
     /// A2A-specific error with ErrorInfo reason.
     #[error("A2A error {status}: {message}")]
     A2aError {
+        /// HTTP status code of the response.
         status: u16,
+        /// `error.message` from the A2A error body, or `Unknown error` when absent.
         message: String,
+        /// `google.rpc.ErrorInfo.reason` discriminator, when the error body carries one.
         reason: Option<String>,
     },
 

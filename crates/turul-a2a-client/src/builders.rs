@@ -38,6 +38,7 @@ pub struct MessageBuilder {
 }
 
 impl MessageBuilder {
+    /// Creates a builder for a user-role message with a fresh message id and no parts.
     pub fn new() -> Self {
         Self {
             message_id: uuid::Uuid::now_v7().to_string(),

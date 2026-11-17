@@ -141,6 +141,11 @@ pub(crate) fn compile_schema(schema: &Value) -> Result<jsonschema::Validator, Va
 /// Schema keywords outside the 2020-12 dialect are rejected at this
 /// call site via the same strict-keyword check used by SKILL.md
 /// manifest parsing.
+///
+/// # Errors
+///
+/// Returns [`ValidationError::UnsupportedKeyword`] if `schema` uses a keyword outside the 2020-12
+/// dialect, and [`ValidationError::Invalid`] if the schema does not compile or `instance` does not satisfy it.
 pub fn validate_json(
     schema: &serde_json::Value,
     instance: &serde_json::Value,

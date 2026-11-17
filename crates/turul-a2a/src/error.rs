@@ -16,36 +16,71 @@ use turul_a2a_types::wire::errors;
 #[non_exhaustive]
 pub enum A2aError {
     #[error("Task not found: {task_id}")]
-    TaskNotFound { task_id: String },
+    /// The requested task does not exist.
+    TaskNotFound {
+        /// Identifier of the task that was not found.
+        task_id: String,
+    },
 
     #[error("Task not cancelable: {task_id}")]
-    TaskNotCancelable { task_id: String },
+    /// The task is already in a terminal state and cannot be cancelled.
+    TaskNotCancelable {
+        /// Identifier of the task that could not be cancelled.
+        task_id: String,
+    },
 
     #[error("Push notifications not supported")]
+    /// The agent card does not advertise push notification support, so push-config operations are refused.
     PushNotificationNotSupported,
 
     #[error("Unsupported operation: {message}")]
-    UnsupportedOperation { message: String },
+    /// The operation is not supported by this agent or not valid for the task's current state, such as subscribing to a terminal task.
+    UnsupportedOperation {
+        /// Explanation of why the operation was refused.
+        message: String,
+    },
 
     #[error("Content type not supported: {content_type}")]
-    ContentTypeNotSupported { content_type: String },
+    /// A request or message part uses a media type the agent does not accept.
+    ContentTypeNotSupported {
+        /// The unsupported media type.
+        content_type: String,
+    },
 
     #[error("Invalid agent response: {message}")]
-    InvalidAgentResponse { message: String },
+    /// The executor produced a response that violates the protocol.
+    InvalidAgentResponse {
+        /// Description of what was invalid in the response.
+        message: String,
+    },
 
     #[error("Extended agent card not configured")]
+    /// The agent card declares an extended card but the executor supplies none for this request.
     ExtendedAgentCardNotConfigured,
 
     #[error("Extension support required: {extension}")]
-    ExtensionSupportRequired { extension: String },
+    /// The request did not activate an extension the agent requires.
+    ExtensionSupportRequired {
+        /// URI of the required extension.
+        extension: String,
+    },
 
     #[error("Version not supported: {version}")]
-    VersionNotSupported { version: String },
+    /// The `A2A-Version` the client requested is not one this server supports.
+    VersionNotSupported {
+        /// The unsupported version string as requested.
+        version: String,
+    },
 
     #[error("Invalid request: {message}")]
-    InvalidRequest { message: String },
+    /// The request is malformed or fails validation, such as a bad parameter or an identifier mismatch.
+    InvalidRequest {
+        /// Description of what was wrong with the request.
+        message: String,
+    },
 
     #[error("Internal error: {0}")]
+    /// An unexpected server-side failure, such as a storage error with no protocol mapping; the string is returned as the error message.
     Internal(String),
 }
 

@@ -2,7 +2,8 @@
 //!
 //! Every RPC dispatches into the same `core_*` function that HTTP and
 //! JSON-RPC call. The adapter does only:
-//!   1. tenant + owner extraction (metadata → fallback to proto → fallback "")
+//!   1. tenant + owner extraction (proto `tenant` field → `x-tenant-id`
+//!      metadata → "", see `tenant_from`)
 //!   2. serialize incoming proto to JSON for the core body argument
 //!   3. deserialize core JSON response back to the proto response type
 //!   4. map `A2aError` via [`crate::grpc::error::a2a_to_status`]
@@ -32,6 +33,7 @@ pub struct GrpcService {
 }
 
 impl GrpcService {
+    /// Creates a service that dispatches every RPC into the shared core handlers using `state`.
     pub fn new(state: AppState) -> Self {
         Self { state }
     }
@@ -61,7 +63,7 @@ pub(crate) fn tenant_from<T>(req: &Request<T>, proto_tenant: &str) -> String {
 
 /// Pull the caller's owner identity from the request extensions.
 ///
-/// When the `A2aAuthLayer` is wired (next commit), it injects a
+/// When the `A2aAuthLayer` is wired, it injects a
 /// [`RequestContext`] into `http::Request::extensions_mut()`; tonic
 /// surfaces those same extensions to the service impl. When no layer is
 /// configured (bare test harness, compile-only checks) the owner falls

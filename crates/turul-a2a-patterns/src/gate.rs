@@ -16,8 +16,11 @@ use crate::sink::SkillProgressSink;
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct GateContext<'a> {
+    /// Identifier of the skill being invoked.
     pub skill_id: &'a str,
+    /// Parameters the skill was invoked with.
     pub params: &'a Value,
+    /// Output the handler produced, pending the gate's verdict.
     pub output: &'a Value,
 }
 
@@ -36,6 +39,11 @@ pub struct GateContext<'a> {
 /// decide, they do not emit events.
 #[async_trait]
 pub trait PreTerminalGate: Send + Sync {
+    /// Decides whether `ctx.output` may pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkillError::Rejected`] to veto the output, or [`SkillError::Internal`] if the gate itself fails.
     async fn check(&self, ctx: GateContext<'_>) -> Result<(), SkillError>;
 }
 
@@ -52,6 +60,7 @@ pub struct GatedHandler {
 }
 
 impl GatedHandler {
+    /// Wraps `inner` with no gates; `skill_id` is reported to gates in [`GateContext`].
     pub fn new(skill_id: impl Into<String>, inner: Arc<dyn SkillHandler>) -> Self {
         Self {
             skill_id: skill_id.into(),

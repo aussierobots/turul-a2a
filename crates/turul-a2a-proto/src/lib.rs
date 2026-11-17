@@ -48,12 +48,15 @@
 //! - The [`a2a.proto`](https://github.com/aussierobots/turul-a2a/blob/main/crates/turul-a2a-proto/proto/a2a.proto)
 //!   definition this crate is generated from
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 /// Raw prost-generated types for the A2A Protocol v1.0 (package lf.a2a.v1).
 ///
 /// These types are generated from the normative `a2a.proto` definition.
 /// Use `turul-a2a-types` for ergonomic wrapper types with state machine
 /// enforcement and builder patterns.
 pub mod lf {
+    /// Namespace for the `a2a` proto package.
     pub mod a2a {
         // pbjson-build output triggers `clippy::useless_borrows_in_formatting`
         // on newer clippy versions inside generated `Visitor::expecting`
@@ -61,6 +64,7 @@ pub mod lf {
         // the lint at the module boundary is the standard escape hatch.
         // `unknown_lints` covers older toolchains that don't know the lint
         // name yet, so `-D warnings` stays green on both.
+        /// Generated messages, enums and serde impls of package `lf.a2a.v1`.
         #[allow(unknown_lints, clippy::useless_borrows_in_formatting)]
         pub mod v1 {
             include!(concat!(env!("OUT_DIR"), "/lf.a2a.v1.rs"));

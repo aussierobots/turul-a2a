@@ -20,7 +20,9 @@ use crate::streaming::StreamEvent;
 /// SQLite storage configuration.
 #[derive(Debug, Clone)]
 pub struct SqliteConfig {
+    /// Connection URL of the database.
     pub database_url: String,
+    /// Maximum number of pooled connections.
     pub max_connections: u32,
     /// When true, [`SqliteA2aStorage::new`] skips DDL bootstrap and
     /// trusts the operator-provisioned schema. Default `false`
@@ -53,6 +55,11 @@ pub struct SqliteA2aStorage {
 }
 
 impl SqliteA2aStorage {
+    /// Connects to the database and, unless `assume_schema_initialized` is set, creates the schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aStorageError::DatabaseError` when the connection or schema creation fails.
     pub async fn new(config: SqliteConfig) -> Result<Self, A2aStorageError> {
         let pool = SqlitePoolOptions::new()
             .max_connections(config.max_connections)
@@ -970,7 +977,7 @@ impl A2aPushNotificationStorage for SqliteA2aStorage {
         let json = serde_json::to_string(&config)
             .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
 
-        // -floor CAS: read `latest_event_sequence`
+        // Causal-floor CAS: read `latest_event_sequence`
         // and INSERT the config row with
         // `registered_after_event_sequence = seq_read` in the SAME
         // transaction, conditional on `latest_event_sequence` still

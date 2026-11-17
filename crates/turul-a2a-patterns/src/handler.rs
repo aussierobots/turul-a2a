@@ -14,5 +14,10 @@ use crate::sink::SkillProgressSink;
 /// generic parameter, so registries can store boxed handlers.
 #[async_trait]
 pub trait SkillHandler: Send + Sync {
+    /// Runs the skill with `params`, emitting progress through `sink`, and returns its structured output.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SkillError`] if the skill fails.
     async fn run(&self, params: Value, sink: &dyn SkillProgressSink) -> Result<Value, SkillError>;
 }

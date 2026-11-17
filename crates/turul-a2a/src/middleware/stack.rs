@@ -15,6 +15,7 @@ pub struct MiddlewareStack {
 }
 
 impl MiddlewareStack {
+    /// Creates a stack that runs `middleware` in order.
     pub fn new(middleware: Vec<Arc<dyn A2aMiddleware>>) -> Self {
         Self { middleware }
     }
@@ -26,10 +27,16 @@ impl MiddlewareStack {
         Self::new(vec![])
     }
 
+    /// Returns `true` when the stack has no middleware.
     pub fn is_empty(&self) -> bool {
         self.middleware.is_empty()
     }
 
+    /// Runs each middleware in order, stopping at the first failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`MiddlewareError`] a middleware produces.
     pub async fn before_request(&self, ctx: &mut RequestContext) -> Result<(), MiddlewareError> {
         for mw in &self.middleware {
             mw.before_request(ctx).await?;
@@ -51,6 +58,11 @@ pub struct AnyOfMiddleware {
 }
 
 impl AnyOfMiddleware {
+    /// Creates a combinator over `children`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `children` is empty.
     pub fn new(children: Vec<Arc<dyn A2aMiddleware>>) -> Self {
         assert!(
             !children.is_empty(),

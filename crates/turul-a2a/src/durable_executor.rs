@@ -40,9 +40,13 @@ pub struct QueuedExecutorJob {
     /// Envelope version. Current: `1`. Increment on any schema change
     /// that cannot be handled by adding optional fields.
     pub version: u16,
+    /// Tenant the task belongs to.
     pub tenant: String,
+    /// Authenticated owner the task is scoped to.
     pub owner: String,
+    /// Identifier of the task the executor runs for.
     pub task_id: String,
+    /// Context the task belongs to.
     pub context_id: String,
     /// The incoming `SendMessage.message` from the HTTP request,
     /// preserved verbatim. Forwarded to the executor's
@@ -116,7 +120,12 @@ pub enum QueueError {
     /// rejection (HTTP 400 `InvalidRequest`) before any task is
     /// created.
     #[error("queue payload too large: {actual} bytes exceeds limit of {max} bytes")]
-    PayloadTooLarge { actual: usize, max: usize },
+    PayloadTooLarge {
+        /// Size in bytes of the encoded payload.
+        actual: usize,
+        /// Largest payload in bytes the transport accepts.
+        max: usize,
+    },
 
     /// Transport-level failure (SQS API error, network, IAM,
     /// throttling). Caller typically responds with FAILED-compensation
@@ -125,8 +134,8 @@ pub enum QueueError {
     Transport(String),
 }
 
-/// Durable executor queue — the integration point for Pattern B
-/// (framework-managed durable continuation).
+/// Durable executor queue — the integration point for
+/// framework-managed durable continuation.
 ///
 /// **Public extension point, semver-sensitive.** External
 /// implementers should treat method additions (and signature changes)
@@ -157,6 +166,12 @@ pub trait DurableExecutorQueue: Send + Sync {
     ///
     /// Called by `core_send_message` BEFORE task creation so oversize
     /// payloads never persist a task row.
+    ///
+    /// # Errors
+    ///
+    /// Returns `QueueError::Encode` when the job cannot be serialised and
+    /// `QueueError::PayloadTooLarge` when its encoded size exceeds
+    /// [`Self::max_payload_bytes`].
     fn check_payload_size(&self, job: &QueuedExecutorJob) -> Result<usize, QueueError> {
         let encoded = serde_json::to_vec(job)?;
         let max = self.max_payload_bytes();
@@ -175,6 +190,11 @@ pub trait DurableExecutorQueue: Send + Sync {
     /// internally as a defence-in-depth guard; `core_send_message`
     /// also calls it upstream so `enqueue` failures for oversize
     /// payloads are unexpected at this point.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `QueueError` when the payload is too large or the transport
+    /// fails to accept the job.
     async fn enqueue(&self, job: QueuedExecutorJob) -> Result<(), QueueError>;
 
     /// Identifier for logs / errors / diagnostics (`"sqs"`,

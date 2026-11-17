@@ -42,15 +42,12 @@ async fn build_stack() -> (
     cfg.claim_expiry = std::time::Duration::from_millis(50);
     cfg.max_payload_bytes = 64 * 1024;
     cfg.allow_insecure_urls = true;
-    let worker = Arc::new(
-        PushDeliveryWorker::new(
-            delivery.clone(),
-            cfg,
-            None,
-            "scheduled-recovery-test".into(),
-        )
-        .expect("worker build"),
-    );
+    let worker = Arc::new(PushDeliveryWorker::new(
+        delivery.clone(),
+        cfg,
+        None,
+        "scheduled-recovery-test".into(),
+    ));
     let dispatcher = Arc::new(PushDispatcher::new(worker, push_storage, task_storage));
     (storage, dispatcher, delivery)
 }
@@ -263,10 +260,12 @@ async fn scheduled_sweep_counts_transient_error_and_retains_marker() {
     cfg.claim_expiry = std::time::Duration::from_secs(30);
     cfg.max_payload_bytes = 64 * 1024;
     cfg.allow_insecure_urls = true;
-    let worker = Arc::new(
-        PushDeliveryWorker::new(delivery.clone(), cfg, None, "flaky-sched-test".into())
-            .expect("worker"),
-    );
+    let worker = Arc::new(PushDeliveryWorker::new(
+        delivery.clone(),
+        cfg,
+        None,
+        "flaky-sched-test".into(),
+    ));
     let push_storage: Arc<dyn A2aPushNotificationStorage> = storage.clone();
     let dispatcher = Arc::new(PushDispatcher::new(worker, push_storage, flaky));
 

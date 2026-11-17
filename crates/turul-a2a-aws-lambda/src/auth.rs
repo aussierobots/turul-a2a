@@ -34,6 +34,7 @@ pub struct LambdaAuthorizerMiddleware {
 }
 
 impl LambdaAuthorizerMiddleware {
+    /// Creates a middleware that reads the owner and claims named by `mapping`.
     pub fn new(mapping: AuthorizerMapping) -> Self {
         Self { mapping }
     }

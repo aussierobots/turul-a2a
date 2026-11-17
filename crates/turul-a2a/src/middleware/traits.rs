@@ -37,11 +37,14 @@ pub trait A2aMiddleware: Send + Sync {
 /// Multiple schemes in one `SecurityRequirement` = AND (all required).
 #[derive(Debug, Clone, Default)]
 pub struct SecurityContribution {
+    /// Security scheme definitions, keyed by the name that requirements refer to.
     pub schemes: Vec<(String, turul_a2a_proto::SecurityScheme)>,
+    /// Requirement groups that select among the schemes by name.
     pub requirements: Vec<turul_a2a_proto::SecurityRequirement>,
 }
 
 impl SecurityContribution {
+    /// Creates an empty contribution.
     pub fn new() -> Self {
         Self::default()
     }
@@ -64,6 +67,7 @@ impl SecurityContribution {
         self
     }
 
+    /// Returns `true` when no scheme or requirement is contributed.
     pub fn is_empty(&self) -> bool {
         self.schemes.is_empty() && self.requirements.is_empty()
     }

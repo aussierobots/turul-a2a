@@ -14,6 +14,7 @@ use turul_a2a::middleware::{
 /// Returns `Some(owner)` if the key is valid, `None` if invalid.
 #[async_trait]
 pub trait ApiKeyLookup: Send + Sync {
+    /// Returns the owner the key authenticates, or `None` if the key is not valid.
     async fn lookup(&self, key: &str) -> Option<String>;
 }
 
@@ -23,6 +24,7 @@ pub struct StaticApiKeyLookup {
 }
 
 impl StaticApiKeyLookup {
+    /// Creates a lookup from a map of key to owner.
     pub fn new(keys: HashMap<String, String>) -> Self {
         Self { keys }
     }
@@ -63,6 +65,7 @@ pub struct RedactedApiKeyLookup {
 }
 
 impl RedactedApiKeyLookup {
+    /// Creates a lookup from a map of key to owner.
     pub fn new(keys: HashMap<String, String>) -> Self {
         Self { keys }
     }
@@ -73,6 +76,7 @@ impl RedactedApiKeyLookup {
         self.keys.len()
     }
 
+    /// Returns `true` if no keys are registered.
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
@@ -103,6 +107,7 @@ pub struct ApiKeyMiddleware {
 }
 
 impl ApiKeyMiddleware {
+    /// Creates a middleware that reads the key from the `header_name` request header and resolves it with `lookup`.
     pub fn new(lookup: Arc<dyn ApiKeyLookup>, header_name: impl Into<String>) -> Self {
         Self {
             lookup,

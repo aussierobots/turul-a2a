@@ -20,7 +20,9 @@ use crate::streaming::StreamEvent;
 /// PostgreSQL storage configuration.
 #[derive(Debug, Clone)]
 pub struct PostgresConfig {
+    /// Connection URL of the database.
     pub database_url: String,
+    /// Maximum number of pooled connections.
     pub max_connections: u32,
     /// When true, [`PostgresA2aStorage::new`] skips DDL bootstrap (no
     /// `CREATE TABLE`, no `CREATE INDEX`) and trusts
@@ -52,6 +54,11 @@ pub struct PostgresA2aStorage {
 }
 
 impl PostgresA2aStorage {
+    /// Connects to the database and, unless `assume_schema_initialized` is set, creates the schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns `A2aStorageError::DatabaseError` when the connection or schema creation fails.
     pub async fn new(config: PostgresConfig) -> Result<Self, A2aStorageError> {
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
@@ -938,7 +945,7 @@ impl A2aPushNotificationStorage for PostgresA2aStorage {
         let json = serde_json::to_value(&config)
             .map_err(|e| A2aStorageError::SerializationError(e.to_string()))?;
 
-        // -floor CAS: SERIALIZABLE tx reading
+        // Causal-floor CAS: SERIALIZABLE tx reading
         // `latest_event_sequence` and inserting the config with
         // `registered_after_event_sequence = seq_read`. A concurrent
         // `update_task_status_with_events` committing between our

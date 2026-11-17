@@ -79,7 +79,7 @@ When all children fail: Internal short-circuits (fatal), then Forbidden(403) > H
 
 ### 5. Local JWT Validator
 
-Originally a local workspace crate; now consumed as the published `turul-jwt-validator` crate. Design sourced from `turul-mcp-oauth::jwt` (read-only reference). Supports RS256+ES256, JWKS caching, kid-miss refetch. No cross-repo dependencies or changes.
+Originally a local workspace crate; now consumed as the published `turul-jwt-validator` crate. Design sourced from `turul-mcp-oauth::jwt` (read-only reference). Supports RS256+ES256, JWKS caching, kid-miss refetch. Minimum version 0.3.5: a token with no `aud` claim, or no `iss` claim when an issuer is configured, is rejected (`BearerMiddleware` answers 401 `invalid_token`); earlier versions accepted it. No cross-repo dependencies or changes.
 
 **Provenance note:** This crate's design originates from `turul-mcp-framework/crates/turul-mcp-oauth/src/jwt.rs`. Future extraction to a shared crate used by both MCP and A2A is a separate follow-up ADR.
 
@@ -107,3 +107,4 @@ If Lambda uses API Gateway authorizers instead of (or in addition to) applicatio
 
 - **2026-10-22** — §4: ADR-016 superseded merging `WWW-Authenticate` headers from every failing `HttpChallenge` child with precedence selection — one error is selected and the transport builds its single challenge from the selected kind. Text updated to what ships. §5: the validator is the published `turul-jwt-validator` crate, not a workspace member.
 - **2026-10-23** — Context and Consequences restated without naming a specific identity provider. No contract change.
+- **2026-11-18** — §5: `turul-jwt-validator` minimum raised to 0.3.5, which rejects tokens missing `aud` (or `iss` when an issuer is configured); `turul-a2a-auth` tests pin both cases.

@@ -337,6 +337,7 @@ pub struct InFlightRegistry {
 }
 
 impl InFlightRegistry {
+    /// Creates an empty registry.
     pub fn new() -> Self {
         Self::default()
     }
@@ -346,6 +347,10 @@ impl InFlightRegistry {
     /// internal error at spawn time. Silent overwrites are NOT permitted:
     /// overwriting a live handle would lose track of an executor we are
     /// responsible for aborting on cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InsertCollision`] when an entry already exists for `key`.
     pub fn try_insert(
         &self,
         key: InFlightKey,
@@ -477,7 +482,9 @@ impl InFlightRegistry {
 /// log or inspect it for diagnostics; the caller MUST NOT proceed as if
 /// the insert succeeded.
 pub struct InsertCollision {
+    /// Key the insert asked for, which is already occupied.
     pub key: InFlightKey,
+    /// Handle of the registered executor occupying the key.
     pub existing: Arc<InFlightHandle>,
 }
 

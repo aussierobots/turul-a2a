@@ -34,10 +34,11 @@ use crate::streaming::StreamEvent;
 /// the requirement applies to every atomic-store implementation.
 #[async_trait]
 pub trait A2aAtomicStore: Send + Sync {
+    /// Returns the backend's name; the server builder requires every store it is given to report the same one.
     fn backend_name(&self) -> &'static str;
 
-    /// Does this atomic store also write pending-dispatch markers atomically
-    /// with terminal status commits?
+    /// Returns whether this atomic store also writes pending-dispatch markers
+    /// atomically with terminal status commits.
     ///
     /// `false` (default): task + event rows only. Non-push deployments never
     /// touch `a2a_push_pending_dispatches`; no marker writes, no IAM, no
@@ -60,8 +61,12 @@ pub trait A2aAtomicStore: Send + Sync {
         false
     }
 
-    /// Create a task and append initial events atomically.
-    /// Returns the created task and assigned event sequences.
+    /// Creates a task and appends initial events atomically, returning the
+    /// created task and the assigned event sequences.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn create_task_with_events(
         &self,
         tenant: &str,
@@ -70,8 +75,9 @@ pub trait A2aAtomicStore: Send + Sync {
         events: Vec<StreamEvent>,
     ) -> Result<(Task, Vec<u64>), A2aStorageError>;
 
-    /// Update a task's status and append events atomically.
-    /// Validates state machine transition. Returns updated task and sequences.
+    /// Updates a task's status and appends events atomically.
+    /// Validates the state machine transition and returns the updated task
+    /// and the assigned sequences.
     ///
     /// # Terminal-write CAS contract (normative)
     ///
@@ -119,6 +125,12 @@ pub trait A2aAtomicStore: Send + Sync {
     ///
     /// Concurrent-write parity tests (`parity_tests::terminal_cas_*`) gate
     /// acceptance of each backend implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError::TerminalStateAlreadySet`] when the persisted
+    /// task is already terminal, [`A2aStorageError::InvalidTransition`] for an
+    /// illegal transition, and another [`A2aStorageError`] when the backend fails.
     async fn update_task_status_with_events(
         &self,
         tenant: &str,
@@ -128,8 +140,8 @@ pub trait A2aAtomicStore: Send + Sync {
         events: Vec<StreamEvent>,
     ) -> Result<(Task, Vec<u64>), A2aStorageError>;
 
-    /// Full replacement update of a task and append events atomically.
-    /// Returns assigned event sequences.
+    /// Replaces a task in full and appends events atomically, returning the
+    /// assigned event sequences.
     ///
     /// # Terminal-preservation CAS contract (normative)
     ///
@@ -174,6 +186,12 @@ pub trait A2aAtomicStore: Send + Sync {
     /// whose persisted state is terminal. Together the two clauses
     /// ensure that once a terminal is persisted, it is immutable from
     /// every write path in the trait.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError::TerminalStateAlreadySet`] when the persisted
+    /// task is already terminal, and another [`A2aStorageError`] when the
+    /// backend fails.
     async fn update_task_with_events(
         &self,
         tenant: &str,

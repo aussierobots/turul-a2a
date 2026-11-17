@@ -1,3 +1,5 @@
+//! Storage traits for tasks, push configs and the cancellation supervisor.
+
 use async_trait::async_trait;
 use turul_a2a_types::{Artifact, Message, Task, TaskStatus};
 
@@ -43,9 +45,14 @@ use super::filter::{PushConfigListPage, TaskFilter, TaskListPage};
 /// read can miss, the backend does not satisfy this trait.
 #[async_trait]
 pub trait A2aTaskStorage: Send + Sync {
+    /// Returns the backend's name; the server builder requires every store it is given to report the same one.
     fn backend_name(&self) -> &'static str;
 
-    /// Create a new task. Server generates `id` if empty on the task.
+    /// Creates a new task. The server generates `id` if empty on the task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn create_task(
         &self,
         tenant: &str,
@@ -53,9 +60,13 @@ pub trait A2aTaskStorage: Send + Sync {
         task: Task,
     ) -> Result<Task, A2aStorageError>;
 
-    /// Get a task by ID. Returns `None` if not found or not accessible.
+    /// Gets a task by ID, or `None` if not found or not accessible.
     /// Enforces tenant + owner isolation.
     /// `history_length`: Some(0)=omit, None=no limit, Some(n)=last n.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn get_task(
         &self,
         tenant: &str,
@@ -64,7 +75,12 @@ pub trait A2aTaskStorage: Send + Sync {
         history_length: Option<i32>,
     ) -> Result<Option<Task>, A2aStorageError>;
 
-    /// Full replacement update of a task. Enforces tenant + owner match.
+    /// Replaces a task in full. Enforces tenant + owner match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the task does not exist, belongs to
+    /// another owner, or the backend fails.
     async fn update_task(
         &self,
         tenant: &str,
@@ -72,7 +88,11 @@ pub trait A2aTaskStorage: Send + Sync {
         task: Task,
     ) -> Result<(), A2aStorageError>;
 
-    /// Delete a task. Returns `true` if deleted, `false` if not found.
+    /// Deletes a task, returning `true` if deleted and `false` if not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn delete_task(
         &self,
         tenant: &str,
@@ -80,11 +100,22 @@ pub trait A2aTaskStorage: Send + Sync {
         owner: &str,
     ) -> Result<bool, A2aStorageError>;
 
-    /// List tasks with filtering and pagination.
+    /// Lists tasks with filtering and pagination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError::InvalidListRequest`] for an out-of-range page
+    /// size or an unrecognised page token, and another [`A2aStorageError`]
+    /// when the backend fails.
     async fn list_tasks(&self, filter: TaskFilter) -> Result<TaskListPage, A2aStorageError>;
 
-    /// Update a task's status with state machine validation.
-    /// Rejects invalid transitions with `InvalidTransition` or `TerminalState`.
+    /// Updates a task's status with state machine validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError::InvalidTransition`] or
+    /// [`A2aStorageError::TerminalState`] for an invalid transition, and
+    /// another [`A2aStorageError`] when the backend fails.
     async fn update_task_status(
         &self,
         tenant: &str,
@@ -93,7 +124,11 @@ pub trait A2aTaskStorage: Send + Sync {
         new_status: TaskStatus,
     ) -> Result<Task, A2aStorageError>;
 
-    /// Append a message to a task's history. Enforces tenant + owner isolation.
+    /// Appends a message to a task's history. Enforces tenant + owner isolation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn append_message(
         &self,
         tenant: &str,
@@ -102,12 +137,16 @@ pub trait A2aTaskStorage: Send + Sync {
         message: Message,
     ) -> Result<(), A2aStorageError>;
 
-    /// Append an artifact to a task. Enforces tenant + owner isolation.
+    /// Appends an artifact to a task. Enforces tenant + owner isolation.
     /// `append`: if true and artifact_id matches existing, append parts to it.
     /// `last_chunk`: transport metadata carried in the SSE
     ///   `ArtifactUpdate` event. Storage does not persist it as task
     ///   state; the server layer forwards it to streaming
     ///   subscribers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn append_artifact(
         &self,
         tenant: &str,
@@ -118,13 +157,21 @@ pub trait A2aTaskStorage: Send + Sync {
         last_chunk: bool,
     ) -> Result<(), A2aStorageError>;
 
-    /// Total number of tasks across all tenants.
+    /// Returns the total number of tasks across all tenants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn task_count(&self) -> Result<usize, A2aStorageError>;
 
-    /// Periodic maintenance (cleanup, compaction).
+    /// Runs periodic maintenance (cleanup, compaction).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn maintenance(&self) -> Result<(), A2aStorageError>;
 
-    /// Set the `cancel_requested` marker on a non-terminal task.
+    /// Sets the `cancel_requested` marker on a non-terminal task.
     ///
     /// Owner-scoped (unlike the supervisor-only reads on
     /// [`A2aCancellationSupervisor`]): wrong owner or missing task returns
@@ -141,6 +188,12 @@ pub trait A2aTaskStorage: Send + Sync {
     /// on the instance running the executor discovers the marker via
     /// [`A2aCancellationSupervisor::supervisor_list_cancel_requested`]
     /// and trips the executor's cancellation token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError::TaskNotFound`] for a wrong owner or missing task,
+    /// [`A2aStorageError::TerminalState`] for a terminal task, and another
+    /// [`A2aStorageError`] when the backend fails.
     async fn set_cancel_requested(
         &self,
         tenant: &str,
@@ -187,34 +240,43 @@ pub trait A2aTaskStorage: Send + Sync {
 /// system prevents it from calling the unscoped reads.
 #[async_trait]
 pub trait A2aCancellationSupervisor: Send + Sync {
+    /// Returns the backend's name; the server builder requires every store it is given to report the same one.
     fn backend_name(&self) -> &'static str;
 
-    /// Read the cancel-requested marker for a single task.
+    /// Reads the cancel-requested marker for a single task.
     ///
     /// Returns `false` if the marker is unset OR the task is already
     /// terminal (supervisor treats these identically — no token trip
     /// needed in either case). Owner is intentionally not checked; see
     /// trait-level docs for the authorization invariant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn supervisor_get_cancel_requested(
         &self,
         tenant: &str,
         task_id: &str,
     ) -> Result<bool, A2aStorageError>;
 
-    /// Batch-read: return the subset of `task_ids` in `tenant` that have
-    /// the cancel-requested marker set AND are not terminal.
+    /// Returns the subset of `task_ids` in `tenant` that have the
+    /// cancel-requested marker set AND are not terminal.
     ///
     /// One database round-trip per supervisor poll tick, bounded by the
     /// in-flight registry size. Task IDs absent from storage are silently
     /// skipped — they aren't returned, and the caller should clean up
     /// its registry independently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn supervisor_list_cancel_requested(
         &self,
         tenant: &str,
         task_ids: &[String],
     ) -> Result<Vec<String>, A2aStorageError>;
 
-    /// Set the executor-lease expiry (epoch microseconds) on the named
+    /// Sets the executor-lease expiry (epoch microseconds) on the named
     /// tasks of `tenant`, whatever their state, or clear it with `None`.
     /// Ids absent from storage never gain a task and are never listed by
     /// `supervisor_list_expired_executor_leases`; a backend that stores the
@@ -223,6 +285,10 @@ pub trait A2aCancellationSupervisor: Send + Sync {
     ///
     /// The lease is storage-internal: it is not part of the task's wire
     /// shape, and ordinary task writes never change it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn supervisor_renew_executor_leases(
         &self,
         tenant: &str,
@@ -230,7 +296,7 @@ pub trait A2aCancellationSupervisor: Send + Sync {
         expires_at_micros: Option<i64>,
     ) -> Result<(), A2aStorageError>;
 
-    /// Return every SUBMITTED or WORKING task, across all tenants and
+    /// Returns every SUBMITTED or WORKING task, across all tenants and
     /// owners, that has an executor lease expiring before `now_micros`.
     /// A task that never had a lease is never returned.
     ///
@@ -240,17 +306,25 @@ pub trait A2aCancellationSupervisor: Send + Sync {
     /// side effect, delete (best effort, and only if the lease is unchanged
     /// since it was read) expired leases whose task is gone or is not
     /// SUBMITTED or WORKING.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn supervisor_list_expired_executor_leases(
         &self,
         now_micros: i64,
     ) -> Result<Vec<SupervisedTask>, A2aStorageError>;
 
-    /// Return at most `limit` INPUT_REQUIRED or AUTH_REQUIRED tasks,
+    /// Returns at most `limit` INPUT_REQUIRED or AUTH_REQUIRED tasks,
     /// across all tenants and owners, whose status timestamp is earlier
     /// than `status_before_micros` (epoch microseconds).
     ///
     /// Owner-unscoped and store-wide; the only callers are the idle-task
     /// sweeps, which act for the framework rather than a requester.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn supervisor_list_idle_client_held_tasks(
         &self,
         status_before_micros: i64,
@@ -263,13 +337,18 @@ pub trait A2aCancellationSupervisor: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SupervisedTask {
+    /// Tenant the task belongs to.
     pub tenant: String,
+    /// Identifier of the task.
     pub task_id: String,
+    /// Owner of the task.
     pub owner: String,
+    /// Identifier of the context the task belongs to.
     pub context_id: String,
 }
 
 impl SupervisedTask {
+    /// Creates a supervised-task record from its identity and routing fields.
     pub fn new(
         tenant: impl Into<String>,
         task_id: impl Into<String>,
@@ -294,16 +373,27 @@ impl SupervisedTask {
 /// proto type's serde behavior is stable via pbjson.
 #[async_trait]
 pub trait A2aPushNotificationStorage: Send + Sync {
+    /// Returns the backend's name; the server builder requires every store it is given to report the same one.
     fn backend_name(&self) -> &'static str;
 
-    /// Create a push notification config. Server generates `id` if empty.
+    /// Creates a push notification config. The server generates `id` if empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError::CreateConfigCasTimeout`] when the create's
+    /// compare-and-swap exhausts its retries, and another [`A2aStorageError`]
+    /// when the backend fails.
     async fn create_config(
         &self,
         tenant: &str,
         config: turul_a2a_proto::TaskPushNotificationConfig,
     ) -> Result<turul_a2a_proto::TaskPushNotificationConfig, A2aStorageError>;
 
-    /// Get a push notification config. Returns `None` if not found.
+    /// Gets a push notification config, or `None` if not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn get_config(
         &self,
         tenant: &str,
@@ -311,7 +401,11 @@ pub trait A2aPushNotificationStorage: Send + Sync {
         config_id: &str,
     ) -> Result<Option<turul_a2a_proto::TaskPushNotificationConfig>, A2aStorageError>;
 
-    /// List push notification configs for a task with pagination.
+    /// Lists push notification configs for a task with pagination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn list_configs(
         &self,
         tenant: &str,
@@ -320,7 +414,7 @@ pub trait A2aPushNotificationStorage: Send + Sync {
         page_size: Option<i32>,
     ) -> Result<PushConfigListPage, A2aStorageError>;
 
-    /// List configs eligible for fan-out of a specific terminal event.
+    /// Lists configs eligible for fan-out of a specific terminal event.
     ///
     /// Returns configs whose `registered_after_event_sequence <
     /// event_sequence`. Strictly less-than: a config recorded AT
@@ -329,6 +423,10 @@ pub trait A2aPushNotificationStorage: Send + Sync {
     /// succeeded. The unfiltered `list_configs` remains for CRUD
     /// endpoints; this method is for the dispatcher's fan-out path
     /// and the Lambda recovery workers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn list_configs_eligible_at_event(
         &self,
         tenant: &str,
@@ -338,7 +436,11 @@ pub trait A2aPushNotificationStorage: Send + Sync {
         page_size: Option<i32>,
     ) -> Result<PushConfigListPage, A2aStorageError>;
 
-    /// Delete a push notification config. Idempotent — no error if not found.
+    /// Deletes a push notification config. Idempotent — no error if not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A2aStorageError`] when the backend fails.
     async fn delete_config(
         &self,
         tenant: &str,

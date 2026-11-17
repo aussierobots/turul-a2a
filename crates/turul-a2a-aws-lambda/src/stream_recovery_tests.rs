@@ -60,10 +60,12 @@ async fn build_stack() -> (
     cfg.max_payload_bytes = 64 * 1024;
     cfg.allow_insecure_urls = true;
 
-    let worker = Arc::new(
-        PushDeliveryWorker::new(delivery.clone(), cfg, None, "stream-recovery-test".into())
-            .expect("worker build"),
-    );
+    let worker = Arc::new(PushDeliveryWorker::new(
+        delivery.clone(),
+        cfg,
+        None,
+        "stream-recovery-test".into(),
+    ));
     let dispatcher = Arc::new(PushDispatcher::new(worker, push_storage, task_storage));
     (storage, dispatcher, delivery)
 }
@@ -411,9 +413,12 @@ async fn stream_transient_storage_error_surfaces_batch_item_failure() {
     cfg.max_payload_bytes = 64 * 1024;
     cfg.allow_insecure_urls = true;
     let delivery2: Arc<dyn A2aPushDeliveryStore> = storage.clone();
-    let worker = Arc::new(
-        PushDeliveryWorker::new(delivery2, cfg, None, "flaky-test".into()).expect("worker"),
-    );
+    let worker = Arc::new(PushDeliveryWorker::new(
+        delivery2,
+        cfg,
+        None,
+        "flaky-test".into(),
+    ));
     let push_storage: Arc<dyn A2aPushNotificationStorage> = storage.clone();
     let dispatcher = Arc::new(PushDispatcher::new(worker, push_storage, flaky));
 

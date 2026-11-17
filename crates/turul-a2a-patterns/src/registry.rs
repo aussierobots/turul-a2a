@@ -26,8 +26,11 @@ use crate::manifest::SkillCard;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct SkillDescriptor {
+    /// Skill identifier; equals `agent_skill.id`.
     pub id: String,
+    /// The skill advertised on the agent card.
     pub agent_skill: AgentSkill,
+    /// JSON Schema describing the skill's parameters; local metadata, never sent on the wire.
     pub params_schema: Option<Value>,
 }
 
@@ -37,6 +40,10 @@ pub trait SkillRegistry: Send + Sync {
     /// Register a manifest-backed skill. The `params_schema` field of the
     /// returned descriptor is derived from `card.input_schema` (single
     /// source of truth).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SkillError`] if the skill cannot be registered, for example `InvalidRequest` for an empty id.
     async fn register_manifest(
         &self,
         card: SkillCard,
@@ -46,6 +53,10 @@ pub trait SkillRegistry: Send + Sync {
     /// Register a programmatic skill with an optional one-shot schema.
     /// The supplied schema becomes `params_schema`; there is no second
     /// surface that can override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SkillError`] if the skill cannot be registered, for example `InvalidRequest` for an empty id.
     async fn register_programmatic(
         &self,
         agent_skill: AgentSkill,
@@ -80,6 +91,7 @@ pub struct InMemorySkillRegistry {
 }
 
 impl InMemorySkillRegistry {
+    /// Creates an empty registry.
     pub fn new() -> Self {
         Self::default()
     }

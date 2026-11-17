@@ -41,6 +41,10 @@ impl A2aGrpcClient {
     /// accepts — typically `"http://host:port"` or
     /// `"https://host:port"`. Use `Channel` directly for advanced
     /// composition (TLS config, load balancing).
+    ///
+    /// # Errors
+    ///
+    /// Returns `GrpcTransport` if `endpoint` is invalid or the connection cannot be established.
     pub async fn connect(endpoint: impl Into<String>) -> Result<Self, A2aClientError> {
         let ep = tonic::transport::Endpoint::from_shared(endpoint.into())
             .map_err(|e| A2aClientError::GrpcTransport(e.to_string()))?;
@@ -61,11 +65,13 @@ impl A2aGrpcClient {
         }
     }
 
+    /// Sets the credentials sent as metadata on every call.
     pub fn with_auth(mut self, auth: ClientAuth) -> Self {
         self.auth = auth;
         self
     }
 
+    /// Sets the tenant written to the `tenant` field of every request.
     pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
         self.tenant = Some(tenant.into());
         self
@@ -110,6 +116,11 @@ impl A2aGrpcClient {
 
     // --- Unary verbs ---------------------------------------------------
 
+    /// Sends a message and returns the raw proto response.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Grpc` with the status code, message and `ErrorInfo.reason` if the call fails.
     pub async fn send_message(
         &mut self,
         message: pb::Message,
@@ -127,6 +138,11 @@ impl A2aGrpcClient {
             .into_inner())
     }
 
+    /// Returns the task with `task_id`, with up to `history_length` history messages if given.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Grpc` with the status code, message and `ErrorInfo.reason` if the call fails.
     pub async fn get_task(
         &mut self,
         task_id: impl Into<String>,
@@ -140,6 +156,11 @@ impl A2aGrpcClient {
         Ok(self.inner.get_task(self.prepare(req)).await?.into_inner())
     }
 
+    /// Returns one page of tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Grpc` with the status code, message and `ErrorInfo.reason` if the call fails.
     pub async fn list_tasks(
         &mut self,
         page_size: Option<i32>,
@@ -158,6 +179,11 @@ impl A2aGrpcClient {
         Ok(self.inner.list_tasks(self.prepare(req)).await?.into_inner())
     }
 
+    /// Requests cancellation of the task and returns its resulting state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Grpc` with the status code, message and `ErrorInfo.reason` if the call fails.
     pub async fn cancel_task(
         &mut self,
         task_id: impl Into<String>,
@@ -174,6 +200,11 @@ impl A2aGrpcClient {
             .into_inner())
     }
 
+    /// Returns the extended agent card (requires authentication).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Grpc` with the status code, message and `ErrorInfo.reason` if the call fails.
     pub async fn get_extended_agent_card(&mut self) -> Result<pb::AgentCard, A2aClientError> {
         let req = pb::GetExtendedAgentCardRequest {
             tenant: self.scoped_tenant(),
@@ -192,6 +223,10 @@ impl A2aGrpcClient {
     /// [`turul_a2a_types::PushConfig`] via
     /// [`turul_a2a_types::PushConfigBuilder`] and call
     /// [`Self::create_push_config_with`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Grpc` with the status code, message and `ErrorInfo.reason` if the call fails.
     pub async fn create_push_config(
         &mut self,
         task_id: impl Into<String>,
@@ -207,6 +242,10 @@ impl A2aGrpcClient {
 
     /// Create a push notification config from a fully-constructed
     /// [`turul_a2a_types::PushConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Grpc` with the status code, message and `ErrorInfo.reason` if the call fails.
     pub async fn create_push_config_with(
         &mut self,
         config: turul_a2a_types::PushConfig,
@@ -223,6 +262,11 @@ impl A2aGrpcClient {
         Ok(resp.into())
     }
 
+    /// Returns the push notification config `config_id` of a task.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Grpc` with the status code, message and `ErrorInfo.reason` if the call fails.
     pub async fn get_push_config(
         &mut self,
         task_id: impl Into<String>,
@@ -241,6 +285,11 @@ impl A2aGrpcClient {
         Ok(resp.into())
     }
 
+    /// Returns the push notification configs of a task.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Grpc` with the status code, message and `ErrorInfo.reason` if the call fails.
     pub async fn list_push_configs(
         &mut self,
         task_id: impl Into<String>,
@@ -262,6 +311,11 @@ impl A2aGrpcClient {
         ))
     }
 
+    /// Deletes the push notification config `config_id` of a task.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Grpc` with the status code, message and `ErrorInfo.reason` if the call fails.
     pub async fn delete_push_config(
         &mut self,
         task_id: impl Into<String>,
@@ -280,6 +334,11 @@ impl A2aGrpcClient {
 
     // --- Streaming verbs -----------------------------------------------
 
+    /// Sends a message and returns the stream of events for the resulting task.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Grpc` if the call fails before the stream opens; later failures arrive as stream items.
     pub async fn send_streaming_message(
         &mut self,
         message: pb::Message,
@@ -300,6 +359,10 @@ impl A2aGrpcClient {
 
     /// Subscribe to a task. The stream opens with the task snapshot; to
     /// recover from a dropped stream, subscribe again.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Grpc` if the call fails before the stream opens; later failures arrive as stream items.
     pub async fn subscribe_to_task(
         &mut self,
         task_id: impl Into<String>,

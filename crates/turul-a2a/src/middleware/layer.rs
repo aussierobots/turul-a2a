@@ -21,6 +21,7 @@ pub struct AuthLayer {
 }
 
 impl AuthLayer {
+    /// Creates a layer that runs `stack` before each request.
     pub fn new(stack: Arc<MiddlewareStack>) -> Self {
         Self { stack }
     }

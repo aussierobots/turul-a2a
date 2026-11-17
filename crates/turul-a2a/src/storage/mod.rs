@@ -1,3 +1,9 @@
+//! Storage traits and the first-party backends that implement them.
+//!
+//! A backend implements the task, push-config, event, atomic and
+//! cancellation-supervisor traits on one struct; the builder rejects
+//! configurations that mix backends.
+
 // The artifact-separation helpers are consumed only by the persistent
 // backends (SQLite, PostgreSQL, DynamoDB); the in-memory backend stores
 // whole tasks and needs none of them. Gate the module so a default build

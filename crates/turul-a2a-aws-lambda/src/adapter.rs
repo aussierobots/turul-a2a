@@ -7,7 +7,7 @@ use http_body_util::BodyExt;
 /// prefix are stripped (anti-spoofing).
 pub const AUTHORIZER_HEADER_PREFIX: &str = "x-authorizer-";
 
-/// Convert a Lambda HTTP request to an axum request.
+/// Converts a Lambda HTTP request to an axum request.
 ///
 /// - Strips any client-supplied x-authorizer-* headers (anti-spoofing)
 /// - Injects authorizer context from Lambda requestContext as x-authorizer-* headers
@@ -132,7 +132,11 @@ fn inject_authorizer_header(headers: &mut http::HeaderMap, key: &str, value: &st
     }
 }
 
-/// Convert an axum response to a Lambda HTTP response.
+/// Converts an axum response to a Lambda HTTP response.
+///
+/// # Errors
+///
+/// Returns an error if the response body cannot be read to completion.
 pub async fn axum_to_lambda_response(
     resp: http::Response<Body>,
 ) -> Result<lambda_http::Response<lambda_http::Body>, lambda_http::Error> {

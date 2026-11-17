@@ -8,8 +8,7 @@
 //! [`PushDispatcher::try_redispatch_pending`]. Transient failures are
 //! reported as `BatchItemFailures` so the Lambda service re-delivers
 //! the affected records; successes (including deleted-task cases) are
-//! acknowledged by returning an empty `item_identifier` slot for
-//! that record.
+//! acknowledged by leaving the record out of `BatchItemFailures`.
 //!
 //! ## Record classification
 //!
@@ -46,12 +45,14 @@ pub struct LambdaStreamRecoveryHandler {
 }
 
 impl LambdaStreamRecoveryHandler {
+    /// Creates a handler that redispatches pending markers through `dispatcher`.
     pub fn new(dispatcher: Arc<PushDispatcher>) -> Self {
         Self { dispatcher }
     }
 
-    /// Handle a batch of DynamoDB Stream records. Returns the
-    /// `DynamoDbEventResponse` with `BatchItemFailures` populated for
+    /// Handles a batch of DynamoDB Stream records.
+    ///
+    /// Returns the `DynamoDbEventResponse` with `BatchItemFailures` populated for
     /// records whose redispatch hit a transient error or whose
     /// NEW_IMAGE could not be parsed. Records with a missing
     /// `SequenceNumber` are skipped with a log warning — they cannot

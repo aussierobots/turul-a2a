@@ -97,15 +97,12 @@ fn build_handler() -> Result<LambdaStreamRecoveryHandler, Error> {
     let mut delivery_cfg = PushDeliveryConfig::default();
     delivery_cfg.allow_insecure_urls =
         std::env::var("A2A_ALLOW_INSECURE_PUSH").is_ok_and(|v| v == "1");
-    let worker = Arc::new(
-        PushDeliveryWorker::new(
-            delivery,
-            delivery_cfg,
-            None,
-            format!("stream-worker-{}", uuid_v7()),
-        )
-        .map_err(|e| Error::from(format!("worker build failed: {e}")))?,
-    );
+    let worker = Arc::new(PushDeliveryWorker::new(
+        delivery,
+        delivery_cfg,
+        None,
+        format!("stream-worker-{}", uuid_v7()),
+    ));
     let dispatcher = Arc::new(PushDispatcher::new(worker, push_storage, task_storage));
     Ok(LambdaStreamRecoveryHandler::new(dispatcher))
 }

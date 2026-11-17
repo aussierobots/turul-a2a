@@ -78,6 +78,8 @@
 //! - [`lambda-agent`](https://github.com/aussierobots/turul-a2a/tree/main/examples/lambda-agent)
 //!   and the worker examples on GitHub
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 mod adapter;
 mod auth;
 mod event;
@@ -147,6 +149,7 @@ pub struct LambdaA2aServerBuilder {
 }
 
 impl LambdaA2aServerBuilder {
+    /// Creates a builder with no executor or storage wired.
     pub fn new() -> Self {
         Self {
             executor: None,
@@ -163,7 +166,7 @@ impl LambdaA2aServerBuilder {
         }
     }
 
-    /// Configure an HTTP path prefix to strip before the A2A router
+    /// Configures an HTTP path prefix to strip before the A2A router
     /// sees the request. Needed when Lambda sits behind an API Gateway
     /// whose stage + resource tree is forwarded into the function
     /// (e.g. REST API `AWS_PROXY` integrations surface
@@ -184,7 +187,7 @@ impl LambdaA2aServerBuilder {
         self
     }
 
-    /// Wire a durable executor queue. When set, the
+    /// Wires a durable executor queue. When set, the
     /// `return_immediately = true` path in `core_send_message` enqueues
     /// a [`turul_a2a::durable_executor::QueuedExecutorJob`] on this
     /// queue instead of spawning the executor locally, and the
@@ -206,7 +209,7 @@ impl LambdaA2aServerBuilder {
         self
     }
 
-    /// Wire the AWS SQS durable executor queue. Ergonomic
+    /// Wires the AWS SQS durable executor queue. Ergonomic
     /// helper over [`Self::with_durable_executor`] that constructs a
     /// [`SqsDurableExecutorQueue`] from a `queue_url` + shared SQS
     /// client. Requires the `sqs` feature.
@@ -220,12 +223,13 @@ impl LambdaA2aServerBuilder {
         self.with_durable_executor(queue)
     }
 
+    /// Sets the executor that handles incoming messages.
     pub fn executor(mut self, exec: impl AgentExecutor + 'static) -> Self {
         self.executor = Some(Arc::new(exec));
         self
     }
 
-    /// Set all storage from a single backend instance.
+    /// Sets all storage from a single backend instance.
     ///
     /// This is the **preferred** method — a single struct implementing all
     /// storage traits guarantees the same-backend requirement
@@ -234,7 +238,7 @@ impl LambdaA2aServerBuilder {
     /// task storage + in-memory cancellation supervisor) silently
     /// breaks cross-instance cancellation.
     ///
-    /// errata: `.storage()` wires storage traits only. It does
+    /// Note: `.storage()` wires storage traits only. It does
     /// **not** auto-register the storage as a push-delivery store, even if
     /// the backend happens to implement [`A2aPushDeliveryStore`]. To opt in
     /// to push delivery, call [`Self::push_delivery_store`] explicitly and
@@ -258,32 +262,32 @@ impl LambdaA2aServerBuilder {
         self
     }
 
-    /// Set task storage individually. Must be paired with event_store/atomic_store
+    /// Sets task storage individually. Must be paired with event_store/atomic_store
     /// AND `cancellation_supervisor()` for same-backend compliance.
     pub fn task_storage(mut self, s: impl A2aTaskStorage + 'static) -> Self {
         self.task_storage = Some(Arc::new(s));
         self
     }
 
-    /// Set push notification storage individually.
+    /// Sets push notification storage individually.
     pub fn push_storage(mut self, s: impl A2aPushNotificationStorage + 'static) -> Self {
         self.push_storage = Some(Arc::new(s));
         self
     }
 
-    /// Set event store individually. Must match task_storage backend.
+    /// Sets the event store individually. Must match task_storage backend.
     pub fn event_store(mut self, s: impl A2aEventStore + 'static) -> Self {
         self.event_store = Some(Arc::new(s));
         self
     }
 
-    /// Set atomic store individually. Must match task_storage backend.
+    /// Sets the atomic store individually. Must match task_storage backend.
     pub fn atomic_store(mut self, s: impl A2aAtomicStore + 'static) -> Self {
         self.atomic_store = Some(Arc::new(s));
         self
     }
 
-    /// Set the cancellation supervisor individually. Must match
+    /// Sets the cancellation supervisor individually. Must match
     /// task_storage backend — otherwise `:cancel` writes the marker to
     /// one backend and the supervisor reads from another, silently
     /// breaking cross-instance cancellation. Prefer `.storage()` for
@@ -293,19 +297,18 @@ impl LambdaA2aServerBuilder {
         self
     }
 
-    /// Set the push delivery store individually.
+    /// Sets the push delivery store individually.
     ///
     /// Prefer `.storage()` for unified wiring. The delivery store MUST
     /// be on the same backend as `.task_storage(...)` — the builder
     /// rejects mismatches. Passing a delivery store also requires the
-    /// atomic store to have opted in via `with_push_dispatch_enabled(true)`
-    ///.
+    /// atomic store to have opted in via `with_push_dispatch_enabled(true)`.
     pub fn push_delivery_store(mut self, store: impl A2aPushDeliveryStore + 'static) -> Self {
         self.push_delivery_store = Some(Arc::new(store));
         self
     }
 
-    /// Override the runtime configuration (timeouts, retry budgets).
+    /// Overrides the runtime configuration (timeouts, retry budgets).
     /// Defaults to [`RuntimeConfig::default()`]. The `push_*` delivery
     /// fields have no effect here: a Lambda invocation delivers no push,
     /// and each recovery worker takes its own `PushDeliveryConfig`.
@@ -314,11 +317,20 @@ impl LambdaA2aServerBuilder {
         self
     }
 
+    /// Appends a middleware to the stack; middleware runs in the order added.
     pub fn middleware(mut self, mw: Arc<dyn A2aMiddleware>) -> Self {
         self.middleware.push(mw);
         self
     }
 
+    /// Builds the handler.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the executor or any storage trait is missing, the
+    /// storage traits do not share one backend, the push-delivery store and
+    /// the atomic store's push-dispatch flag disagree, `idle_task_timeout` is
+    /// zero, or the `strip_path_prefix` value is malformed.
     pub fn build(self) -> Result<LambdaA2aHandler, A2aError> {
         let executor = self
             .executor
@@ -522,15 +534,21 @@ pub struct LambdaA2aHandler {
 }
 
 impl LambdaA2aHandler {
+    /// Returns a new [`LambdaA2aServerBuilder`].
     pub fn builder() -> LambdaA2aServerBuilder {
         LambdaA2aServerBuilder::new()
     }
 
-    /// Cancel tasks left waiting on their client for longer than the
+    /// Cancels tasks left waiting on their client for longer than the
     /// runtime configuration's `idle_task_timeout`; see
     /// [`turul_a2a::server::A2aServerBuilder::idle_task_timeout`]. With no
     /// timeout set this does nothing. Run by
     /// [`LambdaScheduledRecoveryHandler::with_idle_task_sweep`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage error if listing idle tasks fails. A failed
+    /// cancel of one task is counted in the returned sweep, not returned.
     pub async fn cancel_idle_tasks(
         &self,
     ) -> Result<turul_a2a::server::IdleSweep, turul_a2a::storage::A2aStorageError> {
@@ -547,10 +565,15 @@ impl LambdaA2aHandler {
         }
     }
 
-    /// Handle a Lambda HTTP request. An executor still running when the
+    /// Handles a Lambda HTTP request. An executor still running when the
     /// response is ready (work after it reported its result) is aborted
     /// before this returns, so no storage request it started outlives the
     /// invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be converted, the router fails,
+    /// or the response body cannot be read.
     pub async fn handle(
         &self,
         event: lambda_http::Request,
@@ -571,7 +594,7 @@ impl LambdaA2aHandler {
         resp
     }
 
-    /// Handle a raw Lambda HTTP event delivered as `serde_json::Value`
+    /// Handles a raw Lambda HTTP event delivered as `serde_json::Value`
     /// and return a response envelope **matching the inbound event
     /// shape**:
     ///
@@ -608,6 +631,11 @@ impl LambdaA2aHandler {
     /// only serve HTTP should continue to use [`Self::run_http_only`]
     /// or [`LambdaA2aServerBuilder::run`]; this entry point exists for
     /// composition with adopter-owned third triggers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the value is not an API Gateway v1/v2 or ALB HTTP
+    /// event, or if the response cannot be read or serialised.
     pub async fn handle_http_event_value(
         &self,
         value: serde_json::Value,
@@ -734,7 +762,7 @@ enum HttpEventShape {
 }
 
 impl LambdaA2aHandler {
-    /// Handle an SQS batch from the durable executor queue.
+    /// Handles an SQS batch from the durable executor queue.
     ///
     /// Returns `SqsBatchResponse` whose `batch_item_failures` list
     /// tells the event source mapping which records to retry.
@@ -752,7 +780,7 @@ impl LambdaA2aHandler {
         durable::drive_sqs_batch(&self.state, event).await
     }
 
-    /// Run this handler as a pure HTTP Lambda. Strict: any non-HTTP
+    /// Runs this handler as a pure HTTP Lambda. Strict: any non-HTTP
     /// event shape (SQS, DynamoDB stream, scheduler, …) causes
     /// `lambda_http::run` to return a deserialization error on
     /// invocation.
@@ -760,6 +788,10 @@ impl LambdaA2aHandler {
     /// Appropriate for Lambdas whose only trigger is a Function URL,
     /// API Gateway, or ALB. The request Lambda in the two-Lambda
     /// durable-executor topology is the canonical caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Lambda runtime fails.
     pub async fn run_http_only(self) -> Result<(), lambda_runtime::Error> {
         let handler = Arc::new(self);
         lambda_http::run(lambda_http::service_fn(move |event| {
@@ -778,17 +810,25 @@ impl LambdaA2aHandler {
     /// Default Lambda runner. Dispatches based on the event shape the
     /// binary receives. Without the `sqs` feature this is HTTP-only
     /// (equivalent to [`LambdaA2aHandler::run_http_only`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Lambda runtime fails.
     pub async fn run(self) -> Result<(), lambda_runtime::Error> {
         self.run_http_only().await
     }
 }
 
 impl LambdaA2aServerBuilder {
-    /// Build and run in one call. Sugar for
+    /// Builds and runs in one call. Sugar for
     /// `self.build()?.run().await`. Hides the handler from the adopter —
     /// use `.build()` + `handler.run_*()` instead when the handler is
     /// needed for unit tests, custom middleware, or an explicit
     /// topology runner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `build` fails or the Lambda runtime fails.
     pub async fn run(self) -> Result<(), lambda_runtime::Error> {
         let handler = self.build().map_err(|e| {
             lambda_runtime::Error::from(format!("LambdaA2aServerBuilder::run: {e}"))
