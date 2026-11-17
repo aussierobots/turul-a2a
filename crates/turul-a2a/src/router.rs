@@ -496,6 +496,18 @@ pub(crate) async fn open_send_stream(
     let inline_push_config = inline_push_config(&state, request.configuration.as_ref())?;
 
     let target = resolve_send_target(&state, tenant, owner, &message).await?;
+    validate_send(
+        &state,
+        tenant,
+        owner,
+        claims.as_ref(),
+        &target,
+        &message,
+        &accepted_output_modes,
+        request_metadata.as_ref(),
+        &activated_extensions,
+    )
+    .await?;
     start_task_turn(&state, tenant, owner, &target, &message).await?;
     if let Some(cfg) = inline_push_config {
         register_inline_push_config(&state, tenant, owner, &target, cfg).await?;
@@ -920,6 +932,34 @@ pub(crate) async fn resolve_send_target(
     })
 }
 
+/// Run the executor's own check on a message, after the framework's
+/// request checks and target resolution and before any write.
+#[allow(clippy::too_many_arguments)]
+async fn validate_send(
+    state: &AppState,
+    tenant: &str,
+    owner: &str,
+    claims: Option<&serde_json::Value>,
+    target: &SendTarget,
+    message: &Message,
+    accepted_output_modes: &[String],
+    request_metadata: Option<&serde_json::Value>,
+    activated_extensions: &[String],
+) -> Result<(), A2aError> {
+    let ctx = crate::executor::ValidationContext {
+        owner,
+        tenant: (!tenant.is_empty()).then_some(tenant),
+        task_id: &target.task_id,
+        context_id: &target.context_id,
+        is_continuation: target.is_continuation,
+        claims,
+        accepted_output_modes,
+        request_metadata,
+        activated_extensions,
+    };
+    state.executor.validate_message(message, &ctx).await
+}
+
 /// Commit the start of a turn so subscribers and push delivery observe
 /// the lifecycle: a new task is created in SUBMITTED and advanced to
 /// WORKING; a continuation appends the message and moves
@@ -1188,6 +1228,18 @@ pub async fn core_send_message(
     let inline_push_config = inline_push_config(&state, request.configuration.as_ref())?;
 
     let target = resolve_send_target(&state, tenant, owner, &message).await?;
+    validate_send(
+        &state,
+        tenant,
+        owner,
+        claims.as_ref(),
+        &target,
+        &message,
+        &accepted_output_modes,
+        request_metadata.as_ref(),
+        &activated_extensions,
+    )
+    .await?;
     let task_id = target.task_id.clone();
     let context_id = target.context_id.clone();
 

@@ -549,6 +549,70 @@ async fn create_persist_failure_returns_error_and_enqueues_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// Executor validation refuses before task creation and enqueue
+// ---------------------------------------------------------------------------
+
+/// Refuses every message in `validate_message`.
+struct RefusingExecutor;
+
+#[async_trait]
+impl AgentExecutor for RefusingExecutor {
+    async fn validate_message(
+        &self,
+        _message: &Message,
+        _ctx: &turul_a2a::executor::ValidationContext<'_>,
+    ) -> Result<(), A2aError> {
+        Err(A2aError::InvalidRequest {
+            message: "field `x`: invalid".into(),
+        })
+    }
+
+    async fn execute(
+        &self,
+        _task: &mut Task,
+        _msg: &Message,
+        _ctx: &ExecutionContext,
+    ) -> Result<(), A2aError> {
+        panic!("a refused message must not reach execute");
+    }
+
+    fn agent_card(&self) -> turul_a2a_proto::AgentCard {
+        NoOpExecutor.agent_card()
+    }
+}
+
+#[tokio::test]
+async fn validation_refusal_creates_no_task_and_enqueues_nothing() {
+    let (queue, captured) = FakeQueue::new(256 * 1024);
+    let state = state_with_queue(Arc::new(RefusingExecutor), queue);
+    let task_storage = state.task_storage.clone();
+    let router = build_router(state);
+
+    let req = Request::post("/message:send")
+        .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
+        .body(Body::from(send_body(true)))
+        .unwrap();
+    let (status, body) = json_response(router, req).await;
+    let expected = A2aError::InvalidRequest {
+        message: "field `x`: invalid".into(),
+    };
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body, expected.to_http_error_body());
+
+    assert!(captured.lock().await.is_empty(), "nothing was enqueued");
+    let page = task_storage
+        .list_tasks(turul_a2a::storage::TaskFilter {
+            tenant: Some(String::new()),
+            owner: Some("anonymous".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(page.tasks.is_empty(), "no task was created");
+}
+
+// ---------------------------------------------------------------------------
 // Claims plumbing — executor sees Some(claims) on blocking send
 // ---------------------------------------------------------------------------
 

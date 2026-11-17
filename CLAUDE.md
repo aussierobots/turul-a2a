@@ -126,7 +126,7 @@ Authorize each `cargo publish` call separately. A prior "go ahead" does not auth
 
 ### Preludes
 
-- `turul_a2a::prelude::*` — server/agent authoring: `A2aServer`, `AgentExecutor`, `ExecutionContext`, `A2aError`, `AgentCardBuilder`, `Task`, `Message`, `Part`, `Artifact`, `TaskState`, `TaskStatus`
+- `turul_a2a::prelude::*` — server/agent authoring: `A2aServer`, `AgentExecutor`, `ExecutionContext`, `ValidationContext`, `A2aError`, `AgentCardBuilder`, `Task`, `Message`, `Part`, `Artifact`, `TaskState`, `TaskStatus`
 - `turul_a2a_client::prelude::*` — client/caller: `A2aClient`, `ClientAuth`, `MessageBuilder`, `A2aClientError`, `ListTasksParams`, `SendResponse`, `ListResponse`, `StreamEvent`, `TypedSseEvent`, `TypedSseStream`, `artifact_text`, `first_data_artifact`; under `--features grpc` also re-exports `A2aGrpcClient` and `GrpcStreamResponses` (ADR-014 §2.7)
 
 These are separate by design. Only add types that are genuinely part of the common happy path — do not turn preludes into "export everything."

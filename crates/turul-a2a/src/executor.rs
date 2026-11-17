@@ -15,7 +15,8 @@ use crate::event_sink::EventSink;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ExecutionContext {
-    /// The authenticated owner (from middleware). Empty string for anonymous.
+    /// The caller identity from middleware; `"anonymous"` when no
+    /// middleware authenticated the request.
     pub owner: String,
     /// Tenant scope. `None` on default (un-tenanted) routes.
     pub tenant: Option<String>,
@@ -86,6 +87,54 @@ impl ExecutionContext {
     }
 }
 
+/// What [`AgentExecutor::validate_message`] knows about a send before
+/// the task is created or changed.
+///
+/// `#[non_exhaustive]` allows adding fields in future versions.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ValidationContext<'a> {
+    /// The caller identity from middleware; `"anonymous"` when no
+    /// middleware authenticated the request.
+    pub owner: &'a str,
+    /// Tenant scope. `None` on default (un-tenanted) routes.
+    pub tenant: Option<&'a str>,
+    /// The task the message targets: a new id for a new task, or the
+    /// existing task's id for a follow-up.
+    pub task_id: &'a str,
+    /// Context ID for this conversation.
+    pub context_id: &'a str,
+    /// `true` when the message continues an existing INPUT_REQUIRED or
+    /// AUTH_REQUIRED task.
+    pub is_continuation: bool,
+    /// Auth claims from middleware (JWT claims, API key metadata, etc.).
+    pub claims: Option<&'a serde_json::Value>,
+    /// As [`ExecutionContext::accepted_output_modes`].
+    pub accepted_output_modes: &'a [String],
+    /// As [`ExecutionContext::request_metadata`].
+    pub request_metadata: Option<&'a serde_json::Value>,
+    /// As [`ExecutionContext::activated_extensions`].
+    pub activated_extensions: &'a [String],
+}
+
+impl<'a> ValidationContext<'a> {
+    /// A context for a new task sent anonymously, for unit-testing a
+    /// validator without a server.
+    pub fn anonymous(task_id: &'a str) -> Self {
+        Self {
+            owner: "anonymous",
+            tenant: None,
+            task_id,
+            context_id: "",
+            is_continuation: false,
+            claims: None,
+            accepted_output_modes: &[],
+            request_metadata: None,
+            activated_extensions: &[],
+        }
+    }
+}
+
 /// Trait that users implement to define agent behavior.
 ///
 /// The server calls `execute` when a message arrives. The executor
@@ -105,6 +154,27 @@ pub trait AgentExecutor: Send + Sync {
         message: &Message,
         ctx: &ExecutionContext,
     ) -> Result<(), A2aError>;
+
+    /// Check a message before it is accepted.
+    ///
+    /// Called on `SendMessage` and `SendStreamingMessage`, on every
+    /// transport, after the framework's own request checks and before
+    /// anything is written: no task is created or changed, nothing is
+    /// enqueued and [`Self::execute`] is not called until this returns
+    /// `Ok`. An `Err` is returned to the caller as the response; return
+    /// [`A2aError::InvalidRequest`] for invalid input (HTTP 400, JSON-RPC
+    /// `-32602`, gRPC `INVALID_ARGUMENT`), naming the field and why.
+    ///
+    /// Keep it cheap and free of side effects: it runs on the request
+    /// path, and a request it passes may still be refused afterwards.
+    /// The default accepts every message.
+    async fn validate_message(
+        &self,
+        _message: &Message,
+        _ctx: &ValidationContext<'_>,
+    ) -> Result<(), A2aError> {
+        Ok(())
+    }
 
     /// Return the public agent card (unauthenticated discovery).
     fn agent_card(&self) -> turul_a2a_proto::AgentCard;

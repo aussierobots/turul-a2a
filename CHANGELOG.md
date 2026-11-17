@@ -6,6 +6,20 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.13] — 2026-11-17
+
+### Added
+
+- **`AgentExecutor::validate_message`**, with `ValidationContext`. An agent can refuse a `SendMessage` or `SendStreamingMessage` before it is accepted. A2A v1.0.1 requires servers to validate input before processing. The hook runs on HTTP+JSON, JSON-RPC and gRPC, and on Lambda through the shared router. It runs after the framework's own request checks and before anything is written. Return `A2aError::InvalidRequest` naming the field and why. The caller gets HTTP 400 / JSON-RPC `-32602` / gRPC `INVALID_ARGUMENT`; no task is created, a continued task is left unchanged, nothing is enqueued, and `execute` is not called. The default accepts every message. Keep it cheap and free of side effects. See ADR-031.
+
+### Compatibility
+
+- Additive: `validate_message` is a provided trait method, so existing executors compile and behave as before. No wire format or storage schema changes.
+
+### Verification
+
+- Message-validation tests passed on HTTP+JSON, JSON-RPC, gRPC and the durable-queue path.
+
 ## [0.2.12] — 2026-11-16
 
 ### Fixed
