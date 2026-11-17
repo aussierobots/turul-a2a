@@ -78,8 +78,8 @@ fn bearer_scheme() -> turul_a2a_proto::SecurityScheme {
 
 fn base_card(skills: Vec<turul_a2a_proto::AgentSkill>) -> turul_a2a_proto::AgentCard {
     turul_a2a_proto::AgentCard {
-        name: "ADR-015 Test Agent".into(),
-        description: "Agent used by ADR-015 tests".into(),
+        name: "Skill security test agent".into(),
+        description: "Agent used by the skill security tests".into(),
         supported_interfaces: vec![turul_a2a_proto::AgentInterface {
             url: "http://localhost".into(),
             protocol_binding: "JSONRPC".into(),

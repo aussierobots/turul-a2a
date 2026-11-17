@@ -30,7 +30,7 @@ use turul_a2a::executor::{AgentExecutor, ExecutionContext};
 use turul_a2a::router::{AppState, build_router};
 use turul_a2a::server::RuntimeConfig;
 use turul_a2a::server::in_flight::InFlightRegistry;
-use turul_a2a::storage::InMemoryA2aStorage;
+use turul_a2a::storage::{A2aAtomicStore, A2aStorageError, InMemoryA2aStorage};
 use turul_a2a::streaming::TaskEventBroker;
 use turul_a2a_types::{Message, Task, TaskState};
 
@@ -81,8 +81,8 @@ impl AgentExecutor for ClaimsObservingExecutor {
     }
 
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
-        turul_a2a::card_builder::AgentCardBuilder::new("ADR-018 test", "1.0.0")
-            .description("ADR-018 wire test harness")
+        turul_a2a::card_builder::AgentCardBuilder::new("Durable executor test", "1.0.0")
+            .description("Durable executor queue test harness")
             .url("http://localhost", "JSONRPC", "1.0")
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
@@ -113,8 +113,8 @@ impl AgentExecutor for NoOpExecutor {
     }
 
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
-        turul_a2a::card_builder::AgentCardBuilder::new("ADR-018 test", "1.0.0")
-            .description("ADR-018 wire test harness")
+        turul_a2a::card_builder::AgentCardBuilder::new("Durable executor test", "1.0.0")
+            .description("Durable executor queue test harness")
             .url("http://localhost", "JSONRPC", "1.0")
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
@@ -445,6 +445,105 @@ async fn enqueue_failure_compensates_to_failed_with_reason() {
         .collect::<String>();
     assert_eq!(text, reason, "the FAILED status message carries the reason");
 
+    assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    assert_eq!(in_flight.len(), 0, "no executor was registered");
+}
+
+// ---------------------------------------------------------------------------
+// Create-persist failure → typed error, nothing enqueued
+// ---------------------------------------------------------------------------
+
+/// Atomic store whose task creation always fails; every other write
+/// goes to the wrapped in-memory store.
+struct CreateFailingStore {
+    inner: Arc<InMemoryA2aStorage>,
+}
+
+#[async_trait]
+impl A2aAtomicStore for CreateFailingStore {
+    fn backend_name(&self) -> &'static str {
+        "create-failing"
+    }
+
+    fn push_dispatch_enabled(&self) -> bool {
+        self.inner.push_dispatch_enabled()
+    }
+
+    async fn create_task_with_events(
+        &self,
+        _tenant: &str,
+        _owner: &str,
+        _task: Task,
+        _events: Vec<turul_a2a::streaming::StreamEvent>,
+    ) -> Result<(Task, Vec<u64>), A2aStorageError> {
+        Err(A2aStorageError::DatabaseError(
+            "simulated persist failure".into(),
+        ))
+    }
+
+    async fn update_task_status_with_events(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        owner: &str,
+        new_status: turul_a2a_types::TaskStatus,
+        events: Vec<turul_a2a::streaming::StreamEvent>,
+    ) -> Result<(Task, Vec<u64>), A2aStorageError> {
+        self.inner
+            .update_task_status_with_events(tenant, task_id, owner, new_status, events)
+            .await
+    }
+
+    async fn update_task_with_events(
+        &self,
+        tenant: &str,
+        owner: &str,
+        task: Task,
+        events: Vec<turul_a2a::streaming::StreamEvent>,
+    ) -> Result<Vec<u64>, A2aStorageError> {
+        self.inner
+            .update_task_with_events(tenant, owner, task, events)
+            .await
+    }
+}
+
+/// The task is persisted before the job is enqueued and before the
+/// accepting response: when the persist fails, the send returns the
+/// typed storage error, nothing is enqueued, and no task exists.
+#[tokio::test]
+async fn create_persist_failure_returns_error_and_enqueues_nothing() {
+    let (queue, captured) = FakeQueue::new(256 * 1024);
+    let (executor, invocations, _claims) = ClaimsObservingExecutor::new();
+    let mut state = state_with_queue(executor, queue);
+    let s = storage_with_push_dispatch();
+    state.task_storage = s.clone();
+    state.atomic_store = Arc::new(CreateFailingStore { inner: s.clone() });
+    let task_storage = state.task_storage.clone();
+    let in_flight = state.in_flight.clone();
+    let router = build_router(state);
+
+    let req = Request::post("/message:send")
+        .header("content-type", "application/json")
+        .header("a2a-version", "1.0")
+        .body(Body::from(send_body(true)))
+        .unwrap();
+    let (status, body) = json_response(router, req).await;
+    let expected = A2aError::from(A2aStorageError::DatabaseError(
+        "simulated persist failure".into(),
+    ));
+    assert_eq!(status, expected.http_status(), "{body}");
+    assert_eq!(body, expected.to_http_error_body());
+
+    assert!(captured.lock().await.is_empty(), "nothing was enqueued");
+    let page = task_storage
+        .list_tasks(turul_a2a::storage::TaskFilter {
+            tenant: Some(String::new()),
+            owner: Some("anonymous".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(page.tasks.is_empty(), "no task was persisted");
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
     assert_eq!(in_flight.len(), 0, "no executor was registered");
 }

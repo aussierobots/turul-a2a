@@ -104,7 +104,7 @@ Explicitly deferred:
 
 ## Test obligations
 
-> **Amended 2026-10-22.** The tests below are named as they exist. Core-crate tests are in `crates/turul-a2a/tests/adr017_tests.rs` unless another file is given; Lambda tests are in `crates/turul-a2a-aws-lambda/src/builder_tests.rs`.
+> **Amended 2026-10-22.** The tests below are named as they exist. Core-crate tests are in `crates/turul-a2a/tests/return_immediately_tests.rs` unless another file is given; Lambda tests are in `crates/turul-a2a-aws-lambda/src/builder_tests.rs`.
 
 **New — Lambda gate (HTTP + JSON-RPC only; gRPC on Lambda is out of scope):**
 
@@ -181,3 +181,4 @@ Adopters on Lambda:
 - 2026-10-22 — Step 1 gains the capability check: an inline push config on an agent whose card does not declare `capabilities.pushNotifications = true` is refused with `PushNotificationNotSupportedError` before any write, on blocking and streaming sends and every transport (A2A v1.0.1 §3.3.4). Test: `capability_tests::inline_push_config_requires_push_capability_and_persists_nothing` (plus its gRPC and Lambda variants).
 - 2026-10-22 — Bug 3: a negative `historyLength` is an invalid request, refused before any write on SendMessage and SendStreamingMessage on every transport; one check (`checked_history_length`) also guards GetTask and ListTasks.
 - 2026-10-22 — Compliance: the gRPC code for `UnsupportedOperation` corrected from `INVALID_ARGUMENT` to `FAILED_PRECONDITION`, the A2A v1.0.1 §5.4 mapping that `wire::errors::GRPC_UNSUPPORTED_OPERATION` already implements.
+- 2026-11-17 — The core-crate test file is renamed from `adr017_tests.rs` to `return_immediately_tests.rs`: test files are named for what they test, not for an ADR.

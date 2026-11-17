@@ -67,8 +67,8 @@ impl AgentExecutor for NoOpExecutor {
     }
 
     fn agent_card(&self) -> turul_a2a_proto::AgentCard {
-        turul_a2a::card_builder::AgentCardBuilder::new("ADR-017 test", "1.0.0")
-            .description("ADR-017 wire surface test harness")
+        turul_a2a::card_builder::AgentCardBuilder::new("Return-immediately test", "1.0.0")
+            .description("Return-immediately and inline push-config test harness")
             .url("http://localhost", "JSONRPC", "1.0")
             .default_input_modes(vec!["text/plain"])
             .default_output_modes(vec!["text/plain"])
