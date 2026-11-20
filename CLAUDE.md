@@ -31,6 +31,9 @@ cargo test -p turul-a2a-types              # Types, state machine, wrappers
 cargo test -p turul-a2a                    # Server, storage, handlers, auth, E2E
 cargo test -p turul-a2a-auth               # Auth middleware (API key, Bearer)
 cargo test -p turul-a2a-client             # Client library
+cargo check -p turul-a2a-client --target wasm32-unknown-unknown   # Client builds for wasm (ADR-033)
+TURUL_WASM_E2E_URL=http://127.0.0.1:3014 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+  cargo test -p turul-a2a-client --target wasm32-unknown-unknown --test wasm   # wasm client under Node; needs `cargo run -p post-task-hook-agent`
 cargo test -p turul-a2a-aws-lambda         # Lambda adapter
 
 # Storage backend parity tests (feature-gated)
@@ -88,6 +91,7 @@ The workspace publishes 7 crates (proto, types, server, client, auth, aws-lambda
    - `cargo clippy --workspace --all-targets -- -D warnings` clean — and **lint each storage feature in isolation**, not just default and all-features. Dead code hides under any *superset* of features: an all-features run (`--features sqlite,postgres,dynamodb`) marks a helper used by *any* backend as live, so it cannot catch code that is dead under one backend alone. Run the matrix: default (no features), `--features sqlite`, `--features postgres`, `--features dynamodb`, and all three together — each must be clean. (Example: the TEXT-column JSON helpers are used by SQLite/DynamoDB but not PostgreSQL, which uses JSONB; they are gated to `any(feature = "sqlite", feature = "dynamodb")` so a Postgres-only build carries no dead code.) A module consumed only by feature-gated backends must itself be gated on those features.
    - `cargo fmt --all -- --check` clean
    - `cargo doc --no-deps --workspace` no warnings
+   - `cargo clippy -p turul-a2a-client --target wasm32-unknown-unknown --all-targets -- -D warnings` clean, and the wasm test above green against a running `post-task-hook-agent`
    - `cargo package` warning-free for all publish crates **as one set** (`cargo package -p turul-a2a-proto -p turul-a2a-types -p turul-a2a -p turul-a2a-auth -p turul-a2a-client -p turul-a2a-aws-lambda -p turul-a2a-patterns --no-verify --allow-dirty`). Packaging crates one at a time misses dependency cycles: `turul-a2a` dev-depends on `turul-a2a-client` and `turul-a2a-auth`, which depend on `turul-a2a`, so those two root entries stay path-only (cargo strips path-only dev-deps).
 4. **Commit the release-prep changes.** `cargo publish` refuses a dirty tree. Do not use `--allow-dirty` on real publishes — it is only for `cargo package` dry-runs.
 5. **Push main.** `git push origin main`. If the push fails (merge conflict, branch protection, auth), stop and fix the local repo first. Do not publish from a tree that cannot be pushed.
@@ -121,7 +125,7 @@ Authorize each `cargo publish` call separately. A prior "go ahead" does not auth
 - `turul-a2a-types` — Ergonomic Rust wrappers over proto types. Publishable, no server/storage/auth deps. `#[non_exhaustive]` on all public types. State machine enforcement on `TaskState`.
 - `turul-a2a` — Server + storage + HTTP/JSON-RPC/SSE transports + auth middleware foundation. Feature-gated backends (in-memory default). `AgentExecutor` trait, `A2aMiddleware` trait, `A2aServer::builder()`.
 - `turul-a2a-auth` — Concrete auth middleware: `BearerMiddleware` (JWT), `ApiKeyMiddleware`. Uses the external `turul-jwt-validator` crate.
-- `turul-a2a-client` — Independent A2A client: discovery, send, get, cancel, list, auth, tenant.
+- `turul-a2a-client` — Independent A2A client: discovery, send, get, cancel, list, auth, tenant. Builds for `wasm32-unknown-unknown` (HTTP+JSON only; no tokio in its dependencies, ADR-033).
 - `turul-a2a-aws-lambda` — Lambda adapter: thin wrapper over same Router, request/response only (ADR-008).
 
 ### Preludes

@@ -6,6 +6,20 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.16] — 2026-11-20
+
+### Added
+
+- **`turul-a2a-client` builds for `wasm32-unknown-unknown`.** The HTTP+JSON client, including SSE streaming, runs on a JavaScript host (a browser or Node) through reqwest's `fetch` backend, with no async runtime. On wasm, `SseStream` and `TypedSseStream` are not `Send`, and the `grpc` feature does not build (tonic is native-only). In a browser, a server on another origin must send CORS headers. turul-a2a does not send them, so put a CORS layer or gateway in front. See ADR-033.
+
+### Changed
+
+- `turul-a2a-client` no longer depends on `tokio` (it never used it outside tests). Native behaviour and the native `SseStream`/`TypedSseStream` types (still `Send`) are unchanged.
+
+### Verification
+
+- New wasm test runs card discovery, a blocking send and a streaming send under Node against a live server. All three fail against a closed port. Workspace tests and the native client suite pass unchanged.
+
 ## [0.2.15] — 2026-11-18
 
 ### Security

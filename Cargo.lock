@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-role-critic-agent"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "agent-role-planner-router-agent"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -157,7 +157,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auth-agent"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "axum",
@@ -822,7 +822,7 @@ dependencies = [
 
 [[package]]
 name = "callback-agent"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "axum",
@@ -837,6 +837,12 @@ dependencies = [
  "turul-a2a-types",
  "uuid",
 ]
+
+[[package]]
+name = "cast"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "cc"
@@ -920,7 +926,7 @@ checksum = "be95d4a884358a21a199689323c29e9256b4a1b315e22f183d155422041d3a9a"
 
 [[package]]
 name = "conversation-agent"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "axum",
@@ -1152,7 +1158,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "echo-agent"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "axum",
@@ -1481,7 +1487,7 @@ dependencies = [
 
 [[package]]
 name = "grpc-agent"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "futures",
@@ -1975,7 +1981,7 @@ dependencies = [
 
 [[package]]
 name = "interop-agent-role-critic-rust"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "serde_json",
  "tokio",
@@ -1985,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "interop-agent-role-planner-router-rust"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "serde_json",
  "tokio",
@@ -1995,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "interop-post-task-hook-rust"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "serde_json",
  "tokio",
@@ -2005,7 +2011,7 @@ dependencies = [
 
 [[package]]
 name = "interop-remote-delegate-rust"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "serde_json",
  "tokio",
@@ -2015,7 +2021,7 @@ dependencies = [
 
 [[package]]
 name = "interop-skill-dispatch-profile-rust"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "serde_json",
  "tokio",
@@ -2025,7 +2031,7 @@ dependencies = [
 
 [[package]]
 name = "interop-skill-manifest-ollama-rust"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "serde_json",
  "tokio",
@@ -2035,7 +2041,7 @@ dependencies = [
 
 [[package]]
 name = "interrupting-agent"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "axum",
@@ -2278,7 +2284,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-agent"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "lambda_http",
@@ -2295,7 +2301,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-durable-agent"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2313,7 +2319,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-durable-single"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2331,7 +2337,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-durable-worker"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "lambda_runtime",
@@ -2346,7 +2352,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-scheduled-worker"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "aws_lambda_events",
@@ -2364,7 +2370,7 @@ dependencies = [
 
 [[package]]
 name = "lambda-stream-worker"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "aws_lambda_events",
@@ -2462,6 +2468,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
 name = "libsqlite3-sys"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2547,6 +2559,16 @@ name = "mime"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5848f5a9e8117cf94f2f90faac24a87ff81600ff8628c1e3deaab572e76bfa1"
+
+[[package]]
+name = "minicov"
+version = "0.3.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4869b6a491569605d66d3952bcdf03df789e5b536e5f0cf7758a7f08a55ae24d"
+dependencies = [
+ "cc",
+ "walkdir",
+]
 
 [[package]]
 name = "mio"
@@ -2662,6 +2684,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+ "libm",
 ]
 
 [[package]]
@@ -2679,6 +2702,12 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "oorandom"
+version = "11.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "openssl-probe"
@@ -2840,7 +2869,7 @@ dependencies = [
 
 [[package]]
 name = "post-task-hook-agent"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -3180,7 +3209,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remote-delegate-agent"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "dotenvy",
@@ -3715,7 +3744,7 @@ dependencies = [
 
 [[package]]
 name = "skill-dispatch-profile-agent"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -3733,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "skill-manifest-ollama-agent"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "dotenvy",
@@ -3755,7 +3784,7 @@ dependencies = [
 
 [[package]]
 name = "skill-security-agent"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "axum",
@@ -4001,7 +4030,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "streaming-agent"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "axum",
@@ -4503,7 +4532,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "turul-a2a"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4546,7 +4575,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-auth"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -4568,7 +4597,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-aws-lambda"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "aws-sdk-sqs",
@@ -4598,12 +4627,13 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-client"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "futures",
  "reqwest",
  "serde",
  "serde_json",
+ "static_assertions",
  "thiserror",
  "tokio",
  "tonic",
@@ -4612,12 +4642,13 @@ dependencies = [
  "turul-a2a-proto",
  "turul-a2a-types",
  "uuid",
+ "wasm-bindgen-test",
  "wiremock",
 ]
 
 [[package]]
 name = "turul-a2a-patterns"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "async-trait",
  "jsonschema",
@@ -4632,7 +4663,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-proto"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "chrono",
  "pbjson",
@@ -4651,7 +4682,7 @@ dependencies = [
 
 [[package]]
 name = "turul-a2a-types"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "chrono",
  "pbjson-types",
@@ -4987,6 +5018,44 @@ checksum = "3b1f9c3798725016c6ee5f2f57869ec0831e8bbc0ab0310a86e787e97f41389e"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "wasm-bindgen-test"
+version = "0.3.80"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b4913c0ade07e01ab574b20d2741538f070efa12cb7a1a1e2d5df6ea41cf522"
+dependencies = [
+ "cast",
+ "js-sys",
+ "libm",
+ "minicov",
+ "nu-ansi-term",
+ "num-traits",
+ "oorandom",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test-macro",
+ "wasm-bindgen-test-shared",
+]
+
+[[package]]
+name = "wasm-bindgen-test-macro"
+version = "0.3.80"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "238071aa4c5b268e57d21018621a2e2403c29dd11c55dbdf790ed47fdb9241c0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
+
+[[package]]
+name = "wasm-bindgen-test-shared"
+version = "0.2.130"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ab365ce29ba0232367502b2894556ae77a9c214d33dbf453fdba7f586905918"
 
 [[package]]
 name = "wasm-streams"

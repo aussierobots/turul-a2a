@@ -12,6 +12,7 @@
 //! ```toml
 //! [dependencies]
 //! turul-a2a-client = "0.2"
+//! # On native targets, any async runtime; on wasm, none (see WebAssembly below).
 //! tokio = { version = "1", features = ["full"] }
 //! ```
 //!
@@ -33,7 +34,17 @@
 //!
 //! | Feature | Enables |
 //! |---|---|
-//! | `grpc` | `A2aGrpcClient` over the gRPC transport |
+//! | `grpc` | `A2aGrpcClient` over the gRPC transport (native targets only) |
+//!
+//! # WebAssembly
+//!
+//! The HTTP+JSON client builds for `wasm32-unknown-unknown` and runs on
+//! a JavaScript host (a browser or Node), where reqwest sends requests
+//! with `fetch`. It needs no async runtime: await it from
+//! `wasm_bindgen_futures::spawn_local` or an exported `async fn`. On
+//! wasm, [`SseStream`] and [`TypedSseStream`] are not `Send`, and
+//! the `grpc` feature does not build. In a browser, a server on another
+//! origin must send CORS headers, and `fetch` follows redirects itself.
 //!
 //! # Where next
 //!

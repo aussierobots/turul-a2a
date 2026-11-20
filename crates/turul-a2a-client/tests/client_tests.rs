@@ -1,4 +1,5 @@
 //! Client integration tests with wiremock mock server.
+#![cfg(not(target_arch = "wasm32"))]
 
 use serde_json::json;
 use wiremock::matchers::{header, method, path};

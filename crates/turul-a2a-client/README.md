@@ -15,22 +15,38 @@ compliant server.
 - Tenant scoping, API-key and Bearer auth.
 - Wrapper-first request/response types with typed streaming events.
 - Optional gRPC transport via the `grpc` feature.
+- Builds for `wasm32-unknown-unknown` (browser or Node) without a runtime.
 
 ## Quick start
 
 ```rust
-use turul_a2a_client::{A2aClient, MessageBuilder};
+use turul_a2a_client::prelude::*;
 
 let client = A2aClient::discover("http://localhost:3000").await?;
-let response = client
-    .send_message(MessageBuilder::new().text("hello").build())
-    .await?;
-println!("task: {}", response.task.unwrap().id);
+let reply = client.send_message(MessageBuilder::new().text("hello")).await?;
+if let Some(task) = reply.task() {
+    println!("{}", artifact_text(task));
+}
 ```
 
 `discover` performs `GET /.well-known/agent-card.json` and caches the
 agent card. Skip discovery with `A2aClient::new(base_url)` if you
 already know the routes.
+
+## WebAssembly
+
+The HTTP+JSON client builds for `wasm32-unknown-unknown`. reqwest sends
+requests through the host's `fetch`, so it needs a JavaScript host (a
+browser or Node) and no async runtime. Await it from
+`wasm_bindgen_futures::spawn_local` or an exported `async fn`.
+
+- `SseStream` and `TypedSseStream` are not `Send` on wasm.
+- The `grpc` feature is native-only and fails to compile on wasm.
+- In a browser, a server on another origin must send CORS headers, and
+  `fetch` follows redirects itself.
+
+`tests/wasm.rs` runs discovery, a blocking send and a streaming send under
+Node against `post-task-hook-agent` (see the file for the command).
 
 ## Streaming
 
@@ -38,7 +54,7 @@ already know the routes.
 use futures::StreamExt;
 
 let mut stream = client
-    .send_streaming_message(MessageBuilder::new().text("stream this").build())
+    .send_streaming_message(MessageBuilder::new().text("stream this"))
     .await?;
 
 while let Some(event) = stream.next().await {

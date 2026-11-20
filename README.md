@@ -24,7 +24,7 @@ Proto-first: types are generated from the normative `proto/a2a.proto` (package `
 | `turul-a2a-types` | [📖](https://docs.rs/turul-a2a-types) | Ergonomic wrappers, state machine, `#[non_exhaustive]` |
 | `turul-a2a` | [📖](https://docs.rs/turul-a2a) | Server framework: HTTP + JSON-RPC + SSE, storage, middleware |
 | `turul-a2a-auth` | [📖](https://docs.rs/turul-a2a-auth) | Bearer JWT and API key middleware |
-| `turul-a2a-client` | [📖](https://docs.rs/turul-a2a-client) | Client library: discovery, send, stream, subscribe |
+| `turul-a2a-client` | [📖](https://docs.rs/turul-a2a-client) | Client library: discovery, send, stream, subscribe; builds for wasm32 (browser or Node) |
 | `turul-a2a-aws-lambda` | [📖](https://docs.rs/turul-a2a-aws-lambda) | AWS Lambda adapter |
 | `turul-jwt-validator` | [📖](https://docs.rs/turul-jwt-validator) | Local JWT validator with JWKS caching |
 
@@ -87,13 +87,13 @@ See [`crates/turul-a2a/README.md`](crates/turul-a2a/README.md) for storage wirin
 ## Client
 
 ```rust
-use turul_a2a_client::{A2aClient, MessageBuilder};
+use turul_a2a_client::prelude::*;
 
 let client = A2aClient::discover("http://localhost:3000").await?;
-let response = client.send_message(MessageBuilder::new().text("hello").build()).await?;
+let reply = client.send_message(MessageBuilder::new().text("hello")).await?;
 ```
 
-See [`crates/turul-a2a-client/README.md`](crates/turul-a2a-client/README.md) for streaming, push config, and tenant routing.
+See [`crates/turul-a2a-client/README.md`](crates/turul-a2a-client/README.md) for streaming, push config, tenant routing and WebAssembly ([ADR-033](docs/adr/ADR-033-client-wasm32.md)).
 
 ## Storage
 

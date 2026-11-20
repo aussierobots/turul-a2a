@@ -14,6 +14,14 @@ use turul_a2a_types::{Message, Task};
 
 use crate::A2aClientError;
 
+/// A boxed event stream. It is `Send` on native targets, so it can be
+/// moved across tokio worker threads. On wasm the fetch body stream is
+/// tied to the JS thread and is not `Send`.
+#[cfg(not(target_arch = "wasm32"))]
+type BoxedStream<T> = Pin<Box<dyn Stream<Item = Result<T, A2aClientError>> + Send>>;
+#[cfg(target_arch = "wasm32")]
+type BoxedStream<T> = Pin<Box<dyn Stream<Item = Result<T, A2aClientError>>>>;
+
 /// A parsed SSE event from the server.
 #[derive(Debug, Clone)]
 pub struct SseEvent {
@@ -27,7 +35,7 @@ pub struct SseEvent {
 ///
 /// Wraps a `reqwest::Response` byte stream and parses SSE format line-by-line.
 pub struct SseStream {
-    inner: Pin<Box<dyn Stream<Item = Result<SseEvent, A2aClientError>> + Send>>,
+    inner: BoxedStream<SseEvent>,
 }
 
 impl SseStream {
@@ -45,9 +53,9 @@ impl SseStream {
 /// inside a line, between the CR and LF of a line ending, or inside a
 /// multi-byte UTF-8 character. An event whose data is not JSON is an
 /// error item; the stream continues after it.
-fn sse_events<S, B>(bytes: S) -> impl Stream<Item = Result<SseEvent, A2aClientError>> + Send
+fn sse_events<S, B>(bytes: S) -> impl Stream<Item = Result<SseEvent, A2aClientError>>
 where
-    S: Stream<Item = Result<B, reqwest::Error>> + Send + Unpin,
+    S: Stream<Item = Result<B, reqwest::Error>> + Unpin,
     B: AsRef<[u8]>,
 {
     futures::stream::unfold(
@@ -295,7 +303,7 @@ fn parse_stream_event(raw: &SseEvent) -> Result<TypedSseEvent, A2aClientError> {
 ///
 /// Wraps `SseStream` and parses raw JSON events into typed `StreamEvent` variants.
 pub struct TypedSseStream {
-    inner: Pin<Box<dyn Stream<Item = Result<TypedSseEvent, A2aClientError>> + Send>>,
+    inner: BoxedStream<TypedSseEvent>,
 }
 
 impl TypedSseStream {
@@ -323,11 +331,15 @@ impl Stream for TypedSseStream {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 
     use serde_json::json;
+
+    // Native callers move streams across tokio worker threads.
+    static_assertions::assert_impl_all!(SseStream: Send);
+    static_assertions::assert_impl_all!(TypedSseStream: Send);
 
     #[test]
     fn parse_status_update_event() {

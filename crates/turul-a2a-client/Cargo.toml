@@ -29,7 +29,6 @@ grpc = ["dep:tonic", "dep:tonic-prost", "dep:tonic-types", "turul-a2a-proto/grpc
 turul-a2a-types = { workspace = true }
 turul-a2a-proto = { workspace = true }
 reqwest = { workspace = true, features = ["stream"] }
-tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -39,6 +38,15 @@ tonic = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
 tonic-types = { workspace = true, optional = true }
 
-[dev-dependencies]
+# Browser wasm has no OS randomness; uuid draws it from the JS crypto API.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+uuid = { workspace = true, features = ["js"] }
+
+# Native-only: tokio and wiremock do not build for wasm32.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }
+static_assertions = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = { workspace = true }
